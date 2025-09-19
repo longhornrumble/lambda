@@ -21,28 +21,36 @@ class CloudWatchReader:
         Query CloudWatch Insights for QA_COMPLETE logs from both Lambda functions
         """
         cache_key = f"{tenant_hash}:{start_time.isoformat()}:{end_time.isoformat()}"
-        
+
         if cache_key in self._cache:
             cache_age = time.time() - self._cache_timestamps.get(cache_key, 0)
             if cache_age < CACHE_TTL_SECONDS:
                 logger.info(f"Returning cached results for {tenant_hash[:8]}... (age: {cache_age:.0f}s)")
                 return self._cache[cache_key]
+
+        logger.info(f"\n=== CloudWatch Query Debug ===")
+        logger.info(f"Tenant hash: {tenant_hash}")
+        logger.info(f"Start time: {start_time.isoformat()}")
+        logger.info(f"End time: {end_time.isoformat()}")
+        logger.info(f"Time range: {(end_time - start_time).days} days")
         
-        logger.info(f"Querying CloudWatch for tenant_hash: {tenant_hash[:8]}... from {start_time.isoformat()} to {end_time.isoformat()}")
-        
+        # Use separate filters - this matches what worked in direct query
         query = f"""
         fields @timestamp, @message
         | filter @message like /QA_COMPLETE/
         | filter @message like /{tenant_hash}/
-        | sort @timestamp desc
+        | sort @timestamp asc
         | limit {MAX_QUERY_RESULTS}
         """
+
+        logger.info(f"Query string:\n{query}")
+        logger.info(f"Max results limit: {MAX_QUERY_RESULTS}")
         
         all_results = []
         
         for log_group in [LOG_GROUP_STREAMING, LOG_GROUP_MASTER]:
             try:
-                logger.info(f"Querying log group: {log_group}")
+                logger.info(f"\n--- Querying log group: {log_group} ---")
                 
                 response = self.logs_client.start_query(
                     logGroupName=log_group,
@@ -54,32 +62,99 @@ class CloudWatchReader:
                 query_id = response['queryId']
                 
                 status = 'Running'
-                max_wait = 30  
+                max_wait = 60  # Increased from 30 to 60 seconds
                 wait_time = 0
-                
+                poll_count = 0
+
                 while status == 'Running' and wait_time < max_wait:
-                    time.sleep(1)
-                    wait_time += 1
+                    time.sleep(2)  # Poll every 2 seconds instead of 1
+                    wait_time += 2
+                    poll_count += 1
                     
                     result = self.logs_client.get_query_results(queryId=query_id)
                     status = result['status']
+
+                    # Log progress every 10 seconds
+                    if poll_count % 5 == 0:
+                        logger.info(f"Query still running... ({wait_time}s elapsed)")
                 
                 if status == 'Complete':
                     results = result.get('results', [])
-                    logger.info(f"Found {len(results)} QA_COMPLETE logs in {log_group}")
-                    
-                    for log_entry in results:
+                    logger.info(f"Raw results count: {len(results)} from {log_group}")
+
+                    parsed_count = 0
+                    failed_count = 0
+                    seen_sessions = set()
+                    seen_questions = set()
+
+                    for idx, log_entry in enumerate(results):
                         parsed_log = self._parse_log_entry(log_entry)
                         if parsed_log:
                             all_results.append(parsed_log)
+                            parsed_count += 1
+
+                            # Track unique sessions and questions
+                            session_id = parsed_log.get('session_id', '')
+                            question = parsed_log.get('question', '')
+                            if session_id:
+                                seen_sessions.add(session_id)
+                            if question:
+                                seen_questions.add(question[:50])  # First 50 chars
+
+                            # Log first few successful parses
+                            if parsed_count <= 3:
+                                logger.info(f"Parsed log {parsed_count}: session={session_id[:8]}..., question={question[:30]}...")
+                        else:
+                            failed_count += 1
+                            # Log all failures for debugging
+                            logger.warning(f"Failed to parse log entry {idx+1}/{len(results)}")
+                            # Always log failed messages for Foster Village debug
+                            if tenant_hash == "fo85e6a06dcdf4" or failed_count <= 5:
+                                # Get the message field for debugging
+                                msg_field = next((f for f in log_entry if f.get('field') == '@message'), None)
+                                if msg_field:
+                                    msg_value = msg_field.get('value', '')
+                                    # Check if it contains QA_COMPLETE
+                                    if 'QA_COMPLETE' in msg_value:
+                                        logger.warning(f"Failed to parse QA_COMPLETE log! Message preview: {msg_value[:300]}")
+                                    else:
+                                        logger.warning(f"Non-QA_COMPLETE message: {msg_value[:100]}")
+
+                    logger.info(f"Parse summary for {log_group}:")
+                    logger.info(f"  - Successfully parsed: {parsed_count}")
+                    logger.info(f"  - Failed to parse: {failed_count}")
+                    logger.info(f"  - Unique sessions: {len(seen_sessions)}")
+                    logger.info(f"  - Unique questions: {len(seen_questions)}")
                 else:
-                    logger.warning(f"Query did not complete in time. Status: {status}")
+                    logger.warning(f"Query did not complete. Status: {status}")
+                    if status == 'Running':
+                        logger.warning(f"Query still running after {max_wait} seconds timeout")
                     
             except Exception as e:
                 logger.error(f"Error querying {log_group}: {str(e)}")
                 continue
         
+        # Final summary
+        unique_sessions = set()
+        unique_questions = set()
+        for log in all_results:
+            if log.get('session_id'):
+                unique_sessions.add(log['session_id'])
+            if log.get('question'):
+                unique_questions.add(log['question'][:50])
+
+        logger.info(f"\n=== Final Query Results ===")
         logger.info(f"Total QA_COMPLETE logs found: {len(all_results)}")
+        logger.info(f"Unique sessions: {len(unique_sessions)}")
+        logger.info(f"Unique questions: {len(unique_questions)}")
+
+        # Log all found logs for Foster Village to debug
+        if tenant_hash == "fo85e6a06dcdf4":
+            logger.info(f"\n=== Foster Village Debug - All {len(all_results)} logs ===")
+            for i, log in enumerate(all_results, 1):
+                logger.info(f"Log {i}: session={log.get('session_id', 'N/A')[:12]}, "
+                          f"timestamp={log.get('timestamp', 'N/A')[:19]}, "
+                          f"question={log.get('question', 'N/A')[:40]}...")
         
         self._cache[cache_key] = all_results
         self._cache_timestamps[cache_key] = time.time()
@@ -105,13 +180,18 @@ class CloudWatchReader:
             
             # Try to parse as JSON directly
             try:
-                # Handle potential log prefix (like timestamp and request ID)
-                if '\t' in message:
-                    # Split by tab and get the last part (the actual JSON)
+                # Handle Lambda log format: "timestamp request-id INFO {json}"
+                if ' INFO ' in message:
+                    # Split by INFO and take everything after it
+                    parts = message.split(' INFO ', 1)
+                    if len(parts) > 1:
+                        message = parts[1].strip()
+                elif '\t' in message:
+                    # Handle tab-separated format (legacy)
                     parts = message.split('\t')
                     if len(parts) > 1:
                         message = parts[-1]
-                
+
                 log_data = json.loads(message)
             except json.JSONDecodeError:
                 # Try to extract JSON from the message
@@ -128,6 +208,14 @@ class CloudWatchReader:
             
             # Check if this is a QA_COMPLETE log
             if log_data.get('type') != 'QA_COMPLETE':
+                # Log why we're skipping this
+                logger.debug(f"Skipping non-QA_COMPLETE log: type={log_data.get('type')}")
+                return None
+
+            # Validate tenant_hash matches what we're looking for
+            log_tenant_hash = log_data.get('tenant_hash', '')
+            if not log_tenant_hash:
+                logger.debug(f"Skipping log with no tenant_hash")
                 return None
             
             return {

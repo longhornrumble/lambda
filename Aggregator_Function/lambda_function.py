@@ -7,6 +7,11 @@ from typing import Dict, List, Any, Optional
 from decimal import Decimal
 from collections import defaultdict
 import hashlib
+import gzip
+try:
+    import pytz
+except ImportError:
+    pytz = None
 
 # Configure logging
 logger = logging.getLogger()
@@ -20,6 +25,7 @@ s3 = boto3.client('s3')
 # Configuration
 ANALYTICS_TABLE = os.environ.get('ANALYTICS_TABLE', 'picasso-analytics-daily')
 CONFIG_BUCKET = os.environ.get('CONFIG_BUCKET', 'myrecruiter-picasso')
+ARCHIVE_BUCKET = os.environ.get('ARCHIVE_BUCKET', 'picasso-analytics-archive')
 LOG_GROUP_STREAMING = '/aws/lambda/Bedrock_Streaming_Handler'
 LOG_GROUP_MASTER = '/aws/lambda/Master_Function'
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'production')
@@ -70,7 +76,7 @@ def lambda_handler(event, context):
             qa_logs = get_qa_complete_logs(tenant_hash, start_time, end_time)
             
             # Process the logs into metrics (same as Analytics_Function)
-            metrics = process_qa_logs(qa_logs)
+            metrics = process_qa_logs(qa_logs, tenant_id)
             
             # Store in DynamoDB if there's data
             if metrics['conversation_count'] > 0:
@@ -225,7 +231,29 @@ def _parse_log_entry(log_entry: List[Dict[str, str]]) -> Optional[Dict[str, Any]
         logger.debug(f"Error parsing log entry: {str(e)}")
         return None
 
-def process_qa_logs(qa_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+def get_tenant_timezone(tenant_id: str) -> Optional[str]:
+    """Get tenant's timezone from config file"""
+    try:
+        # Try to load config from S3
+        config_key = f'tenants/{tenant_id}/{tenant_id}-config.json'
+        response = s3.get_object(
+            Bucket=CONFIG_BUCKET,
+            Key=config_key
+        )
+        config = json.loads(response['Body'].read())
+        timezone = config.get('timezone', None)
+
+        if timezone:
+            logger.info(f"Found timezone {timezone} for tenant {tenant_id}")
+        else:
+            logger.warning(f"No timezone configured for tenant {tenant_id}")
+
+        return timezone
+    except Exception as e:
+        logger.warning(f"Could not load timezone for tenant {tenant_id}: {str(e)}")
+        return None
+
+def process_qa_logs(qa_logs: List[Dict[str, Any]], tenant_id: str = None) -> Dict[str, Any]:
     """Process QA logs into metrics (same logic as Analytics_Function)"""
     metrics = {
         'conversation_count': 0,
@@ -240,22 +268,44 @@ def process_qa_logs(qa_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         'after_hours_count': 0,
         'streaming_enabled_count': 0
     }
-    
+
+    # Get tenant's timezone
+    tenant_timezone = get_tenant_timezone(tenant_id) if tenant_id else None
+
+    # Track unique sessions for conversation count
+    unique_sessions = set()
+
     for log in qa_logs:
         try:
             if 'question' in log:
                 metrics['questions'][log['question']] += 1
                 metrics['total_messages'] += 1
-                
+
+                # Track unique session for conversation counting
+                session_id = log.get('session_id')
+                if session_id:
+                    unique_sessions.add(session_id)
+
                 # Extract timestamp for distribution
                 if 'timestamp' in log:
                     dt = datetime.fromisoformat(log['timestamp'].replace('Z', '+00:00'))
-                    hour = dt.hour
-                    day = dt.weekday()
+
+                    # Convert to tenant's local timezone if available
+                    if tenant_timezone and pytz:
+                        tz = pytz.timezone(tenant_timezone)
+                        local_dt = dt.astimezone(tz)
+                    else:
+                        # Fallback to UTC if no timezone configured
+                        local_dt = dt
+                        if tenant_id:
+                            logger.warning(f"No timezone for tenant {tenant_id}, using UTC")
+
+                    hour = local_dt.hour
+                    day = local_dt.weekday()
                     metrics['hourly_distribution'][hour] += 1
                     metrics['daily_distribution'][day] += 1
-                    
-                    # Check if after hours (before 9am or after 5pm)
+
+                    # Check if after hours (before 9am or after 5pm in LOCAL time)
                     if hour < 9 or hour >= 17:
                         metrics['after_hours_count'] += 1
                 
@@ -270,21 +320,31 @@ def process_qa_logs(qa_logs: List[Dict[str, Any]]) -> Dict[str, Any]:
                         metrics['response_times'].append(log_metrics['response_time_ms'])
                 
                 # Add to conversations list
+                # Extract timing metrics from the metrics sub-object
+                log_metrics_data = log.get('metrics', {})
+                first_token = log_metrics_data.get('first_token_ms', 0)
+                total_time = log_metrics_data.get('total_time_ms', 0)
+                response_time = log_metrics_data.get('response_time_ms', 0)
+
                 conversation = {
                     'timestamp': log.get('timestamp', ''),
                     'session_id': log.get('session_id', ''),
                     'conversation_id': log.get('conversation_id'),
                     'question': log.get('question', ''),
                     'answer': log.get('answer', ''),
-                    'response_time_ms': log.get('metrics', {}).get('total_time_ms', 0)
+                    'response_time_ms': response_time,  # Keep for compatibility
+                    'first_token_ms': first_token,       # Time to first token
+                    'total_time_ms': total_time          # Total completion time
                 }
                 metrics['conversations'].append(conversation)
-                
-                metrics['conversation_count'] += 1
-                
+
         except Exception as e:
             logger.warning(f"Error processing log entry: {str(e)}")
-    
+
+    # Set conversation count to number of unique sessions
+    metrics['conversation_count'] = len(unique_sessions)
+    logger.info(f"Aggregator: Found {len(unique_sessions)} unique sessions, {metrics['total_messages']} total messages")
+
     # Calculate aggregated values
     if metrics['response_times']:
         metrics['avg_response_time_ms'] = sum(metrics['response_times']) / len(metrics['response_times'])
@@ -348,12 +408,81 @@ def store_metrics(tenant_id, tenant_hash, process_date, metrics):
         'environment': ENVIRONMENT
     }
     
+    # Path 1: Write to DynamoDB (existing)
     try:
         table.put_item(Item=item)
-        logger.info(f"Stored metrics for {tenant_id} on {process_date}")
+        logger.info(f"Stored metrics in DynamoDB for {tenant_id} on {process_date}")
     except Exception as e:
-        logger.error(f"Error storing metrics: {str(e)}")
+        logger.error(f"Error storing metrics in DynamoDB: {str(e)}")
         raise
+
+    # Path 2: Write to S3/Glacier IR (new)
+    try:
+        # Calculate percentages if not already present
+        if 'after_hours_percentage' not in metrics:
+            if metrics['total_messages'] > 0:
+                metrics['after_hours_percentage'] = (metrics['after_hours_count'] / metrics['total_messages']) * 100
+            else:
+                metrics['after_hours_percentage'] = 0
+
+        if 'streaming_enabled_percentage' not in metrics:
+            if metrics['total_messages'] > 0:
+                metrics['streaming_enabled_percentage'] = (metrics['streaming_enabled_count'] / metrics['total_messages']) * 100
+            else:
+                metrics['streaming_enabled_percentage'] = 0
+
+        # Prepare data for S3 (convert Decimal to float for JSON serialization)
+        s3_data = {
+            'tenant_id': tenant_id,
+            'tenant_hash': tenant_hash,
+            'date': process_date,
+            'conversation_count': int(metrics['conversation_count']),
+            'total_messages': int(metrics['total_messages']),
+            'avg_response_time_ms': float(metrics['avg_response_time_ms']),
+            'avg_first_token_ms': float(metrics['avg_first_token_ms']),
+            'avg_total_time_ms': float(metrics['avg_total_time_ms']),
+            'after_hours_percentage': float(metrics['after_hours_percentage']),
+            'after_hours_count': int(metrics['after_hours_count']),
+            'streaming_enabled_percentage': float(metrics['streaming_enabled_percentage']),
+            'streaming_enabled_count': int(metrics['streaming_enabled_count']),
+            'top_questions': metrics['top_questions'],  # Already has floats
+            'hourly_distribution': dict(metrics['hourly_distribution']),
+            'daily_distribution': dict(metrics['daily_distribution']),
+            'heat_grid': metrics.get('heat_grid', [0] * 56),
+            'conversations': metrics['conversations'][:100],  # Store up to 100 conversations
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'environment': ENVIRONMENT
+        }
+
+        # Compress the JSON data
+        json_str = json.dumps(s3_data, separators=(',', ':'))
+        compressed_data = gzip.compress(json_str.encode('utf-8'))
+
+        # Create S3 key with date partitioning for efficient querying
+        s3_key = f"daily-aggregates/{process_date[:4]}/{process_date[5:7]}/{process_date}/{tenant_id}.json.gz"
+
+        # Upload to S3 with Glacier Instant Retrieval storage class
+        s3.put_object(
+            Bucket=ARCHIVE_BUCKET,
+            Key=s3_key,
+            Body=compressed_data,
+            StorageClass='GLACIER_IR',
+            ContentType='application/json',
+            ContentEncoding='gzip',
+            Metadata={
+                'tenant_id': tenant_id,
+                'tenant_hash': tenant_hash,
+                'date': process_date,
+                'conversation_count': str(metrics['conversation_count']),
+                'environment': ENVIRONMENT
+            }
+        )
+        logger.info(f"Archived metrics to S3 for {tenant_id} on {process_date}: s3://{ARCHIVE_BUCKET}/{s3_key}")
+
+    except Exception as e:
+        logger.error(f"Error archiving metrics to S3: {str(e)}")
+        # Don't raise here - we want DynamoDB write to succeed even if S3 fails
+        # but log it for monitoring
 
 # For local testing
 if __name__ == "__main__":

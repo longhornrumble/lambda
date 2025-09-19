@@ -12,7 +12,7 @@ else:
     LOG_GROUP_STREAMING = os.environ.get('LOG_GROUP_STREAMING', '/aws/lambda/Bedrock_Streaming_Handler')
     LOG_GROUP_MASTER = os.environ.get('LOG_GROUP_MASTER', '/aws/lambda/Master_Function')
 
-CACHE_TTL_SECONDS = int(os.environ.get('CACHE_TTL_SECONDS', '300'))
+CACHE_TTL_SECONDS = int(os.environ.get('CACHE_TTL_SECONDS', '60'))
 
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 

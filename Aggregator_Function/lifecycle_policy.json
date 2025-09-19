@@ -1,0 +1,17 @@
+{
+  "Rules": [
+    {
+      "ID": "DeleteAfterOneYear",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "daily-aggregates/"
+      },
+      "Expiration": {
+        "Days": 365
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 7
+      }
+    }
+  ]
+}
