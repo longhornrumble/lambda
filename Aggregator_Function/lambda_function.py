@@ -43,7 +43,7 @@ def lambda_handler(event, context):
         yesterday = datetime.now(timezone.utc) - timedelta(days=1)
         process_date = yesterday.strftime('%Y-%m-%d')
     
-    logger.info(f"Processing analytics for date: {process_date}")
+    logger.debug(f"Processing analytics for date: {process_date}")
     
     # Get all tenant mappings from S3
     tenants = get_all_tenant_mappings()
@@ -66,7 +66,7 @@ def lambda_handler(event, context):
                 logger.warning(f"Invalid mapping, skipping: {tenant_mapping}")
                 continue
             
-            logger.info(f"Processing tenant: {tenant_id} with hash: {tenant_hash}")
+            logger.debug(f"Processing tenant: {tenant_id} with hash: {tenant_hash}")
             
             # Parse date range for the day
             start_time = datetime.strptime(process_date, '%Y-%m-%d').replace(tzinfo=timezone.utc)
@@ -125,7 +125,7 @@ def get_qa_complete_logs(tenant_hash: str, start_time: datetime, end_time: datet
     """
     Query CloudWatch Insights for QA_COMPLETE logs (copied from Analytics_Function).
     """
-    logger.info(f"Querying CloudWatch for tenant_hash: {tenant_hash[:8]}... from {start_time.isoformat()} to {end_time.isoformat()}")
+    logger.debug(f"Querying CloudWatch for tenant_hash: {tenant_hash[:8]}... from {start_time.isoformat()} to {end_time.isoformat()}")
     
     query = f"""
     fields @timestamp, @message
@@ -139,7 +139,7 @@ def get_qa_complete_logs(tenant_hash: str, start_time: datetime, end_time: datet
     
     for log_group in [LOG_GROUP_STREAMING, LOG_GROUP_MASTER]:
         try:
-            logger.info(f"Querying log group: {log_group}")
+            logger.debug(f"Querying log group: {log_group}")
             
             response = logs_client.start_query(
                 logGroupName=log_group,
@@ -176,7 +176,7 @@ def get_qa_complete_logs(tenant_hash: str, start_time: datetime, end_time: datet
             logger.error(f"Error querying {log_group}: {str(e)}")
             continue
     
-    logger.info(f"Total QA_COMPLETE logs found: {len(all_results)}")
+    logger.debug(f"Total QA_COMPLETE logs found: {len(all_results)}")
     return all_results
 
 def _parse_log_entry(log_entry: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
@@ -244,7 +244,7 @@ def get_tenant_timezone(tenant_id: str) -> Optional[str]:
         timezone = config.get('timezone', None)
 
         if timezone:
-            logger.info(f"Found timezone {timezone} for tenant {tenant_id}")
+            logger.debug(f"Found timezone {timezone} for tenant {tenant_id}")
         else:
             logger.warning(f"No timezone configured for tenant {tenant_id}")
 
@@ -484,10 +484,3 @@ def store_metrics(tenant_id, tenant_hash, process_date, metrics):
         # Don't raise here - we want DynamoDB write to succeed even if S3 fails
         # but log it for monitoring
 
-# For local testing
-if __name__ == "__main__":
-    test_event = {
-        'date': '2025-09-14'
-    }
-    result = lambda_handler(test_event, None)
-    print(json.dumps(result, indent=2))

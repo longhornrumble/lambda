@@ -52,7 +52,7 @@ class AnalyticsFunction:
                        include_heat_map: bool = False, include_full_conversations: bool = False,
                        full_conversations_limit: int = 50) -> Dict[str, Any]:
         """Process analytics for a specific tenant with date range using hybrid approach"""
-        logger.info(f"Processing analytics for tenant_hash: {tenant_hash[:8]}... from {start_date} to {end_date}")
+        logger.debug(f"Processing analytics for tenant_hash: {tenant_hash[:8]}... from {start_date} to {end_date}")
         
         # Parse dates or use defaults
         if end_date:
@@ -61,7 +61,7 @@ class AnalyticsFunction:
                 # For date-only strings, set to end of day
                 end_time = datetime.strptime(end_date, "%Y-%m-%d")
                 end_time = end_time.replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
-                logger.info(f"Parsed end_date '{end_date}' as end-of-day: {end_time.isoformat()}")
+                logger.debug(f"Parsed end_date '{end_date}' as end-of-day: {end_time.isoformat()}")
             else:
                 # For full ISO timestamps
                 try:
@@ -94,7 +94,7 @@ class AnalyticsFunction:
         # Determine cutoffs
         cutoff_7_days = datetime.now(timezone.utc) - timedelta(days=7)
         cutoff_90_days = datetime.now(timezone.utc) - timedelta(days=90)
-        logger.info(f"Data source cutoffs: S3 Archive < {cutoff_90_days.date()} < DynamoDB < {cutoff_7_days.date()} < CloudWatch")
+        logger.debug(f"Data source cutoffs: S3 Archive < {cutoff_90_days.date()} < DynamoDB < {cutoff_7_days.date()} < CloudWatch")
 
         # Initialize combined metrics
         combined_metrics = {
