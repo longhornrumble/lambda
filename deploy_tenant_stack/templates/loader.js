@@ -1,0 +1,1 @@
+console.log('Loaded for {{ config.tenant_id }}');
