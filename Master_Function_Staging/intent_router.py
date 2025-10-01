@@ -79,14 +79,16 @@ def route_intent(event, config=None, conversation_context=None):
                 config = get_config_for_tenant_by_hash(tenant_hash)
                 logger.info(f"[{tenant_hash[:8]}...] ✅ Config loaded using hash")
                 
-                # Warm cache for this tenant if cache warming is available
-                if warm_cache_for_tenant and config:
-                    # Check if cache is empty (likely cold start or expired)
-                    if get_cache_status:
-                        cache_status = get_cache_status()
-                        if cache_status['kb_cache_size'] == 0 and cache_status['response_cache_size'] == 0:
-                            logger.info(f"[{tenant_hash[:8]}...] 🔥 Cold start detected, warming cache...")
-                            warm_cache_for_tenant(tenant_hash, config)
+                # DISABLED: Synchronous cache warming blocks user requests for 78+ seconds
+                # This should be done asynchronously or via a separate Lambda invocation
+                # Commenting out for now to fix HTTP fallback performance
+                # if warm_cache_for_tenant and config:
+                #     # Check if cache is empty (likely cold start or expired)
+                #     if get_cache_status:
+                #         cache_status = get_cache_status()
+                #         if cache_status['kb_cache_size'] == 0 and cache_status['response_cache_size'] == 0:
+                #             logger.info(f"[{tenant_hash[:8]}...] 🔥 Cold start detected, warming cache...")
+                #             warm_cache_for_tenant(tenant_hash, config)
                 
             except Exception as e:
                 logger.warning(f"[{tenant_hash[:8]}...] ⚠️ Could not load config: {e}")
@@ -125,6 +127,15 @@ def route_intent(event, config=None, conversation_context=None):
                 )
             )
         else:
+            # Extract conversation history for form CTA enhancement
+            conversation_history = []
+            if conversation_context and conversation_context.get('messages'):
+                for msg in conversation_context['messages']:
+                    if msg['role'] == 'user':
+                        conversation_history.append({'user': msg['content']})
+                    elif msg['role'] == 'assistant':
+                        conversation_history.append({'assistant': msg['content']})
+
             return format_http_response(
                 response_text,
                 session_id,
@@ -132,7 +143,10 @@ def route_intent(event, config=None, conversation_context=None):
                     "x-amz-lex:qna-search-response": response_text,
                     "x-amz-lex:qna-search-response-source": ", ".join(sources) or "unknown",
                     "tenant_hash": tenant_hash
-                }
+                },
+                tenant_hash=tenant_hash,
+                user_message=user_input,
+                conversation_history=conversation_history
             )
 
     except Exception as e:

@@ -33,10 +33,11 @@ def format_lex_markdown_response(response_text, session_attributes):
         ]
     }
 
-def format_http_response(message, session_id, context=None, request_headers=None, tenant_hash=None):
+def format_http_response(message, session_id, context=None, request_headers=None, tenant_hash=None, user_message=None, conversation_history=None):
     """
     Format HTTP response with CloudFront optimization headers and secure CORS
     Security: Implements tenant-specific CORS validation
+    Enhancement: Includes form CTA injection for v5 implementation
     """
     logger.info(f"📦 Formatting HTTP response for session_id: {session_id} via CloudFront")
     
@@ -83,20 +84,35 @@ def format_http_response(message, session_id, context=None, request_headers=None
         logger.error(f"Error validating CORS in HTTP response: {e}")
         # Fail closed - don't set CORS headers on error
     
+    # Enhance response with form CTAs if tenant_hash and user_message provided
+    response_body = {
+        "type": "text",
+        "content": message,
+        "session_id": session_id,
+        "context": enhanced_context,
+        "_cloudfront": {
+            "domain": CLOUDFRONT_DOMAIN,
+            "response_time": "server-generated",
+            "cache_status": "no-cache"
+        }
+    }
+
+    # PHASE 1B: CTA enhancement moved to lambda_function.py to support session_context
+    # This allows filtering based on completed_forms for HTTP/Streaming parity
+    # The enhancement now happens AFTER extracting session_context from the request body
+    #
+    # OLD CODE (removed to prevent duplicate enhancement without session_context):
+    # if tenant_hash and user_message:
+    #     try:
+    #         from form_cta_enhancer import enhance_response_with_form_cta
+    #         enhanced = enhance_response_with_form_cta(...)
+    #     except Exception as e:
+    #         logger.error(f"Failed to enhance response: {e}")
+
     return {
         "statusCode": 200,
         "headers": headers,
-        "body": json.dumps({
-            "type": "text",
-            "content": message,
-            "session_id": session_id,
-            "context": enhanced_context,
-            "_cloudfront": {
-                "domain": CLOUDFRONT_DOMAIN,
-                "response_time": "server-generated",
-                "cache_status": "no-cache"
-            }
-        })
+        "body": json.dumps(response_body)
     }
 
 def format_http_error(status_code, message, details=None, request_headers=None, tenant_hash=None):

@@ -190,6 +190,9 @@ def handle_save_conversation(event):
     POST Operation: Save conversation state with delta updates
     Security: Compare-and-swap, DLP scrubbing, payload validation
     """
+    logger.info(f"🔴 SAVE HANDLER CALLED at {datetime.utcnow().isoformat()}")
+    logger.info(f"🔴 SAVE EVENT: {json.dumps(event, default=str)[:500]}")
+
     try:
         # 1. Validate and parse state token
         token_data = _validate_state_token(event)
@@ -256,7 +259,7 @@ def handle_save_conversation(event):
         # 7. Generate new rotated token
         new_token = _generate_rotated_token(token_data)
         
-        # 8. Audit successful save (fail-closed for security)
+        # 8. Audit successful save (fail-closed for security in production only)
         if AUDIT_LOGGER_AVAILABLE:
             try:
                 audit_logger._log_audit_event(
@@ -271,10 +274,18 @@ def handle_save_conversation(event):
                 )
             except Exception as e:
                 logger.error(f"❌ Audit logging failed for save: {e}")
-                raise ConversationError("AUDIT_FAILED", "Security audit service unavailable", 503)
+                # Only fail-closed in production environment
+                if ENVIRONMENT == 'production':
+                    raise ConversationError("AUDIT_FAILED", "Security audit service unavailable", 503)
+                else:
+                    logger.warning(f"⚠️ Audit logging skipped in {ENVIRONMENT} environment")
         else:
-            logger.error("❌ Audit logger unavailable for save operation")
-            raise ConversationError("AUDIT_UNAVAILABLE", "Security audit service required", 503)
+            logger.warning(f"⚠️ Audit logger unavailable for save operation in {ENVIRONMENT} environment")
+            # Only fail-closed in production environment
+            if ENVIRONMENT == 'production':
+                raise ConversationError("AUDIT_UNAVAILABLE", "Security audit service required", 503)
+            else:
+                logger.warning(f"⚠️ Continuing without audit logging in {ENVIRONMENT} environment")
         
         # 9. Return success with rotated token
         response_data = {
@@ -648,7 +659,9 @@ def _get_conversation_from_db(session_id, tenant_id):
         
         # Build state object
         state = {}
-        
+
+        logger.info(f"📖 Getting conversation - Summary has Item: {'Item' in summary_response}, Messages count: {len(messages_response.get('Items', []))}")
+
         if 'Item' in summary_response:
             item = summary_response['Item']
             state = {
@@ -657,20 +670,30 @@ def _get_conversation_from_db(session_id, tenant_id):
                 'pending_action': item.get('pending_action', {}).get('S'),
                 'turn': int(item.get('turn', {}).get('N', '0'))
             }
-        
+            logger.info(f"📖 Loaded summary with turn: {state['turn']}")
+
         if 'Items' in messages_response and messages_response['Items']:
             messages = []
             for item in messages_response['Items']:
+                role = item.get('role', {}).get('S', '')
+                content = item.get('content', {}).get('S', '')
                 messages.append({
-                    'role': item.get('role', {}).get('S', ''),
-                    'text': item.get('content', {}).get('S', '')
+                    'role': role,
+                    'text': content
                 })
+                logger.debug(f"  - Loaded message: {role} - {content[:50] if content else 'empty'}...")
             state['lastMessages'] = messages
-        
+            logger.info(f"📖 Added {len(messages)} messages to lastMessages field")
+        else:
+            logger.info(f"📖 No messages found in messages table for session {session_id[:12]}...")
+
         # CRITICAL FIX: Always return a state object with at least a turn field
         # This prevents 409 conflicts when no conversation state exists yet
         if not state:
             state = {'turn': 0}
+            logger.info(f"📖 No state found, returning default with turn: 0")
+
+        logger.info(f"📖 Returning state with lastMessages: {'lastMessages' in state}, message count: {len(state.get('lastMessages', []))}")
         return state
         
     except ClientError as e:
@@ -772,6 +795,12 @@ def _save_conversation_to_db(session_id, tenant_id, delta, expected_turn):
         raise
     except ClientError as e:
         logger.error(f"❌ DynamoDB error saving conversation: {e}")
+        logger.error(f"🔴 SAVE FAILED - Session: {session_id}, Expected turn: {expected_turn}")
+        logger.error(f"🔴 SAVE ERROR Details: {e.response if hasattr(e, 'response') else str(e)}")
+        raise ConversationError("DB_ERROR", "Database error during save", 500)
+    except Exception as unexpected_error:
+        logger.error(f"🔴 UNEXPECTED ERROR in save: {unexpected_error}")
+        logger.error(f"🔴 Error type: {type(unexpected_error).__name__}")
         raise ConversationError("DB_ERROR", "Database error during save", 500)
 
 def _delete_conversation_from_db(session_id, tenant_id):

@@ -1,0 +1,174 @@
+{
+  "email_templates": {
+    "volunteer_signup_confirmation": {
+      "subject": "Thank You for Volunteering with {{organization_name}}",
+      "body_html": "<html><body><h2>Welcome {{first_name}}!</h2><p>Thank you for your interest in volunteering with {{organization_name}}.</p><p>We've received your application and will review it shortly. Here's what you submitted:</p><ul><li><strong>Name:</strong> {{first_name}} {{last_name}}</li><li><strong>Email:</strong> {{email}}</li><li><strong>Phone:</strong> {{phone}}</li><li><strong>Availability:</strong> {{availability}}</li></ul><p>Next Steps:</p><ol><li>Our volunteer coordinator will review your application</li><li>You'll receive an email within 2-3 business days</li><li>We'll schedule an orientation session</li></ol><p>If you have any questions, please don't hesitate to contact us.</p><p>Best regards,<br>The {{organization_name}} Team</p></body></html>",
+      "body_text": "Welcome {{first_name}}!\n\nThank you for your interest in volunteering with {{organization_name}}.\n\nWe've received your application and will review it shortly.\n\nHere's what you submitted:\n- Name: {{first_name}} {{last_name}}\n- Email: {{email}}\n- Phone: {{phone}}\n- Availability: {{availability}}\n\nNext Steps:\n1. Our volunteer coordinator will review your application\n2. You'll receive an email within 2-3 business days\n3. We'll schedule an orientation session\n\nIf you have any questions, please don't hesitate to contact us.\n\nBest regards,\nThe {{organization_name}} Team"
+    },
+    "contact_us_acknowledgment": {
+      "subject": "We Received Your Message - {{organization_name}}",
+      "body_html": "<html><body><h2>Hello {{first_name}},</h2><p>Thank you for contacting {{organization_name}}. We've received your message and will respond as soon as possible.</p><p><strong>Your Message:</strong></p><blockquote style='background: #f4f4f4; padding: 10px; margin: 10px 0;'>{{message}}</blockquote><p>We typically respond within 24-48 hours during business days.</p><p>Thank you for your patience.</p><p>Best regards,<br>{{organization_name}}</p></body></html>",
+      "body_text": "Hello {{first_name}},\n\nThank you for contacting {{organization_name}}. We've received your message and will respond as soon as possible.\n\nYour Message:\n\"{{message}}\"\n\nWe typically respond within 24-48 hours during business days.\n\nThank you for your patience.\n\nBest regards,\n{{organization_name}}"
+    },
+    "donation_thank_you": {
+      "subject": "Thank You for Your Generous Donation to {{organization_name}}",
+      "body_html": "<html><body><h2>Dear {{first_name}},</h2><p>Thank you for your generous donation of <strong>${{amount}}</strong> to {{organization_name}}!</p><p>Your support helps us continue our mission to {{mission_statement}}.</p><p><strong>Donation Details:</strong></p><ul><li>Amount: ${{amount}}</li><li>Date: {{date}}</li><li>Reference: {{submission_id}}</li></ul><p>This email serves as your donation receipt for tax purposes. {{organization_name}} is a 501(c)(3) nonprofit organization. EIN: {{ein_number}}</p><p>Your donation makes a real difference in our community. Thank you for being part of our mission!</p><p>With gratitude,<br>{{organization_name}}</p></body></html>",
+      "body_text": "Dear {{first_name}},\n\nThank you for your generous donation of ${{amount}} to {{organization_name}}!\n\nYour support helps us continue our mission to {{mission_statement}}.\n\nDonation Details:\n- Amount: ${{amount}}\n- Date: {{date}}\n- Reference: {{submission_id}}\n\nThis email serves as your donation receipt for tax purposes. {{organization_name}} is a 501(c)(3) nonprofit organization. EIN: {{ein_number}}\n\nYour donation makes a real difference in our community. Thank you for being part of our mission!\n\nWith gratitude,\n{{organization_name}}"
+    },
+    "event_registration_confirmation": {
+      "subject": "You're Registered! {{event_name}} - {{organization_name}}",
+      "body_html": "<html><body><h2>Hi {{first_name}},</h2><p>You're all set for <strong>{{event_name}}</strong>!</p><p><strong>Event Details:</strong></p><ul><li><strong>Date:</strong> {{event_date}}</li><li><strong>Time:</strong> {{event_time}}</li><li><strong>Location:</strong> {{event_location}}</li><li><strong>Number of Attendees:</strong> {{attendee_count}}</li></ul><p><strong>What to Bring:</strong></p><ul><li>This confirmation email</li><li>Photo ID</li><li>{{additional_items}}</li></ul><p>We're looking forward to seeing you there!</p><p>If you need to cancel or modify your registration, please contact us at {{contact_email}}.</p><p>See you soon,<br>The {{organization_name}} Events Team</p></body></html>",
+      "body_text": "Hi {{first_name}},\n\nYou're all set for {{event_name}}!\n\nEvent Details:\n- Date: {{event_date}}\n- Time: {{event_time}}\n- Location: {{event_location}}\n- Number of Attendees: {{attendee_count}}\n\nWhat to Bring:\n- This confirmation email\n- Photo ID\n- {{additional_items}}\n\nWe're looking forward to seeing you there!\n\nIf you need to cancel or modify your registration, please contact us at {{contact_email}}.\n\nSee you soon,\nThe {{organization_name}} Events Team"
+    },
+    "support_request_received": {
+      "subject": "Support Request Received - {{organization_name}}",
+      "body_html": "<html><body><h2>Hello {{first_name}},</h2><p>We've received your request for support from {{organization_name}}.</p><p><strong>Request Type:</strong> {{support_type}}</p><p><strong>Your Situation:</strong></p><blockquote style='background: #f4f4f4; padding: 10px;'>{{situation_description}}</blockquote><p><strong>What Happens Next:</strong></p><ol><li>A member of our support team will review your request</li><li>We'll contact you within 1-2 business days</li><li>We'll work together to determine the best way to help</li></ol><p>If this is an emergency, please call our hotline at {{emergency_phone}}.</p><p>We're here to help.</p><p>Warm regards,<br>The {{organization_name}} Support Team</p></body></html>",
+      "body_text": "Hello {{first_name}},\n\nWe've received your request for support from {{organization_name}}.\n\nRequest Type: {{support_type}}\n\nYour Situation:\n\"{{situation_description}}\"\n\nWhat Happens Next:\n1. A member of our support team will review your request\n2. We'll contact you within 1-2 business days\n3. We'll work together to determine the best way to help\n\nIf this is an emergency, please call our hotline at {{emergency_phone}}.\n\nWe're here to help.\n\nWarm regards,\nThe {{organization_name}} Support Team"
+    }
+  },
+  "sms_templates": {
+    "volunteer_signup_confirmation": {
+      "message": "Hi {{first_name}}! Thanks for volunteering with {{organization_name}}. We'll review your application and contact you within 2-3 days. Questions? Reply HELP"
+    },
+    "contact_us_acknowledgment": {
+      "message": "{{organization_name}}: We received your message and will respond within 24-48 hrs. Ref: {{submission_id}}"
+    },
+    "donation_thank_you": {
+      "message": "{{organization_name}}: Thank you for your ${{amount}} donation! Your generosity makes a difference. Receipt sent to {{email}}"
+    },
+    "event_registration_confirmation": {
+      "message": "You're registered for {{event_name}} on {{event_date}} at {{event_time}}. Location: {{event_location}}. See you there! - {{organization_name}}"
+    },
+    "support_request_received": {
+      "message": "{{organization_name}}: We received your support request. Our team will contact you within 1-2 days. For emergencies, call {{emergency_phone}}"
+    },
+    "appointment_reminder": {
+      "message": "Reminder: Your appointment with {{organization_name}} is {{appointment_date}} at {{appointment_time}}. Reply C to confirm or R to reschedule."
+    }
+  },
+  "webhook_templates": {
+    "form_submission": {
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Picasso-Event": "form.submitted",
+        "X-Picasso-Tenant": "{{tenant_id}}"
+      },
+      "body": {
+        "event": "form_submission",
+        "tenant_id": "{{tenant_id}}",
+        "submission_id": "{{submission_id}}",
+        "form_type": "{{form_type}}",
+        "timestamp": "{{timestamp}}",
+        "data": {
+          "responses": "{{responses}}",
+          "metadata": {
+            "session_id": "{{session_id}}",
+            "conversation_id": "{{conversation_id}}",
+            "source": "picasso_chat"
+          }
+        }
+      }
+    },
+    "volunteer_signup": {
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Event-Type": "volunteer.signup"
+      },
+      "body": {
+        "first_name": "{{first_name}}",
+        "last_name": "{{last_name}}",
+        "email": "{{email}}",
+        "phone": "{{phone}}",
+        "availability": "{{availability}}",
+        "skills": "{{skills}}",
+        "interests": "{{interests}}",
+        "source": "chat_widget",
+        "timestamp": "{{timestamp}}"
+      }
+    },
+    "support_request": {
+      "headers": {
+        "Content-Type": "application/json",
+        "X-Priority": "{{priority}}"
+      },
+      "body": {
+        "requester": {
+          "name": "{{first_name}} {{last_name}}",
+          "email": "{{email}}",
+          "phone": "{{phone}}"
+        },
+        "request": {
+          "type": "{{support_type}}",
+          "description": "{{situation_description}}",
+          "urgency": "{{urgency}}",
+          "preferred_contact": "{{preferred_contact_method}}"
+        },
+        "metadata": {
+          "submission_id": "{{submission_id}}",
+          "timestamp": "{{timestamp}}",
+          "source": "conversational_form"
+        }
+      }
+    }
+  },
+  "template_variables": {
+    "common": [
+      "first_name",
+      "last_name",
+      "email",
+      "phone",
+      "organization_name",
+      "submission_id",
+      "timestamp",
+      "date"
+    ],
+    "volunteer": [
+      "availability",
+      "skills",
+      "interests",
+      "experience",
+      "background_check_consent"
+    ],
+    "donation": [
+      "amount",
+      "frequency",
+      "designation",
+      "ein_number",
+      "mission_statement"
+    ],
+    "event": [
+      "event_name",
+      "event_date",
+      "event_time",
+      "event_location",
+      "attendee_count",
+      "additional_items"
+    ],
+    "support": [
+      "support_type",
+      "situation_description",
+      "urgency",
+      "preferred_contact_method",
+      "emergency_phone"
+    ]
+  },
+  "configuration": {
+    "rate_limits": {
+      "email_per_hour": 100,
+      "sms_per_month": 1000,
+      "webhook_per_minute": 60
+    },
+    "retry_policy": {
+      "max_attempts": 3,
+      "backoff_multiplier": 2,
+      "initial_delay_seconds": 5
+    },
+    "template_selection": {
+      "priority_order": [
+        "tenant_specific",
+        "form_type_default",
+        "generic_fallback"
+      ]
+    }
+  }
+}

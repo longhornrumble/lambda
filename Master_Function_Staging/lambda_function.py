@@ -782,7 +782,51 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
         # Call the real intent router with conversation context
         logger.info(f"Calling route_intent with conversation_context: {conversation_context is not None}")
         response_data = route_intent(chat_event, conversation_context=conversation_context)
-        
+
+        # Phase 1B: Extract session_context from request body for CTA enhancement
+        session_context = body.get('session_context', {})
+        logger.info(f"Session context extracted: completed_forms={session_context.get('completed_forms', [])}")
+
+        # Phase 1B: Enhance response with form CTAs (HTTP mode parity with streaming)
+        try:
+            from form_cta_enhancer import enhance_response_with_form_cta
+
+            # Parse the response body from route_intent (it returns a Lambda response structure)
+            response_body = json.loads(response_data.get('body', '{}'))
+
+            # Extract conversation history for readiness scoring
+            conversation_history = []
+            if conversation_context and conversation_context.get('messages'):
+                conversation_history = conversation_context['messages']
+
+            enhanced_response = enhance_response_with_form_cta(
+                response_text=response_body.get('content', ''),
+                user_message=body.get('user_input', ''),
+                tenant_hash=tenant_hash,
+                conversation_history=conversation_history,
+                session_context=session_context  # NEW: Pass session context
+            )
+
+            # Merge enhanced response back into response_body (NOT response_data)
+            if enhanced_response:
+                response_body['content'] = enhanced_response.get('message', response_body.get('content', ''))
+                # PHASE 1B: Use ctaButtons for parity with Bedrock_Streaming_Handler
+                response_body['ctaButtons'] = enhanced_response.get('cards', [])
+                response_body['metadata'] = {
+                    **(response_body.get('metadata', {})),
+                    **enhanced_response.get('metadata', {})
+                }
+                logger.info(f"Response enhanced with {len(enhanced_response.get('cards', []))} CTA buttons")
+                logger.info(f"[DEBUG] response_body keys after enhancement: {list(response_body.keys())}")
+                logger.info(f"[DEBUG] response_body has ctaButtons: {'ctaButtons' in response_body}")
+                if 'ctaButtons' in response_body:
+                    logger.info(f"[DEBUG] ctaButtons value: {response_body['ctaButtons']}")
+
+                # Re-serialize the enhanced body back into response_data
+                response_data['body'] = json.dumps(response_body)
+        except Exception as enhance_error:
+            logger.warning(f"CTA enhancement failed, continuing with unenhanced response: {enhance_error}")
+
         # Calculate response time
         end_time = datetime.utcnow()
         response_time_ms = int((end_time - start_time).total_seconds() * 1000)
@@ -796,30 +840,34 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
             logger.warning(f"Could not resolve tenant_id: {e}")
         
         # Log structured QA_COMPLETE for analytics (matching Bedrock_Streaming_Handler format)
-        if response_data and 'content' in response_data:
-            session_id = body.get('session_id', '')
-            conversation_id = body.get('conversation_id', session_id)
-            
-            qa_complete_log = {
-                "type": "QA_COMPLETE",
-                "timestamp": datetime.utcnow().isoformat(),
-                "session_id": session_id,
-                "tenant_hash": tenant_hash,
-                "tenant_id": tenant_id,
-                "conversation_id": conversation_id,
-                "question": body.get('user_input', ''),
-                "answer": response_data.get('content', ''),
-                "metrics": {
-                    "response_time_ms": response_time_ms,
-                    "source": "master_function_http"  # Identify non-streaming source
+        # Parse the body to get the content for logging
+        try:
+            log_body = json.loads(response_data.get('body', '{}'))
+            if log_body and 'content' in log_body:
+                session_id = body.get('session_id', '')
+                conversation_id = body.get('conversation_id', session_id)
+
+                qa_complete_log = {
+                    "type": "QA_COMPLETE",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "session_id": session_id,
+                    "tenant_hash": tenant_hash,
+                    "tenant_id": tenant_id,
+                    "conversation_id": conversation_id,
+                    "question": body.get('user_input', ''),
+                    "answer": log_body.get('content', ''),
+                    "metrics": {
+                        "response_time_ms": response_time_ms,
+                        "source": "master_function_http"  # Identify non-streaming source
+                    }
                 }
-            }
-            logger.info(json.dumps(qa_complete_log))
-        
-        response = {
-            'statusCode': 200,
-            'body': json.dumps(response_data)
-        }
+                logger.info(json.dumps(qa_complete_log))
+        except Exception as log_error:
+            logger.warning(f"Failed to log QA_COMPLETE: {log_error}")
+
+        # response_data is already a properly formatted Lambda response from route_intent()
+        # with statusCode, headers, and body (the body has been enhanced with ctaButtons above)
+        response = response_data
         
     except ImportError:
         logger.error("Intent router not available")
@@ -944,6 +992,75 @@ def handle_conversation(event: Dict[str, Any], tenant_hash: str, operation: str)
             'body': json.dumps({
                 'error': 'Internal Server Error',
                 'message': 'Failed to handle conversation operation'
+            })
+        }
+        return add_cors_headers(response, event)
+
+def handle_form_submission(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
+    """
+    Handle form submission from Picasso conversational forms
+    """
+    logger.info(f"Form submission for tenant: {tenant_hash[:8] if tenant_hash else 'unknown'}...")
+
+    try:
+        # Parse request body
+        body = json.loads(event.get('body', '{}')) if event.get('body') else {}
+
+        if not body:
+            logger.error("No form data in request body")
+            response = {
+                'statusCode': 400,
+                'body': json.dumps({
+                    'error': 'Bad Request',
+                    'message': 'Form data is required'
+                })
+            }
+            return add_cors_headers(response, event)
+
+        # Import and use form handler
+        from form_handler import FormHandler
+
+        # Get tenant configuration
+        config = None
+        try:
+            from tenant_config_loader import get_config_for_tenant_by_hash
+            config = get_config_for_tenant_by_hash(tenant_hash)
+        except Exception as e:
+            logger.warning(f"Could not load config: {e}")
+
+        # Initialize form handler
+        handler = FormHandler(tenant_hash, config)
+
+        # Process form submission
+        result = handler.handle_form_submission(body)
+
+        logger.info(f"Form submission processed: {result.get('submission_id')}")
+
+        response = {
+            'statusCode': 200,
+            'body': json.dumps(result)
+        }
+
+        return add_cors_headers(response, event)
+
+    except ImportError as e:
+        logger.error(f"Failed to import form_handler: {e}")
+        response = {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': 'Internal Server Error',
+                'message': 'Form processing module not available'
+            })
+        }
+        return add_cors_headers(response, event)
+
+    except Exception as e:
+        logger.error(f"Error processing form submission: {e}", exc_info=True)
+        response = {
+            'statusCode': 500,
+            'body': json.dumps({
+                'error': 'Internal Server Error',
+                'message': 'Failed to process form submission'
             })
         }
         return add_cors_headers(response, event)
@@ -1413,9 +1530,19 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     Main Lambda handler with centralized routing and CORS
     """
     try:
+        # IMMEDIATE LOGGING - Log every single request that comes in
+        logger.info(f"🚀 LAMBDA INVOKED at {datetime.utcnow().isoformat()}")
+
         # Extract HTTP method first thing
         http_method = event.get('httpMethod', event.get('requestContext', {}).get('http', {}).get('method', 'GET'))
-        
+
+        # Log query string to catch save operations
+        query_string = event.get('rawQueryString', '')
+        if 'save' in query_string.lower():
+            logger.info(f"🔴 SAVE OPERATION DETECTED: query={query_string}")
+            logger.info(f"🔴 SAVE REQUEST HEADERS: {json.dumps(event.get('headers', {}), default=str)[:500]}")
+            logger.info(f"🔴 SAVE REQUEST BODY: {event.get('body', 'NO BODY')[:500]}")
+
         # Handle OPTIONS requests immediately for CORS preflight
         if http_method == 'OPTIONS':
             logger.info("OPTIONS request - returning CORS headers immediately")
@@ -1429,7 +1556,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 },
                 'body': ''
             }
-        
+
         # Log the incoming request for debugging
         logger.info(f"Received {http_method} event: {json.dumps(event, default=str)[:500]}")
         
@@ -1460,6 +1587,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             return handle_conversation(event, tenant_hash, operation)
         elif action == 'init_session':
             return handle_init_session(event, tenant_hash)
+        elif action == 'form_submission':
+            return handle_form_submission(event, tenant_hash)
         elif action == 'generate_stream_token':
             return handle_generate_stream_token(event, tenant_hash)
         elif action == 'cache_status':
