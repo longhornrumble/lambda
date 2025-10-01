@@ -278,6 +278,8 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         tenantHash,
         sessionContext,
         completedForms: sessionContext.completed_forms || [],
+        suspendedForms: sessionContext.suspended_forms || [],
+        programInterest: sessionContext.program_interest,
         responseSnippet: bedrockResponse?.substring(0, 100)
     });
 
@@ -285,8 +287,91 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         // Load tenant configuration
         const config = await loadTenantConfig(tenantHash);
 
-        // Extract completed forms from session context
+        // Extract completed forms and suspended forms from session context
         const completedForms = sessionContext.completed_forms || [];
+        const suspendedForms = sessionContext.suspended_forms || [];
+
+        // PHASE 1B: If there are suspended forms, check if user is asking about a DIFFERENT program
+        // This enables intelligent form switching UX
+        if (suspendedForms.length > 0) {
+            console.log(`[Phase 1B] 🔄 Suspended form detected: ${suspendedForms[0]}`);
+
+            const conversationalForms = config.conversational_forms || {};
+
+            // Check if user's message would trigger a different form
+            const triggeredForm = checkFormTriggers(bedrockResponse, userMessage, config);
+
+            if (triggeredForm) {
+                const newFormId = triggeredForm.formId;
+                const suspendedFormId = suspendedForms[0];
+
+                // If user is asking about a DIFFERENT program, offer to switch
+                if (newFormId !== suspendedFormId) {
+                    console.log(`[Phase 1B] 🔀 Program switch detected! Suspended: ${suspendedFormId}, Interested in: ${newFormId}`);
+
+                    // Get program names from form titles in config
+                    const newProgramName = (triggeredForm.title || 'this program').replace(' Application', '');
+
+                    // Get suspended form's title - need to find the config by matching form_id
+                    let suspendedFormConfig = null;
+                    for (const [configKey, formConfig] of Object.entries(conversationalForms)) {
+                        if (formConfig.form_id === suspendedFormId || configKey === suspendedFormId) {
+                            suspendedFormConfig = formConfig;
+                            break;
+                        }
+                    }
+
+                    if (!suspendedFormConfig) {
+                        suspendedFormConfig = {};
+                    }
+
+                    let suspendedProgramName = (suspendedFormConfig.title || 'your application').replace(' Application', '');
+
+                    // If user selected a program_interest in the volunteer form, use that instead of "Volunteer"
+                    const programInterest = sessionContext.program_interest;
+                    if (programInterest) {
+                        const programMap = {
+                            'lovebox': 'Love Box',
+                            'daretodream': 'Dare to Dream',
+                            'both': 'both programs',
+                            'unsure': 'Volunteer'
+                        };
+                        suspendedProgramName = programMap[programInterest.toLowerCase()] || suspendedProgramName;
+                        console.log(`[Phase 1B] 📝 User selected program_interest='${programInterest}', showing as '${suspendedProgramName}'`);
+                    }
+
+                    return {
+                        message: bedrockResponse,
+                        ctaButtons: [],  // No automatic CTAs - frontend will show switch options
+                        metadata: {
+                            enhanced: true,
+                            program_switch_detected: true,
+                            suspended_form: {
+                                form_id: suspendedFormId,
+                                program_name: suspendedProgramName
+                            },
+                            new_form_of_interest: {
+                                form_id: newFormId,
+                                program_name: newProgramName,
+                                cta_text: triggeredForm.ctaText || `Apply to ${newProgramName}`,
+                                fields: triggeredForm.fields || []
+                            }
+                        }
+                    };
+                }
+            }
+
+            // No different program detected - just skip CTAs as before
+            console.log(`[Phase 1B] 🚫 Skipping form CTAs - suspended form active, no program switch detected`);
+            return {
+                message: bedrockResponse,
+                ctaButtons: [],  // No CTAs when form is suspended
+                metadata: {
+                    enhanced: false,
+                    suspended_forms_detected: suspendedForms
+                }
+            };
+        }
 
         // Check for form triggers first (highest priority)
         const formTrigger = checkFormTriggers(bedrockResponse, userMessage, config);

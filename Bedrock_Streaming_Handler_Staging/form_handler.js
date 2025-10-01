@@ -3,14 +3,20 @@
  *
  * Handles form field validation and submission without calling Bedrock.
  * Provides local validation and fulfillment routing.
+ *
+ * MIGRATED TO AWS SDK v3 (October 2025)
  */
 
-const AWS = require('aws-sdk');
+const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
+const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
 
-// Initialize AWS services
-const ses = new AWS.SES({ region: process.env.AWS_REGION || 'us-east-1' });
-const sns = new AWS.SNS({ region: process.env.AWS_REGION || 'us-east-1' });
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+// Initialize AWS SDK v3 clients
+const sesClient = new SESClient({ region: process.env.AWS_REGION || 'us-east-1' });
+const snsClient = new SNSClient({ region: process.env.AWS_REGION || 'us-east-1' });
+const ddbClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'us-east-1' });
+const dynamodb = DynamoDBDocumentClient.from(ddbClient);
 
 // Form submission table
 const FORM_SUBMISSIONS_TABLE = process.env.FORM_SUBMISSIONS_TABLE || 'picasso-form-submissions';
@@ -171,7 +177,7 @@ async function saveFormSubmission(submissionId, formId, formData, config) {
   };
 
   try {
-    await dynamodb.put(params).promise();
+    await dynamodb.send(new PutCommand(params));
     console.log('✅ Form saved to DynamoDB');
   } catch (error) {
     console.error('Error saving to DynamoDB:', error);
@@ -266,7 +272,7 @@ async function sendFormEmail(toEmail, formId, formData, config) {
     }
   };
 
-  await ses.sendEmail(params).promise();
+  await sesClient.send(new SendEmailCommand(params));
   console.log(`✅ Form email sent to ${toEmail}`);
 }
 
@@ -301,7 +307,7 @@ async function sendConfirmationEmail(userEmail, formId, config) {
   };
 
   try {
-    await ses.sendEmail(params).promise();
+    await sesClient.send(new SendEmailCommand(params));
     console.log(`✅ Confirmation email sent to ${userEmail}`);
   } catch (error) {
     console.error('Failed to send confirmation email:', error);
@@ -320,7 +326,7 @@ async function sendFormSMS(phoneNumber, formId, formData) {
     PhoneNumber: phoneNumber
   };
 
-  await sns.publish(params).promise();
+  await snsClient.send(new PublishCommand(params));
   console.log(`✅ SMS notification sent to ${phoneNumber}`);
 }
 

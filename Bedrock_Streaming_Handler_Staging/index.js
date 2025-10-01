@@ -9,7 +9,7 @@ const { BedrockAgentRuntimeClient, RetrieveCommand } = require('@aws-sdk/client-
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const crypto = require('crypto');
 const { enhanceResponse } = require('./response_enhancer');
-// const { handleFormMode } = require('./form_handler'); // Commented out - needs AWS SDK v3 migration
+const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
 
 // Default model configuration - single source of truth
 const DEFAULT_MODEL_ID = 'us.anthropic.claude-3-5-haiku-20241022-v1:0';

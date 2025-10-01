@@ -9,11 +9,15 @@
   "dependencies": {
     "@aws-sdk/client-bedrock-runtime": "^3.600.0",
     "@aws-sdk/client-bedrock-agent-runtime": "^3.600.0",
-    "@aws-sdk/client-s3": "^3.600.0"
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-ses": "^3.600.0",
+    "@aws-sdk/client-sns": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
   },
   "scripts": {
     "build": "npm ci --production",
-    "package": "zip -r deployment.zip index.js node_modules package.json"
+    "package": "zip -r deployment.zip index.js response_enhancer.js form_handler.js node_modules package.json"
   },
   "author": "",
   "license": "MIT"
