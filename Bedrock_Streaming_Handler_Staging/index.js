@@ -8,11 +8,13 @@ const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('
 const { BedrockAgentRuntimeClient, RetrieveCommand } = require('@aws-sdk/client-bedrock-agent-runtime');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const crypto = require('crypto');
+const { enhanceResponse } = require('./response_enhancer');
+// const { handleFormMode } = require('./form_handler'); // Commented out - needs AWS SDK v3 migration
 
 // Default model configuration - single source of truth
 const DEFAULT_MODEL_ID = 'us.anthropic.claude-3-5-haiku-20241022-v1:0';
 const DEFAULT_MAX_TOKENS = 1000;
-const DEFAULT_TEMPERATURE = 0.2;
+const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
 const DEFAULT_TONE = 'You are a helpful assistant.';
 
 // Lambda streaming - use the global awslambda object when available
@@ -132,7 +134,7 @@ async function retrieveKB(userInput, config) {
       knowledgeBaseId: kbId,
       retrievalQuery: { text: userInput },
       retrievalConfiguration: {
-        vectorSearchConfiguration: { numberOfResults: 3 }
+        vectorSearchConfiguration: { numberOfResults: 5 } // Increased from 3 to capture more comprehensive context
       }
     }));
     
@@ -190,8 +192,24 @@ You are a virtual assistant answering the questions of website visitors. You are
   
   // Add essential instructions if we have KB context (from bedrock_handler.py lines 117-129)
   if (kbContext) {
-    parts.push(`ESSENTIAL INSTRUCTIONS:
-- Answer the user's question using only the information from the knowledge base results below
+    // CRITICAL: Add strong anti-hallucination constraints at the TOP
+    parts.push(`CRITICAL CONSTRAINT - PREVENT HALLUCINATIONS:
+You MUST ONLY use information explicitly stated in the knowledge base below.
+If specific details about a program, service, or feature are not mentioned in the knowledge base,
+you MUST NOT include them in your response. It is better to say less than to add information
+not found in the knowledge base.
+
+NEVER include the following unless explicitly found in the knowledge base:
+- Program names or descriptions not mentioned
+- Services or features not listed
+- Contact information not provided
+- Any details you think would be helpful but aren't in the retrieved content
+
+If the knowledge base mentions "TWO programs" do NOT list three or four programs.
+If a program name is "Angel Allies" do NOT change it to "Angel Alliance" or any variation.
+
+ESSENTIAL INSTRUCTIONS:
+- STRICTLY answer the user's question using ONLY the information from the knowledge base results below - DO NOT add any information not explicitly stated
 - Use the previous conversation context to provide personalized and coherent responses
 - Include ALL contact information exactly as it appears: phone numbers, email addresses, websites, and links
 - PRESERVE ALL MARKDOWN FORMATTING: If you see [text](url) keep it as [text](url), not plain text
@@ -200,7 +218,7 @@ You are a virtual assistant answering the questions of website visitors. You are
 - For any dates, times, or locations of events: Direct users to check the events page or contact the team for current details
 - Never include placeholder text like [date], [time], [location], or [topic] in your responses
 - Present information naturally without mentioning "results" or "knowledge base"
-- If the information doesn't fully answer the question, say "From what I can find..." and provide what you can
+- If the information doesn't fully answer the question, say "From what I can find..." and provide ONLY what you can find - never fill in gaps with plausible-sounding information
 - Keep all contact details and links intact and prominent in your response
 
 KNOWLEDGE BASE INFORMATION:
@@ -218,7 +236,7 @@ ${kbContext}`);
   if (kbContext) {
     parts.push(`\nCRITICAL INSTRUCTIONS:
 1. ONLY provide contact information (phone, email, addresses) that appears in the knowledge base results
-2. NEVER make up or invent contact details - if not in the knowledge base, don't include it
+2. NEVER make up or invent ANY details including program names, services, or contact information - if not explicitly in the knowledge base, don't include it
 3. ALWAYS include complete URLs exactly as they appear in the search results
 4. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
 5. If the URL appears as a markdown link [text](url), preserve the markdown format
@@ -358,7 +376,7 @@ const streamingHandler = async (event, responseStream, context) => {
       write('data: {"type":"heartbeat"}\n\n');
       console.log('💓 Heartbeat sent');
     }, 2000);
-    
+
     // Load config
     let config = await loadConfig(tenantHash);
     if (!config) {
@@ -368,11 +386,39 @@ const streamingHandler = async (event, responseStream, context) => {
         tone_prompt: DEFAULT_TONE
       };
     }
-    
+
+    // Check for form mode - bypass Bedrock for form field collection
+    if (body.form_mode === true) {
+      console.log('📝 Form mode detected - handling locally without Bedrock');
+      try {
+        const formResponse = await handleFormMode(body, config);
+
+        // Send the form response as a single SSE event
+        write(`data: ${JSON.stringify(formResponse)}\n\n`);
+        write('data: [DONE]\n\n');
+
+        // Clear heartbeat and end stream
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = null;
+        }
+        streamEnded = true;
+        responseStream.end();
+        return;
+      } catch (error) {
+        console.error('Form mode error:', error);
+        write(`data: {"type": "error", "error": "Form processing failed: ${error.message}"}\n\n`);
+        write('data: [DONE]\n\n');
+        streamEnded = true;
+        responseStream.end();
+        return;
+      }
+    }
+
     // Get KB context
     const kbContext = await retrieveKB(userInput, config);
     const prompt = buildPrompt(userInput, kbContext, config.tone_prompt, conversationHistory, config);
-    
+
     // Prepare Bedrock request - use config model or default
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
@@ -467,7 +513,34 @@ const streamingHandler = async (event, responseStream, context) => {
         }
       }));
     }
-    
+
+    // Enhance response with CTAs after streaming is complete
+    try {
+      const { enhanceResponse } = require('./response_enhancer');
+
+      const enhancedData = await enhanceResponse(
+        responseBuffer,  // The complete Bedrock response
+        userInput,       // The user's message
+        tenantHash,      // Tenant identifier
+        body.session_context || {} // Session context for form tracking
+      );
+
+      if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+        // Send CTAs as a separate SSE event
+        const ctaData = JSON.stringify({
+          type: 'cta_buttons',
+          ctaButtons: enhancedData.ctaButtons,
+          metadata: enhancedData.metadata,
+          session_id: sessionId
+        });
+        write(`data: ${ctaData}\n\n`);
+        console.log(`🎯 Sent ${enhancedData.ctaButtons.length} CTA buttons for branch: ${enhancedData.metadata?.branch_detected || 'form'}`);
+      }
+    } catch (enhanceError) {
+      console.error('❌ CTA enhancement error:', enhanceError);
+      // Don't fail the response if CTA enhancement fails
+    }
+
   } catch (error) {
     console.error('❌ Stream error:', error);
     write(`data: {"type": "error", "error": "${error.message}"}\n\n`);
@@ -636,7 +709,35 @@ const bufferedHandler = async (event, context) => {
         }
       }));
     }
-    
+
+    // Enhance response with CTAs after generation is complete
+    try {
+      const { enhanceResponse } = require('./response_enhancer');
+
+      const enhancedData = await enhanceResponse(
+        responseBuffer,  // The complete Bedrock response
+        userInput,       // The user's message
+        tenantHash,      // Tenant identifier
+        body.session_context || {} // Session context for form tracking
+      );
+
+      if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+        // Add CTAs to the chunks array before completion
+        const ctaData = JSON.stringify({
+          type: 'cta_buttons',
+          ctaButtons: enhancedData.ctaButtons,
+          metadata: enhancedData.metadata,
+          session_id: sessionId
+        });
+        // Insert CTAs before the [DONE] marker
+        chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+        console.log(`🎯 Added ${enhancedData.ctaButtons.length} CTA buttons for branch: ${enhancedData.metadata?.branch_detected || 'form'}`);
+      }
+    } catch (enhanceError) {
+      console.error('❌ CTA enhancement error:', enhanceError);
+      // Don't fail the response if CTA enhancement fails
+    }
+
     // For Lambda Function URLs, we need to return the raw SSE content
     // The Function URL will handle setting the appropriate headers
     return {
