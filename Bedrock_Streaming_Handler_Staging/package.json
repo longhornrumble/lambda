@@ -1,6 +1,6 @@
 {
   "name": "bedrock-streaming-handler",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Bedrock streaming handler with true Lambda response streaming",
   "main": "index.js",
   "engines": {
