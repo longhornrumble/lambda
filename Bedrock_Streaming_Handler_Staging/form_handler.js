@@ -10,16 +10,22 @@
 const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 // Initialize AWS SDK v3 clients
 const sesClient = new SESClient({ region: process.env.AWS_REGION || 'us-east-1' });
 const snsClient = new SNSClient({ region: process.env.AWS_REGION || 'us-east-1' });
 const ddbClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'us-east-1' });
 const dynamodb = DynamoDBDocumentClient.from(ddbClient);
+const lambdaClient = new LambdaClient({ region: process.env.AWS_REGION || 'us-east-1' });
+const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
 
 // Form submission table
 const FORM_SUBMISSIONS_TABLE = process.env.FORM_SUBMISSIONS_TABLE || 'picasso-form-submissions';
+const SMS_USAGE_TABLE = process.env.SMS_USAGE_TABLE || 'picasso-sms-usage';
+const SMS_MONTHLY_LIMIT = parseInt(process.env.SMS_MONTHLY_LIMIT || '100', 10);
 
 /**
  * Handle form mode requests (bypass Bedrock)
@@ -129,16 +135,33 @@ async function submitForm(formId, formData, config) {
   console.log(`📨 Submitting form ${formId}:`, formData);
 
   try {
+    // Validate required parameters
+    if (!formId || !formData || !config) {
+      throw new Error('Missing required parameters: formId, formData, or config');
+    }
+
+    // Determine priority for notifications
+    const formConfig = config.conversational_forms?.[formId] || {};
+    const priority = determinePriority(formId, formData, formConfig);
+    console.log(`📊 Form priority determined: ${priority}`);
+
     // Save to DynamoDB
     const submissionId = `${formId}_${Date.now()}`;
-    await saveFormSubmission(submissionId, formId, formData, config);
+    try {
+      await saveFormSubmission(submissionId, formId, formData, config, priority);
+    } catch (dbError) {
+      console.error('❌ DynamoDB save failed:', dbError);
+      // Continue with fulfillment even if DynamoDB save fails
+    }
 
     // Route to appropriate fulfillment channel
-    const fulfillmentResult = await routeFulfillment(formId, formData, config);
+    const fulfillmentResult = await routeFulfillment(formId, formData, config, submissionId, priority);
 
-    // Send confirmation email if configured
+    // Send confirmation email if configured (non-blocking)
     if (formData.email && config.send_confirmation_email !== false) {
-      await sendConfirmationEmail(formData.email, formId, config);
+      sendConfirmationEmail(formData.email, formId, config).catch(err => {
+        console.error('❌ Confirmation email failed:', err.message);
+      });
     }
 
     return {
@@ -146,11 +169,12 @@ async function submitForm(formId, formData, config) {
       status: 'success',
       message: 'Thank you! Your application has been submitted successfully. You will receive a confirmation email shortly.',
       submissionId: submissionId,
+      priority: priority,
       fulfillment: fulfillmentResult
     };
 
   } catch (error) {
-    console.error('Form submission error:', error);
+    console.error('❌ Form submission error:', error);
     return {
       type: 'form_error',
       status: 'error',
@@ -161,9 +185,57 @@ async function submitForm(formId, formData, config) {
 }
 
 /**
+ * Determine notification priority based on form data
+ * Ported from Master's form_handler.py:154-187
+ */
+function determinePriority(formId, formData, formConfig) {
+  // Check for explicit urgency field
+  if (formData.urgency) {
+    const urgency = formData.urgency.toLowerCase();
+    if (['immediate', 'urgent', 'high'].includes(urgency)) {
+      return 'high';
+    } else if (['normal', 'this week'].includes(urgency)) {
+      return 'normal';
+    } else {
+      return 'low';
+    }
+  }
+
+  // Check priority rules in config
+  const priorityRules = formConfig.priority_rules || [];
+  for (const rule of priorityRules) {
+    const field = rule.field;
+    const value = rule.value;
+    const priority = rule.priority;
+
+    if (formData[field] === value) {
+      return priority;
+    }
+  }
+
+  // Form-type based defaults
+  const priorityDefaults = {
+    'request_support': 'high',
+    'volunteer_apply': 'normal',
+    'lb_apply': 'normal',
+    'dd_apply': 'normal',
+    'donation': 'normal',
+    'contact': 'normal',
+    'newsletter': 'low'
+  };
+
+  return priorityDefaults[formId] || 'normal';
+}
+
+/**
  * Save form submission to DynamoDB
  */
-async function saveFormSubmission(submissionId, formId, formData, config) {
+async function saveFormSubmission(submissionId, formId, formData, config, priority = 'normal') {
+  if (!FORM_SUBMISSIONS_TABLE) {
+    console.warn('⚠️ FORM_SUBMISSIONS_TABLE not configured, skipping DynamoDB save');
+    return;
+  }
+
   const params = {
     TableName: FORM_SUBMISSIONS_TABLE,
     Item: {
@@ -171,6 +243,7 @@ async function saveFormSubmission(submissionId, formId, formData, config) {
       form_id: formId,
       tenant_id: config.tenant_id || 'unknown',
       form_data: formData,
+      priority: priority,
       submitted_at: new Date().toISOString(),
       status: 'pending_fulfillment'
     }
@@ -178,7 +251,7 @@ async function saveFormSubmission(submissionId, formId, formData, config) {
 
   try {
     await dynamodb.send(new PutCommand(params));
-    console.log('✅ Form saved to DynamoDB');
+    console.log(`✅ Form saved to DynamoDB with priority: ${priority}`);
   } catch (error) {
     console.error('Error saving to DynamoDB:', error);
     // Don't fail the submission if DynamoDB fails
@@ -187,18 +260,89 @@ async function saveFormSubmission(submissionId, formId, formData, config) {
 
 /**
  * Route form to appropriate fulfillment channel
+ * Ported from Master's form_handler.py:330-393
  */
-async function routeFulfillment(formId, formData, config) {
+async function routeFulfillment(formId, formData, config, submissionId, priority = 'normal') {
   const results = [];
 
   // Check form-specific fulfillment configuration
   const formConfig = config.conversational_forms?.[formId] || {};
   const fulfillment = formConfig.fulfillment || config.default_fulfillment || {};
 
-  // Email fulfillment
+  // Validate fulfillment configuration
+  if (!fulfillment || Object.keys(fulfillment).length === 0) {
+    console.warn(`⚠️ No fulfillment configured for form ${formId}, using default email`);
+  }
+
+  // Process advanced fulfillment types first (Lambda, S3)
+  const fulfillmentType = fulfillment.type;
+
+  if (fulfillmentType === 'lambda') {
+    // Invoke another Lambda function
+    const functionName = fulfillment.function;
+
+    if (!functionName) {
+      console.error('❌ Lambda fulfillment configured but no function name provided');
+      results.push({ channel: 'lambda', status: 'failed', error: 'Missing function name' });
+    } else {
+      const action = fulfillment.action || 'process_form';
+
+      try {
+        const payload = JSON.stringify({
+          action: action,
+          form_type: formId,
+          submission_id: submissionId,
+          responses: formData,
+          tenant_id: config.tenant_id,
+          priority: priority
+        });
+
+        await lambdaClient.send(new InvokeCommand({
+          FunctionName: functionName,
+          InvocationType: 'Event', // Async
+          Payload: payload
+        }));
+
+        results.push({ channel: 'lambda', function: functionName, status: 'invoked' });
+        console.log(`✅ Lambda function invoked: ${functionName}`);
+      } catch (error) {
+        console.error('❌ Lambda invocation failed:', error);
+        results.push({ channel: 'lambda', status: 'failed', error: error.message });
+      }
+    }
+  }
+
+  if (fulfillmentType === 's3') {
+    // Store in S3
+    const bucket = fulfillment.bucket;
+
+    if (!bucket) {
+      console.error('❌ S3 fulfillment configured but no bucket provided');
+      results.push({ channel: 's3', status: 'failed', error: 'Missing bucket name' });
+    } else {
+      const key = `submissions/${config.tenant_id}/${formId}/${submissionId}.json`;
+
+      try {
+        await s3Client.send(new PutObjectCommand({
+          Bucket: bucket,
+          Key: key,
+          Body: JSON.stringify(formData),
+          ContentType: 'application/json'
+        }));
+
+        results.push({ channel: 's3', location: `s3://${bucket}/${key}`, status: 'stored' });
+        console.log(`✅ Form stored in S3: ${key}`);
+      } catch (error) {
+        console.error('❌ S3 storage failed:', error);
+        results.push({ channel: 's3', status: 'failed', error: error.message });
+      }
+    }
+  }
+
+  // Email fulfillment (notification to organization)
   if (fulfillment.email_to) {
     try {
-      await sendFormEmail(fulfillment.email_to, formId, formData, config);
+      await sendFormEmail(fulfillment.email_to, formId, formData, config, priority);
       results.push({ channel: 'email', status: 'sent' });
     } catch (error) {
       console.error('Email fulfillment failed:', error);
@@ -206,11 +350,19 @@ async function routeFulfillment(formId, formData, config) {
     }
   }
 
-  // SMS fulfillment (if configured)
+  // SMS fulfillment (notification to organization) with rate limiting
   if (fulfillment.sms_to) {
     try {
-      await sendFormSMS(fulfillment.sms_to, formId, formData);
-      results.push({ channel: 'sms', status: 'sent' });
+      // Check SMS rate limit
+      const usage = await getMonthlySMSUsage(config.tenant_id);
+      if (usage >= SMS_MONTHLY_LIMIT) {
+        console.warn(`⚠️ SMS monthly limit reached for tenant ${config.tenant_id}: ${usage}/${SMS_MONTHLY_LIMIT}`);
+        results.push({ channel: 'sms', status: 'skipped', reason: 'monthly_limit_reached', usage: usage, limit: SMS_MONTHLY_LIMIT });
+      } else {
+        await sendFormSMS(fulfillment.sms_to, formId, formData, priority);
+        await incrementSMSUsage(config.tenant_id);
+        results.push({ channel: 'sms', status: 'sent', usage: usage + 1, limit: SMS_MONTHLY_LIMIT });
+      }
     } catch (error) {
       console.error('SMS fulfillment failed:', error);
       results.push({ channel: 'sms', status: 'failed', error: error.message });
@@ -220,7 +372,7 @@ async function routeFulfillment(formId, formData, config) {
   // Webhook fulfillment (e.g., to Google Sheets via Zapier)
   if (fulfillment.webhook_url) {
     try {
-      await sendToWebhook(fulfillment.webhook_url, formId, formData);
+      await sendToWebhook(fulfillment.webhook_url, formId, formData, priority, submissionId);
       results.push({ channel: 'webhook', status: 'sent' });
     } catch (error) {
       console.error('Webhook fulfillment failed:', error);
@@ -232,9 +384,87 @@ async function routeFulfillment(formId, formData, config) {
 }
 
 /**
+ * Get monthly SMS usage for tenant
+ * Ported from Master's form_handler.py:395-413
+ */
+async function getMonthlySMSUsage(tenantId) {
+  if (!SMS_USAGE_TABLE) {
+    console.warn('⚠️ SMS_USAGE_TABLE not configured, returning 0');
+    return 0;
+  }
+
+  if (!tenantId) {
+    console.error('❌ getMonthlySMSUsage called without tenantId');
+    return 0;
+  }
+
+  try {
+    const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM format
+
+    const result = await dynamodb.send(new GetCommand({
+      TableName: SMS_USAGE_TABLE,
+      Key: {
+        tenant_id: tenantId,
+        month: currentMonth
+      }
+    }));
+
+    if (result.Item) {
+      return result.Item.count || 0;
+    }
+    return 0;
+  } catch (error) {
+    console.error('❌ Error getting SMS usage:', error);
+    return 0; // Fail safe - allow SMS if we can't check usage
+  }
+}
+
+/**
+ * Increment SMS usage counter
+ * Ported from Master's form_handler.py:415-436
+ */
+async function incrementSMSUsage(tenantId) {
+  if (!SMS_USAGE_TABLE) {
+    console.warn('⚠️ SMS_USAGE_TABLE not configured, skipping increment');
+    return;
+  }
+
+  if (!tenantId) {
+    console.error('❌ incrementSMSUsage called without tenantId');
+    return;
+  }
+
+  try {
+    const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM format
+
+    await dynamodb.send(new UpdateCommand({
+      TableName: SMS_USAGE_TABLE,
+      Key: {
+        tenant_id: tenantId,
+        month: currentMonth
+      },
+      UpdateExpression: 'SET #count = if_not_exists(#count, :zero) + :inc, updated_at = :now',
+      ExpressionAttributeNames: {
+        '#count': 'count'
+      },
+      ExpressionAttributeValues: {
+        ':inc': 1,
+        ':zero': 0,
+        ':now': new Date().toISOString()
+      }
+    }));
+
+    console.log(`✅ SMS usage incremented for tenant ${tenantId} in ${currentMonth}`);
+  } catch (error) {
+    console.error('Error incrementing SMS usage:', error);
+    // Don't fail the SMS send if we can't track usage
+  }
+}
+
+/**
  * Send form data via email
  */
-async function sendFormEmail(toEmail, formId, formData, config) {
+async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal') {
   const subject = `New Form Submission: ${formId}`;
 
   let htmlBody = `
@@ -255,6 +485,7 @@ async function sendFormEmail(toEmail, formId, formData, config) {
 
   htmlBody += `
     </table>
+    <p><strong>Priority:</strong> ${priority.toUpperCase()}</p>
     <p>Submitted at: ${new Date().toISOString()}</p>
     <p>Tenant: ${config.tenant_id || 'unknown'}</p>
   `;
@@ -318,8 +549,9 @@ async function sendConfirmationEmail(userEmail, formId, config) {
 /**
  * Send form data via SMS
  */
-async function sendFormSMS(phoneNumber, formId, formData) {
-  const message = `New ${formId} submission received. Name: ${formData.first_name} ${formData.last_name}, Email: ${formData.email}`;
+async function sendFormSMS(phoneNumber, formId, formData, priority = 'normal') {
+  const priorityEmoji = priority === 'high' ? '🚨 ' : priority === 'low' ? '📋 ' : '📝 ';
+  const message = `${priorityEmoji}New ${formId} submission. Name: ${formData.first_name} ${formData.last_name}, Email: ${formData.email}`;
 
   const params = {
     Message: message.substring(0, 160), // SMS character limit
@@ -327,18 +559,20 @@ async function sendFormSMS(phoneNumber, formId, formData) {
   };
 
   await snsClient.send(new PublishCommand(params));
-  console.log(`✅ SMS notification sent to ${phoneNumber}`);
+  console.log(`✅ SMS notification sent to ${phoneNumber} (priority: ${priority})`);
 }
 
 /**
  * Send form data to webhook
  */
-async function sendToWebhook(webhookUrl, formId, formData) {
+async function sendToWebhook(webhookUrl, formId, formData, priority = 'normal', submissionId = null) {
   const https = require('https');
   const url = new URL(webhookUrl);
 
   const payload = JSON.stringify({
     form_id: formId,
+    submission_id: submissionId,
+    priority: priority,
     timestamp: new Date().toISOString(),
     data: formData
   });
