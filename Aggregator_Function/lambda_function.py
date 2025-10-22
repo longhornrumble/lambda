@@ -74,15 +74,23 @@ def lambda_handler(event, context):
             
             # Get QA_COMPLETE logs using the same logic as Analytics_Function
             qa_logs = get_qa_complete_logs(tenant_hash, start_time, end_time)
-            
+
             # Process the logs into metrics (same as Analytics_Function)
             metrics = process_qa_logs(qa_logs, tenant_id)
-            
+
             # Store in DynamoDB if there's data
             if metrics['conversation_count'] > 0:
                 store_metrics(tenant_id, tenant_hash, process_date, metrics)
                 results['total_conversations'] += metrics['conversation_count']
                 logger.info(f"Stored {metrics['conversation_count']} conversations for {tenant_id}")
+
+            # NEW: Aggregate form submissions for the day
+            form_metrics = aggregate_form_submissions(tenant_id, start_time, end_time)
+
+            # Store form metrics if there are submissions
+            if form_metrics['total_submissions'] > 0:
+                store_form_metrics(tenant_id, tenant_hash, process_date, form_metrics)
+                logger.info(f"Stored {form_metrics['total_submissions']} form submissions for {tenant_id}")
             
             results['tenants_processed'] += 1
             
@@ -372,6 +380,78 @@ def process_qa_logs(qa_logs: List[Dict[str, Any]], tenant_id: str = None) -> Dic
     metrics['top_questions'] = top_questions
     
     return metrics
+
+def aggregate_form_submissions(tenant_id: str, start_time: datetime, end_time: datetime) -> Dict[str, Any]:
+    """Aggregate form submissions from DynamoDB for a specific day"""
+    try:
+        submissions_table = dynamodb.Table('picasso_form_submissions')
+
+        # Query all submissions for this tenant on this day using GSI
+        response = submissions_table.query(
+            IndexName='tenant-timestamp-index',
+            KeyConditionExpression='tenant_id = :tid AND #ts BETWEEN :start AND :end',
+            ExpressionAttributeNames={'#ts': 'timestamp'},
+            ExpressionAttributeValues={
+                ':tid': tenant_id,
+                ':start': start_time.isoformat(),
+                ':end': end_time.isoformat()
+            }
+        )
+
+        submissions = response['Items']
+
+        # Aggregate by form type
+        form_counts = defaultdict(int)
+        form_details = defaultdict(list)
+
+        for sub in submissions:
+            form_type = sub.get('form_type', 'unknown')
+            form_counts[form_type] += 1
+            form_details[form_type].append({
+                'submission_id': sub['submission_id'],
+                'timestamp': sub['timestamp'],
+                'responses': sub.get('responses', {}),
+                'status': sub.get('status', 'submitted')
+            })
+
+        return {
+            'total_submissions': len(submissions),
+            'form_counts': dict(form_counts),
+            'form_details': dict(form_details),
+            'submissions': submissions[:100]  # Store up to 100 for review
+        }
+
+    except Exception as e:
+        logger.error(f"Error aggregating form submissions for {tenant_id}: {str(e)}")
+        # Return empty metrics on error
+        return {
+            'total_submissions': 0,
+            'form_counts': {},
+            'form_details': {},
+            'submissions': []
+        }
+
+def store_form_metrics(tenant_id: str, tenant_hash: str, process_date: str, form_metrics: Dict):
+    """Store form metrics in DynamoDB"""
+    table = dynamodb.Table(ANALYTICS_TABLE)
+
+    item = {
+        'pk': f"TENANT#{tenant_id}",
+        'sk': f"FORMS#{process_date}",  # Different sort key for forms
+        'tenant_id': tenant_id,
+        'tenant_hash': tenant_hash,
+        'date': process_date,
+        'metric_type': 'form_submissions',  # Distinguish from conversations
+        'total_submissions': form_metrics['total_submissions'],
+        'form_counts': form_metrics['form_counts'],
+        'form_details': convert_floats_to_decimal(form_metrics['form_details']),
+        'submissions': convert_floats_to_decimal(form_metrics['submissions']),
+        'ttl': int((datetime.now(timezone.utc) + timedelta(days=90)).timestamp()),
+        'created_at': datetime.now(timezone.utc).isoformat()
+    }
+
+    table.put_item(Item=item)
+    logger.info(f"Stored form metrics for {tenant_id} on {process_date}: {form_metrics['total_submissions']} submissions")
 
 def convert_floats_to_decimal(obj):
     """Recursively convert floats to Decimal for DynamoDB."""

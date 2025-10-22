@@ -47,10 +47,10 @@ class AnalyticsFunction:
         self.s3_client = boto3.client('s3')
         self._timezone_cache = {}  # Cache tenant timezones
         
-    def process_tenant(self, tenant_hash: str, start_date: Optional[str] = None, 
+    def process_tenant(self, tenant_hash: str, start_date: Optional[str] = None,
                        end_date: Optional[str] = None, top_questions_limit: int = 5,
                        include_heat_map: bool = False, include_full_conversations: bool = False,
-                       full_conversations_limit: int = 50) -> Dict[str, Any]:
+                       full_conversations_limit: int = 50, include_forms: bool = True) -> Dict[str, Any]:
         """Process analytics for a specific tenant with date range using hybrid approach"""
         logger.debug(f"Processing analytics for tenant_hash: {tenant_hash[:8]}... from {start_date} to {end_date}")
         
@@ -141,11 +141,20 @@ class AnalyticsFunction:
         
         # Calculate final metrics
         logger.info(f"Total combined metrics: {combined_metrics['conversation_count']} conversations, {combined_metrics['total_messages']} messages")
+
+        # Query form submissions if requested
+        form_metrics = None
+        if include_forms:
+            logger.info(f"Querying form submissions from {start_time.date()} to {end_time.date()}")
+            form_metrics = self.query_form_submissions(tenant_id, start_time, end_time)
+            logger.info(f"Form submissions: {form_metrics['total_submissions']} total")
+
         return self.format_response(
             combined_metrics, tenant_id, tenant_hash,
             start_time, end_time, period_days,
             top_questions_limit, include_heat_map,
-            include_full_conversations, full_conversations_limit
+            include_full_conversations, full_conversations_limit,
+            form_metrics
         )
     
     def get_tenant_timezone(self, tenant_id: str) -> Optional[str]:
@@ -520,21 +529,76 @@ class AnalyticsFunction:
         target['conversations'].extend(source['conversations'])
         target['after_hours_count'] += source.get('after_hours_count', 0)
         target['streaming_enabled_count'] += source.get('streaming_enabled_count', 0)
-        
+
         # Merge dictionaries
         for question, count in source['questions'].items():
             target['questions'][question] += count
-        
+
         for hour, count in source['hourly_distribution'].items():
             target['hourly_distribution'][hour] += count
-        
+
         for day, count in source['daily_distribution'].items():
             target['daily_distribution'][day] += count
+
+    def query_form_submissions(self, tenant_id: str, start_date: datetime, end_date: datetime) -> Dict:
+        """Query aggregated form submissions from DynamoDB"""
+        combined_forms = {
+            'total_submissions': 0,
+            'form_counts': defaultdict(int),
+            'submissions_by_date': {},
+            'recent_submissions': []
+        }
+
+        # Query DynamoDB for each day in range
+        current_date = start_date.date()
+        end_date_only = end_date.date()
+
+        while current_date <= end_date_only:
+            date_str = current_date.strftime('%Y-%m-%d')
+
+            try:
+                response = self.analytics_table.get_item(
+                    Key={
+                        'pk': f"TENANT#{tenant_id}",
+                        'sk': f"FORMS#{date_str}"
+                    }
+                )
+
+                if 'Item' in response:
+                    item = response['Item']
+                    combined_forms['total_submissions'] += item.get('total_submissions', 0)
+
+                    # Merge form counts
+                    for form_type, count in item.get('form_counts', {}).items():
+                        combined_forms['form_counts'][form_type] += count
+
+                    # Store by date
+                    combined_forms['submissions_by_date'][date_str] = {
+                        'count': item.get('total_submissions', 0),
+                        'forms': item.get('form_counts', {})
+                    }
+
+                    # Add recent submissions
+                    combined_forms['recent_submissions'].extend(
+                        item.get('submissions', [])[:10]
+                    )
+
+            except Exception as e:
+                logger.error(f"Error querying forms for {date_str}: {str(e)}")
+
+            current_date += timedelta(days=1)
+
+        # Limit recent submissions
+        combined_forms['recent_submissions'] = combined_forms['recent_submissions'][:50]
+        combined_forms['form_counts'] = dict(combined_forms['form_counts'])
+
+        return combined_forms
     
     def format_response(self, metrics: Dict, tenant_id: str, tenant_hash: str,
                        start_time: datetime, end_time: datetime, period_days: int,
                        top_questions_limit: int, include_heat_map: bool,
-                       include_full_conversations: bool, full_conversations_limit: int) -> Dict[str, Any]:
+                       include_full_conversations: bool, full_conversations_limit: int,
+                       form_metrics: Optional[Dict] = None) -> Dict[str, Any]:
         """Format the final response."""
         
         # Calculate averages
@@ -639,15 +703,19 @@ class AnalyticsFunction:
         # Add full conversations if requested
         if include_full_conversations:
             sorted_conversations = sorted(
-                metrics['conversations'], 
-                key=lambda x: x.get('timestamp', ''), 
+                metrics['conversations'],
+                key=lambda x: x.get('timestamp', ''),
                 reverse=True
             )[:full_conversations_limit]
-            
+
             response['full_conversations'] = sorted_conversations
             response['full_conversations_total'] = len(metrics['conversations'])
             response['full_conversations_returned'] = len(sorted_conversations)
-        
+
+        # Add form submissions if available
+        if form_metrics:
+            response['form_submissions'] = form_metrics
+
         return response
     
     def format_heat_map_data(self, hourly_dist: Dict, daily_dist: Dict,
@@ -785,10 +853,13 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Handle both string and boolean values for include flags
         heat_map_val = params.get('include_heat_map', body.get('include_heat_map', 'false'))
         include_heat_map = str(heat_map_val).lower() == 'true' if heat_map_val is not None else False
-        
+
         conv_val = params.get('include_full_conversations', body.get('include_full_conversations', 'false'))
         include_full_conversations = str(conv_val).lower() == 'true' if conv_val is not None else False
-        
+
+        forms_val = params.get('include_forms', body.get('include_forms', 'true'))
+        include_forms = str(forms_val).lower() == 'true' if forms_val is not None else True
+
         full_conversations_limit = int(params.get('full_conversations_limit', body.get('full_conversations_limit', 50)))
         
         # If tenant_id provided but no tenant_hash, look it up from S3
@@ -823,7 +894,8 @@ def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             top_questions_limit=top_questions_limit,
             include_heat_map=include_heat_map,
             include_full_conversations=include_full_conversations,
-            full_conversations_limit=full_conversations_limit
+            full_conversations_limit=full_conversations_limit,
+            include_forms=include_forms
         )
         
         return {

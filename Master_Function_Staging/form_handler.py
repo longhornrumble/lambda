@@ -77,6 +77,15 @@ class FormHandler:
                 conversation_id=conversation_id
             )
 
+            # Send to Bubble webhook if configured
+            self._send_bubble_webhook(
+                form_type=form_type,
+                responses=responses,
+                submission_id=submission_id,
+                session_id=session_id,
+                conversation_id=conversation_id
+            )
+
             # Determine priority
             priority = self._determine_priority(form_type, responses, form_config)
 
@@ -326,6 +335,98 @@ class FormHandler:
             logger.error(f"Webhook send error: {str(e)}")
 
         return sent
+
+    def _send_bubble_webhook(self, form_type: str, responses: Dict[str, Any],
+                            submission_id: str, session_id: str, conversation_id: str):
+        """Send form submission to Bubble via Workflow API with pre-extracted fields"""
+        import urllib.request
+        import urllib.error
+        import os
+
+        # Check if forms are enabled for this tenant
+        features = self.tenant_config.get('features', {})
+        if not features.get('conversational_forms'):
+            logger.debug("Conversational forms not enabled for tenant, skipping webhook")
+            return
+
+        # Get webhook URL and API key (tenant config overrides env vars)
+        bubble_config = self.tenant_config.get('bubble_integration', {})
+        webhook_url = bubble_config.get('webhook_url') or os.environ.get('BUBBLE_WEBHOOK_URL')
+        api_key = bubble_config.get('api_key') or os.environ.get('BUBBLE_API_KEY')
+
+        if not webhook_url:
+            logger.debug("Bubble webhook URL not configured, skipping")
+            return
+
+        # Extract common fields from responses
+        # These will be available directly in Bubble without JSON parsing
+        applicant_email = responses.get('email', '')
+        applicant_first_name = responses.get('first_name', '')
+        applicant_last_name = responses.get('last_name', '')
+        applicant_phone = responses.get('phone', '')
+        program_interest = responses.get('program_interest', '')
+        comments = responses.get('comments', '')
+
+        # Build full name
+        applicant_name = f"{applicant_first_name} {applicant_last_name}".strip()
+
+        # Build payload with structured fields
+        payload = {
+            'submission_id': submission_id,
+            'tenant_id': self.tenant_id,
+            'form_type': form_type,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'session_id': session_id,
+            'conversation_id': conversation_id,
+
+            # Pre-extracted fields for easy Bubble mapping
+            'applicant_email': applicant_email,
+            'applicant_first_name': applicant_first_name,
+            'applicant_last_name': applicant_last_name,
+            'applicant_name': applicant_name,
+            'applicant_phone': applicant_phone,
+            'program_interest': program_interest,
+            'comments': comments,
+
+            # Full JSON for reference/archival
+            'responses_json': json.dumps(responses)
+        }
+
+        headers = {
+            'Content-Type': 'application/json',
+        }
+
+        # Add API key if configured
+        if api_key:
+            headers['Authorization'] = f'Bearer {api_key}'
+
+        try:
+            # Convert payload to JSON bytes
+            json_data = json.dumps(payload).encode('utf-8')
+
+            # Create request
+            req = urllib.request.Request(
+                webhook_url,
+                data=json_data,
+                headers=headers,
+                method='POST'
+            )
+
+            # Send request
+            with urllib.request.urlopen(req, timeout=10) as response:
+                status_code = response.getcode()
+                if status_code in [200, 201]:
+                    logger.info(f"Sent form submission to Bubble: {submission_id}")
+                else:
+                    response_text = response.read().decode('utf-8')
+                    logger.error(f"Bubble webhook error: {status_code} - {response_text}")
+
+        except urllib.error.HTTPError as e:
+            logger.error(f"Bubble webhook HTTP error: {e.code} - {e.read().decode('utf-8')}")
+            # Don't fail the form submission if Bubble webhook fails
+        except Exception as e:
+            logger.error(f"Error sending to Bubble: {str(e)}")
+            # Don't fail the form submission if Bubble webhook fails
 
     def _process_fulfillment(self, form_config: Dict[str, Any], form_type: str,
                            responses: Dict[str, Any], submission_id: str) -> Dict[str, Any]:

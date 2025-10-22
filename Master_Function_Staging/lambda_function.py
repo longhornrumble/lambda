@@ -1023,13 +1023,18 @@ def handle_form_submission(event: Dict[str, Any], tenant_hash: str) -> Dict[str,
         # Get tenant configuration
         config = None
         try:
-            from tenant_config_loader import get_config_for_tenant_by_hash
+            from tenant_config_loader import get_config_for_tenant_by_hash, resolve_tenant_hash
             config = get_config_for_tenant_by_hash(tenant_hash)
+
+            # Add tenant_id back for backend operations (it's stripped for frontend security)
+            if config:
+                tenant_id = resolve_tenant_hash(tenant_hash)
+                config['tenant_id'] = tenant_id
         except Exception as e:
             logger.warning(f"Could not load config: {e}")
 
         # Initialize form handler
-        handler = FormHandler(tenant_hash, config)
+        handler = FormHandler(config)
 
         # Process form submission
         result = handler.handle_form_submission(body)

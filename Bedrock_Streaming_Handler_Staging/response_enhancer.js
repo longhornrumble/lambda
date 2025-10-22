@@ -176,8 +176,8 @@ function detectConversationBranch(bedrockResponse, userQuery, config, completedF
                 }
             }
 
-            // Add secondary CTAs if user seems engaged
-            if (branch.available_ctas?.secondary && userQuery.length > 20) {
+            // Add secondary CTAs if defined (user is engaged if branch was detected)
+            if (branch.available_ctas?.secondary) {
                 for (const ctaId of branch.available_ctas.secondary) {
                     const cta = cta_definitions[ctaId];
                     if (cta) {

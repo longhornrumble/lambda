@@ -312,8 +312,8 @@ def detect_conversation_branch(
                             'id': primary_cta_id
                         })
 
-            # Add secondary CTAs if user seems engaged (message > 20 chars)
-            if available_ctas.get('secondary') and len(user_message) > 20:
+            # Add secondary CTAs if defined (user is engaged if branch was detected)
+            if available_ctas.get('secondary'):
                 for cta_id in available_ctas['secondary']:
                     cta = cta_definitions.get(cta_id)
                     if not cta:
