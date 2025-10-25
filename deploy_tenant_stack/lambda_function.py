@@ -523,7 +523,7 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
     feature_mappings = {
         "uploads": "uploads_enabled",
         "photo_uploads": "photo_uploads_enabled",
-        "forms": "forms_enabled",
+        "conversational_forms": "conversational_forms_enabled",  # Form system feature flag
         "sms": "sms_enabled",
         "voice_input": "voice_input",
         "webchat": "webchat_enabled",
@@ -624,7 +624,15 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
         transformed_config["widget_behavior"] = widget_behavior
     if aws_config:
         transformed_config["aws"] = aws_config
-    
+
+    # ALWAYS include form system structure (empty by default)
+    # Web Config Builder will populate these when customer uses the feature
+    # Feature flag in features.conversational_forms controls billing/access
+    transformed_config["programs"] = {}
+    transformed_config["conversational_forms"] = {}
+    transformed_config["cta_definitions"] = {}
+    transformed_config["conversation_branches"] = {}
+
     # Always include metadata for debugging
     transformed_config["metadata"] = {
         "transformation_version": "1.0",
@@ -633,7 +641,7 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
         "s3_bucket": PRODUCTION_BUCKET,
         "cloudfront_domain": CLOUDFRONT_DOMAIN
     }
-    
+
     return transformed_config
 
 
