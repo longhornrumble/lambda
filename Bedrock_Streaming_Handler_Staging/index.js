@@ -235,12 +235,11 @@ ${kbContext}`);
   
   if (kbContext) {
     parts.push(`\nCRITICAL INSTRUCTIONS:
-1. ONLY provide contact information (phone, email, addresses) that appears in the knowledge base results
-2. NEVER make up or invent ANY details including program names, services, or contact information - if not explicitly in the knowledge base, don't include it
-3. ALWAYS include complete URLs exactly as they appear in the search results
-4. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
-5. If the URL appears as a markdown link [text](url), preserve the markdown format
-6. If no specific contact info is available, suggest visiting the website or contacting the main office
+1. NEVER make up or invent ANY details including program names, services, or contact information - if not explicitly in the knowledge base, don't include it
+2. ALWAYS include complete URLs exactly as they appear in the search results
+3. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
+4. If the URL appears as a markdown link [text](url), preserve the markdown format
+5. Answer the user's question comprehensively with all relevant information from the knowledge base, including impact data, outcomes, statistics, and research findings. Do NOT add "Next Steps" or "Getting Involved" sections with contact information or action prompts.
 
 RESPONSE FORMATTING - BALANCED APPROACH:
 
@@ -249,11 +248,11 @@ Write responses that are both informative and well-structured:
 1. **START WITH CONTEXT**: Begin with 1-2 sentences providing a warm, helpful introduction
 2. **USE STRUCTURE FOR CLARITY**: After the introduction, organize information with clear headings
 3. **MIX PARAGRAPHS AND LISTS**: Use short paragraphs to explain concepts, then bullet points for specific details
-4. **ALWAYS INCLUDE ACTIONABLE CONTACT INFO**: Every response should end with specific ways to take action - phone numbers, emails, website links (ONLY if found in knowledge base)
-5. **USE EMOJIS SPARINGLY**: 
+4. **NO CALLS-TO-ACTION**: Do NOT include action phrases like "Apply here", "Sign up today", "Contact us to get started", or "Visit our website". Action buttons are provided automatically by the system based on conversation context.
+5. **USE EMOJIS SPARINGLY**:
    - Maximum 2-3 emojis per response, not in every sentence
    - If using emoji as a bullet point, use EITHER emoji OR dash (-), never both
-   - Good: "📞 Call us at..." OR "- Call us at..."  
+   - Good: "📞 Call us at..." OR "- Call us at..."
    - Bad: "- 📞 Call us at..."
    - Reserve emojis for adding warmth at key moments, not decoration
 
@@ -270,8 +269,7 @@ Key features or services:
 
 [Additional paragraph if more context is helpful]
 
-**Contact/Next Steps:**
-[ALWAYS include specific contact info, links, emails, or phone numbers if available]
+End with a warm, supportive closing statement.
 
 GOOD EXAMPLE:
 "I understand you're looking for information about our grief counseling services. 💙 We offer comprehensive support designed to help you and your family through this difficult journey.
@@ -288,10 +286,7 @@ We also offer a seven-week support group program where you can connect with othe
 **Additional Support:**
 Beyond regular counseling, we provide ongoing bereavement support even after a patient's passing, including our annual Celebration of Life memorial service.
 
-**How to Get Started:**
-To learn more about our grief counseling services or schedule a session, please contact our bereavement team through the information provided in our resources, or visit our website for more details.
-
-Our team is here to support you every step of the way. 💙"
+We're here to support you every step of the way. 💙"
 
 Please provide a helpful, well-structured response:`);
   }
