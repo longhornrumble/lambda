@@ -3,7 +3,8 @@ import json
 import logging
 import time
 import hashlib
-from typing import Dict, Any, Optional
+import re
+from typing import Dict, Any, Optional, List, Set
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -26,6 +27,134 @@ def count_enabled_features(features: Dict[str, Any]) -> int:
         elif isinstance(value, dict) and value.get("enabled") is True:
             count += 1
     return count
+
+
+def slugify(text: str) -> str:
+    """
+    Convert text to URL-friendly slug for action chip IDs
+    Examples:
+        "Learn about Mentoring" -> "learn_about_mentoring"
+        "Request Support for Your Family" -> "request_support_for_your_family"
+        "Volunteer!" -> "volunteer"
+        "FAQ's & Info" -> "faqs_info"
+    """
+    if not text:
+        return ""
+
+    # Convert to lowercase
+    slug = text.lower()
+
+    # Remove special characters except spaces and hyphens
+    slug = re.sub(r'[^\w\s-]', '', slug)
+
+    # Replace spaces and hyphens with underscores
+    slug = re.sub(r'[-\s]+', '_', slug)
+
+    # Remove leading/trailing underscores
+    slug = slug.strip('_')
+
+    return slug
+
+
+def generate_chip_id(label: str, existing_ids: Set[str]) -> str:
+    """
+    Generate unique chip ID from label with collision detection
+    Args:
+        label: The action chip label text
+        existing_ids: Set of already-used chip IDs
+    Returns:
+        Unique chip ID with numeric suffix if needed
+    """
+    base_id = slugify(label)
+
+    if not base_id:
+        base_id = "action_chip"
+
+    chip_id = base_id
+    counter = 2
+
+    # Detect collisions and add numeric suffix
+    while chip_id in existing_ids:
+        chip_id = f"{base_id}_{counter}"
+        counter += 1
+
+    return chip_id
+
+
+def transform_action_chips_array_to_dict(chips_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transform action chips from array format to dictionary format
+
+    Before (Bubble format):
+    {
+        "enabled": true,
+        "default_chips": [
+            {"label": "Learn about Mentoring", "value": "Tell me about..."}
+        ]
+    }
+
+    After (Enhanced format):
+    {
+        "enabled": true,
+        "default_chips": {
+            "learn_about_mentoring": {
+                "label": "Learn about Mentoring",
+                "value": "Tell me about...",
+                "target_branch": null  # Can be set in Config Builder
+            }
+        }
+    }
+    """
+    if not chips_config:
+        return chips_config
+
+    # If default_chips doesn't exist or is not a list, return as-is
+    default_chips = chips_config.get("default_chips")
+    if not default_chips or not isinstance(default_chips, list):
+        return chips_config
+
+    # If it's already a dictionary, return as-is (backward compatibility)
+    if isinstance(default_chips, dict):
+        logger.info("Action chips already in dictionary format, skipping transformation")
+        return chips_config
+
+    # Transform array to dictionary
+    logger.info(f"Transforming {len(default_chips)} action chips from array to dictionary format")
+
+    transformed_chips = {}
+    existing_ids: Set[str] = set()
+
+    for chip in default_chips:
+        if not isinstance(chip, dict):
+            logger.warning(f"Skipping invalid chip (not a dict): {chip}")
+            continue
+
+        label = chip.get("label", "")
+        if not label:
+            logger.warning(f"Skipping chip with no label: {chip}")
+            continue
+
+        # Generate unique ID
+        chip_id = generate_chip_id(label, existing_ids)
+        existing_ids.add(chip_id)
+
+        # Create enhanced chip object
+        transformed_chips[chip_id] = {
+            "label": label,
+            "value": chip.get("value", label),
+            "target_branch": None  # Will be set in Config Builder UI
+        }
+
+        logger.info(f"  Transformed chip: '{label}' -> ID: '{chip_id}'")
+
+    # Return transformed config
+    return {
+        "enabled": chips_config.get("enabled", True),
+        "max_display": chips_config.get("max_display"),
+        "show_on_welcome": chips_config.get("show_on_welcome"),
+        "default_chips": transformed_chips
+    }
+
 
 def lambda_handler(event, context):
     logger.info("🚀 PRODUCTION Deploy Lambda triggered with Universal Widget support")
@@ -577,6 +706,7 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
         quick_help["prompts"] = bubble_data.get("quick_help_prompts")
     
     # Action chips (ONLY include if Bubble sent them)
+    # Now with array→dictionary transformation for enhanced routing
     action_chips = {}
     if bubble_data.get("action_chips_enabled") is not None:
         action_chips["enabled"] = parse_bubble_boolean(bubble_data.get("action_chips_enabled"))
@@ -586,6 +716,10 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
         action_chips["show_on_welcome"] = parse_bubble_boolean(bubble_data.get("action_chips_on_welcome"))
     if bubble_data.get("action_chips_list"):
         action_chips["default_chips"] = bubble_data.get("action_chips_list")
+
+    # Transform action chips from array to dictionary format (if needed)
+    if action_chips:
+        action_chips = transform_action_chips_array_to_dict(action_chips)
     
     # Widget behavior (ONLY include if Bubble sent them)
     widget_behavior = {}
@@ -632,6 +766,11 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
     transformed_config["conversational_forms"] = {}
     transformed_config["cta_definitions"] = {}
     transformed_config["conversation_branches"] = {}
+
+    # CTA settings with fallback branch support (new routing feature)
+    transformed_config["cta_settings"] = {
+        "fallback_branch": None  # Will be set in Config Builder UI
+    }
 
     # Always include metadata for debugging
     transformed_config["metadata"] = {

@@ -2,7 +2,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from urllib.parse import parse_qs
 
 # Try to import Lambda streaming support
@@ -623,6 +623,171 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         
         return response
 
+def get_conversation_branch(metadata: Dict[str, Any], tenant_config: Dict[str, Any]) -> Optional[str]:
+    """
+    Determine conversation branch using 3-tier hierarchy.
+
+    This function implements the Action Chips Explicit Routing PRD (FR-5).
+    It eliminates keyword matching in favor of explicit routing metadata.
+
+    Tier 1: Explicit action chip routing (chip.target_branch)
+    Tier 2: Explicit CTA routing (cta.target_branch)
+    Tier 3: Fallback navigation hub (cta_settings.fallback_branch)
+
+    Args:
+        metadata: Request metadata from frontend containing routing information
+        tenant_config: Full tenant configuration from S3
+
+    Returns:
+        str: Branch name to use for CTA selection
+        None: No CTAs should be shown (backward compatibility)
+
+    Examples:
+        # Action chip clicked with valid target
+        metadata = {"action_chip_triggered": True, "target_branch": "volunteer_interest"}
+        → Returns "volunteer_interest"
+
+        # Free-form query (no metadata)
+        metadata = {}
+        → Returns fallback_branch from cta_settings
+    """
+    branches = tenant_config.get('conversation_branches', {})
+    cta_settings = tenant_config.get('cta_settings', {})
+
+    # TIER 1: Explicit action chip routing
+    if metadata.get('action_chip_triggered'):
+        target_branch = metadata.get('target_branch')
+        if target_branch and target_branch in branches:
+            logger.info(f"[Tier 1] Routing via action chip to branch: {target_branch}")
+            return target_branch
+        if target_branch:
+            logger.warning(f"[Tier 1] Invalid target_branch: {target_branch}, falling back to next tier")
+
+    # TIER 2: Explicit CTA routing
+    if metadata.get('cta_triggered'):
+        target_branch = metadata.get('target_branch')
+        if target_branch and target_branch in branches:
+            logger.info(f"[Tier 2] Routing via CTA to branch: {target_branch}")
+            return target_branch
+        if target_branch:
+            logger.warning(f"[Tier 2] Invalid target_branch: {target_branch}, falling back to next tier")
+
+    # TIER 3: Fallback navigation hub
+    fallback_branch = cta_settings.get('fallback_branch')
+    if fallback_branch and fallback_branch in branches:
+        logger.info(f"[Tier 3] Routing to fallback branch: {fallback_branch}")
+        return fallback_branch
+
+    # No routing match - graceful degradation (backward compatibility)
+    if fallback_branch:
+        logger.warning(f"[Tier 3] Fallback branch '{fallback_branch}' not found in conversation_branches")
+    else:
+        logger.warning("[Tier 3] No fallback_branch configured - no CTAs will be shown")
+
+    return None
+
+def build_ctas_for_branch(
+    branch_name: str,
+    tenant_config: Dict[str, Any],
+    completed_forms: list = None
+) -> list:
+    """
+    Build CTA cards for a specific conversation branch (no keyword matching).
+
+    This function implements explicit CTA selection based on a pre-determined branch,
+    bypassing the keyword detection logic in form_cta_enhancer.
+
+    Args:
+        branch_name: Name of the conversation branch to use
+        tenant_config: Full tenant configuration from S3
+        completed_forms: List of completed form IDs to filter out
+
+    Returns:
+        list: CTA cards to display (max 3)
+    """
+    completed_forms = completed_forms or []
+    branches = tenant_config.get('conversation_branches', {})
+    cta_definitions = tenant_config.get('cta_definitions', {})
+
+    if not branch_name or branch_name not in branches:
+        logger.warning(f"[CTA Builder] Branch '{branch_name}' not found")
+        return []
+
+    branch = branches[branch_name]
+    available_ctas = branch.get('available_ctas', {})
+
+    ctas = []
+
+    # Add primary CTA if defined
+    primary_cta_id = available_ctas.get('primary')
+    if primary_cta_id and primary_cta_id in cta_definitions:
+        primary_cta = cta_definitions[primary_cta_id]
+
+        # Check if this is a form CTA
+        is_form_cta = (
+            primary_cta.get('action') in ['start_form', 'form_trigger'] or
+            primary_cta.get('type') == 'form_cta'
+        )
+
+        if is_form_cta:
+            # Extract program from CTA
+            program = primary_cta.get('program') or primary_cta.get('program_id')
+            form_id = primary_cta.get('formId') or primary_cta.get('form_id')
+
+            # Map formIds to programs if needed
+            if not program and form_id:
+                if form_id == 'lb_apply':
+                    program = 'lovebox'
+                elif form_id == 'dd_apply':
+                    program = 'daretodream'
+
+            # Filter if completed
+            if program and program in completed_forms:
+                logger.info(f"[CTA Builder] Filtering completed program: {program}")
+            else:
+                ctas.append({**primary_cta, 'id': primary_cta_id})
+        else:
+            # Not a form CTA, always show
+            ctas.append({**primary_cta, 'id': primary_cta_id})
+
+    # Add secondary CTAs if defined
+    secondary_ctas = available_ctas.get('secondary', [])
+    for cta_id in secondary_ctas:
+        if cta_id not in cta_definitions:
+            continue
+
+        cta = cta_definitions[cta_id]
+
+        # Check if this is a form CTA
+        is_form_cta = (
+            cta.get('action') in ['start_form', 'form_trigger'] or
+            cta.get('type') == 'form_cta'
+        )
+
+        if is_form_cta:
+            # Extract program from CTA
+            program = cta.get('program') or cta.get('program_id')
+            form_id = cta.get('formId') or cta.get('form_id')
+
+            # Map formIds to programs if needed
+            if not program and form_id:
+                if form_id == 'lb_apply':
+                    program = 'lovebox'
+                elif form_id == 'dd_apply':
+                    program = 'daretodream'
+
+            # Filter if completed
+            if program and program in completed_forms:
+                logger.info(f"[CTA Builder] Filtering completed program: {program}")
+                continue
+
+        ctas.append({**cta, 'id': cta_id})
+
+    # Return max 3 CTAs
+    final_ctas = ctas[:3]
+    logger.info(f"[CTA Builder] Built {len(final_ctas)} CTAs for branch '{branch_name}'")
+    return final_ctas
+
 def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
     """
     Handle chat messages using real intent router with conversation memory support
@@ -787,6 +952,13 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
         session_context = body.get('session_context', {})
         logger.info(f"Session context extracted: completed_forms={session_context.get('completed_forms', [])}")
 
+        # ACTION CHIPS EXPLICIT ROUTING (PRD FR-3, FR-5)
+        # Extract metadata from request for 3-tier routing hierarchy
+        request_metadata = body.get('metadata', {})
+        logger.info(f"[Routing] Extracted metadata: action_chip_triggered={request_metadata.get('action_chip_triggered')}, "
+                   f"cta_triggered={request_metadata.get('cta_triggered')}, "
+                   f"target_branch={request_metadata.get('target_branch')}")
+
         # Phase 1B: Enhance response with form CTAs (HTTP mode parity with streaming)
         try:
             from form_cta_enhancer import enhance_response_with_form_cta
@@ -799,31 +971,93 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
             if conversation_context and conversation_context.get('messages'):
                 conversation_history = conversation_context['messages']
 
-            enhanced_response = enhance_response_with_form_cta(
-                response_text=response_body.get('content', ''),
-                user_message=body.get('user_input', ''),
-                tenant_hash=tenant_hash,
-                conversation_history=conversation_history,
-                session_context=session_context  # NEW: Pass session context
-            )
+            # Load tenant config for explicit routing (3-tier hierarchy)
+            tenant_config = None
+            try:
+                from tenant_config_loader import get_config_for_tenant_by_hash
+                tenant_config = get_config_for_tenant_by_hash(tenant_hash)
+                logger.info(f"[Routing] Loaded tenant config for explicit routing")
+            except Exception as config_error:
+                logger.warning(f"[Routing] Could not load tenant config: {config_error}")
 
-            # Merge enhanced response back into response_body (NOT response_data)
-            if enhanced_response:
-                response_body['content'] = enhanced_response.get('message', response_body.get('content', ''))
-                # PHASE 1B: Use ctaButtons for parity with Bedrock_Streaming_Handler
-                response_body['ctaButtons'] = enhanced_response.get('cards', [])
+            # Determine conversation branch using 3-tier explicit routing
+            # This replaces keyword-based detection in form_cta_enhancer
+            selected_branch = None
+            cta_cards = []
+
+            if tenant_config:
+                selected_branch = get_conversation_branch(request_metadata, tenant_config)
+                if selected_branch:
+                    logger.info(f"[Routing] Selected branch via 3-tier routing: {selected_branch}")
+
+                    # Build CTAs for the selected branch (explicit, no keyword matching)
+                    completed_forms = session_context.get('completed_forms', [])
+                    cta_cards = build_ctas_for_branch(selected_branch, tenant_config, completed_forms)
+                    logger.info(f"[Routing] Built {len(cta_cards)} CTA cards for branch '{selected_branch}'")
+                else:
+                    logger.info(f"[Routing] No branch selected via 3-tier routing - falling back to form_cta_enhancer")
+
+                    # Fallback to existing enhance_response_with_form_cta for backward compatibility
+                    # This handles cases where tenant config doesn't have explicit routing configured
+                    enhanced_response = enhance_response_with_form_cta(
+                        response_text=response_body.get('content', ''),
+                        user_message=body.get('user_input', ''),
+                        tenant_hash=tenant_hash,
+                        conversation_history=conversation_history,
+                        session_context=session_context
+                    )
+
+                    if enhanced_response:
+                        response_body['content'] = enhanced_response.get('message', response_body.get('content', ''))
+                        response_body['ctaButtons'] = enhanced_response.get('cards', [])
+                        response_body['metadata'] = {
+                            **(response_body.get('metadata', {})),
+                            **enhanced_response.get('metadata', {})
+                        }
+                        logger.info(f"[Routing] Fallback enhancement applied: {len(enhanced_response.get('cards', []))} cards")
+
+            # If we have CTAs from explicit routing, use them
+            if cta_cards:
+                # Convert CTAs to frontend format
+                formatted_cards = []
+                for cta in cta_cards:
+                    card = {
+                        "type": cta.get("type", "cta_button"),
+                        "label": cta.get("label") or cta.get("text"),
+                        "action": cta.get("action", "link"),
+                    }
+
+                    # Add optional fields
+                    if cta.get("formId"):
+                        card["formId"] = cta["formId"]
+                    if cta.get("url"):
+                        card["url"] = cta["url"]
+                    if cta.get("fields"):
+                        card["fields"] = cta["fields"]
+                    if cta.get("style"):
+                        card["style"] = cta["style"]
+                    if cta.get("program"):
+                        card["program"] = cta["program"]
+                    elif cta.get("program_id"):
+                        card["program"] = cta["program_id"]
+
+                    formatted_cards.append(card)
+
+                response_body['ctaButtons'] = formatted_cards
                 response_body['metadata'] = {
                     **(response_body.get('metadata', {})),
-                    **enhanced_response.get('metadata', {})
+                    'explicit_routing': True,
+                    'branch_used': selected_branch,
+                    'cta_count': len(formatted_cards)
                 }
-                logger.info(f"Response enhanced with {len(enhanced_response.get('cards', []))} CTA buttons")
-                logger.info(f"[DEBUG] response_body keys after enhancement: {list(response_body.keys())}")
-                logger.info(f"[DEBUG] response_body has ctaButtons: {'ctaButtons' in response_body}")
-                if 'ctaButtons' in response_body:
-                    logger.info(f"[DEBUG] ctaButtons value: {response_body['ctaButtons']}")
+                logger.info(f"[Routing] Explicit routing complete: {len(formatted_cards)} CTAs from branch '{selected_branch}'")
 
-                # Re-serialize the enhanced body back into response_data
-                response_data['body'] = json.dumps(response_body)
+            # Re-serialize the enhanced body back into response_data
+            response_data['body'] = json.dumps(response_body)
+            logger.info(f"[DEBUG] response_body keys after enhancement: {list(response_body.keys())}")
+            logger.info(f"[DEBUG] response_body has ctaButtons: {'ctaButtons' in response_body}")
+            if 'ctaButtons' in response_body:
+                logger.info(f"[DEBUG] ctaButtons count: {len(response_body['ctaButtons'])}")
         except Exception as enhance_error:
             logger.warning(f"CTA enhancement failed, continuing with unenhanced response: {enhance_error}")
 

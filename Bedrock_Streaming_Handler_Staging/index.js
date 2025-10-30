@@ -513,11 +513,15 @@ const streamingHandler = async (event, responseStream, context) => {
     try {
       const { enhanceResponse } = require('./response_enhancer');
 
+      // Extract routing metadata for 3-tier explicit routing (PRD: Action Chips)
+      const routingMetadata = body.routing_metadata || {};
+
       const enhancedData = await enhanceResponse(
         responseBuffer,  // The complete Bedrock response
         userInput,       // The user's message
         tenantHash,      // Tenant identifier
-        body.session_context || {} // Session context for form tracking
+        body.session_context || {}, // Session context for form tracking
+        routingMetadata  // Routing metadata for explicit routing (action chips, CTAs, fallback)
       );
 
       if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
@@ -709,11 +713,15 @@ const bufferedHandler = async (event, context) => {
     try {
       const { enhanceResponse } = require('./response_enhancer');
 
+      // Extract routing metadata for 3-tier explicit routing (PRD: Action Chips)
+      const routingMetadata = body.routing_metadata || {};
+
       const enhancedData = await enhanceResponse(
         responseBuffer,  // The complete Bedrock response
         userInput,       // The user's message
         tenantHash,      // Tenant identifier
-        body.session_context || {} // Session context for form tracking
+        body.session_context || {}, // Session context for form tracking
+        routingMetadata  // Routing metadata for explicit routing (action chips, CTAs, fallback)
       );
 
       if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {

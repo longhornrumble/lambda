@@ -1,0 +1,105 @@
+test_alphanumeric_with_spaces (__main__.TestSlugify.test_alphanumeric_with_spaces)
+Test: Alphanumeric with spaces ... ok
+test_basic_slugification_donate_now (__main__.TestSlugify.test_basic_slugification_donate_now)
+Test 2: 'Donate Now!' → 'donate_now' ... ok
+test_basic_slugification_faqs_info (__main__.TestSlugify.test_basic_slugification_faqs_info)
+Test 4: 'FAQ's & Info' → 'faqs_info' ... ok
+test_basic_slugification_learn_more (__main__.TestSlugify.test_basic_slugification_learn_more)
+Test 1: 'Learn More' → 'learn_more' ... ok
+test_basic_slugification_schedule_discovery_session (__main__.TestSlugify.test_basic_slugification_schedule_discovery_session)
+Test 3: 'Schedule Discovery Session' → 'schedule_discovery_session' ... ok
+test_basic_slugification_unicode (__main__.TestSlugify.test_basic_slugification_unicode)
+Test 5: 'Español' → 'español' (unicode handling) ... ok
+test_combined_spaces_and_hyphens (__main__.TestSlugify.test_combined_spaces_and_hyphens)
+Test: Spaces and hyphens both become underscores ... ok
+test_edge_case_empty_string (__main__.TestSlugify.test_edge_case_empty_string)
+Test 10: '' (empty string) → '' ... ok
+test_edge_case_numbers_only (__main__.TestSlugify.test_edge_case_numbers_only)
+Test 12: '123' (numbers only) → '123' ... ok
+test_edge_case_only_spaces (__main__.TestSlugify.test_edge_case_only_spaces)
+Test 11: '   ' (only spaces) → '' ... ok
+test_edge_case_very_long_label (__main__.TestSlugify.test_edge_case_very_long_label)
+Test 13: Very long label (200 characters) is preserved ... ok
+test_internal_special_chars (__main__.TestSlugify.test_internal_special_chars)
+Test: Internal special characters are removed ... ok
+test_leading_trailing_hyphens (__main__.TestSlugify.test_leading_trailing_hyphens)
+Test: Leading and trailing hyphens are stripped ... ok
+test_mixed_case_conversion (__main__.TestSlugify.test_mixed_case_conversion)
+Test: Mixed case is converted to lowercase ... ok
+test_special_chars_all_special (__main__.TestSlugify.test_special_chars_all_special)
+Test 6: '!@#$%^&*()' → '' (all special chars removed) ... ok
+test_special_chars_hyphens_to_underscores (__main__.TestSlugify.test_special_chars_hyphens_to_underscores)
+Test 7: 'a-b-c' → 'a_b_c' (hyphens to underscores) ... ok
+test_special_chars_leading_trailing_spaces (__main__.TestSlugify.test_special_chars_leading_trailing_spaces)
+Test 8: '  spaces  ' → 'spaces' (leading/trailing spaces) ... ok
+test_special_chars_multiple_underscores (__main__.TestSlugify.test_special_chars_multiple_underscores)
+Test 9: 'multiple   spaces' → 'multiple_spaces' (dedup underscores) ... ok
+test_collision_empty_labels (__main__.TestGenerateChipId.test_collision_empty_labels)
+Test 16: ['', '', ''] → ['action_chip', 'action_chip_2', 'action_chip_3'] ... ok
+test_collision_single (__main__.TestGenerateChipId.test_collision_single)
+Test 14: ['Volunteer', 'Volunteer!'] → ['volunteer', 'volunteer_2'] ... ok
+test_collision_ten_times (__main__.TestGenerateChipId.test_collision_ten_times)
+Test 17: ['x', 'x', ..., 'x'] (10 times) → ['x', 'x_2', ..., 'x_10'] ... ok
+test_collision_triple (__main__.TestGenerateChipId.test_collision_triple)
+Test 15: ['Learn More', 'Learn More!', 'Learn More??'] → ['learn_more', 'learn_more_2', 'learn_more_3'] ... ok
+test_collision_with_numbered_suffix (__main__.TestGenerateChipId.test_collision_with_numbered_suffix)
+Test: Collision detection works when existing ID has suffix ... ok
+test_complex_collision_scenario (__main__.TestGenerateChipId.test_complex_collision_scenario)
+Test: Complex collision scenario with mixed labels ... ok
+test_empty_label_collision (__main__.TestGenerateChipId.test_empty_label_collision)
+Test 19: '' with existing 'action_chip' → 'action_chip_2' ... ok
+test_empty_label_default (__main__.TestGenerateChipId.test_empty_label_default)
+Test 18: '' with no existing IDs → 'action_chip' ... ok
+test_existing_ids_not_modified (__main__.TestGenerateChipId.test_existing_ids_not_modified)
+Test: Existing IDs set is not modified by function ... ok
+test_no_collision_simple (__main__.TestGenerateChipId.test_no_collision_simple)
+Test: ID generation without collisions ... ok
+test_special_chars_only_fallback (__main__.TestGenerateChipId.test_special_chars_only_fallback)
+Test: Special chars only label → 'action_chip' ... ok
+test_unicode_collision (__main__.TestGenerateChipId.test_unicode_collision)
+Test: Unicode characters in colliding labels ... ok
+test_whitespace_label_fallback (__main__.TestGenerateChipId.test_whitespace_label_fallback)
+Test 20: '   ' (whitespace only) → 'action_chip' ... ok
+test_batch_generation_maintains_uniqueness (__main__.TestIntegration.test_batch_generation_maintains_uniqueness)
+Test: Batch generation maintains uniqueness ... ok
+test_idempotency (__main__.TestIntegration.test_idempotency)
+Test: Same label with same existing IDs produces same result ... ok
+test_realistic_tenant_chip_set (__main__.TestIntegration.test_realistic_tenant_chip_set)
+Test: Realistic set of action chips for a tenant ... ok
+test_collision_counter_starts_at_2 (__main__.TestEdgeCasesAndBoundaries.test_collision_counter_starts_at_2)
+Test: Collision counter starts at 2 (not 1) ... ok
+test_generate_id_with_large_existing_set (__main__.TestEdgeCasesAndBoundaries.test_generate_id_with_large_existing_set)
+Test: Generate ID with large existing set ... ok
+test_multiple_consecutive_spaces_and_hyphens (__main__.TestEdgeCasesAndBoundaries.test_multiple_consecutive_spaces_and_hyphens)
+Test: Multiple consecutive spaces and hyphens ... ok
+test_newlines_and_tabs (__main__.TestEdgeCasesAndBoundaries.test_newlines_and_tabs)
+Test: Newlines and tabs are treated as whitespace and become underscores ... ok
+test_slugify_mixed_alphanumeric_special (__main__.TestEdgeCasesAndBoundaries.test_slugify_mixed_alphanumeric_special)
+Test: Mixed alphanumeric and special characters ... ok
+test_slugify_only_special_chars (__main__.TestEdgeCasesAndBoundaries.test_slugify_only_special_chars)
+Test: Only special characters ... ok
+
+----------------------------------------------------------------------
+Ran 40 tests in 0.001s
+
+OK
+================================================================================
+ACTION CHIP ID GENERATION - COMPREHENSIVE TEST SUITE
+================================================================================
+
+Testing slugify() and generate_chip_id() functions
+Target: 100% code coverage
+
+================================================================================
+
+
+================================================================================
+TEST SUMMARY
+================================================================================
+Tests run: 40
+Successes: 40
+Failures: 0
+Errors: 0
+
+✅ ALL TESTS PASSED - 100% SUCCESS RATE
+================================================================================

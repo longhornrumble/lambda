@@ -71,7 +71,8 @@ async function loadTenantConfig(tenantHash) {
         const result = {
             conversation_branches: config.conversation_branches || {},
             cta_definitions: config.cta_definitions || {},
-            conversational_forms: config.conversational_forms || {}
+            conversational_forms: config.conversational_forms || {},
+            cta_settings: config.cta_settings || {}  // Required for Tier 3 fallback routing
         };
 
         // Cache the config
@@ -89,7 +90,177 @@ async function loadTenantConfig(tenantHash) {
 }
 
 /**
+ * Get conversation branch using 3-tier routing hierarchy (PRD: Action Chips Explicit Routing)
+ *
+ * This implements explicit routing metadata, eliminating keyword matching for action chips and CTAs.
+ *
+ * Tier 1: Explicit action chip routing (chip.target_branch)
+ * Tier 2: Explicit CTA routing (cta.target_branch)
+ * Tier 3: Fallback navigation hub (cta_settings.fallback_branch)
+ *
+ * @param {Object} routingMetadata - Routing metadata from frontend
+ * @param {Object} config - Tenant configuration
+ * @returns {string|null} - Branch name to use for CTA selection, or null if no match
+ */
+function getConversationBranch(routingMetadata, config) {
+    const branches = config.conversation_branches || {};
+    const ctaSettings = config.cta_settings || {};
+
+    // TIER 1: Explicit action chip routing
+    if (routingMetadata.action_chip_triggered) {
+        const targetBranch = routingMetadata.target_branch;
+        if (targetBranch && branches[targetBranch]) {
+            console.log(`[Tier 1] Routing via action chip to branch: ${targetBranch}`);
+            return targetBranch;
+        }
+        if (targetBranch) {
+            console.log(`[Tier 1] Invalid target_branch: ${targetBranch}, falling back to next tier`);
+        }
+    }
+
+    // TIER 2: Explicit CTA routing
+    if (routingMetadata.cta_triggered) {
+        const targetBranch = routingMetadata.target_branch;
+        if (targetBranch && branches[targetBranch]) {
+            console.log(`[Tier 2] Routing via CTA to branch: ${targetBranch}`);
+            return targetBranch;
+        }
+        if (targetBranch) {
+            console.log(`[Tier 2] Invalid target_branch: ${targetBranch}, falling back to next tier`);
+        }
+    }
+
+    // TIER 3: Fallback navigation hub
+    const fallbackBranch = ctaSettings.fallback_branch;
+    if (fallbackBranch && branches[fallbackBranch]) {
+        console.log(`[Tier 3] Routing to fallback branch: ${fallbackBranch}`);
+        return fallbackBranch;
+    }
+
+    // No routing match - graceful degradation (backward compatibility)
+    if (fallbackBranch) {
+        console.log(`[Tier 3] Fallback branch '${fallbackBranch}' not found in conversation_branches`);
+    } else {
+        console.log('[Tier 3] No fallback_branch configured - no CTAs will be shown');
+    }
+
+    return null;
+}
+
+/**
+ * Build CTA cards for a specific conversation branch (no keyword matching)
+ *
+ * This function implements explicit CTA selection based on a pre-determined branch,
+ * bypassing the keyword detection logic.
+ *
+ * @param {string} branchName - Name of the conversation branch to use
+ * @param {Object} config - Tenant configuration
+ * @param {Array} completedForms - List of completed form IDs to filter out
+ * @returns {Array} - CTA cards to display (max 3)
+ */
+function buildCtasFromBranch(branchName, config, completedForms = []) {
+    const branches = config.conversation_branches || {};
+    const ctaDefinitions = config.cta_definitions || {};
+
+    if (!branchName || !branches[branchName]) {
+        console.log(`[CTA Builder] Branch '${branchName}' not found`);
+        return [];
+    }
+
+    const branch = branches[branchName];
+    const availableCtas = branch.available_ctas || {};
+    const ctas = [];
+
+    // Add primary CTA if defined
+    const primaryCtaId = availableCtas.primary;
+    if (primaryCtaId && ctaDefinitions[primaryCtaId]) {
+        const primaryCta = ctaDefinitions[primaryCtaId];
+
+        // Check if this is a form CTA
+        const isFormCta = (
+            primaryCta.action === 'start_form' ||
+            primaryCta.action === 'form_trigger' ||
+            primaryCta.type === 'form_cta'
+        );
+
+        if (isFormCta) {
+            // Extract program from CTA
+            let program = primaryCta.program || primaryCta.program_id;
+            const formId = primaryCta.formId || primaryCta.form_id;
+
+            // Map formIds to programs if needed
+            if (!program && formId) {
+                if (formId === 'lb_apply') {
+                    program = 'lovebox';
+                } else if (formId === 'dd_apply') {
+                    program = 'daretodream';
+                }
+            }
+
+            // Filter if completed
+            if (program && completedForms.includes(program)) {
+                console.log(`[CTA Builder] Filtering completed program: ${program}`);
+            } else {
+                ctas.push({ ...primaryCta, id: primaryCtaId });
+            }
+        } else {
+            // Not a form CTA, always show
+            ctas.push({ ...primaryCta, id: primaryCtaId });
+        }
+    }
+
+    // Add secondary CTAs if defined
+    const secondaryCtas = availableCtas.secondary || [];
+    for (const ctaId of secondaryCtas) {
+        if (!ctaDefinitions[ctaId]) {
+            continue;
+        }
+
+        const cta = ctaDefinitions[ctaId];
+
+        // Check if this is a form CTA
+        const isFormCta = (
+            cta.action === 'start_form' ||
+            cta.action === 'form_trigger' ||
+            cta.type === 'form_cta'
+        );
+
+        if (isFormCta) {
+            // Extract program from CTA
+            let program = cta.program || cta.program_id;
+            const formId = cta.formId || cta.form_id;
+
+            // Map formIds to programs if needed
+            if (!program && formId) {
+                if (formId === 'lb_apply') {
+                    program = 'lovebox';
+                } else if (formId === 'dd_apply') {
+                    program = 'daretodream';
+                }
+            }
+
+            // Filter if completed
+            if (program && completedForms.includes(program)) {
+                console.log(`[CTA Builder] Filtering completed program: ${program}`);
+                continue;
+            }
+        }
+
+        ctas.push({ ...cta, id: ctaId });
+    }
+
+    // Return max 3 CTAs
+    const finalCtas = ctas.slice(0, 3);
+    console.log(`[CTA Builder] Built ${finalCtas.length} CTAs for branch '${branchName}'`);
+    return finalCtas;
+}
+
+/**
  * Detect conversation branch based on Bedrock response content
+ *
+ * DEPRECATED: This function uses keyword matching and should be replaced with explicit routing.
+ * Kept for backward compatibility only.
+ *
  * This is the "context bridge" - matches response to configuration
  */
 function detectConversationBranch(bedrockResponse, userQuery, config, completedForms = []) {
@@ -271,12 +442,13 @@ function checkFormTriggers(bedrockResponse, userQuery, config) {
 /**
  * Main enhancement function - adds CTAs to Bedrock response
  */
-async function enhanceResponse(bedrockResponse, userMessage, tenantHash, sessionContext = {}) {
+async function enhanceResponse(bedrockResponse, userMessage, tenantHash, sessionContext = {}, routingMetadata = {}) {
     console.log('🔍 enhanceResponse called with:', {
         responseLength: bedrockResponse?.length,
         userMessage,
         tenantHash,
         sessionContext,
+        routingMetadata,
         completedForms: sessionContext.completed_forms || [],
         suspendedForms: sessionContext.suspended_forms || [],
         programInterest: sessionContext.program_interest,
@@ -290,6 +462,36 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         // Extract completed forms and suspended forms from session context
         const completedForms = sessionContext.completed_forms || [];
         const suspendedForms = sessionContext.suspended_forms || [];
+
+        // ============================================================================
+        // TIER 1-3: Explicit Routing (PRD: Action Chips Explicit Routing)
+        // ============================================================================
+        // Check for explicit routing metadata BEFORE keyword detection or form triggers
+        const explicitBranch = getConversationBranch(routingMetadata, config);
+        if (explicitBranch) {
+            console.log(`[Explicit Routing] Using branch: ${explicitBranch}`);
+            const ctas = buildCtasFromBranch(explicitBranch, config, completedForms);
+
+            if (ctas.length > 0) {
+                console.log(`[Explicit Routing] Returning ${ctas.length} CTAs from branch '${explicitBranch}'`);
+                return {
+                    message: bedrockResponse,
+                    ctaButtons: ctas,
+                    metadata: {
+                        enhanced: true,
+                        branch: explicitBranch,
+                        routing_tier: 'explicit',
+                        routing_method: routingMetadata.action_chip_triggered ? 'action_chip' :
+                                       routingMetadata.cta_triggered ? 'cta' : 'fallback'
+                    }
+                };
+            } else {
+                console.log(`[Explicit Routing] Branch '${explicitBranch}' has no CTAs to display`);
+            }
+        }
+        // ============================================================================
+        // End of Explicit Routing - Continue to existing logic for backward compatibility
+        // ============================================================================
 
         // PHASE 1B: If there are suspended forms, check if user is asking about a DIFFERENT program
         // This enables intelligent form switching UX
@@ -404,10 +606,14 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
             }
         }
 
-        // Detect conversation branch for general CTAs
+        // ============================================================================
+        // DEPRECATED: Keyword Detection (Backward Compatibility Only)
+        // ============================================================================
+        // This is kept for tenants that haven't migrated to v1.4.1 explicit routing yet
+        console.log('[DEPRECATED] Using keyword detection - consider configuring explicit routing via target_branch');
         const branchResult = detectConversationBranch(bedrockResponse, userMessage, config, completedForms);
 
-        console.log('🌿 Branch detection result:', {
+        console.log('🌿 Branch detection result (keyword-based):', {
             branchFound: !!branchResult,
             branch: branchResult?.branch,
             ctaCount: branchResult?.ctas?.length || 0,
@@ -482,5 +688,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
 module.exports = {
     enhanceResponse,
     loadTenantConfig,
-    detectConversationBranch
+    detectConversationBranch,  // DEPRECATED - kept for backward compatibility
+    getConversationBranch,      // NEW - 3-tier routing
+    buildCtasFromBranch         // NEW - explicit CTA building
 };
