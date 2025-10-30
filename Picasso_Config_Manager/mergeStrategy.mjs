@@ -11,6 +11,8 @@ const EDITABLE_SECTIONS = [
   'conversational_forms',
   'cta_definitions',
   'conversation_branches',
+  'content_showcase',
+  'cta_settings',
 ];
 
 /**

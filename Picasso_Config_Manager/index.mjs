@@ -140,17 +140,20 @@ export const handler = async (event) => {
         validate_only = false,
       } = requestBody;
 
-      // Validate edited sections
-      const validation = validateEditedSections(editedConfig);
-      if (!validation.isValid) {
-        return {
-          statusCode: 400,
-          headers,
-          body: JSON.stringify({
-            error: 'Invalid edited sections',
-            details: validation.errors,
-          }),
-        };
+      // Only validate sections if merge=true (section-based editing)
+      // When merge=false, full config replacement is allowed
+      if (merge) {
+        const validation = validateEditedSections(editedConfig);
+        if (!validation.isValid) {
+          return {
+            statusCode: 400,
+            headers,
+            body: JSON.stringify({
+              error: 'Invalid edited sections',
+              details: validation.errors,
+            }),
+          };
+        }
       }
 
       // If validation only, return without saving
