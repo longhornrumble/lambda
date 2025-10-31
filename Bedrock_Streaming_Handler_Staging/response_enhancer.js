@@ -201,11 +201,15 @@ function buildCtasFromBranch(branchName, config, completedForms = []) {
             if (program && completedForms.includes(program)) {
                 console.log(`[CTA Builder] Filtering completed program: ${program}`);
             } else {
-                ctas.push({ ...primaryCta, id: primaryCtaId });
+                // Strip legacy style field and add position metadata
+                const { style, ...cleanCta } = primaryCta;
+                ctas.push({ ...cleanCta, id: primaryCtaId, _position: 'primary' });
             }
         } else {
             // Not a form CTA, always show
-            ctas.push({ ...primaryCta, id: primaryCtaId });
+            // Strip legacy style field and add position metadata
+            const { style, ...cleanCta } = primaryCta;
+            ctas.push({ ...cleanCta, id: primaryCtaId, _position: 'primary' });
         }
     }
 
@@ -246,7 +250,9 @@ function buildCtasFromBranch(branchName, config, completedForms = []) {
             }
         }
 
-        ctas.push({ ...cta, id: ctaId });
+        // Strip legacy style field and add position metadata
+        const { style, ...cleanCta } = cta;
+        ctas.push({ ...cleanCta, id: ctaId, _position: 'secondary' });
     }
 
     // Return max 3 CTAs
@@ -332,16 +338,22 @@ function detectConversationBranch(bedrockResponse, userQuery, config, completedF
                             console.log(`🚫 Filtering primary CTA for completed program: ${program} (branch: ${branchName}, formId: ${primaryCta.formId || primaryCta.form_id})`);
                         } else {
                             console.log(`✅ Adding primary CTA - program: ${program || 'none'}, completed: [${completedForms.join(',')}], formId: ${primaryCta.formId || primaryCta.form_id}`);
+                            // Strip legacy style field and add position metadata
+                            const { style, ...cleanCta } = primaryCta;
                             ctas.push({
-                                ...primaryCta,
-                                id: branch.available_ctas.primary
+                                ...cleanCta,
+                                id: branch.available_ctas.primary,
+                                _position: 'primary'
                             });
                         }
                     } else {
                         // Not a form CTA, always show
+                        // Strip legacy style field and add position metadata
+                        const { style, ...cleanCta } = primaryCta;
                         ctas.push({
-                            ...primaryCta,
-                            id: branch.available_ctas.primary
+                            ...cleanCta,
+                            id: branch.available_ctas.primary,
+                            _position: 'primary'
                         });
                     }
                 }
@@ -378,16 +390,22 @@ function detectConversationBranch(bedrockResponse, userQuery, config, completedF
                             if (program && completedForms.includes(program)) {
                                 console.log(`🚫 Filtering secondary CTA for completed program: ${program} (CTA: ${ctaId})`);
                             } else {
+                                // Strip legacy style field and add position metadata
+                                const { style, ...cleanCta } = cta;
                                 ctas.push({
-                                    ...cta,
-                                    id: ctaId
+                                    ...cleanCta,
+                                    id: ctaId,
+                                    _position: 'secondary'
                                 });
                             }
                         } else {
                             // Not a form CTA, always show
+                            // Strip legacy style field and add position metadata
+                            const { style, ...cleanCta } = cta;
                             ctas.push({
-                                ...cta,
-                                id: ctaId
+                                ...cleanCta,
+                                id: ctaId,
+                                _position: 'secondary'
                             });
                         }
                     }

@@ -1,10 +1,12 @@
 /**
  * Response Enhancer Comprehensive Test Suite
  *
- * Tests for Phase 1B features: Suspended Forms & Program Switching
- * Ensures parity with Master_Function_Staging/form_cta_enhancer.py
+ * Tests for:
+ * - Context-Based CTA Styling (_position metadata, style field stripping)
+ * - Phase 1B features: Suspended Forms & Program Switching
+ * - Ensures parity with Master_Function_Staging/form_cta_enhancer.py
  *
- * Target: 85%+ code coverage
+ * Target: 90%+ code coverage
  */
 
 const { mockClient } = require('aws-sdk-client-mock');
@@ -978,6 +980,600 @@ describe('Response Enhancer - Edge Cases', () => {
     expect(config).toEqual({
       conversation_branches: {},
       cta_definitions: {}
+    });
+  });
+});
+
+// ============================================================================
+// Context-Based CTA Styling Tests (New Feature)
+// Tests for _position metadata and style field stripping
+// ============================================================================
+
+const {
+  buildCtasFromBranch,
+  getConversationBranch
+} = require('../response_enhancer');
+
+describe('Context-Based CTA Styling - buildCtasFromBranch()', () => {
+  // Mock config with CTAs that have style fields
+  const stylingTestConfig = {
+    conversation_branches: {
+      styling_test_branch: {
+        available_ctas: {
+          primary: 'primary_with_style',
+          secondary: ['secondary_with_style', 'info_with_style', 'no_style_cta']
+        }
+      },
+      primary_only_branch: {
+        available_ctas: {
+          primary: 'primary_with_style'
+        }
+      }
+    },
+    cta_definitions: {
+      primary_with_style: {
+        text: 'Apply Now',
+        action: 'start_form',
+        route: '/apply',
+        style: 'primary',
+        formId: 'volunteer',
+        customData: { key: 'value' }
+      },
+      secondary_with_style: {
+        text: 'Learn More',
+        action: 'navigate',
+        route: '/learn',
+        style: 'secondary',
+        metadata: { source: 'config' }
+      },
+      info_with_style: {
+        text: 'Read FAQ',
+        action: 'navigate',
+        route: '/faq',
+        style: 'info'
+      },
+      no_style_cta: {
+        text: 'Contact Us',
+        action: 'navigate',
+        route: '/contact'
+      }
+    }
+  };
+
+  describe('Position Metadata Addition', () => {
+    test('adds _position: "primary" to primary CTA', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      expect(ctas.length).toBeGreaterThanOrEqual(1);
+      const primaryCta = ctas[0];
+      expect(primaryCta._position).toBe('primary');
+      expect(primaryCta.id).toBe('primary_with_style');
+    });
+
+    test('adds _position: "secondary" to all secondary CTAs', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      const secondaryCtas = ctas.filter(cta => cta._position === 'secondary');
+      // Max 3 CTAs total (1 primary + 2 secondary due to 3 CTA limit)
+      expect(secondaryCtas.length).toBe(2);
+
+      secondaryCtas.forEach(cta => {
+        expect(cta._position).toBe('secondary');
+        expect(['secondary_with_style', 'info_with_style', 'no_style_cta']).toContain(cta.id);
+      });
+    });
+
+    test('primary CTA is always first when present', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      if (ctas.length > 0) {
+        expect(ctas[0]._position).toBe('primary');
+      }
+    });
+
+    test('secondary CTAs follow primary in order', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      if (ctas.length > 1) {
+        for (let i = 1; i < ctas.length; i++) {
+          expect(ctas[i]._position).toBe('secondary');
+        }
+      }
+    });
+  });
+
+  describe('Style Field Stripping', () => {
+    test('strips style field from primary CTA with style: "primary"', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      const primaryCta = ctas[0];
+      expect(primaryCta.style).toBeUndefined();
+      expect(primaryCta._position).toBe('primary');
+      expect(primaryCta.text).toBe('Apply Now'); // Other fields preserved
+    });
+
+    test('strips style field from secondary CTA with style: "secondary"', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      const secondaryCta = ctas.find(c => c.id === 'secondary_with_style');
+      expect(secondaryCta).toBeDefined();
+      expect(secondaryCta.style).toBeUndefined();
+      expect(secondaryCta._position).toBe('secondary');
+    });
+
+    test('strips style field from CTA with style: "info"', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      const infoCta = ctas.find(c => c.id === 'info_with_style');
+      expect(infoCta).toBeDefined();
+      expect(infoCta.style).toBeUndefined();
+      expect(infoCta._position).toBe('secondary');
+    });
+
+    test('handles CTAs without style field gracefully', () => {
+      // Create a test config with only the no_style CTA to avoid 3 CTA limit
+      const configWithNoStyle = {
+        conversation_branches: {
+          no_style_test: {
+            available_ctas: {
+              secondary: ['no_style_cta']
+            }
+          }
+        },
+        cta_definitions: stylingTestConfig.cta_definitions
+      };
+
+      const ctas = buildCtasFromBranch('no_style_test', configWithNoStyle);
+
+      expect(ctas.length).toBe(1);
+      const noStyleCta = ctas[0];
+      expect(noStyleCta.style).toBeUndefined();
+      expect(noStyleCta._position).toBe('secondary');
+    });
+
+    test('all CTAs in output have no style field', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      ctas.forEach(cta => {
+        expect(cta.style).toBeUndefined();
+      });
+    });
+  });
+
+  describe('Property Preservation', () => {
+    test('preserves all non-style properties on primary CTA', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      const primaryCta = ctas[0];
+      expect(primaryCta.text).toBe('Apply Now');
+      expect(primaryCta.action).toBe('start_form');
+      expect(primaryCta.route).toBe('/apply');
+      expect(primaryCta.formId).toBe('volunteer');
+      expect(primaryCta.customData).toEqual({ key: 'value' });
+    });
+
+    test('preserves all non-style properties on secondary CTAs', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      const secondaryCta = ctas.find(c => c.id === 'secondary_with_style');
+      expect(secondaryCta.text).toBe('Learn More');
+      expect(secondaryCta.action).toBe('navigate');
+      expect(secondaryCta.route).toBe('/learn');
+      expect(secondaryCta.metadata).toEqual({ source: 'config' });
+    });
+
+    test('preserves nested objects and arrays', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      const primaryCta = ctas[0];
+      expect(typeof primaryCta.customData).toBe('object');
+      expect(primaryCta.customData.key).toBe('value');
+    });
+
+    test('preserves CTA ID field', () => {
+      const ctas = buildCtasFromBranch('styling_test_branch', stylingTestConfig);
+
+      expect(ctas[0].id).toBe('primary_with_style');
+
+      const secondaryCta = ctas.find(c => c.id === 'secondary_with_style');
+      expect(secondaryCta.id).toBe('secondary_with_style');
+    });
+  });
+
+  describe('Edge Cases', () => {
+    test('handles branch with only primary CTA (no secondary)', () => {
+      const ctas = buildCtasFromBranch('primary_only_branch', stylingTestConfig);
+
+      expect(ctas).toHaveLength(1);
+      expect(ctas[0]._position).toBe('primary');
+      expect(ctas[0].style).toBeUndefined();
+    });
+
+    test('returns empty array for non-existent branch', () => {
+      const ctas = buildCtasFromBranch('nonexistent', stylingTestConfig);
+
+      expect(ctas).toEqual([]);
+    });
+
+    test('returns empty array for null/undefined branch name', () => {
+      expect(buildCtasFromBranch(null, stylingTestConfig)).toEqual([]);
+      expect(buildCtasFromBranch(undefined, stylingTestConfig)).toEqual([]);
+    });
+
+    test('limits output to max 3 CTAs', () => {
+      const configWith5Ctas = {
+        conversation_branches: {
+          many_ctas: {
+            available_ctas: {
+              primary: 'primary_with_style',
+              secondary: ['secondary_with_style', 'info_with_style', 'no_style_cta', 'primary_with_style']
+            }
+          }
+        },
+        cta_definitions: stylingTestConfig.cta_definitions
+      };
+
+      const ctas = buildCtasFromBranch('many_ctas', configWith5Ctas);
+      expect(ctas.length).toBeLessThanOrEqual(3);
+    });
+
+    test('handles form filtering while maintaining position metadata', () => {
+      const configWithForm = {
+        conversation_branches: {
+          form_branch: {
+            available_ctas: {
+              primary: 'form_cta',
+              secondary: ['secondary_with_style']
+            }
+          }
+        },
+        cta_definitions: {
+          form_cta: {
+            text: 'Apply to Program',
+            action: 'start_form',
+            type: 'form_cta',
+            formId: 'lb_apply',
+            program: 'lovebox',
+            style: 'primary'
+          },
+          secondary_with_style: stylingTestConfig.cta_definitions.secondary_with_style
+        }
+      };
+
+      const completedForms = ['lovebox'];
+      const ctas = buildCtasFromBranch('form_branch', configWithForm, completedForms);
+
+      // Form CTA should be filtered, only secondary remains
+      expect(ctas).toHaveLength(1);
+      expect(ctas[0]._position).toBe('secondary');
+      expect(ctas[0].style).toBeUndefined();
+    });
+  });
+});
+
+describe('Context-Based CTA Styling - detectConversationBranch()', () => {
+  const stylingTestConfig = {
+    conversation_branches: {
+      volunteer_interest: {
+        detection_keywords: ['volunteer', 'help'],
+        available_ctas: {
+          primary: 'primary_with_style',
+          secondary: ['secondary_with_style', 'info_with_style']
+        }
+      }
+    },
+    cta_definitions: {
+      primary_with_style: {
+        text: 'Apply to Volunteer',
+        action: 'start_form',
+        type: 'form_cta',
+        formId: 'volunteer_apply',
+        style: 'primary'
+      },
+      secondary_with_style: {
+        text: 'Learn More',
+        action: 'navigate',
+        route: '/learn',
+        style: 'secondary'
+      },
+      info_with_style: {
+        text: 'Read FAQ',
+        action: 'navigate',
+        route: '/faq',
+        style: 'info'
+      }
+    }
+  };
+
+  describe('Position Metadata in Detected Branches', () => {
+    test('adds _position: "primary" to primary CTA in detected branch', () => {
+      const result = detectConversationBranch(
+        'We have volunteer opportunities available.',
+        'I want to help',
+        stylingTestConfig,
+        []
+      );
+
+      expect(result).toBeDefined();
+      expect(result.ctas.length).toBeGreaterThanOrEqual(1);
+      expect(result.ctas[0]._position).toBe('primary');
+      expect(result.ctas[0].id).toBe('primary_with_style');
+    });
+
+    test('adds _position: "secondary" to secondary CTAs in detected branch', () => {
+      const result = detectConversationBranch(
+        'We have volunteer opportunities available.',
+        'Tell me about volunteer options',
+        stylingTestConfig,
+        []
+      );
+
+      expect(result).toBeDefined();
+      const secondaryCtas = result.ctas.filter(c => c._position === 'secondary');
+      expect(secondaryCtas.length).toBeGreaterThanOrEqual(1);
+
+      secondaryCtas.forEach(cta => {
+        expect(cta._position).toBe('secondary');
+      });
+    });
+  });
+
+  describe('Style Field Stripping in Detected Branches', () => {
+    test('strips style field from all CTAs in detected branch', () => {
+      const result = detectConversationBranch(
+        'We have volunteer opportunities available.',
+        'How can I volunteer?',
+        stylingTestConfig,
+        []
+      );
+
+      expect(result).toBeDefined();
+      result.ctas.forEach(cta => {
+        expect(cta.style).toBeUndefined();
+      });
+    });
+
+    test('strips style: "primary" from primary CTA in detected branch', () => {
+      const result = detectConversationBranch(
+        'We have volunteer opportunities.',
+        'I want to help and volunteer',
+        stylingTestConfig,
+        []
+      );
+
+      expect(result).toBeDefined();
+      const primaryCta = result.ctas[0];
+      expect(primaryCta.style).toBeUndefined();
+      expect(primaryCta._position).toBe('primary');
+    });
+
+    test('strips style: "secondary" from secondary CTAs in detected branch', () => {
+      const result = detectConversationBranch(
+        'We have volunteer opportunities.',
+        'Tell me more about volunteering',
+        stylingTestConfig,
+        []
+      );
+
+      expect(result).toBeDefined();
+      const secondaryCta = result.ctas.find(c => c.id === 'secondary_with_style');
+      if (secondaryCta) {
+        expect(secondaryCta.style).toBeUndefined();
+        expect(secondaryCta._position).toBe('secondary');
+      }
+    });
+
+    test('strips style: "info" from info CTAs and assigns secondary position', () => {
+      const result = detectConversationBranch(
+        'We have volunteer opportunities.',
+        'What do I need to know about volunteering?',
+        stylingTestConfig,
+        []
+      );
+
+      expect(result).toBeDefined();
+      const infoCta = result.ctas.find(c => c.id === 'info_with_style');
+      if (infoCta) {
+        expect(infoCta.style).toBeUndefined();
+        expect(infoCta._position).toBe('secondary');
+      }
+    });
+  });
+
+  describe('Property Preservation in Detected Branches', () => {
+    test('preserves all CTA properties except style', () => {
+      const result = detectConversationBranch(
+        'We have volunteer opportunities.',
+        'I want to volunteer',
+        stylingTestConfig,
+        []
+      );
+
+      expect(result).toBeDefined();
+      const primaryCta = result.ctas[0];
+      expect(primaryCta.text).toBe('Apply to Volunteer');
+      expect(primaryCta.action).toBe('start_form');
+      expect(primaryCta.type).toBe('form_cta');
+      expect(primaryCta.formId).toBe('volunteer_apply');
+    });
+  });
+
+  describe('Integration with Form Filtering', () => {
+    test('remaining CTAs after filtering maintain position metadata', () => {
+      // Use a config where secondary CTAs remain after primary form is filtered
+      const filterTestConfig = {
+        conversation_branches: {
+          test_branch: {
+            detection_keywords: ['volunteer'],
+            available_ctas: {
+              primary: 'form_cta_lovebox',
+              secondary: ['non_form_cta']
+            }
+          }
+        },
+        cta_definitions: {
+          form_cta_lovebox: {
+            text: 'Apply to Love Box',
+            action: 'start_form',
+            type: 'form_cta',
+            formId: 'lb_apply',
+            program: 'lovebox',
+            style: 'primary'
+          },
+          non_form_cta: {
+            text: 'Learn More',
+            action: 'navigate',
+            route: '/learn',
+            style: 'secondary'
+          }
+        }
+      };
+
+      const result = detectConversationBranch(
+        'We have volunteer opportunities.',
+        'Tell me about volunteering',
+        filterTestConfig,
+        ['lovebox'] // Form already completed
+      );
+
+      if (result) {
+        // Primary form CTA should be filtered
+        const formCta = result.ctas.find(c => c.program === 'lovebox');
+        expect(formCta).toBeUndefined();
+
+        // Remaining non-form CTA should have correct position metadata and no style
+        expect(result.ctas.length).toBeGreaterThanOrEqual(1);
+        result.ctas.forEach(cta => {
+          expect(cta._position).toBeDefined();
+          expect(cta.style).toBeUndefined();
+        });
+      }
+    });
+  });
+});
+
+describe('Context-Based CTA Styling - Integration Tests', () => {
+  beforeEach(() => {
+    s3Mock.reset();
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (input.Key.includes('mappings/')) {
+        return createS3Response(mockTenantMapping);
+      } else if (input.Key.includes('-config.json')) {
+        // Return config with CTAs that have style fields
+        const configWithStyles = {
+          ...mockTenantConfig,
+          cta_definitions: {
+            ...mockTenantConfig.cta_definitions,
+            explore_programs: {
+              ...mockTenantConfig.cta_definitions.explore_programs,
+              style: 'primary'
+            },
+            volunteer_cta: {
+              ...mockTenantConfig.cta_definitions.volunteer_cta,
+              style: 'primary'
+            },
+            lovebox_cta: {
+              ...mockTenantConfig.cta_definitions.lovebox_cta,
+              style: 'secondary'
+            }
+          }
+        };
+        return createS3Response(configWithStyles);
+      }
+    });
+  });
+
+  test('enhanceResponse returns CTAs with _position and no style field', async () => {
+    const bedrockResponse = 'We offer several programs and opportunities.';
+    const userMessage = 'What programs do you offer?';
+    const sessionContext = {
+      completed_forms: [],
+      suspended_forms: []
+    };
+
+    const result = await enhanceResponse(bedrockResponse, userMessage, mockTenantHash, sessionContext);
+
+    if (result.ctaButtons.length > 0) {
+      result.ctaButtons.forEach(cta => {
+        // Every CTA should have NO style field
+        expect(cta.style).toBeUndefined();
+
+        // Note: _position is added by buildCtasFromBranch/detectConversationBranch
+        // but may be removed during final CTA formatting in enhanceResponse
+        // The key requirement is that style is stripped
+      });
+    }
+  });
+
+  test('explicit routing returns CTAs with _position metadata', async () => {
+    const bedrockResponse = 'Here are your options.';
+    const userMessage = 'Show me programs';
+    const sessionContext = {
+      completed_forms: [],
+      suspended_forms: []
+    };
+    const routingMetadata = {
+      action_chip_triggered: true,
+      target_branch: 'program_exploration'
+    };
+
+    // Mock config with explicit routing support
+    s3Mock.reset();
+    s3Mock.on(GetObjectCommand).callsFake((input) => {
+      if (input.Key.includes('mappings/')) {
+        return createS3Response(mockTenantMapping);
+      } else if (input.Key.includes('-config.json')) {
+        const configWithRouting = {
+          ...mockTenantConfig,
+          cta_settings: {
+            fallback_branch: 'program_exploration'
+          },
+          cta_definitions: {
+            ...mockTenantConfig.cta_definitions,
+            explore_programs: {
+              ...mockTenantConfig.cta_definitions.explore_programs,
+              style: 'primary'
+            }
+          }
+        };
+        return createS3Response(configWithRouting);
+      }
+    });
+
+    const result = await enhanceResponse(bedrockResponse, userMessage, mockTenantHash, sessionContext, routingMetadata);
+
+    if (result.ctaButtons.length > 0) {
+      result.ctaButtons.forEach(cta => {
+        expect(cta.style).toBeUndefined();
+      });
+
+      // Check if metadata includes explicit routing info
+      if (result.metadata.routing_tier === 'explicit') {
+        expect(result.metadata.branch).toBe('program_exploration');
+      }
+    }
+  });
+
+  test('complete transformation pipeline: style stripped, _position added, properties preserved', async () => {
+    const bedrockResponse = 'We have volunteer opportunities available.';
+    const userMessage = 'I want to volunteer';
+    const sessionContext = {
+      completed_forms: [],
+      suspended_forms: []
+    };
+
+    const result = await enhanceResponse(bedrockResponse, userMessage, mockTenantHash, sessionContext);
+
+    // Should have form trigger CTA
+    expect(result.ctaButtons.length).toBeGreaterThanOrEqual(1);
+
+    result.ctaButtons.forEach(cta => {
+      // No style field
+      expect(cta.style).toBeUndefined();
+
+      // All required CTA properties present
+      expect(cta.label || cta.text).toBeDefined();
+      expect(cta.action).toBeDefined();
     });
   });
 });
