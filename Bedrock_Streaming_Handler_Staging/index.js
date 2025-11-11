@@ -161,20 +161,20 @@ async function retrieveKB(userInput, config) {
 
 function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
   const parts = [];
-  
+
   // Start with tone prompt (matching bedrock_handler.py)
   const tonePrompt = tone || DEFAULT_TONE;
   parts.push(tonePrompt);
-  
+
   // Add role instructions (exactly from bedrock_handler.py line 115)
   const roleInstructions = `
 You are a virtual assistant answering the questions of website visitors. You are always courteous and respectful and respond as if you are an employee of the organization. You replace words like they or their with our, which conveys that you are a representative of the team. You are answering a user's question using information from a knowledge base. Your job is to provide a helpful, natural response based on the information provided below.`;
-  
+
   parts.push(roleInstructions);
-  
+
   console.log(`🎯 Building prompt - KB context: ${kbContext ? kbContext.length + ' chars' : 'NONE'}`);
   console.log(`💬 Conversation history: ${conversationHistory ? 'PROVIDED' : 'NONE'}`);
-  
+
   // Add conversation history if provided (matching bedrock_handler.py format)
   if (conversationHistory && conversationHistory.length > 0) {
     parts.push('\nPREVIOUS CONVERSATION:');
@@ -188,8 +188,114 @@ You are a virtual assistant answering the questions of website visitors. You are
     });
     parts.push('\nREMEMBER: The user\'s name and any personal information they\'ve shared should be remembered and used in your response when appropriate.\n');
     console.log(`✅ Added ${conversationHistory.length} messages from history`);
+
+    // Add context-aware instructions for interpreting short/ambiguous responses
+    parts.push(`\nCRITICAL INSTRUCTION - CONTEXT INTERPRETATION:
+When the user gives a SHORT or AMBIGUOUS response (like "yes", "no", "sure", "okay", "tell me more", "I'm interested", "not really", "maybe"):
+1. FIRST look at the PREVIOUS CONVERSATION above to understand what they're responding to
+2. The user is likely confirming, declining, or asking about something from our recent discussion
+3. DO NOT say "I don't have information" - instead, refer back to what we were just discussing
+4. Use the conversation context to interpret their intent, even if the knowledge base doesn't have specific information about their exact words
+
+Examples of how to interpret short responses:
+- If user says "yes" after you asked about submitting a request, they mean "yes, I want to proceed with that"
+- If user says "tell me more" after discussing a specific program or service, they want more details about that same topic
+- If user says "I'm interested" after mentioning an opportunity, they're interested in that specific opportunity
+- If user says "no thanks" after you offered information, acknowledge and ask what else they need
+- If user says "sure" or "okay", they're agreeing to whatever was just proposed
+
+IMPORTANT: Short responses are ALWAYS about continuing the previous conversation topic. Never treat them as new, unrelated questions.\n`);
+    console.log(`✅ Added context-aware interpretation instructions`);
+
+    // Add capability boundaries to prevent offering services the bot can't deliver
+    parts.push(`\nCRITICAL INSTRUCTION - CAPABILITY BOUNDARIES:
+
+You are an INFORMATION ASSISTANT. Be crystal clear about what you CAN and CANNOT do:
+
+✅ WHAT YOU CAN DO:
+- Provide information about programs, services, and processes
+- Share links to forms, applications, and resources
+- Explain eligibility requirements and prerequisites
+- Give contact information (only when found in knowledge base)
+- Answer questions about how things work
+- Clarify details about what's available
+
+❌ WHAT YOU CANNOT DO:
+- Walk users through filling out forms step-by-step
+- Fill out applications or forms with users
+- Submit forms or requests on behalf of users
+- Access external systems, databases, or applications
+- Make commitments about interactive actions you can't perform
+- Guide users through multi-step processes you can't see or control
+
+CRITICAL: DO NOT ask questions like:
+- ❌ "Would you like me to walk you through the request form?"
+- ❌ "Shall I help you fill out the application?"
+- ❌ "Would you like me to guide you through the specific sections?"
+- ❌ "Can I help you start filling this out?"
+
+INSTEAD, say things like:
+- ✅ "Here's the link to the request form: [URL]"
+- ✅ "You can submit your application here: [link]. The form will ask for [key info]."
+- ✅ "To get started, visit [link]. If you have questions about the form, I'm here to help!"
+- ✅ "The application is available at [URL]. Let me know if you need clarification on any requirements."
+
+REMEMBER: Your role is to INFORM and DIRECT, not to INTERACT with external systems. Always provide resources and let users take action themselves.\n`);
+    console.log(`✅ Added capability boundaries instructions`);
+
+    // Add loop prevention and conversation progression logic
+    parts.push(`\nCRITICAL INSTRUCTION - AVOID REPETITIVE LOOPS:
+
+BEFORE responding, check the PREVIOUS CONVERSATION above:
+
+1. **Have I already provided this information?**
+   - If YES: Don't repeat it. Acknowledge their interest and provide the NEXT ACTION (link/resource)
+   - If NO: Proceed with providing new information
+
+2. **Have I already asked this question?**
+   - If YES: Don't ask it again. They've already confirmed - provide the resource instead
+   - If NO: You may ask if relevant and genuinely new
+
+3. **Is the user confirming interest for the second or third time?**
+   - If YES: STOP asking questions. Provide direct link/resource and conclude
+   - If NO: Continue normal flow
+
+CONVERSATION STAGES - Recognize where you are:
+
+**STAGE 1 - Information Request:** User asks about something
+→ Provide comprehensive answer
+
+**STAGE 2 - Interest/Clarification:** User says "tell me more", "yes", "I'm interested"
+→ Provide deeper detail OR actionable resource (form link, contact)
+
+**STAGE 3 - Confirmation:** User confirms again with "yes", "okay", "sure"
+→ CONCLUDE: Give direct link/resource, confirm next steps, shift to different topic
+
+CRITICAL: After Stage 3, DO NOT:
+- Re-explain what you already explained
+- Ask if they want what they already confirmed
+- Provide same information in different words
+
+After Stage 3, DO:
+- Give the direct resource: "Here's the link: [URL]"
+- Confirm what happens next: "You can submit there and we'll respond within 24 hours"
+- Open to NEW topic: "What else can I help you with?"
+
+EXAMPLE OF PROPER PROGRESSION:
+
+User: "How do I request supplies?"
+Bot: [Stage 1] "We help with supply requests. You can request items like... through our online form."
+
+User: "yes"
+Bot: [Stage 2] "Great! Here's the direct link to the request form: [URL]. The form will ask for your contact info and what items you need."
+
+User: "yes"
+Bot: [Stage 3] "Perfect! You're all set - just visit that link to submit your request. Our team responds within 24 hours. Is there anything else I can help you with today?" ✅ DONE - moved to new topic
+
+DO NOT create loops by asking "Would you like me to help with that?" after they've already said yes twice.\n`);
+    console.log(`✅ Added loop prevention instructions`);
   }
-  
+
   // Add essential instructions if we have KB context (from bedrock_handler.py lines 117-129)
   if (kbContext) {
     // CRITICAL: Add strong anti-hallucination constraints at the TOP
@@ -229,17 +335,18 @@ ${kbContext}`);
     parts.push(`\nI don't have information about this topic in my knowledge base. Would you like me to connect you with someone who can help?`);
     console.log(`⚠️ No KB context - using fallback response`);
   }
-  
+
   // Add current question and final instruction
   parts.push(`\nCURRENT USER QUESTION: ${userInput}`);
-  
+
   if (kbContext) {
     parts.push(`\nCRITICAL INSTRUCTIONS:
-1. NEVER make up or invent ANY details including program names, services, or contact information - if not explicitly in the knowledge base, don't include it
-2. ALWAYS include complete URLs exactly as they appear in the search results
-3. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
-4. If the URL appears as a markdown link [text](url), preserve the markdown format
-5. Answer the user's question comprehensively with all relevant information from the knowledge base, including impact data, outcomes, statistics, and research findings. Do NOT add "Next Steps" or "Getting Involved" sections with contact information or action prompts.
+1. Do NOT include phone numbers or email addresses in your response unless the user specifically asks "how do I contact you" or similar contact-focused questions
+2. NEVER make up or invent ANY details including program names, services, or contact information - if not explicitly in the knowledge base, don't include it
+3. ALWAYS include complete URLs exactly as they appear in the search results - links to resources and topic pages are encouraged
+4. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
+5. If the URL appears as a markdown link [text](url), preserve the markdown format
+6. Include relevant action links from the knowledge base (like "submit a support request" or resource page links) when appropriate
 
 RESPONSE FORMATTING - BALANCED APPROACH:
 
@@ -248,8 +355,14 @@ Write responses that are both informative and well-structured:
 1. **START WITH CONTEXT**: Begin with 1-2 sentences providing a warm, helpful introduction
 2. **USE STRUCTURE FOR CLARITY**: After the introduction, organize information with clear headings
 3. **MIX PARAGRAPHS AND LISTS**: Use short paragraphs to explain concepts, then bullet points for specific details
-4. **NO CALLS-TO-ACTION**: Do NOT include action phrases like "Apply here", "Sign up today", "Contact us to get started", or "Visit our website". Action buttons are provided automatically by the system based on conversation context.
-5. **USE EMOJIS SPARINGLY**:
+4. **INCLUDE RELEVANT RESOURCE LINKS**: Include URLs to relevant topic pages and resources from the knowledge base when appropriate
+5. **END STRATEGICALLY BASED ON CONVERSATION STAGE**:
+   - **If initial information request**: End with relevant clarifying question about the same topic
+   - **If user has confirmed interest (said "yes", "I'm interested")**: Provide the resource/link and ask about DIFFERENT topics: "What else can I help you with?" or "Is there anything else you'd like to know about?"
+   - **If you've provided same information twice**: Don't ask another question about that topic - conclude with "Let me know if you need anything else!"
+   - **Never ask the same question twice** - check conversation history first
+   - **Never ask questions about actions you can't perform** (like "Would you like me to walk you through the form?")
+6. **USE EMOJIS SPARINGLY**:
    - Maximum 2-3 emojis per response, not in every sentence
    - If using emoji as a bullet point, use EITHER emoji OR dash (-), never both
    - Good: "📞 Call us at..." OR "- Call us at..."
@@ -269,7 +382,9 @@ Key features or services:
 
 [Additional paragraph if more context is helpful]
 
-End with a warm, supportive closing statement.
+[Optional: Include relevant resource links if present in knowledge base]
+
+[Close with warm statement and conversational follow-up question]
 
 GOOD EXAMPLE:
 "I understand you're looking for information about our grief counseling services. 💙 We offer comprehensive support designed to help you and your family through this difficult journey.
@@ -286,11 +401,11 @@ We also offer a seven-week support group program where you can connect with othe
 **Additional Support:**
 Beyond regular counseling, we provide ongoing bereavement support even after a patient's passing, including our annual Celebration of Life memorial service.
 
-We're here to support you every step of the way. 💙"
+Our team is here to support you every step of the way. 💙 What else would you like to know about our grief counseling services?"
 
 Please provide a helpful, well-structured response:`);
   }
-  
+
   const finalPrompt = parts.join('\n');
   console.log(`📝 Final prompt length: ${finalPrompt.length} chars`);
   console.log(`📝 Prompt preview: ${finalPrompt.substring(0, 200)}...`);
