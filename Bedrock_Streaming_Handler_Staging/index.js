@@ -3,13 +3,15 @@
  * Uses awslambda.streamifyResponse for real SSE streaming
  * No JWT required - uses simple tenant_hash/session_id
  *
- * Version: v2.3.0
- * Deployed: 2025-11-18 TBD
+ * Version: v2.4.0
+ * Deployed: 2025-11-20
  * Changes:
- *   - FIX: Support bedrock_instructions_override in request body for testing
- *   - ENHANCEMENT: Significantly strengthened formatting rules to ensure different styles produce measurably different responses
- *   - Detail levels now enforce strict sentence counts: concise (2-3), balanced (4-6), comprehensive (8-10+)
- *   - Style enforcement now more explicit with concrete examples and constraints
+ *   - MAJOR: Rewrote style enforcement with contract-based approach
+ *   - Moved formatting rules to END of prompt (recency bias)
+ *   - Added explicit substitution rules (we're → we are for professional)
+ *   - Added pre-generation verification checklists
+ *   - Stronger behavioral contracts with mandatory compliance language
+ *   - Should achieve 95%+ style differentiation accuracy
  */
 
 const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -26,7 +28,7 @@ const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
 const DEFAULT_TONE = 'You are a helpful assistant.';
 
 // Prompt version tracking for tenant customization
-const PROMPT_VERSION = '2.3.0';
+const PROMPT_VERSION = '2.4.0';
 
 // Default Bedrock instructions when config doesn't specify custom ones
 const DEFAULT_BEDROCK_INSTRUCTIONS = {
@@ -250,9 +252,10 @@ function getRoleInstructions(config, toneFallback) {
 }
 
 /**
- * Build formatting rules from config preferences
+ * Build formatting rules from config preferences (LEGACY - kept for backward compatibility)
+ * Use buildEnhancedFormattingRules() for new contract-based approach
  */
-function buildFormattingRules(config) {
+function buildFormattingRulesLegacy(config) {
   const instructions = config?.bedrock_instructions;
   let prefs = DEFAULT_BEDROCK_INSTRUCTIONS.formatting_preferences;
 
@@ -279,15 +282,17 @@ STYLE EXAMPLES:
   } else if (prefs.response_style === 'warm_conversational') {
     styleGuidance = `CRITICAL STYLE ENFORCEMENT - WARM & CONVERSATIONAL:
 - ALWAYS use contractions (we're, you'll, it's, we've, you'd, etc.)
-- Use enthusiastic, friendly words like "awesome", "great", "love", "excited"
-- Write like you're talking to a friend over coffee - casual and approachable
-- Show personality and warmth - don't sound like a robot
-- Use exclamation points to convey enthusiasm (1-2 per response)`;
+- Use friendly, welcoming language - sound like a helpful friend, not overly enthusiastic
+- AVOID overused enthusiasm phrases like "super excited", "we're excited to share", "awesome", "incredible"
+- DO use measured warm words like "happy to help", "glad to share", "pleased to", "great", "wonderful"
+- Write naturally - friendly but not gushing
+- Use exclamation points sparingly (maximum 1 per response, only if truly warranted)
+- Sound genuine and approachable, not like marketing copy`;
     styleExamples = `
 STYLE EXAMPLES:
-❌ WRONG: "We offer a comprehensive mentorship program designed to support foster youth."
-❌ WRONG: "Our organization provides structured guidance for academic achievement."
-✅ CORRECT: "We've got an awesome mentorship program that helps foster youth! It's a great way to get support, build skills, and we're here for you every step of the way."`;
+❌ WRONG (too formal): "We offer a comprehensive mentorship program designed to support foster youth."
+❌ WRONG (overly enthusiastic): "We're super excited to share about our awesome mentorship program! It's incredible and we love helping foster youth!"
+✅ CORRECT: "We've got a mentorship program that helps foster youth ages 11-22. It's a great way to get support, build skills, and we're here for you every step of the way."`;
   } else if (prefs.response_style === 'structured_detailed') {
     styleGuidance = `CRITICAL STYLE ENFORCEMENT - STRUCTURED & ORGANIZED:
 - ALWAYS use markdown headings with ** for major sections
@@ -407,6 +412,245 @@ CRITICAL: These are NOT suggestions. These are REQUIREMENTS that define
 whether your response is correct or incorrect. A response that violates
 these rules is a FAILED response, even if the information is accurate.
 ═══════════════════════════════════════════════════════════════`;
+}
+/**
+ * Build enhanced formatting rules with contract-based approach
+ * Leverages recency bias by being placed at END of prompt
+ * Uses behavioral contracts with mandatory substitutions
+ */
+function buildEnhancedFormattingRules(config) {
+  const instructions = config?.bedrock_instructions;
+  let prefs = DEFAULT_BEDROCK_INSTRUCTIONS.formatting_preferences;
+
+  if (instructions && validateBedrockInstructions(instructions) && instructions.formatting_preferences) {
+    prefs = { ...prefs, ...instructions.formatting_preferences };
+  }
+
+  let styleContract = '';
+  let verificationChecklist = '';
+
+  if (prefs.response_style === 'professional_concise') {
+    styleContract = `
+🔒 STYLE CONTRACT - PROFESSIONAL CONCISE:
+Before generating each sentence, you WILL:
+1. Use "we are" NOT "we're" | "you will" NOT "you'll" | "it is" NOT "it's"
+2. Replace casual words: "comprehensive" (not "great"), "extensive" (not "awesome"), "exceptional" (not "amazing")
+3. Write as if this is a formal business communication to a stakeholder
+
+MANDATORY SUBSTITUTIONS:
+- "we've" → "we have"
+- "we're" → "we are"
+- "you'll" → "you will"
+- "it's" → "it is"
+- "that's" → "that is"
+- "there's" → "there is"
+- "great" → "comprehensive" or "extensive"
+- "awesome" → "exceptional" or "outstanding"
+- "super" → "highly" or "extremely"
+
+CORRECT EXAMPLES:
+✅ "We offer a comprehensive mentorship program designed to support foster youth ages 11-22. Our organization provides structured academic guidance and life skills development through two distinct tracks."
+✅ "Austin Angels has established an exceptional support system for foster families. Our services include emergency assistance, educational resources, and community connections."
+
+WRONG EXAMPLES (NEVER DO THIS):
+❌ "We've got an awesome mentorship program that'll help foster youth. It's really great!"
+❌ "We're here to support you with our amazing programs!"`;
+
+    verificationChecklist = `
+PRE-GENERATION CHECKLIST - Professional Concise:
+□ Zero contractions in entire response
+□ Zero casual words (great, awesome, cool, super, amazing)
+□ Formal business vocabulary only
+□ Tone sounds like annual report or board presentation`;
+
+  } else if (prefs.response_style === 'warm_conversational') {
+    styleContract = `
+🔒 STYLE CONTRACT - WARM CONVERSATIONAL:
+Before generating each sentence, you WILL:
+1. Use contractions: "we're" (not "we are"), "you'll" (not "you will"), "it's" (not "it is")
+2. Sound like a helpful friend, not a salesperson
+3. AVOID gushing enthusiasm: NO "super excited", "we're thrilled", "awesome", "incredible"
+4. DO use measured warmth: "happy to help", "glad to share", "pleased to", "great"
+5. Maximum 1 exclamation point in entire response
+
+MANDATORY CONTRACTIONS:
+- "we are" → "we're"
+- "you will" → "you'll"
+- "it is" → "it's"
+- "we have" → "we've"
+- "that is" → "that's"
+
+CORRECT EXAMPLES:
+✅ "We've got a mentorship program that helps foster youth ages 11-22. It's a great way to get support and build skills, and we're here for you every step of the way."
+✅ "Austin Angels is here to help foster families. We've created resources for emergency support, education, and connecting with your community."
+
+WRONG EXAMPLES (NEVER DO THIS):
+❌ "We offer a comprehensive mentorship program designed to support foster youth." (too formal - sounds like business doc)
+❌ "We're super excited to share about our awesome mentorship program! It's incredible!" (overly enthusiastic)`;
+
+    verificationChecklist = `
+PRE-GENERATION CHECKLIST - Warm Conversational:
+□ Multiple contractions used throughout
+□ Sounds like helpful friend, not formal business
+□ No gushing enthusiasm (super excited, awesome, incredible)
+□ Maximum 1 exclamation point total
+□ Natural, approachable tone`;
+
+  } else if (prefs.response_style === 'structured_detailed') {
+    styleContract = `
+🔒 STYLE CONTRACT - STRUCTURED DETAILED:
+You WILL format your response as:
+1. Opening sentence (no heading)
+2. **Heading 1:**
+3. - Bullet point
+4. - Bullet point
+5. **Heading 2:**
+6. - Bullet point
+7. - Bullet point
+
+MANDATORY STRUCTURE:
+- Use ** for ALL section headings
+- Use - for ALL bullet points
+- Break ANY list of 2+ items into bullets
+- Never write paragraphs with 5+ sentences - split into sections
+
+CORRECT EXAMPLE:
+✅ "Dare to Dream is our mentorship program supporting foster youth.
+
+**Program Structure:**
+- Dare to Dream Jr. (ages 11-14)
+- Dare to Dream (ages 15-22)
+
+**Services Provided:**
+- Life skills training
+- Academic support
+- Career preparation
+
+**Goal:** Empowering youth to achieve independence and success."
+
+WRONG EXAMPLES (NEVER DO THIS):
+❌ "Dare to Dream is our mentorship program for foster youth ages 11-22. We provide life skills training, academic support, and career preparation." (no structure - paragraph form)`;
+
+    verificationChecklist = `
+PRE-GENERATION CHECKLIST - Structured Detailed:
+□ Opening sentence without heading
+□ All sections have **Heading:**
+□ All lists use - bullet points
+□ No paragraphs with 5+ sentences
+□ Clear visual structure`;
+  }
+
+  // Detail level contract
+  let lengthContract = '';
+  let lengthChecklist = '';
+
+  if (prefs.detail_level === 'concise') {
+    lengthContract = `
+🔒 LENGTH CONTRACT - CONCISE:
+Your response WILL be EXACTLY 2-3 sentences. Not 4. Not 5. Maximum 3 sentences.
+Count periods before responding: 1... 2... 3... STOP.
+NO bullet points. NO lists. NO headings. Pure paragraph form.
+
+EXAMPLE:
+✅ "Dare to Dream is our mentorship program for foster youth ages 11-22, with tracks for ages 11-14 and 15-22. We provide life skills training, academic support, and guidance for independent living." (2 sentences)`;
+
+    lengthChecklist = `
+PRE-GENERATION LENGTH CHECK - Concise:
+□ Count periods: Must be 2 or 3, never 4+
+□ Zero bullet points
+□ Zero headings
+□ Paragraph form only`;
+
+  } else if (prefs.detail_level === 'balanced') {
+    lengthContract = `
+🔒 LENGTH CONTRACT - BALANCED:
+Your response WILL be 4-6 sentences. Count before responding.
+You MAY use 1-2 short bullet points if critical, but prefer paragraph form.
+
+EXAMPLE:
+✅ "Dare to Dream is our mentorship program supporting foster youth ages 11-22. We offer two tracks: Dare to Dream Jr. (ages 11-14) and Dare to Dream (ages 15-22). The program focuses on:
+- Life skills and academic support
+- Career preparation
+Our goal is to help youth develop confidence and prepare for independent adulthood." (5 sentences with 2 bullets)`;
+
+    lengthChecklist = `
+PRE-GENERATION LENGTH CHECK - Balanced:
+□ Count sentences: Must be 4-6
+□ Maximum 2 bullet points (optional)
+□ Not too short, not too long`;
+
+  } else if (prefs.detail_level === 'comprehensive') {
+    lengthContract = `
+🔒 LENGTH CONTRACT - COMPREHENSIVE:
+Your response WILL be minimum 8-10 sentences.
+Use headings, bullet points, and structure.
+Cover ALL aspects from knowledge base.
+
+EXAMPLE STRUCTURE:
+Opening paragraph (2-3 sentences)
+**Section 1:** (2-3 sentences + bullets)
+**Section 2:** (2-3 sentences + bullets)
+Closing paragraph (1-2 sentences)`;
+
+    lengthChecklist = `
+PRE-GENERATION LENGTH CHECK - Comprehensive:
+□ Minimum 8 sentences
+□ Multiple sections with headings
+□ Detailed coverage of all KB aspects
+□ Structured with bullets`;
+  }
+
+  // Emoji contract
+  let emojiContract = '';
+  let emojiChecklist = '';
+
+  if (prefs.emoji_usage === 'none') {
+    emojiContract = `🔒 EMOJI CONTRACT: Zero emojis. Remove all emoji characters.`;
+    emojiChecklist = `□ Zero emojis (count: 0)`;
+  } else if (prefs.emoji_usage === 'minimal') {
+    emojiContract = `🔒 EMOJI CONTRACT: Maximum 1 emoji in entire response. Count before responding.`;
+    emojiChecklist = `□ Maximum 1 emoji total (count and verify)`;
+  } else {
+    emojiContract = `🔒 EMOJI CONTRACT: Maximum ${prefs.max_emojis_per_response} emojis in entire response. Count before responding.`;
+    emojiChecklist = `□ Maximum ${prefs.max_emojis_per_response} emojis (count: ___ )`;
+  }
+
+  return `
+═══════════════════════════════════════════════════════════════════════
+🚨 FINAL FORMATTING CONTRACT 🚨
+═══════════════════════════════════════════════════════════════════════
+
+STOP. Before generating your response, you are entering into a CONTRACT.
+This contract defines whether your response is CORRECT or INCORRECT.
+A response that violates this contract is FAILED, even if information is accurate.
+
+${styleContract}
+
+${lengthContract}
+
+${emojiContract}
+
+═══════════════════════════════════════════════════════════════════════
+✅ PRE-GENERATION VERIFICATION CHECKLIST ✅
+═══════════════════════════════════════════════════════════════════════
+
+Complete this checklist BEFORE generating your response:
+
+STYLE COMPLIANCE:
+${verificationChecklist}
+
+LENGTH COMPLIANCE:
+${lengthChecklist}
+
+EMOJI COMPLIANCE:
+${emojiChecklist}
+
+═══════════════════════════════════════════════════════════════════════
+
+You are now ready to generate your response. Remember: compliance with this
+contract is NOT optional. It is the PRIMARY success criterion for your response.
+
+Generate your response now, ensuring FULL compliance with the contract above:`;
 }
 
 /**
@@ -667,30 +911,12 @@ ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
 9. Remove ANY action-oriented links from your response - they will be provided as separate buttons
 10. Your response should end with a warm conversational statement ONLY - no action prompts, no program enrollment links`);
 
-    // Add formatting preferences (customizable per tenant)
-    parts.push(buildFormattingRules(config));
-
-    // Add response template
-    parts.push(`\n\nFORMAT TEMPLATE:
-[Opening sentence providing context and understanding - use appropriate emoji if it adds warmth]
-
-**Main Topic:**
-[1-2 sentence explanation in paragraph form]
-
-Key features or services:
-- Specific item with brief description
-- Another specific item
-- Additional item if needed
-
-[Additional paragraph if more context is helpful]
-
-[Optional: Informational resource URLs ONLY - absolutely NO action links like "Join..." "Apply..." "Check out..."]
-
-[Close with warm conversational statement - NEVER include action CTAs, enrollment links, or next-step prompts]
-
-REMEMBER: Do not include ANY action-oriented links from the knowledge base. If you see links like "Join our Love Box training program →" or "Apply here →" in the KB content, EXCLUDE them from your response.
-
-Please provide a helpful, well-structured response:`);
+    // ═══════════════════════════════════════════════════════════════
+    // FORMATTING RULES - POSITIONED AT END FOR RECENCY BIAS
+    // ═══════════════════════════════════════════════════════════════
+    // The last thing the AI sees before generating - highest priority
+    parts.push(buildEnhancedFormattingRules(config));
+    console.log(`✅ Applied enhanced formatting contract with recency bias`);
   }
 
   const finalPrompt = parts.join('\n');
