@@ -2,6 +2,14 @@
  * Bedrock Streaming Handler - True Lambda Response Streaming
  * Uses awslambda.streamifyResponse for real SSE streaming
  * No JWT required - uses simple tenant_hash/session_id
+ *
+ * Version: v2.3.0
+ * Deployed: 2025-11-18 TBD
+ * Changes:
+ *   - FIX: Support bedrock_instructions_override in request body for testing
+ *   - ENHANCEMENT: Significantly strengthened formatting rules to ensure different styles produce measurably different responses
+ *   - Detail levels now enforce strict sentence counts: concise (2-3), balanced (4-6), comprehensive (8-10+)
+ *   - Style enforcement now more explicit with concrete examples and constraints
  */
 
 const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -16,6 +24,22 @@ const DEFAULT_MODEL_ID = 'us.anthropic.claude-3-5-haiku-20241022-v1:0';
 const DEFAULT_MAX_TOKENS = 1000;
 const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
 const DEFAULT_TONE = 'You are a helpful assistant.';
+
+// Prompt version tracking for tenant customization
+const PROMPT_VERSION = '2.3.0';
+
+// Default Bedrock instructions when config doesn't specify custom ones
+const DEFAULT_BEDROCK_INSTRUCTIONS = {
+  role_instructions: "You are a virtual assistant answering the questions of website visitors. You are always courteous and respectful and respond as if you are an employee of the organization. You replace words like they or their with our, which conveys that you are a representative of the team. You are answering a user's question using information from a knowledge base. Your job is to provide a helpful, natural response based on the information provided below.",
+  formatting_preferences: {
+    emoji_usage: "moderate",
+    max_emojis_per_response: 3,
+    response_style: "professional_concise",
+    detail_level: "balanced"
+  },
+  custom_constraints: [],
+  fallback_message: "I don't have specific information about that topic in my knowledge base. Would you like me to connect you with someone who can help?"
+};
 
 // Lambda streaming - use the global awslambda object when available
 // The awslambda global is injected by the Lambda runtime for streaming functions
@@ -114,12 +138,12 @@ async function retrieveKB(userInput, config) {
   const kbId = config?.aws?.knowledge_base_id;
   console.log(`🔍 KB Retrieval - KB ID: ${kbId || 'NOT SET'}`);
   console.log(`🔍 User input: "${userInput.substring(0, 50)}..."`);
-  
+
   if (!kbId) {
     console.log('⚠️ No KB ID found in config - returning empty context');
     return '';
   }
-  
+
   try {
     const cacheKey = getCacheKey(userInput, `kb:${kbId}`);
     if (KB_CACHE[cacheKey] && isCacheValid(KB_CACHE[cacheKey])) {
@@ -128,7 +152,7 @@ async function retrieveKB(userInput, config) {
       console.log(`📄 Cached KB context length: ${cachedData.length} chars`);
       return cachedData;
     }
-    
+
     console.log(`📚 Retrieving from KB: ${kbId}`);
     const response = await bedrockAgent.send(new RetrieveCommand({
       knowledgeBaseId: kbId,
@@ -137,9 +161,9 @@ async function retrieveKB(userInput, config) {
         vectorSearchConfiguration: { numberOfResults: 5 } // Increased from 3 to capture more comprehensive context
       }
     }));
-    
+
     console.log(`📊 KB Response - ${response.retrievalResults?.length || 0} results found`);
-    
+
     const chunks = (response.retrievalResults || [])
       .map((r, i) => {
         const text = r.content?.text || '';
@@ -147,11 +171,11 @@ async function retrieveKB(userInput, config) {
         return `**Context ${i+1}:**\n${text}`;
       })
       .join('\n\n---\n\n');
-    
+
     console.log(`✅ KB context retrieved - ${chunks.length} chars`);
     KB_CACHE[cacheKey] = { data: chunks, timestamp: Date.now() };
     return chunks;
-    
+
   } catch (error) {
     console.error('❌ KB retrieval error:', error.message);
     console.error('Full KB error:', error);
@@ -159,56 +183,295 @@ async function retrieveKB(userInput, config) {
   }
 }
 
-function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
-  const parts = [];
+// ============================================================================
+// PROMPT BUILDING HELPERS - Modular prompt construction for tenant customization
+// ============================================================================
 
-  // Start with tone prompt (matching bedrock_handler.py)
-  const tonePrompt = tone || DEFAULT_TONE;
-  parts.push(tonePrompt);
+/**
+ * Validate bedrock_instructions structure
+ */
+function validateBedrockInstructions(instructions) {
+  if (!instructions || typeof instructions !== 'object') {
+    return false;
+  }
 
-  // Add role instructions (exactly from bedrock_handler.py line 115)
-  const roleInstructions = `
-You are a virtual assistant answering the questions of website visitors. You are always courteous and respectful and respond as if you are an employee of the organization. You replace words like they or their with our, which conveys that you are a representative of the team. You are answering a user's question using information from a knowledge base. Your job is to provide a helpful, natural response based on the information provided below.`;
+  // Check for required fields
+  if (!instructions.role_instructions || typeof instructions.role_instructions !== 'string') {
+    console.log('⚠️ Invalid bedrock_instructions: missing or invalid role_instructions');
+    return false;
+  }
 
-  parts.push(roleInstructions);
+  // Check formatting preferences structure if present
+  if (instructions.formatting_preferences) {
+    const prefs = instructions.formatting_preferences;
+    if (typeof prefs !== 'object') {
+      console.log('⚠️ Invalid bedrock_instructions: formatting_preferences must be object');
+      return false;
+    }
+  }
 
-  console.log(`🎯 Building prompt - KB context: ${kbContext ? kbContext.length + ' chars' : 'NONE'}`);
-  console.log(`💬 Conversation history: ${conversationHistory ? 'PROVIDED' : 'NONE'}`);
+  // Check custom_constraints is array if present
+  if (instructions.custom_constraints && !Array.isArray(instructions.custom_constraints)) {
+    console.log('⚠️ Invalid bedrock_instructions: custom_constraints must be array');
+    return false;
+  }
 
-  // Add conversation history if provided (matching bedrock_handler.py format)
-  if (conversationHistory && conversationHistory.length > 0) {
-    parts.push('\nPREVIOUS CONVERSATION:');
-    conversationHistory.forEach(msg => {
-      const role = msg.role === 'user' ? 'User' : 'Assistant';
-      const content = msg.content || msg.text || '';
-      // Skip empty messages
-      if (content && content.trim()) {
-        parts.push(`${role}: ${content}`);
-      }
-    });
-    parts.push('\nREMEMBER: The user\'s name and any personal information they\'ve shared should be remembered and used in your response when appropriate.\n');
-    console.log(`✅ Added ${conversationHistory.length} messages from history`);
+  return true;
+}
 
-    // Add context-aware instructions for interpreting short/ambiguous responses
-    parts.push(`\nCRITICAL INSTRUCTION - CONTEXT INTERPRETATION:
-When the user gives a SHORT or AMBIGUOUS response (like "yes", "no", "sure", "okay", "tell me more", "I'm interested", "not really", "maybe"):
-1. FIRST look at the PREVIOUS CONVERSATION above to understand what they're responding to
-2. The user is likely confirming, declining, or asking about something from our recent discussion
-3. DO NOT say "I don't have information" - instead, refer back to what we were just discussing
-4. Use the conversation context to interpret their intent, even if the knowledge base doesn't have specific information about their exact words
+/**
+ * Get role instructions - AI personality and identity
+ *
+ * Migration path:
+ * 1. NEW configs: Set bedrock_instructions.role_instructions
+ * 2. OLD configs: tone_prompt used as fallback (deprecated)
+ * 3. Future: Remove tone_prompt support entirely
+ *
+ * To migrate: Copy tone_prompt value → bedrock_instructions.role_instructions
+ */
+function getRoleInstructions(config, toneFallback) {
+  const instructions = config?.bedrock_instructions;
 
-Examples of how to interpret short responses:
-- If user says "yes" after you asked about submitting a request, they mean "yes, I want to proceed with that"
-- If user says "tell me more" after discussing a specific program or service, they want more details about that same topic
-- If user says "I'm interested" after mentioning an opportunity, they're interested in that specific opportunity
-- If user says "no thanks" after you offered information, acknowledge and ask what else they need
-- If user says "sure" or "okay", they're agreeing to whatever was just proposed
+  // Priority 1: Use bedrock_instructions.role_instructions if present
+  if (instructions && validateBedrockInstructions(instructions)) {
+    console.log('✅ Using bedrock_instructions.role_instructions (master)');
+    return instructions.role_instructions;
+  }
 
-IMPORTANT: Short responses are ALWAYS about continuing the previous conversation topic. Never treat them as new, unrelated questions.\n`);
-    console.log(`✅ Added context-aware interpretation instructions`);
+  // Priority 2: Fallback to tone_prompt for backward compatibility
+  if (toneFallback) {
+    console.log('⚠️ Using tone_prompt as fallback (deprecated - migrate to bedrock_instructions.role_instructions)');
+    return toneFallback;
+  }
 
-    // Add capability boundaries to prevent offering services the bot can't deliver
-    parts.push(`\nCRITICAL INSTRUCTION - CAPABILITY BOUNDARIES:
+  // Priority 3: Use default
+  console.log('ℹ️ Using DEFAULT role instructions');
+  return DEFAULT_BEDROCK_INSTRUCTIONS.role_instructions;
+}
+
+/**
+ * Build formatting rules from config preferences
+ */
+function buildFormattingRules(config) {
+  const instructions = config?.bedrock_instructions;
+  let prefs = DEFAULT_BEDROCK_INSTRUCTIONS.formatting_preferences;
+
+  if (instructions && validateBedrockInstructions(instructions) && instructions.formatting_preferences) {
+    prefs = { ...prefs, ...instructions.formatting_preferences };
+  }
+
+  // Build style-specific examples and constraints
+  let styleGuidance = '';
+  let styleExamples = '';
+
+  if (prefs.response_style === 'professional_concise') {
+    styleGuidance = `CRITICAL STYLE ENFORCEMENT - PROFESSIONAL & FORMAL:
+- NEVER use contractions (no "we're", "you'll", "it's" - use "we are", "you will", "it is")
+- NEVER use casual words like "awesome", "great", "cool", "super", "amazing"
+- Use formal vocabulary: "comprehensive" not "great", "exceptional" not "awesome"
+- Maintain a business-professional tone throughout
+- Write as if this is a formal business document`;
+    styleExamples = `
+STYLE EXAMPLES:
+❌ WRONG: "We've got an awesome mentorship program that'll help foster youth! It's really great!"
+❌ WRONG: "Our program is super helpful and we're here to support you!"
+✅ CORRECT: "We offer a comprehensive mentorship program designed to support foster youth. Our organization provides structured guidance for academic achievement and life skills development."`;
+  } else if (prefs.response_style === 'warm_conversational') {
+    styleGuidance = `CRITICAL STYLE ENFORCEMENT - WARM & CONVERSATIONAL:
+- ALWAYS use contractions (we're, you'll, it's, we've, you'd, etc.)
+- Use enthusiastic, friendly words like "awesome", "great", "love", "excited"
+- Write like you're talking to a friend over coffee - casual and approachable
+- Show personality and warmth - don't sound like a robot
+- Use exclamation points to convey enthusiasm (1-2 per response)`;
+    styleExamples = `
+STYLE EXAMPLES:
+❌ WRONG: "We offer a comprehensive mentorship program designed to support foster youth."
+❌ WRONG: "Our organization provides structured guidance for academic achievement."
+✅ CORRECT: "We've got an awesome mentorship program that helps foster youth! It's a great way to get support, build skills, and we're here for you every step of the way."`;
+  } else if (prefs.response_style === 'structured_detailed') {
+    styleGuidance = `CRITICAL STYLE ENFORCEMENT - STRUCTURED & ORGANIZED:
+- ALWAYS use markdown headings with ** for major sections
+- ALWAYS use bullet points (-) or numbered lists for any list of items
+- Break content into clear sections with headings
+- Use this structure: [Intro sentence] → [**Heading:**] → [bullets] → [**Heading:**] → [bullets]
+- Never write long paragraphs - always break into structured sections`;
+    styleExamples = `
+STYLE EXAMPLES:
+❌ WRONG: "Dare to Dream is our mentorship program for foster youth ages 11-22. We provide life skills training, academic support, and career preparation. Our goal is to help youth succeed."
+✅ CORRECT: "Dare to Dream is our mentorship program supporting foster youth.
+
+**Program Structure:**
+- Dare to Dream Jr. (ages 11-14)
+- Dare to Dream (ages 15-22)
+
+**Services Provided:**
+- Life skills training
+- Academic support
+- Career preparation
+
+**Goal:** Empowering youth to achieve independence and success."`;
+  } else {
+    styleGuidance = prefs.response_style; // Custom style
+  }
+
+  // Build detail-level specific constraints with examples
+  let detailGuidance = '';
+  let detailExamples = '';
+
+  if (prefs.detail_level === 'concise') {
+    detailGuidance = `CRITICAL CONSTRAINT - MAXIMUM LENGTH ENFORCEMENT:
+Your response MUST be EXACTLY 2-3 sentences. Count your sentences BEFORE responding.
+DO NOT exceed 3 sentences under ANY circumstances. NO bullet points, NO lists, NO headings.
+Write in pure paragraph form - one continuous block of text.`;
+    detailExamples = `
+LENGTH EXAMPLES:
+❌ WRONG (4+ sentences): "Dare to Dream is our mentorship program. We have two tracks. One is for ages 11-14. The other is for ages 15-22."
+❌ WRONG (has bullets): "Dare to Dream is our mentorship program for foster youth ages 11-22. We provide:\n- Life skills training\n- Academic support"
+✅ CORRECT (2 sentences): "Dare to Dream is our mentorship program for foster youth ages 11-22, with separate tracks for ages 11-14 and 15-22. We provide life skills training, academic support, and guidance for independent living."`;
+  } else if (prefs.detail_level === 'balanced') {
+    detailGuidance = `CONSTRAINT - MODERATE LENGTH:
+Your response MUST be 4-6 sentences. Not less, not more.
+You MAY use 1-2 short bullet points if absolutely necessary, but prefer paragraph form.
+Keep it focused - don't ramble.`;
+    detailExamples = `
+LENGTH EXAMPLES:
+❌ TOO SHORT (2 sentences): "Dare to Dream is our mentorship program. We help foster youth."
+❌ TOO LONG (8+ sentences with extensive bullets): [long detailed response with many bullet points]
+✅ CORRECT (5 sentences with optional short bullets): "Dare to Dream is our mentorship program supporting foster youth ages 11-22. We offer two tracks: Dare to Dream Jr. (ages 11-14) and Dare to Dream (ages 15-22). The program focuses on:\n- Life skills and academic support\n- Career preparation\nOur goal is to help youth develop confidence and prepare for independent adulthood."`;
+  } else if (prefs.detail_level === 'comprehensive') {
+    detailGuidance = `COMPREHENSIVE DETAIL REQUIRED:
+Your response MUST be thorough and detailed - minimum 8-10 sentences.
+Use headings, bullet points, and structured sections to organize information.
+Cover ALL aspects mentioned in the knowledge base. Include examples and context.
+Anticipate follow-up questions and proactively address them.`;
+    detailExamples = `
+LENGTH EXAMPLES:
+❌ TOO SHORT: "Dare to Dream is our mentorship program for foster youth ages 11-22."
+✅ CORRECT (comprehensive with structure): "**Dare to Dream - Comprehensive Overview**\n\n[Opening paragraph with 2-3 sentences]\n\n**Program Structure:**\n[Detailed explanation with bullet points]\n\n**Key Features:**\n- [Multiple detailed bullet points]\n\n**Impact and Outcomes:**\n[Additional paragraphs explaining benefits]\n\n[10+ sentences total with clear organization]"`;
+  } else {
+    detailGuidance = prefs.detail_level; // Custom detail level
+  }
+
+  // Build emoji guidance with examples
+  let emojiGuidance = '';
+  let emojiExamples = '';
+
+  if (prefs.emoji_usage === 'none') {
+    emojiGuidance = 'CRITICAL: Do NOT use any emojis. Zero emojis allowed.';
+    emojiExamples = `
+EMOJI EXAMPLES:
+❌ BAD: "🌟 Dare to Dream is our mentorship program"
+✅ GOOD: "Dare to Dream is our mentorship program"`;
+  } else if (prefs.emoji_usage === 'minimal') {
+    emojiGuidance = `CONSTRAINT: Use maximum 1 emoji per response, only for key emphasis.`;
+    emojiExamples = `
+EMOJI EXAMPLES:
+❌ TOO MANY: "🌟 Dare to Dream 📚 is our 🏆 mentorship program"
+✅ GOOD: "Dare to Dream is our mentorship program 🌟"`;
+  } else {
+    emojiGuidance = `CONSTRAINT: Use maximum ${prefs.max_emojis_per_response} emojis per response.`;
+    emojiExamples = `
+EMOJI USAGE:
+- Maximum ${prefs.max_emojis_per_response} emojis total
+- Use for emphasis, not decoration
+- Never combine emoji with dash: ❌ "- 📞 Call" ✅ "📞 Call" or "- Call"`;
+  }
+
+  return `
+═══════════════════════════════════════════════════════════════
+🚨 MANDATORY FORMATTING RULES - NON-NEGOTIABLE 🚨
+═══════════════════════════════════════════════════════════════
+
+STOP AND READ: Before you write your response, you MUST check it against
+ALL rules below. If your response violates ANY rule, rewrite it.
+
+${detailGuidance}
+
+${styleGuidance}
+
+${emojiGuidance}
+
+${detailExamples}
+
+${styleExamples}
+
+${emojiExamples}
+
+🚨 FINAL CHECKPOINT - Before sending your response:
+1. Count your sentences - does it match the required length?
+2. Check your tone - does it match the required style?
+3. Count emojis - does it match the emoji constraint?
+4. If ANY rule is violated, REWRITE your response before sending
+
+CRITICAL: These are NOT suggestions. These are REQUIREMENTS that define
+whether your response is correct or incorrect. A response that violates
+these rules is a FAILED response, even if the information is accurate.
+═══════════════════════════════════════════════════════════════`;
+}
+
+/**
+ * Get custom constraints from config
+ */
+function getCustomConstraints(config) {
+  const instructions = config?.bedrock_instructions;
+
+  if (instructions && validateBedrockInstructions(instructions) &&
+      instructions.custom_constraints && instructions.custom_constraints.length > 0) {
+    return '\n\nCUSTOM INSTRUCTIONS:\n' + instructions.custom_constraints.map(c => `- ${c}`).join('\n');
+  }
+
+  return '';
+}
+
+/**
+ * Get fallback message for when KB context is empty
+ */
+function getFallbackMessage(config) {
+  const instructions = config?.bedrock_instructions;
+
+  if (instructions && validateBedrockInstructions(instructions) && instructions.fallback_message) {
+    return instructions.fallback_message;
+  }
+
+  return DEFAULT_BEDROCK_INSTRUCTIONS.fallback_message;
+}
+
+/**
+ * LOCKED: Anti-hallucination rules - never customizable
+ */
+function getLockedAntiHallucinationRules() {
+  return `CRITICAL CONSTRAINT - PREVENT HALLUCINATIONS:
+You MUST ONLY use information explicitly stated in the knowledge base below.
+If specific details about a program, service, or feature are not mentioned in the knowledge base,
+you MUST NOT include them in your response. It is better to say less than to add information
+not found in the knowledge base.
+
+NEVER include the following unless explicitly found in the knowledge base:
+- Program names or descriptions not mentioned
+- Services or features not listed
+- Contact information not provided
+- Any details you think would be helpful but aren't in the retrieved content
+
+If the knowledge base mentions "TWO programs" do NOT list three or four programs.
+If a program name is "Angel Allies" do NOT change it to "Angel Alliance" or any variation.`;
+}
+
+/**
+ * LOCKED: URL handling rules - never customizable
+ */
+function getLockedUrlHandling() {
+  return `URL AND CONTACT PRESERVATION:
+- Include ALL contact information exactly as it appears: phone numbers, email addresses, websites, and links
+- PRESERVE ALL MARKDOWN FORMATTING: If you see [text](url) keep it as [text](url), not plain text
+- Do not modify, shorten, or reformat any URLs, emails, or phone numbers
+- When you see markdown links like [donation page](https://example.com), keep them as markdown links`;
+}
+
+/**
+ * LOCKED: Capability boundaries - never customizable
+ */
+function getLockedCapabilityBoundaries() {
+  return `CRITICAL INSTRUCTION - CAPABILITY BOUNDARIES:
 
 You are an INFORMATION ASSISTANT. Be crystal clear about what you CAN and CANNOT do:
 
@@ -240,11 +503,14 @@ INSTEAD, say things like:
 - ✅ "To get started, visit [link]. If you have questions about the form, I'm here to help!"
 - ✅ "The application is available at [URL]. Let me know if you need clarification on any requirements."
 
-REMEMBER: Your role is to INFORM and DIRECT, not to INTERACT with external systems. Always provide resources and let users take action themselves.\n`);
-    console.log(`✅ Added capability boundaries instructions`);
+REMEMBER: Your role is to INFORM and DIRECT, not to INTERACT with external systems. Always provide resources and let users take action themselves.`;
+}
 
-    // Add loop prevention and conversation progression logic
-    parts.push(`\nCRITICAL INSTRUCTION - AVOID REPETITIVE LOOPS:
+/**
+ * LOCKED: Loop prevention logic - never customizable
+ */
+function getLockedLoopPrevention() {
+  return `CRITICAL INSTRUCTION - AVOID REPETITIVE LOOPS:
 
 BEFORE responding, check the PREVIOUS CONVERSATION above:
 
@@ -292,35 +558,74 @@ Bot: [Stage 2] "Great! Here's the direct link to the request form: [URL]. The fo
 User: "yes"
 Bot: [Stage 3] "Perfect! You're all set - just visit that link to submit your request. Our team responds within 24 hours. Is there anything else I can help you with today?" ✅ DONE - moved to new topic
 
-DO NOT create loops by asking "Would you like me to help with that?" after they've already said yes twice.\n`);
-    console.log(`✅ Added loop prevention instructions`);
+DO NOT create loops by asking "Would you like me to help with that?" after they've already said yes twice.`;
+}
+
+/**
+ * Get context-aware interpretation instructions
+ */
+function getContextInterpretationRules() {
+  return `CRITICAL INSTRUCTION - CONTEXT INTERPRETATION:
+When the user gives a SHORT or AMBIGUOUS response (like "yes", "no", "sure", "okay", "tell me more", "I'm interested", "not really", "maybe"):
+1. FIRST look at the PREVIOUS CONVERSATION above to understand what they're responding to
+2. The user is likely confirming, declining, or asking about something from our recent discussion
+3. DO NOT say "I don't have information" - instead, refer back to what we were just discussing
+4. Use the conversation context to interpret their intent, even if the knowledge base doesn't have specific information about their exact words
+
+Examples of how to interpret short responses:
+- If user says "yes" after you asked about submitting a request, they mean "yes, I want to proceed with that"
+- If user says "tell me more" after discussing a specific program or service, they want more details about that same topic
+- If user says "I'm interested" after mentioning an opportunity, they're interested in that specific opportunity
+- If user says "no thanks" after you offered information, acknowledge and ask what else they need
+- If user says "sure" or "okay", they're agreeing to whatever was just proposed
+
+IMPORTANT: Short responses are ALWAYS about continuing the previous conversation topic. Never treat them as new, unrelated questions.`;
+}
+
+function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
+  // Log prompt build metadata
+  console.log(`🎯 Building prompt v${PROMPT_VERSION}`);
+  console.log(`📋 Config has bedrock_instructions: ${config?.bedrock_instructions ? 'YES' : 'NO'}`);
+  console.log(`🎯 KB context: ${kbContext ? kbContext.length + ' chars' : 'NONE'}`);
+  console.log(`💬 Conversation history: ${conversationHistory ? conversationHistory.length + ' messages' : 'NONE'}`);
+
+  const parts = [];
+
+  // Use bedrock_instructions.role_instructions as master, fallback to tone_prompt for backward compatibility
+  const personalityPrompt = getRoleInstructions(config, tone);
+  parts.push(personalityPrompt);
+
+  // Add conversation history if provided
+  if (conversationHistory && conversationHistory.length > 0) {
+    parts.push('\nPREVIOUS CONVERSATION:');
+    conversationHistory.forEach(msg => {
+      const role = msg.role === 'user' ? 'User' : 'Assistant';
+      const content = msg.content || msg.text || '';
+      if (content && content.trim()) {
+        parts.push(`${role}: ${content}`);
+      }
+    });
+    parts.push('\nREMEMBER: The user\'s name and any personal information they\'ve shared should be remembered and used in your response when appropriate.\n');
+    console.log(`✅ Added ${conversationHistory.length} messages from history`);
+
+    // Add LOCKED sections (never customizable)
+    parts.push('\n' + getContextInterpretationRules());
+    parts.push('\n' + getLockedCapabilityBoundaries());
+    parts.push('\n' + getLockedLoopPrevention());
   }
 
-  // Add essential instructions if we have KB context (from bedrock_handler.py lines 117-129)
+  // Add KB-specific instructions
   if (kbContext) {
-    // CRITICAL: Add strong anti-hallucination constraints at the TOP
-    parts.push(`CRITICAL CONSTRAINT - PREVENT HALLUCINATIONS:
-You MUST ONLY use information explicitly stated in the knowledge base below.
-If specific details about a program, service, or feature are not mentioned in the knowledge base,
-you MUST NOT include them in your response. It is better to say less than to add information
-not found in the knowledge base.
+    // LOCKED anti-hallucination rules
+    parts.push('\n' + getLockedAntiHallucinationRules());
 
-NEVER include the following unless explicitly found in the knowledge base:
-- Program names or descriptions not mentioned
-- Services or features not listed
-- Contact information not provided
-- Any details you think would be helpful but aren't in the retrieved content
+    // LOCKED URL handling
+    parts.push('\n' + getLockedUrlHandling());
 
-If the knowledge base mentions "TWO programs" do NOT list three or four programs.
-If a program name is "Angel Allies" do NOT change it to "Angel Alliance" or any variation.
-
-ESSENTIAL INSTRUCTIONS:
+    // Essential KB instructions
+    parts.push(`\n\nESSENTIAL INSTRUCTIONS:
 - STRICTLY answer the user's question using ONLY the information from the knowledge base results below - DO NOT add any information not explicitly stated
 - Use the previous conversation context to provide personalized and coherent responses
-- Include ALL contact information exactly as it appears: phone numbers, email addresses, websites, and links
-- PRESERVE ALL MARKDOWN FORMATTING: If you see [text](url) keep it as [text](url), not plain text
-- Do not modify, shorten, or reformat any URLs, emails, or phone numbers
-- When you see markdown links like [donation page](https://example.com), keep them as markdown links
 - For any dates, times, or locations of events: Direct users to check the events page or contact the team for current details
 - Never include placeholder text like [date], [time], [location], or [topic] in your responses
 - Present information naturally without mentioning "results" or "knowledge base"
@@ -331,45 +636,42 @@ KNOWLEDGE BASE INFORMATION:
 ${kbContext}`);
     console.log(`✅ Added KB context to prompt`);
   } else {
-    // No KB context fallback (from bedrock_handler.py lines 106-111)
-    parts.push(`\nI don't have information about this topic in my knowledge base. Would you like me to connect you with someone who can help?`);
-    console.log(`⚠️ No KB context - using fallback response`);
+    // Use customizable fallback message
+    parts.push('\n' + getFallbackMessage(config));
+    console.log(`⚠️ No KB context - using fallback message`);
   }
 
-  // Add current question and final instruction
-  parts.push(`\nCURRENT USER QUESTION: ${userInput}`);
+  // Add custom constraints if configured
+  const customConstraints = getCustomConstraints(config);
+  if (customConstraints) {
+    parts.push(customConstraints);
+    console.log(`✅ Added custom constraints`);
+  }
 
+  // Add current question
+  parts.push(`\n\nCURRENT USER QUESTION: ${userInput}`);
+
+  // Add final instructions if we have KB context
   if (kbContext) {
-    parts.push(`\nCRITICAL INSTRUCTIONS:
+    parts.push(`\n\nCRITICAL INSTRUCTIONS:
 1. Do NOT include phone numbers or email addresses in your response unless the user specifically asks "how do I contact you" or similar contact-focused questions
 2. NEVER make up or invent ANY details including program names, services, or contact information - if not explicitly in the knowledge base, don't include it
-3. ALWAYS include complete URLs exactly as they appear in the search results - links to resources and topic pages are encouraged
+3. You MAY include informational resource URLs that provide additional context (like program pages or resource links)
 4. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
 5. If the URL appears as a markdown link [text](url), preserve the markdown format
-6. Include relevant action links from the knowledge base (like "submit a support request" or resource page links) when appropriate
 
-RESPONSE FORMATTING - BALANCED APPROACH:
+ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
+6. DO NOT EVER include action-oriented call-to-action links or phrases in your response
+7. NEVER write things like "Join our [program] →", "Apply here →", "Check out...", "Want to learn more?", "Ready to get started?", "Sign up for..."
+8. If the knowledge base contains action links (like "Join our Love Box training program →"), DO NOT INCLUDE THEM in your response
+9. Remove ANY action-oriented links from your response - they will be provided as separate buttons
+10. Your response should end with a warm conversational statement ONLY - no action prompts, no program enrollment links`);
 
-Write responses that are both informative and well-structured:
+    // Add formatting preferences (customizable per tenant)
+    parts.push(buildFormattingRules(config));
 
-1. **START WITH CONTEXT**: Begin with 1-2 sentences providing a warm, helpful introduction
-2. **USE STRUCTURE FOR CLARITY**: After the introduction, organize information with clear headings
-3. **MIX PARAGRAPHS AND LISTS**: Use short paragraphs to explain concepts, then bullet points for specific details
-4. **INCLUDE RELEVANT RESOURCE LINKS**: Include URLs to relevant topic pages and resources from the knowledge base when appropriate
-5. **END STRATEGICALLY BASED ON CONVERSATION STAGE**:
-   - **If initial information request**: End with relevant clarifying question about the same topic
-   - **If user has confirmed interest (said "yes", "I'm interested")**: Provide the resource/link and ask about DIFFERENT topics: "What else can I help you with?" or "Is there anything else you'd like to know about?"
-   - **If you've provided same information twice**: Don't ask another question about that topic - conclude with "Let me know if you need anything else!"
-   - **Never ask the same question twice** - check conversation history first
-   - **Never ask questions about actions you can't perform** (like "Would you like me to walk you through the form?")
-6. **USE EMOJIS SPARINGLY**:
-   - Maximum 2-3 emojis per response, not in every sentence
-   - If using emoji as a bullet point, use EITHER emoji OR dash (-), never both
-   - Good: "📞 Call us at..." OR "- Call us at..."
-   - Bad: "- 📞 Call us at..."
-   - Reserve emojis for adding warmth at key moments, not decoration
-
-FORMAT TEMPLATE:
+    // Add response template
+    parts.push(`\n\nFORMAT TEMPLATE:
 [Opening sentence providing context and understanding - use appropriate emoji if it adds warmth]
 
 **Main Topic:**
@@ -382,34 +684,110 @@ Key features or services:
 
 [Additional paragraph if more context is helpful]
 
-[Optional: Include relevant resource links if present in knowledge base]
+[Optional: Informational resource URLs ONLY - absolutely NO action links like "Join..." "Apply..." "Check out..."]
 
-[Close with warm statement and conversational follow-up question]
+[Close with warm conversational statement - NEVER include action CTAs, enrollment links, or next-step prompts]
 
-GOOD EXAMPLE:
-"I understand you're looking for information about our grief counseling services. 💙 We offer comprehensive support designed to help you and your family through this difficult journey.
-
-**Individual Grief Counseling:**
-Our professional grief counselors provide one-on-one support in a confidential, compassionate environment. Sessions are customized to meet your individual needs and can be scheduled weekly or bi-weekly.
-
-**Peer Support Groups:**
-We also offer a seven-week support group program where you can connect with others experiencing similar loss. This provides:
-- A safe space for emotional expression
-- Connection with others who understand
-- Professional facilitation and guidance
-
-**Additional Support:**
-Beyond regular counseling, we provide ongoing bereavement support even after a patient's passing, including our annual Celebration of Life memorial service.
-
-Our team is here to support you every step of the way. 💙 What else would you like to know about our grief counseling services?"
+REMEMBER: Do not include ANY action-oriented links from the knowledge base. If you see links like "Join our Love Box training program →" or "Apply here →" in the KB content, EXCLUDE them from your response.
 
 Please provide a helpful, well-structured response:`);
   }
 
   const finalPrompt = parts.join('\n');
   console.log(`📝 Final prompt length: ${finalPrompt.length} chars`);
-  console.log(`📝 Prompt preview: ${finalPrompt.substring(0, 200)}...`);
+  console.log(`📝 Prompt version: ${PROMPT_VERSION}`);
+
   return finalPrompt;
+}
+
+/**
+ * Preview prompt handler - returns the constructed prompt without calling Bedrock
+ * This allows the Config Builder UI to preview how prompts will be built
+ */
+async function handlePromptPreview(event) {
+  console.log('🔍 Prompt preview handler invoked');
+
+  try {
+    // Parse request
+    const body = event.body ? JSON.parse(event.body) : event;
+    const tenantHash = body.tenant_hash || '';
+    const userInput = body.user_input || 'Hello, how can you help me?';
+    const conversationHistory = body.conversation_history || [];
+    const kbContext = body.kb_context || 'Sample knowledge base context about our services...';
+
+    if (!tenantHash) {
+      return {
+        statusCode: 400,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify({ error: 'Missing tenant_hash' })
+      };
+    }
+
+    // Load config
+    const config = await loadConfig(tenantHash);
+    if (!config) {
+      return {
+        statusCode: 404,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify({ error: 'Config not found for tenant' })
+      };
+    }
+
+    // Build the prompt
+    const prompt = buildPrompt(
+      userInput,
+      kbContext,
+      config.tone_prompt,
+      conversationHistory,
+      config
+    );
+
+    // Return preview data
+    return {
+      statusCode: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept'
+      },
+      body: JSON.stringify({
+        prompt_version: PROMPT_VERSION,
+        tenant_hash: tenantHash,
+        tenant_id: config.tenant_id,
+        has_custom_instructions: !!config.bedrock_instructions,
+        bedrock_instructions: config.bedrock_instructions || null,
+        prompt_length: prompt.length,
+        prompt: prompt,
+        metadata: {
+          role_instructions_source: config.bedrock_instructions ? 'custom' : 'default',
+          fallback_message_source: config.bedrock_instructions?.fallback_message ? 'custom' : 'default',
+          has_custom_constraints: config.bedrock_instructions?.custom_constraints?.length > 0,
+          formatting_preferences: config.bedrock_instructions?.formatting_preferences || DEFAULT_BEDROCK_INSTRUCTIONS.formatting_preferences
+        }
+      }, null, 2)
+    };
+
+  } catch (error) {
+    console.error('❌ Preview error:', error);
+    return {
+      statusCode: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      },
+      body: JSON.stringify({
+        error: error.message,
+        stack: error.stack
+      })
+    };
+  }
 }
 
 /**
@@ -495,6 +873,12 @@ const streamingHandler = async (event, responseStream, context) => {
         streaming: { max_tokens: DEFAULT_MAX_TOKENS, temperature: DEFAULT_TEMPERATURE },
         tone_prompt: DEFAULT_TONE
       };
+    }
+
+    // Support bedrock_instructions_override for testing
+    if (body.bedrock_instructions_override) {
+      console.log('🔧 Applying bedrock_instructions_override from request');
+      config.bedrock_instructions = body.bedrock_instructions_override;
     }
 
     // Check for form mode - bypass Bedrock for form field collection
@@ -678,8 +1062,19 @@ const streamingHandler = async (event, responseStream, context) => {
  * Buffered handler for when streaming is not available
  */
 const bufferedHandler = async (event, context) => {
-  console.log('📡 Using buffered SSE handler');
-  
+  console.log('📡 Handler invoked');
+
+  // Check for preview endpoint
+  const queryParams = event.queryStringParameters || {};
+  const body = event.body ? JSON.parse(event.body) : event;
+
+  if (queryParams.action === 'preview' || body.action === 'preview') {
+    console.log('🔍 Routing to preview handler');
+    return await handlePromptPreview(event);
+  }
+
+  console.log('📡 Using buffered SSE handler for streaming');
+
   // Handle OPTIONS
   if (event.httpMethod === 'OPTIONS' || event.requestContext?.http?.method === 'OPTIONS') {
     return {
@@ -746,7 +1141,13 @@ const bufferedHandler = async (event, context) => {
         tone_prompt: DEFAULT_TONE
       };
     }
-    
+
+    // Support bedrock_instructions_override for testing
+    if (body.bedrock_instructions_override) {
+      console.log('🔧 Applying bedrock_instructions_override from request');
+      config.bedrock_instructions = body.bedrock_instructions_override;
+    }
+
     // Get KB context
     const kbContext = await retrieveKB(userInput, config);
     const prompt = buildPrompt(userInput, kbContext, config.tone_prompt, conversationHistory, config);
