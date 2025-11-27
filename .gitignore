@@ -55,3 +55,22 @@ htmlcov/
 *.temp
 tmp/
 temp/
+
+# Development/deployment artifacts
+**/DEPLOYMENT_*.md
+**/IMPLEMENTATION_*.md
+**/FORMATTING_*.md
+**/BEDROCK_*.md
+**/CONFIG_BUILDER_*.md
+**/PROMPT_REFACTOR_*.md
+**/QUICK_REFERENCE.md
+**/*_SUMMARY.md
+**/deploy-*.sh
+**/rollback-*.sh
+**/pre-deployment-*.sh
+**/test-*.sh
+**/test-*.js
+**/verify-*.js
+**/*_example.json
+**/formatting-test-results.txt
+**/zikji2AG
