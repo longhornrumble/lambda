@@ -262,6 +262,35 @@ function buildCtasFromBranch(branchName, config, completedForms = []) {
 }
 
 /**
+ * Parse branch hint from Bedrock response (Tier 4 AI-suggested routing)
+ *
+ * Extracts the <!-- BRANCH: xxx --> tag from the model's response and strips it
+ * from the visible text.
+ *
+ * @param {string} response - Raw Bedrock response text
+ * @returns {Object} - { branch: string|null, cleanedResponse: string }
+ */
+function parseBranchHint(response) {
+    if (!response || typeof response !== 'string') {
+        return { branch: null, cleanedResponse: response || '' };
+    }
+
+    // Match <!-- BRANCH: branch_name --> pattern (case insensitive, allows whitespace)
+    const branchPattern = /<!--\s*BRANCH:\s*([a-zA-Z0-9_-]+)\s*-->/i;
+    const match = response.match(branchPattern);
+
+    if (match) {
+        const branch = match[1].toLowerCase();
+        // Strip the branch tag from visible response
+        const cleanedResponse = response.replace(branchPattern, '').trim();
+        console.log(`[Tier 4] Parsed branch hint: "${branch}"`);
+        return { branch, cleanedResponse };
+    }
+
+    return { branch: null, cleanedResponse: response };
+}
+
+/**
  * Detect conversation branch based on Bedrock response content
  *
  * DEPRECATED: This function uses keyword matching and should be replaced with explicit routing.
@@ -511,6 +540,66 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         // End of Explicit Routing - Continue to existing logic for backward compatibility
         // ============================================================================
 
+        // ============================================================================
+        // TIER 4: AI-Suggested Branch Routing (Free-flow conversations)
+        // ============================================================================
+        // Parse branch hint from model response (<!-- BRANCH: xxx -->)
+        const { branch: suggestedBranch, cleanedResponse } = parseBranchHint(bedrockResponse);
+
+        if (suggestedBranch) {
+            const branches = config.conversation_branches || {};
+            const ctaSettings = config.cta_settings || {};
+
+            // Validate suggested branch exists
+            if (branches[suggestedBranch]) {
+                console.log(`[Tier 4] AI suggested valid branch: ${suggestedBranch}`);
+                const ctas = buildCtasFromBranch(suggestedBranch, config, completedForms);
+
+                if (ctas.length > 0) {
+                    console.log(`[Tier 4] Returning ${ctas.length} CTAs from AI-suggested branch '${suggestedBranch}'`);
+                    return {
+                        message: cleanedResponse,  // Use cleaned response (tag stripped)
+                        ctaButtons: ctas,
+                        metadata: {
+                            enhanced: true,
+                            branch: suggestedBranch,
+                            routing_tier: 'tier4_ai_suggested',
+                            routing_method: 'model_branch_hint'
+                        }
+                    };
+                }
+            } else {
+                // Invalid branch suggested - use fallback
+                console.log(`[Tier 4] AI suggested invalid branch '${suggestedBranch}', using fallback`);
+                const fallbackBranch = ctaSettings.fallback_branch;
+
+                if (fallbackBranch && branches[fallbackBranch]) {
+                    const ctas = buildCtasFromBranch(fallbackBranch, config, completedForms);
+
+                    if (ctas.length > 0) {
+                        console.log(`[Tier 4] Returning ${ctas.length} CTAs from fallback branch '${fallbackBranch}'`);
+                        return {
+                            message: cleanedResponse,
+                            ctaButtons: ctas,
+                            metadata: {
+                                enhanced: true,
+                                branch: fallbackBranch,
+                                routing_tier: 'tier4_ai_suggested',
+                                routing_method: 'model_fallback',
+                                original_suggestion: suggestedBranch
+                            }
+                        };
+                    }
+                }
+            }
+
+            // If we parsed a branch hint but couldn't route, still return cleaned response
+            bedrockResponse = cleanedResponse;
+        }
+        // ============================================================================
+        // End of Tier 4 - Continue to existing logic for backward compatibility
+        // ============================================================================
+
         // PHASE 1B: If there are suspended forms, check if user is asking about a DIFFERENT program
         // This enables intelligent form switching UX
         if (suspendedForms.length > 0) {
@@ -707,6 +796,7 @@ module.exports = {
     enhanceResponse,
     loadTenantConfig,
     detectConversationBranch,  // DEPRECATED - kept for backward compatibility
-    getConversationBranch,      // NEW - 3-tier routing
-    buildCtasFromBranch         // NEW - explicit CTA building
+    getConversationBranch,      // Tier 1-3 explicit routing
+    buildCtasFromBranch,        // Explicit CTA building from branch
+    parseBranchHint             // Tier 4 - AI-suggested branch parsing
 };

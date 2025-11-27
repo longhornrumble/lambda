@@ -3,6 +3,54 @@
  * Uses awslambda.streamifyResponse for real SSE streaming
  * No JWT required - uses simple tenant_hash/session_id
  *
+ * Version: v2.7.0
+ * Deployed: 2025-11-26
+ * Changes:
+ *   - NEW: Tier 4 AI-suggested branch routing for CTAs
+ *   - Model suggests conversation branch based on response content
+ *   - Branch hint injected via prompt, extracted via <!-- BRANCH: xxx --> tag
+ *   - Enables CTAs for free-flow conversations without explicit routing
+ *   - Falls back to fallback_branch if invalid branch suggested
+ *
+ * Version: v2.6.0
+ * Deployed: 2025-11-26
+ * Changes:
+ *   - NEW: Intelligent follow-up question detection
+ *   - Detects when user says "yes" to a question the bot asked
+ *   - Extracts the topic from questions like "Would you like to learn more about X?"
+ *   - Adds explicit directive telling model exactly what to answer
+ *   - Should eliminate "I noticed you said yes..." responses
+ *
+ * Version: v2.5.1
+ * Deployed: 2025-11-26
+ * Changes:
+ *   - FIXED: Formatting preference conflicts between response_style and detail_level
+ *   - Added conflict resolution for structured_detailed + concise (was contradicting)
+ *   - Added conflict resolution for structured_detailed + balanced (was tension)
+ *   - All 9 combinations now have consistent, non-conflicting instructions
+ *
+ * Version: v2.5.0
+ * Deployed: 2025-11-26
+ * Changes:
+ *   - UPGRADED MODEL: Claude 3.5 Haiku → Claude Haiku 4.5
+ *   - Better instruction following for follow-up questions
+ *   - 8x larger max output (64K vs 8K tokens)
+ *   - Vision/image support added
+ *
+ * Version: v2.4.2
+ * Deployed: 2025-11-26
+ * Changes:
+ *   - STRONGER follow-up question fix: moved instruction to CRITICAL section near end of prompt
+ *   - Added explicit WRONG/RIGHT examples for the model to follow
+ *   - Instructions now have higher priority via recency bias positioning
+ *
+ * Version: v2.4.1
+ * Deployed: 2025-11-26
+ * Changes:
+ *   - Fixed follow-up question handling: bot now answers its own questions when user affirms
+ *   - Added explicit instructions to prevent "I noticed you said yes" preambles
+ *   - Improved context interpretation for affirmative responses
+ *
  * Version: v2.4.0
  * Deployed: 2025-11-20
  * Changes:
@@ -22,13 +70,14 @@ const { enhanceResponse } = require('./response_enhancer');
 const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
 
 // Default model configuration - single source of truth
-const DEFAULT_MODEL_ID = 'us.anthropic.claude-3-5-haiku-20241022-v1:0';
+// Upgraded to Haiku 4.5 for better instruction following (2025-11-26)
+const DEFAULT_MODEL_ID = 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
 const DEFAULT_MAX_TOKENS = 1000;
 const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
 const DEFAULT_TONE = 'You are a helpful assistant.';
 
 // Prompt version tracking for tenant customization
-const PROMPT_VERSION = '2.4.0';
+const PROMPT_VERSION = '2.7.0';
 
 // Default Bedrock instructions when config doesn't specify custom ones
 const DEFAULT_BEDROCK_INSTRUCTIONS = {
@@ -540,12 +589,38 @@ PRE-GENERATION CHECKLIST - Structured Detailed:
 □ Clear visual structure`;
   }
 
-  // Detail level contract
+  // Detail level contract - with conflict resolution for structured_detailed style
   let lengthContract = '';
   let lengthChecklist = '';
+  const isStructuredStyle = prefs.response_style === 'structured_detailed';
 
   if (prefs.detail_level === 'concise') {
-    lengthContract = `
+    if (isStructuredStyle) {
+      // CONFLICT RESOLUTION: structured_detailed + concise
+      // Keep it short but allow minimal structure
+      lengthContract = `
+🔒 LENGTH CONTRACT - CONCISE STRUCTURED:
+Your response WILL be brief (3-4 sentences worth of content) but WITH structure.
+Use ONE heading and 2-4 bullet points maximum.
+
+EXAMPLE:
+✅ "Dare to Dream supports foster youth ages 11-22.
+
+**Key Features:**
+- Two age tracks: Jr. (11-14) and Senior (15-22)
+- Life skills training and academic support
+- Career preparation guidance"
+
+This format keeps content brief while maintaining structure.`;
+
+      lengthChecklist = `
+PRE-GENERATION LENGTH CHECK - Concise Structured:
+□ Brief total content (equivalent to 3-4 sentences)
+□ Maximum 1 heading
+□ Maximum 4 bullet points
+□ No long paragraphs`;
+    } else {
+      lengthContract = `
 🔒 LENGTH CONTRACT - CONCISE:
 Your response WILL be EXACTLY 2-3 sentences. Not 4. Not 5. Maximum 3 sentences.
 Count periods before responding: 1... 2... 3... STOP.
@@ -554,30 +629,58 @@ NO bullet points. NO lists. NO headings. Pure paragraph form.
 EXAMPLE:
 ✅ "Dare to Dream is our mentorship program for foster youth ages 11-22, with tracks for ages 11-14 and 15-22. We provide life skills training, academic support, and guidance for independent living." (2 sentences)`;
 
-    lengthChecklist = `
+      lengthChecklist = `
 PRE-GENERATION LENGTH CHECK - Concise:
 □ Count periods: Must be 2 or 3, never 4+
 □ Zero bullet points
 □ Zero headings
 □ Paragraph form only`;
+    }
 
   } else if (prefs.detail_level === 'balanced') {
-    lengthContract = `
-🔒 LENGTH CONTRACT - BALANCED:
-Your response WILL be 4-6 sentences. Count before responding.
-You MAY use 1-2 short bullet points if critical, but prefer paragraph form.
+    if (isStructuredStyle) {
+      // CONFLICT RESOLUTION: structured_detailed + balanced
+      // Medium length WITH required structure
+      lengthContract = `
+🔒 LENGTH CONTRACT - BALANCED STRUCTURED:
+Your response WILL be medium length (4-6 sentences worth of content) WITH structure.
+Use 1-2 headings and organized bullet points.
 
 EXAMPLE:
-✅ "Dare to Dream is our mentorship program supporting foster youth ages 11-22. We offer two tracks: Dare to Dream Jr. (ages 11-14) and Dare to Dream (ages 15-22). The program focuses on:
-- Life skills and academic support
-- Career preparation
-Our goal is to help youth develop confidence and prepare for independent adulthood." (5 sentences with 2 bullets)`;
+✅ "Dare to Dream is our mentorship program supporting foster youth.
 
-    lengthChecklist = `
+**Program Tracks:**
+- Dare to Dream Jr. (ages 11-14): Focus on confidence and academic skills
+- Dare to Dream (ages 15-22): Career preparation and independent living
+
+**What We Provide:**
+- Life skills training
+- Academic support and tutoring
+- Career guidance
+
+Our goal is helping youth build independence and achieve their potential."`;
+
+      lengthChecklist = `
+PRE-GENERATION LENGTH CHECK - Balanced Structured:
+□ Medium content length (4-6 sentences equivalent)
+□ 1-2 section headings
+□ Organized bullet points
+□ Clear visual structure`;
+    } else {
+      lengthContract = `
+🔒 LENGTH CONTRACT - BALANCED:
+Your response WILL be 4-6 sentences. Count before responding.
+You MAY use 1-2 short bullet points if helpful, but paragraph form is fine.
+
+EXAMPLE:
+✅ "Dare to Dream is our mentorship program supporting foster youth ages 11-22. We offer two tracks: Dare to Dream Jr. (ages 11-14) and Dare to Dream (ages 15-22). The program provides life skills and academic support, along with career preparation. Our goal is to help youth develop confidence and prepare for independent adulthood." (4 sentences)`;
+
+      lengthChecklist = `
 PRE-GENERATION LENGTH CHECK - Balanced:
 □ Count sentences: Must be 4-6
-□ Maximum 2 bullet points (optional)
+□ Bullet points optional (0-2)
 □ Not too short, not too long`;
+    }
 
   } else if (prefs.detail_level === 'comprehensive') {
     lengthContract = `
@@ -816,6 +919,23 @@ When the user gives a SHORT or AMBIGUOUS response (like "yes", "no", "sure", "ok
 3. DO NOT say "I don't have information" - instead, refer back to what we were just discussing
 4. Use the conversation context to interpret their intent, even if the knowledge base doesn't have specific information about their exact words
 
+CRITICAL - ANSWERING YOUR OWN FOLLOW-UP QUESTIONS:
+If your previous message ended with a question (like "Would you like to learn more about X?" or "Shall I explain the requirements?") and the user responds affirmatively:
+1. ANSWER THAT QUESTION DIRECTLY - provide the information you offered
+2. DO NOT say "I noticed you said yes" or "Since you're interested" - just provide the answer
+3. DO NOT repeat information you already gave - provide NEW details about what you asked
+4. Treat their "yes" as if they had asked the question themselves
+
+Example of CORRECT behavior:
+- You asked: "Would you like to learn about the requirements to become a mentor?"
+- User says: "yes"
+- Your response: "To become a mentor with Dare to Dream, you'll need to be at least 21 years old, pass a background check, and commit to meeting with your mentee at least twice per month..." ✅
+
+Example of WRONG behavior:
+- You asked: "Would you like to learn about the requirements to become a mentor?"
+- User says: "yes"
+- Your response: "I noticed you said yes. Since we were discussing Dare to Dream, here's some more context about our mentorship program..." ❌
+
 Examples of how to interpret short responses:
 - If user says "yes" after you asked about submitting a request, they mean "yes, I want to proceed with that"
 - If user says "tell me more" after discussing a specific program or service, they want more details about that same topic
@@ -824,6 +944,150 @@ Examples of how to interpret short responses:
 - If user says "sure" or "okay", they're agreeing to whatever was just proposed
 
 IMPORTANT: Short responses are ALWAYS about continuing the previous conversation topic. Never treat them as new, unrelated questions.`;
+}
+
+/**
+ * Build branch prompt section for Tier 4 AI-suggested routing
+ *
+ * Generates a prompt section that tells the model which conversation branches
+ * are available and how to suggest one by appending <!-- BRANCH: xxx --> to the response.
+ *
+ * @param {Object} config - Tenant configuration
+ * @returns {string} - Prompt section for branch suggestions, or empty string if no branches
+ */
+function buildBranchPromptSection(config) {
+  const branches = config?.conversation_branches || {};
+  const ctaDefinitions = config?.cta_definitions || {};
+
+  // Filter out branches that shouldn't be suggested
+  const suggestibleBranches = Object.entries(branches).filter(([name, branch]) => {
+    // Exclude 'fallback' branch - it's for when no branch matches
+    if (name === 'fallback') return false;
+    // Only include branches that have CTAs defined
+    if (!branch.available_ctas) return false;
+    return true;
+  });
+
+  if (suggestibleBranches.length === 0) {
+    console.log('ℹ️ No suggestible branches found - skipping Tier 4 prompt injection');
+    return '';
+  }
+
+  // Build branch descriptions from CTA labels
+  const branchDescriptions = suggestibleBranches.map(([branchName, branch]) => {
+    const ctaLabels = [];
+
+    // Get primary CTA label
+    const primaryId = branch.available_ctas?.primary;
+    if (primaryId && ctaDefinitions[primaryId]) {
+      const primaryCta = ctaDefinitions[primaryId];
+      ctaLabels.push(primaryCta.label || primaryCta.text || primaryId);
+    }
+
+    // Get secondary CTA labels
+    const secondaryIds = branch.available_ctas?.secondary || [];
+    for (const ctaId of secondaryIds) {
+      if (ctaDefinitions[ctaId]) {
+        const cta = ctaDefinitions[ctaId];
+        ctaLabels.push(cta.label || cta.text || ctaId);
+      }
+    }
+
+    // Format: "branch_name": CTA1, CTA2, CTA3
+    const description = ctaLabels.slice(0, 3).join(', ');
+    return `- "${branchName}": ${description || 'General actions'}`;
+  });
+
+  console.log(`✅ Built branch prompt section with ${suggestibleBranches.length} branches`);
+
+  return `
+
+CONVERSATION TOPIC ROUTING (Tier 4):
+When your response clearly relates to one of these topics, append a branch tag at the very end:
+
+${branchDescriptions.join('\n')}
+
+INSTRUCTIONS:
+- If your response discusses a specific program or topic that matches a branch, append the tag
+- Format: <!-- BRANCH: branch_name -->
+- Example: If discussing Love Box volunteering, end with <!-- BRANCH: volunteer_lovebox -->
+- Only suggest ONE branch per response
+- If no branch clearly applies, do NOT add any tag
+- The tag will be stripped from the visible response - it's for internal routing only
+`;
+}
+
+/**
+ * Detects if the user is responding affirmatively to a question the assistant asked
+ * Returns the extracted question if detected, null otherwise
+ */
+function detectFollowUpQuestionResponse(userInput, conversationHistory) {
+  // Check if user input is a short affirmative response
+  const affirmativePatterns = /^(yes|yeah|yep|sure|okay|ok|please|definitely|absolutely|yea|yup|go ahead|tell me|i'd like that|sounds good|please do|yes please)\.?!?$/i;
+  const isAffirmative = affirmativePatterns.test(userInput.trim());
+
+  if (!isAffirmative || !conversationHistory || conversationHistory.length === 0) {
+    return null;
+  }
+
+  // Find the last assistant message
+  let lastAssistantMessage = null;
+  for (let i = conversationHistory.length - 1; i >= 0; i--) {
+    const msg = conversationHistory[i];
+    if (msg.role === 'assistant') {
+      lastAssistantMessage = msg.content || msg.text || '';
+      break;
+    }
+  }
+
+  if (!lastAssistantMessage) {
+    return null;
+  }
+
+  // Check if the assistant's last message ended with a question
+  // Look for question patterns at the end of the message
+  const questionPatterns = [
+    /Would you like (?:to |me to )?(?:learn |know |hear )?(more )?about ([^?]+)\?/i,
+    /Would you like (?:to |me to )?([^?]+)\?/i,
+    /Shall I (?:tell you |explain |share )?(more )?about ([^?]+)\?/i,
+    /Do you want (?:to |me to )?(?:learn |know |hear )?(more )?about ([^?]+)\?/i,
+    /Can I (?:tell you |share |explain )?(more )?about ([^?]+)\?/i,
+    /Want (?:to |me to )?(?:learn |know |hear )?(more )?about ([^?]+)\?/i,
+    /Interested in (?:learning |knowing |hearing )?(more )?about ([^?]+)\?/i,
+  ];
+
+  for (const pattern of questionPatterns) {
+    const match = lastAssistantMessage.match(pattern);
+    if (match) {
+      // Extract the topic from the question
+      const topic = match[match.length - 1] || match[1];
+      if (topic) {
+        console.log(`🔍 Detected follow-up question response. Topic: "${topic.trim()}"`);
+        return {
+          originalQuestion: match[0],
+          topic: topic.trim(),
+          fullAssistantMessage: lastAssistantMessage
+        };
+      }
+    }
+  }
+
+  // Check for general question ending
+  if (lastAssistantMessage.trim().endsWith('?')) {
+    // Extract the last sentence that ends with ?
+    const sentences = lastAssistantMessage.split(/[.!]\s+/);
+    const lastSentence = sentences[sentences.length - 1];
+    if (lastSentence && lastSentence.includes('?')) {
+      console.log(`🔍 Detected affirmative to question: "${lastSentence.trim()}"`);
+      return {
+        originalQuestion: lastSentence.trim(),
+        topic: null,
+        fullAssistantMessage: lastAssistantMessage
+      };
+    }
+  }
+
+  return null;
 }
 
 function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
@@ -839,6 +1103,9 @@ function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
   const personalityPrompt = getRoleInstructions(config, tone);
   parts.push(personalityPrompt);
 
+  // Detect if user is responding to a follow-up question
+  const followUpDetection = detectFollowUpQuestionResponse(userInput, conversationHistory);
+
   // Add conversation history if provided
   if (conversationHistory && conversationHistory.length > 0) {
     parts.push('\nPREVIOUS CONVERSATION:');
@@ -851,6 +1118,16 @@ function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
     });
     parts.push('\nREMEMBER: The user\'s name and any personal information they\'ve shared should be remembered and used in your response when appropriate.\n');
     console.log(`✅ Added ${conversationHistory.length} messages from history`);
+
+    // Add explicit follow-up question directive if detected
+    if (followUpDetection) {
+      if (followUpDetection.topic) {
+        parts.push(`\n🎯 CRITICAL CONTEXT: The user just said "${userInput}" in response to your question about "${followUpDetection.topic}". You MUST now provide detailed information about ${followUpDetection.topic}. Do NOT acknowledge their "yes" - just answer the question directly as if they asked "${followUpDetection.topic}" themselves.\n`);
+      } else {
+        parts.push(`\n🎯 CRITICAL CONTEXT: The user just said "${userInput}" in response to your question: "${followUpDetection.originalQuestion}". You MUST now answer that question directly. Do NOT acknowledge their response - just provide the information you offered to share.\n`);
+      }
+      console.log(`✅ Added explicit follow-up question directive`);
+    }
 
     // Add LOCKED sections (never customizable)
     parts.push('\n' + getContextInterpretationRules());
@@ -909,7 +1186,27 @@ ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
 7. NEVER write things like "Join our [program] →", "Apply here →", "Check out...", "Want to learn more?", "Ready to get started?", "Sign up for..."
 8. If the knowledge base contains action links (like "Join our Love Box training program →"), DO NOT INCLUDE THEM in your response
 9. Remove ANY action-oriented links from your response - they will be provided as separate buttons
-10. Your response should end with a warm conversational statement ONLY - no action prompts, no program enrollment links`);
+10. Your response should end with a warm conversational statement ONLY - no action prompts, no program enrollment links
+
+🚨 CRITICAL - ANSWERING FOLLOW-UP QUESTIONS 🚨
+11. If your PREVIOUS message asked a question (like "Would you like to learn more about X?") and the user says "yes", "sure", "okay", etc.:
+    - ANSWER THAT SPECIFIC QUESTION - provide the information about X
+    - DO NOT start with "Since the previous conversation..." or "I noticed you said yes..."
+    - DO NOT repeat information you already gave - provide NEW details about what you asked
+    - Just answer directly as if the user had asked the question themselves
+
+    WRONG: "Since the previous conversation was about Dare to Dream and you responded with 'yes', I'll provide more details..."
+    RIGHT: [Directly answer the question you asked, e.g., "Our mentorship approach supports foster youth through..."]`);
+
+    // ═══════════════════════════════════════════════════════════════
+    // TIER 4: BRANCH ROUTING SUGGESTIONS
+    // ═══════════════════════════════════════════════════════════════
+    // Inject branch suggestions for free-flow conversations
+    const branchPromptSection = buildBranchPromptSection(config);
+    if (branchPromptSection) {
+      parts.push(branchPromptSection);
+      console.log(`✅ Injected Tier 4 branch routing prompt`);
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // FORMATTING RULES - POSITIONED AT END FOR RECENCY BIAS
