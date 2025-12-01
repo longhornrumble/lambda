@@ -77,7 +77,7 @@ const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
 const DEFAULT_TONE = 'You are a helpful assistant.';
 
 // Prompt version tracking for tenant customization
-const PROMPT_VERSION = '2.7.0';
+const PROMPT_VERSION = '2.8.0';
 
 // Default Bedrock instructions when config doesn't specify custom ones
 const DEFAULT_BEDROCK_INSTRUCTIONS = {
@@ -973,8 +973,14 @@ function buildBranchPromptSection(config) {
     return '';
   }
 
-  // Build branch descriptions from CTA labels
+  // Build branch descriptions - prefer explicit description, fallback to CTA labels
   const branchDescriptions = suggestibleBranches.map(([branchName, branch]) => {
+    // Use explicit description if provided
+    if (branch.description && branch.description.trim()) {
+      return `- "${branchName}": ${branch.description.trim()}`;
+    }
+
+    // Fallback: build description from CTA labels
     const ctaLabels = [];
 
     // Get primary CTA label
@@ -994,8 +1000,8 @@ function buildBranchPromptSection(config) {
     }
 
     // Format: "branch_name": CTA1, CTA2, CTA3
-    const description = ctaLabels.slice(0, 3).join(', ');
-    return `- "${branchName}": ${description || 'General actions'}`;
+    const fallbackDescription = ctaLabels.slice(0, 3).join(', ');
+    return `- "${branchName}": ${fallbackDescription || 'General actions'}`;
   });
 
   console.log(`✅ Built branch prompt section with ${suggestibleBranches.length} branches`);
