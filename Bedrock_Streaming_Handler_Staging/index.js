@@ -1438,6 +1438,54 @@ const streamingHandler = async (event, responseStream, context) => {
       }
     }
 
+    // Check for show_showcase action - bypass Bedrock and return showcase card directly
+    const routingMetadata = body.routing_metadata || {};
+    if (routingMetadata.action === 'show_showcase' && routingMetadata.target_showcase_id) {
+      console.log(`🎨 Show showcase mode detected - bypassing Bedrock for showcase: ${routingMetadata.target_showcase_id}`);
+      try {
+        const { getShowcaseById, loadTenantConfig } = require('./response_enhancer');
+        const fullConfig = await loadTenantConfig(tenantHash);
+        const showcaseCard = getShowcaseById(routingMetadata.target_showcase_id, fullConfig);
+
+        if (showcaseCard) {
+          // Send showcase card as SSE event
+          const showcaseResponse = JSON.stringify({
+            type: 'showcase_card',
+            showcaseCard: showcaseCard,
+            session_id: sessionId,
+            metadata: {
+              routing_tier: 'action_chip_direct',
+              routing_method: 'show_showcase',
+              showcase_id: showcaseCard.id
+            }
+          });
+          write(`data: ${showcaseResponse}\n\n`);
+          console.log(`✅ Sent showcase card: ${showcaseCard.id}`);
+        } else {
+          // Showcase not found - send error
+          write(`data: {"type": "error", "error": "Showcase item not found: ${routingMetadata.target_showcase_id}"}\n\n`);
+        }
+
+        write('data: [DONE]\n\n');
+
+        // Clear heartbeat and end stream
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = null;
+        }
+        streamEnded = true;
+        responseStream.end();
+        return;
+      } catch (error) {
+        console.error('Showcase mode error:', error);
+        write(`data: {"type": "error", "error": "Showcase processing failed: ${error.message}"}\n\n`);
+        write('data: [DONE]\n\n');
+        streamEnded = true;
+        responseStream.end();
+        return;
+      }
+    }
+
     // Get KB context
     const kbContext = await retrieveKB(userInput, config);
     const prompt = buildPrompt(userInput, kbContext, config.tone_prompt, conversationHistory, config);
@@ -1677,15 +1725,73 @@ const bufferedHandler = async (event, context) => {
       config.bedrock_instructions = body.bedrock_instructions_override;
     }
 
+    // Check for show_showcase action - bypass Bedrock and return showcase card directly
+    const routingMetadata = body.routing_metadata || {};
+    if (routingMetadata.action === 'show_showcase' && routingMetadata.target_showcase_id) {
+      console.log(`🎨 Show showcase mode detected - bypassing Bedrock for showcase: ${routingMetadata.target_showcase_id}`);
+      try {
+        const { getShowcaseById, loadTenantConfig } = require('./response_enhancer');
+        const fullConfig = await loadTenantConfig(tenantHash);
+        const showcaseCard = getShowcaseById(routingMetadata.target_showcase_id, fullConfig);
+
+        if (showcaseCard) {
+          // Send showcase card as SSE event
+          const showcaseResponse = JSON.stringify({
+            type: 'showcase_card',
+            showcaseCard: showcaseCard,
+            session_id: sessionId,
+            metadata: {
+              routing_tier: 'action_chip_direct',
+              routing_method: 'show_showcase',
+              showcase_id: showcaseCard.id
+            }
+          });
+          chunks.push(`data: ${showcaseResponse}\n\n`);
+          console.log(`✅ Sent showcase card: ${showcaseCard.id}`);
+        } else {
+          // Showcase not found - send error
+          chunks.push(`data: {"type": "error", "error": "Showcase item not found: ${routingMetadata.target_showcase_id}"}\n\n`);
+        }
+
+        chunks.push('data: [DONE]\n\n');
+
+        return {
+          statusCode: 200,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache, no-transform',
+            'Access-Control-Allow-Origin': '*',
+            'X-Accel-Buffering': 'no'
+          },
+          body: chunks.join(''),
+          isBase64Encoded: false
+        };
+      } catch (error) {
+        console.error('Showcase mode error:', error);
+        chunks.push(`data: {"type": "error", "error": "Showcase processing failed: ${error.message}"}\n\n`);
+        chunks.push('data: [DONE]\n\n');
+
+        return {
+          statusCode: 500,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache, no-transform',
+            'Access-Control-Allow-Origin': '*'
+          },
+          body: chunks.join('')
+        };
+      }
+    }
+
     // Get KB context
     const kbContext = await retrieveKB(userInput, config);
     const prompt = buildPrompt(userInput, kbContext, config.tone_prompt, conversationHistory, config);
-    
+
     // Prepare Bedrock request - use config model or default
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
     const temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
-    
+
     // Invoke Bedrock
     const response = await bedrock.send(new InvokeModelWithResponseStreamCommand({
       modelId: modelId,

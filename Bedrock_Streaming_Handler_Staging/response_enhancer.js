@@ -72,7 +72,8 @@ async function loadTenantConfig(tenantHash) {
             conversation_branches: config.conversation_branches || {},
             cta_definitions: config.cta_definitions || {},
             conversational_forms: config.conversational_forms || {},
-            cta_settings: config.cta_settings || {}  // Required for Tier 3 fallback routing
+            cta_settings: config.cta_settings || {},  // Required for Tier 3 fallback routing
+            content_showcase: config.content_showcase || []  // Required for showcase items
         };
 
         // Cache the config
@@ -288,6 +289,106 @@ function parseBranchHint(response) {
     }
 
     return { branch: null, cleanedResponse: response };
+}
+
+/**
+ * Get showcase item for a conversation branch
+ *
+ * Looks up a branch by name and returns the associated showcase item if one exists.
+ * Showcase items act as "digital flyers" with rich media and CTAs.
+ *
+ * @param {string} branchName - Name of the conversation branch
+ * @param {Object} config - Tenant configuration with conversation_branches and content_showcase
+ * @returns {Object|null} - Showcase item object or null if not found
+ */
+function getShowcaseForBranch(branchName, config) {
+    const branches = config.conversation_branches || {};
+    const contentShowcase = config.content_showcase || [];
+
+    // Check if branch exists
+    if (!branchName || !branches[branchName]) {
+        console.log(`[Showcase] Branch '${branchName}' not found`);
+        return null;
+    }
+
+    const branch = branches[branchName];
+
+    // Check if branch has a showcase_item_id
+    if (!branch.showcase_item_id) {
+        console.log(`[Showcase] Branch '${branchName}' has no showcase_item_id`);
+        return null;
+    }
+
+    // Find matching showcase item in content_showcase array
+    const showcaseItem = contentShowcase.find(item => item.id === branch.showcase_item_id);
+
+    if (!showcaseItem) {
+        console.log(`[Showcase] Showcase item '${branch.showcase_item_id}' not found in content_showcase`);
+        return null;
+    }
+
+    // Check if showcase item is enabled (if the field exists)
+    if (showcaseItem.hasOwnProperty('enabled') && !showcaseItem.enabled) {
+        console.log(`[Showcase] Showcase item '${showcaseItem.id}' is disabled`);
+        return null;
+    }
+
+    console.log(`[Showcase] Found showcase item '${showcaseItem.id}' for branch '${branchName}'`);
+    return showcaseItem;
+}
+
+/**
+ * Resolve showcase item CTAs to full CTA definitions
+ *
+ * Takes the CTA IDs from a showcase item's available_ctas and resolves them
+ * to full CTA definitions from the tenant configuration.
+ *
+ * @param {Object} showcaseItem - Showcase item with available_ctas
+ * @param {Object} config - Tenant configuration with cta_definitions
+ * @returns {Object} - { primary: CTA|null, secondary: CTA[] }
+ */
+function resolveShowcaseCTAs(showcaseItem, config) {
+    const ctaDefinitions = config.cta_definitions || {};
+    const availableCtas = showcaseItem.available_ctas || {};
+
+    const resolvedCtas = {
+        primary: null,
+        secondary: []
+    };
+
+    // Resolve primary CTA
+    if (availableCtas.primary) {
+        const primaryCtaId = availableCtas.primary;
+        const primaryCta = ctaDefinitions[primaryCtaId];
+
+        if (primaryCta) {
+            // Strip legacy style field and include ID
+            const { style, ...cleanCta } = primaryCta;
+            resolvedCtas.primary = { ...cleanCta, id: primaryCtaId };
+            console.log(`[Showcase CTAs] Resolved primary CTA: ${primaryCtaId}`);
+        } else {
+            console.log(`[Showcase CTAs] Primary CTA '${primaryCtaId}' not found in cta_definitions`);
+        }
+    }
+
+    // Resolve secondary CTAs
+    if (Array.isArray(availableCtas.secondary)) {
+        for (const ctaId of availableCtas.secondary) {
+            const cta = ctaDefinitions[ctaId];
+
+            if (cta) {
+                // Strip legacy style field and include ID
+                const { style, ...cleanCta } = cta;
+                resolvedCtas.secondary.push({ ...cleanCta, id: ctaId });
+                console.log(`[Showcase CTAs] Resolved secondary CTA: ${ctaId}`);
+            } else {
+                console.log(`[Showcase CTAs] Secondary CTA '${ctaId}' not found in cta_definitions`);
+            }
+        }
+    }
+
+    console.log(`[Showcase CTAs] Resolved ${resolvedCtas.primary ? 1 : 0} primary + ${resolvedCtas.secondary.length} secondary CTAs`);
+    return resolvedCtas;
 }
 
 /**
@@ -519,9 +620,30 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
             console.log(`[Explicit Routing] Using branch: ${explicitBranch}`);
             const ctas = buildCtasFromBranch(explicitBranch, config, completedForms);
 
-            if (ctas.length > 0) {
-                console.log(`[Explicit Routing] Returning ${ctas.length} CTAs from branch '${explicitBranch}'`);
-                return {
+            // Check if this branch has an associated showcase item
+            const showcaseItem = getShowcaseForBranch(explicitBranch, config);
+            let showcaseCard = null;
+
+            if (showcaseItem) {
+                // Build showcase card with resolved CTAs
+                const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
+
+                showcaseCard = {
+                    id: showcaseItem.id,
+                    type: showcaseItem.type,
+                    name: showcaseItem.name,
+                    tagline: showcaseItem.tagline,
+                    description: showcaseItem.description,
+                    image_url: showcaseItem.image_url,
+                    highlights: showcaseItem.highlights,
+                    ctaButtons: resolvedCtas
+                };
+
+                console.log(`[Explicit Routing] Including showcase card: ${showcaseItem.id}`);
+            }
+
+            if (ctas.length > 0 || showcaseCard) {
+                const response = {
                     message: bedrockResponse,
                     ctaButtons: ctas,
                     metadata: {
@@ -532,8 +654,17 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                                        routingMetadata.cta_triggered ? 'cta' : 'fallback'
                     }
                 };
+
+                // Add showcase card if present
+                if (showcaseCard) {
+                    response.showcaseCard = showcaseCard;
+                    response.metadata.has_showcase = true;
+                }
+
+                console.log(`[Explicit Routing] Returning ${ctas.length} CTAs${showcaseCard ? ' + showcase card' : ''} from branch '${explicitBranch}'`);
+                return response;
             } else {
-                console.log(`[Explicit Routing] Branch '${explicitBranch}' has no CTAs to display`);
+                console.log(`[Explicit Routing] Branch '${explicitBranch}' has no CTAs or showcase items to display`);
             }
         }
         // ============================================================================
@@ -555,9 +686,30 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                 console.log(`[Tier 4] AI suggested valid branch: ${suggestedBranch}`);
                 const ctas = buildCtasFromBranch(suggestedBranch, config, completedForms);
 
-                if (ctas.length > 0) {
-                    console.log(`[Tier 4] Returning ${ctas.length} CTAs from AI-suggested branch '${suggestedBranch}'`);
-                    return {
+                // Check if this branch has an associated showcase item
+                const showcaseItem = getShowcaseForBranch(suggestedBranch, config);
+                let showcaseCard = null;
+
+                if (showcaseItem) {
+                    // Build showcase card with resolved CTAs
+                    const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
+
+                    showcaseCard = {
+                        id: showcaseItem.id,
+                        type: showcaseItem.type,
+                        name: showcaseItem.name,
+                        tagline: showcaseItem.tagline,
+                        description: showcaseItem.description,
+                        image_url: showcaseItem.image_url,
+                        highlights: showcaseItem.highlights,
+                        ctaButtons: resolvedCtas
+                    };
+
+                    console.log(`[Tier 4] Including showcase card: ${showcaseItem.id}`);
+                }
+
+                if (ctas.length > 0 || showcaseCard) {
+                    const response = {
                         message: cleanedResponse,  // Use cleaned response (tag stripped)
                         ctaButtons: ctas,
                         metadata: {
@@ -567,6 +719,15 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                             routing_method: 'model_branch_hint'
                         }
                     };
+
+                    // Add showcase card if present
+                    if (showcaseCard) {
+                        response.showcaseCard = showcaseCard;
+                        response.metadata.has_showcase = true;
+                    }
+
+                    console.log(`[Tier 4] Returning ${ctas.length} CTAs${showcaseCard ? ' + showcase card' : ''} from AI-suggested branch '${suggestedBranch}'`);
+                    return response;
                 }
             } else {
                 // Invalid branch suggested - use fallback
@@ -576,9 +737,30 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                 if (fallbackBranch && branches[fallbackBranch]) {
                     const ctas = buildCtasFromBranch(fallbackBranch, config, completedForms);
 
-                    if (ctas.length > 0) {
-                        console.log(`[Tier 4] Returning ${ctas.length} CTAs from fallback branch '${fallbackBranch}'`);
-                        return {
+                    // Check if fallback branch has an associated showcase item
+                    const showcaseItem = getShowcaseForBranch(fallbackBranch, config);
+                    let showcaseCard = null;
+
+                    if (showcaseItem) {
+                        // Build showcase card with resolved CTAs
+                        const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
+
+                        showcaseCard = {
+                            id: showcaseItem.id,
+                            type: showcaseItem.type,
+                            name: showcaseItem.name,
+                            tagline: showcaseItem.tagline,
+                            description: showcaseItem.description,
+                            image_url: showcaseItem.image_url,
+                            highlights: showcaseItem.highlights,
+                            ctaButtons: resolvedCtas
+                        };
+
+                        console.log(`[Tier 4] Including showcase card from fallback: ${showcaseItem.id}`);
+                    }
+
+                    if (ctas.length > 0 || showcaseCard) {
+                        const response = {
                             message: cleanedResponse,
                             ctaButtons: ctas,
                             metadata: {
@@ -589,6 +771,15 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                                 original_suggestion: suggestedBranch
                             }
                         };
+
+                        // Add showcase card if present
+                        if (showcaseCard) {
+                            response.showcaseCard = showcaseCard;
+                            response.metadata.has_showcase = true;
+                        }
+
+                        console.log(`[Tier 4] Returning ${ctas.length} CTAs${showcaseCard ? ' + showcase card' : ''} from fallback branch '${fallbackBranch}'`);
+                        return response;
                     }
                 }
             }
@@ -791,6 +982,58 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
     }
 }
 
+/**
+ * Get showcase item by ID directly (for action chip routing)
+ *
+ * Unlike getShowcaseForBranch, this looks up a showcase item directly by ID,
+ * bypassing the branch lookup. Used when action chips target showcase items
+ * with action: 'show_showcase'.
+ *
+ * @param {string} showcaseId - ID of the showcase item
+ * @param {Object} config - Tenant configuration with content_showcase
+ * @returns {Object|null} - Showcase item object with resolved CTAs, or null if not found
+ */
+function getShowcaseById(showcaseId, config) {
+    const contentShowcase = config.content_showcase || [];
+
+    if (!showcaseId) {
+        console.log(`[Showcase] No showcase ID provided`);
+        return null;
+    }
+
+    // Find matching showcase item
+    const showcaseItem = contentShowcase.find(item => item.id === showcaseId);
+
+    if (!showcaseItem) {
+        console.log(`[Showcase] Showcase item '${showcaseId}' not found in content_showcase`);
+        return null;
+    }
+
+    // Check if showcase item is enabled
+    if (showcaseItem.hasOwnProperty('enabled') && !showcaseItem.enabled) {
+        console.log(`[Showcase] Showcase item '${showcaseId}' is disabled`);
+        return null;
+    }
+
+    console.log(`[Showcase] Found showcase item '${showcaseId}' for direct routing`);
+
+    // Build showcase card with resolved CTAs
+    const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
+
+    return {
+        id: showcaseItem.id,
+        type: showcaseItem.type,
+        name: showcaseItem.name,
+        tagline: showcaseItem.tagline,
+        description: showcaseItem.description,
+        image_url: showcaseItem.image_url,
+        stats: showcaseItem.stats,
+        testimonial: showcaseItem.testimonial,
+        highlights: showcaseItem.highlights,
+        ctaButtons: resolvedCtas
+    };
+}
+
 // Export for use in main handler
 module.exports = {
     enhanceResponse,
@@ -798,5 +1041,8 @@ module.exports = {
     detectConversationBranch,  // DEPRECATED - kept for backward compatibility
     getConversationBranch,      // Tier 1-3 explicit routing
     buildCtasFromBranch,        // Explicit CTA building from branch
-    parseBranchHint             // Tier 4 - AI-suggested branch parsing
+    parseBranchHint,            // Tier 4 - AI-suggested branch parsing
+    getShowcaseForBranch,       // Phase 2.3 - Showcase items lookup
+    resolveShowcaseCTAs,        // Phase 2.3 - Showcase CTA resolution
+    getShowcaseById             // Action chip → showcase direct routing
 };
