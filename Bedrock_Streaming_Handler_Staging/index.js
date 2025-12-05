@@ -3,6 +3,14 @@
  * Uses awslambda.streamifyResponse for real SSE streaming
  * No JWT required - uses simple tenant_hash/session_id
  *
+ * Version: v2.9.0
+ * Deployed: 2025-12-05
+ * Changes:
+ *   - NEW: Engagement question feature - responses end with contextual follow-up questions
+ *   - Prompts users to explore related topics (e.g., "Would you like to know the requirements?")
+ *   - Works with existing loop prevention (Stage 1 only, skips Stage 2/3)
+ *   - ENHANCED: Links and contact info now ALWAYS included regardless of formatting preferences
+ *
  * Version: v2.7.0
  * Deployed: 2025-11-26
  * Changes:
@@ -805,13 +813,37 @@ If a program name is "Angel Allies" do NOT change it to "Angel Alliance" or any 
 
 /**
  * LOCKED: URL handling rules - never customizable
+ * CRITICAL: Links and contact info ALWAYS included regardless of response style/detail level
  */
 function getLockedUrlHandling() {
-  return `URL AND CONTACT PRESERVATION:
-- Include ALL contact information exactly as it appears: phone numbers, email addresses, websites, and links
+  return `🔒 MANDATORY: LINKS AND CONTACT INFORMATION (OVERRIDES ALL OTHER FORMATTING RULES)
+
+This rule OVERRIDES response style and detail level settings. Even in concise mode, you MUST include:
+
+ALWAYS INCLUDE (regardless of response length or style):
+- ALL URLs and links from the knowledge base - use markdown format [text](url)
+- ALL email addresses (e.g., erika@nationalangels.org)
+- ALL phone numbers (e.g., (512) 521-3165)
+- ALL contact names and titles (e.g., "Contact Erika, Partnership Director")
+- ALL call-to-action links for forms, applications, or next steps
+
+FORMAT REQUIREMENTS:
 - PRESERVE ALL MARKDOWN FORMATTING: If you see [text](url) keep it as [text](url), not plain text
 - Do not modify, shorten, or reformat any URLs, emails, or phone numbers
-- When you see markdown links like [donation page](https://example.com), keep them as markdown links`;
+- When the knowledge base mentions "contact us at..." or "apply at..." include the FULL contact method
+
+EXAMPLES:
+❌ WRONG (even in concise mode): "For partnerships, reach out to our team."
+✅ CORRECT (even in concise mode): "For partnerships, contact Erika at erika@nationalangels.org."
+
+❌ WRONG (even in concise mode): "Visit our website to learn more."
+✅ CORRECT (even in concise mode): "Learn more at [nationalangels.org](https://www.nationalangels.org)."
+
+❌ WRONG: Omitting a relevant link to shorten the response
+✅ CORRECT: Include the link even if it makes the response slightly longer
+
+NOTE: If including all relevant links/contacts pushes you past the sentence count limit, that is ACCEPTABLE.
+Links and contact info are MORE important than strict adherence to length constraints.`;
 }
 
 /**
@@ -906,6 +938,38 @@ User: "yes"
 Bot: [Stage 3] "Perfect! You're all set - just visit that link to submit your request. Our team responds within 24 hours. Is there anything else I can help you with today?" ✅ DONE - moved to new topic
 
 DO NOT create loops by asking "Would you like me to help with that?" after they've already said yes twice.`;
+}
+
+/**
+ * LOCKED: Engagement question - end responses with contextual follow-up
+ */
+function getLockedEngagementQuestion() {
+  return `ENGAGEMENT QUESTION - END EACH RESPONSE WITH A CONTEXTUAL FOLLOW-UP:
+
+At the END of your response, include a brief follow-up question that:
+1. Relates directly to the topic you just discussed
+2. Offers a natural next step or deeper exploration
+3. Is specific, not generic
+
+EXAMPLES OF GOOD ENGAGEMENT QUESTIONS:
+- After explaining partnerships: "Would you like to know more about the different partnership levels?"
+- After describing Love Box: "Would you like to know the requirements to become a Love Box volunteer?"
+- After discussing mentorship: "Would you like to learn about the application process for mentors?"
+- After explaining donations: "Would you like to know about our monthly giving program?"
+- After describing a chapter: "Would you like to know how to get involved with your local chapter?"
+
+EXAMPLES OF BAD ENGAGEMENT QUESTIONS (avoid these):
+- ❌ "Is there anything else I can help you with?" (too generic - save for Stage 3)
+- ❌ "Do you have any other questions?" (too generic)
+- ❌ "Would you like more information?" (too vague - about what?)
+- ❌ "Can I help you with something else?" (off-topic)
+
+WHEN TO SKIP THE ENGAGEMENT QUESTION:
+- Stage 2/3: When user has already confirmed interest (e.g., said "yes" to your previous question)
+- Contact requests: When user asked "how do I contact you" - just provide contact info
+- Simple confirmations: When you're providing a direct resource link as the final step
+
+The engagement question should feel like a natural extension of the conversation, inviting the user to learn more about a specific aspect of what you just discussed.`;
 }
 
 /**
@@ -1139,6 +1203,7 @@ function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
     parts.push('\n' + getContextInterpretationRules());
     parts.push('\n' + getLockedCapabilityBoundaries());
     parts.push('\n' + getLockedLoopPrevention());
+    parts.push('\n' + getLockedEngagementQuestion());
   }
 
   // Add KB-specific instructions
@@ -1192,7 +1257,7 @@ ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
 7. NEVER write things like "Join our [program] →", "Apply here →", "Check out...", "Want to learn more?", "Ready to get started?", "Sign up for..."
 8. If the knowledge base contains action links (like "Join our Love Box training program →"), DO NOT INCLUDE THEM in your response
 9. Remove ANY action-oriented links from your response - they will be provided as separate buttons
-10. Your response should end with a warm conversational statement ONLY - no action prompts, no program enrollment links
+10. Your response should end with a CONTEXTUAL FOLLOW-UP QUESTION that invites deeper exploration of the topic (e.g., "Would you like to know more about the partnership requirements?")
 
 🚨 CRITICAL - ANSWERING FOLLOW-UP QUESTIONS 🚨
 11. If your PREVIOUS message asked a question (like "Would you like to learn more about X?") and the user says "yes", "sure", "okay", etc.:
