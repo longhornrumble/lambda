@@ -103,16 +103,24 @@ def lambda_handler(event, context):
     """
     Main handler for SQS-triggered Lambda.
     Processes batch of analytics events from queue.
+
+    Uses partial batch failure reporting - only failed messages are retried,
+    not the entire batch. This prevents duplicate processing of successful records.
     """
-    logger.info(f"Processing {len(event.get('Records', []))} records")
+    records = event.get('Records', [])
+    logger.info(f"Processing {len(records)} records")
 
     processed_count = 0
     error_count = 0
 
+    # Track failed message IDs for partial batch failure reporting
+    failed_message_ids = []
+
     # Collect all events for batch write
     events_to_write = []
 
-    for record in event.get('Records', []):
+    for record in records:
+        message_id = record.get('messageId', 'unknown')
         try:
             # Parse SQS message body
             body = json.loads(record['body'])
@@ -132,26 +140,32 @@ def lambda_handler(event, context):
                     processed_count += 1
 
         except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON in SQS message: {e}")
+            logger.error(f"Invalid JSON in SQS message {message_id}: {e}")
             error_count += 1
+            failed_message_ids.append(message_id)
         except Exception as e:
-            logger.error(f"Error processing record: {e}")
+            logger.error(f"Error processing record {message_id}: {e}")
             error_count += 1
-            # Re-raise to trigger DLQ after retries
-            raise
+            failed_message_ids.append(message_id)
+            # Continue processing remaining records instead of raising
 
-    # Write all events to S3
+    # Write all successfully parsed events to S3
     if events_to_write:
-        write_events_to_s3(events_to_write)
+        try:
+            write_events_to_s3(events_to_write)
+        except Exception as e:
+            # If S3 write fails, all records in this batch need retry
+            logger.error(f"S3 write failed, marking all records as failed: {e}")
+            failed_message_ids = [r.get('messageId', 'unknown') for r in records]
 
-    logger.info(f"Processed: {processed_count}, Errors: {error_count}")
+    logger.info(f"Processed: {processed_count}, Errors: {error_count}, Failed IDs: {len(failed_message_ids)}")
 
+    # Return partial batch failure response
+    # SQS will only retry the failed message IDs, not the entire batch
     return {
-        'statusCode': 200,
-        'body': json.dumps({
-            'processed': processed_count,
-            'errors': error_count
-        })
+        'batchItemFailures': [
+            {'itemIdentifier': msg_id} for msg_id in failed_message_ids
+        ]
     }
 
 

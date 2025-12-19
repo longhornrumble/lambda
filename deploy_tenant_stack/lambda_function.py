@@ -24,6 +24,29 @@ ATHENA_DATABASE = "picasso_analytics"
 ATHENA_TABLE = "events"
 ATHENA_OUTPUT_LOCATION = "s3://picasso-analytics/athena-results/"
 
+# Security: Tenant ID validation pattern (alphanumeric, underscore, hyphen only)
+# This prevents SQL injection in Athena queries
+TENANT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def sanitize_tenant_id(tenant_id: str) -> str:
+    """
+    Validate tenant_id is safe for SQL interpolation and S3 paths.
+    Prevents SQL injection by ensuring only alphanumeric characters.
+
+    Raises ValueError if tenant_id is invalid.
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id is required")
+
+    if len(tenant_id) > 50:
+        raise ValueError("tenant_id too long (max 50 chars)")
+
+    if not TENANT_ID_PATTERN.match(tenant_id):
+        raise ValueError(f"Invalid tenant_id format: must be alphanumeric, underscore, or hyphen only")
+
+    return tenant_id
+
 def count_enabled_features(features: Dict[str, Any]) -> int:
     """Count enabled features, including nested ones like callout"""
     count = 0
@@ -188,10 +211,17 @@ def lambda_handler(event, context):
         logger.error("❌ Failed to parse event body: %s", str(e))
         return _error("Invalid request body", details=str(e))
 
-    # Extract tenant ID
+    # Extract and validate tenant ID
     tenant_id = bubble_data.get("tenant_id")
     if not tenant_id:
         return _error("Missing required: tenant_id")
+
+    # 🔒 SECURITY: Validate tenant_id format to prevent SQL injection
+    try:
+        tenant_id = sanitize_tenant_id(tenant_id)
+    except ValueError as e:
+        logger.warning(f"⚠️ Invalid tenant_id format rejected")
+        return _error("Invalid tenant_id format", details=str(e))
 
     # 🔒 SURGICAL FIX 1: Remove tenant_id from logs
     logger.info(f"🎯 PRODUCTION DEPLOYMENT initiated")

@@ -24,11 +24,12 @@ import json
 import os
 import logging
 import time
+import re
 import boto3
 import hashlib
 import hmac
 import base64
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional, List
 from botocore.exceptions import ClientError
 
@@ -51,6 +52,51 @@ secrets_manager = boto3.client('secretsmanager')
 _jwt_secret_cache = None
 _jwt_secret_cache_time = 0
 JWT_SECRET_CACHE_TTL = 300  # 5 minutes
+
+# Security: Allowed event types whitelist
+ALLOWED_EVENT_TYPES = {
+    'WIDGET_OPENED', 'WIDGET_CLOSED', 'MESSAGE_SENT', 'FORM_STARTED',
+    'FORM_COMPLETED', 'ACTION_CHIP_CLICKED', 'CTA_CLICKED', 'SESSION_STARTED',
+    'SESSION_ENDED', 'ERROR'
+}
+
+# Security: Tenant ID validation pattern (alphanumeric, underscore, hyphen only)
+TENANT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def sanitize_tenant_id(tenant_id: str) -> str:
+    """
+    Validate tenant_id is safe for SQL interpolation.
+    Prevents SQL injection by ensuring only alphanumeric characters.
+
+    Raises ValueError if tenant_id is invalid.
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id is required")
+
+    if len(tenant_id) > 50:
+        raise ValueError("tenant_id too long (max 50 chars)")
+
+    if not TENANT_ID_PATTERN.match(tenant_id):
+        raise ValueError(f"Invalid tenant_id format: must be alphanumeric")
+
+    return tenant_id
+
+
+def sanitize_event_type(event_type: str) -> str:
+    """
+    Validate event_type against whitelist.
+    Prevents SQL injection by only allowing known event types.
+
+    Raises ValueError if event_type is not in whitelist.
+    """
+    if not event_type:
+        return None
+
+    if event_type not in ALLOWED_EVENT_TYPES:
+        raise ValueError(f"Invalid event type: {event_type}")
+
+    return event_type
 
 
 def lambda_handler(event, context):
@@ -80,7 +126,13 @@ def lambda_handler(event, context):
     if not auth_result['success']:
         return cors_response(401, {'error': auth_result['error']})
 
-    tenant_id = auth_result['tenant_id']
+    # Sanitize tenant_id to prevent SQL injection
+    try:
+        tenant_id = sanitize_tenant_id(auth_result['tenant_id'])
+    except ValueError as e:
+        logger.warning(f"Invalid tenant_id in token: {e}")
+        return cors_response(400, {'error': str(e)})
+
     logger.info(f"Authenticated request for tenant: {tenant_id[:8]}...")
 
     # Parse query parameters
@@ -219,6 +271,7 @@ def handle_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
     date_range = parse_date_range(params.get('range', '30d'))
 
+    # Use ISO date comparison for proper cross-month-boundary filtering
     query = f"""
     SELECT
         COUNT(DISTINCT session_id) as total_sessions,
@@ -230,9 +283,10 @@ def handle_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         COUNT(CASE WHEN event_type = 'CTA_CLICKED' THEN 1 END) as cta_clicks
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
     WHERE tenant_id = '{tenant_id}'
-      AND year >= {date_range['start_year']}
-      AND month >= {date_range['start_month']}
-      AND day >= {date_range['start_day']}
+      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+          >= DATE '{date_range['start_date_iso']}'
     """
 
     results = execute_athena_query(query)
@@ -298,6 +352,7 @@ def handle_sessions(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         group_by = "year, month, day"
         select_date = "CAST(year AS VARCHAR) || '-' || LPAD(CAST(month AS VARCHAR), 2, '0') || '-' || LPAD(CAST(day AS VARCHAR), 2, '0') as period"
 
+    # Use ISO date comparison for proper cross-month-boundary filtering
     query = f"""
     SELECT
         {select_date},
@@ -305,8 +360,10 @@ def handle_sessions(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         COUNT(*) as events
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
     WHERE tenant_id = '{tenant_id}'
-      AND year >= {date_range['start_year']}
-      AND month >= {date_range['start_month']}
+      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+          >= DATE '{date_range['start_date_iso']}'
     GROUP BY {group_by}
     ORDER BY period
     """
@@ -335,13 +392,21 @@ def handle_events(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
 
     Query params:
     - range: Time range (7d, 30d, 90d) - default 30d
-    - type: Filter by specific event type (optional)
+    - type: Filter by specific event type (optional, must be in whitelist)
     """
     date_range = parse_date_range(params.get('range', '30d'))
+
+    # Validate event_type against whitelist to prevent SQL injection
     event_type_filter = params.get('type')
+    if event_type_filter:
+        try:
+            event_type_filter = sanitize_event_type(event_type_filter)
+        except ValueError as e:
+            return cors_response(400, {'error': str(e), 'allowed_types': list(ALLOWED_EVENT_TYPES)})
 
     type_clause = f"AND event_type = '{event_type_filter}'" if event_type_filter else ""
 
+    # Use ISO date comparison for proper cross-month-boundary filtering
     query = f"""
     SELECT
         event_type,
@@ -349,8 +414,10 @@ def handle_events(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         COUNT(DISTINCT session_id) as unique_sessions
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
     WHERE tenant_id = '{tenant_id}'
-      AND year >= {date_range['start_year']}
-      AND month >= {date_range['start_month']}
+      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+          >= DATE '{date_range['start_date_iso']}'
       {type_clause}
     GROUP BY event_type
     ORDER BY count DESC
@@ -388,6 +455,7 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
     date_range = parse_date_range(params.get('range', '30d'))
 
+    # Use ISO date comparison for proper cross-month-boundary filtering
     query = f"""
     SELECT
         COUNT(DISTINCT CASE WHEN event_type = 'WIDGET_OPENED' THEN session_id END) as stage1_widget_opened,
@@ -396,8 +464,10 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         COUNT(DISTINCT CASE WHEN event_type = 'FORM_COMPLETED' THEN session_id END) as stage4_form_completed
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
     WHERE tenant_id = '{tenant_id}'
-      AND year >= {date_range['start_year']}
-      AND month >= {date_range['start_month']}
+      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+          >= DATE '{date_range['start_date_iso']}'
     """
 
     results = execute_athena_query(query)
@@ -511,9 +581,10 @@ def execute_athena_query(query: str, timeout: int = 30) -> Optional[List[Dict[st
         return None
 
 
-def parse_date_range(range_str: str) -> Dict[str, int]:
+def parse_date_range(range_str: str) -> Dict[str, Any]:
     """
     Parse date range string (7d, 30d, 90d) into date components.
+    Returns ISO date string for proper cross-month-boundary filtering.
     """
     days = 30  # default
     if range_str.endswith('d'):
@@ -522,12 +593,13 @@ def parse_date_range(range_str: str) -> Dict[str, int]:
         except ValueError:
             pass
 
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     return {
         'start_year': start_date.year,
         'start_month': start_date.month,
         'start_day': start_date.day,
+        'start_date_iso': start_date.strftime('%Y-%m-%d'),
         'days': days
     }
 
