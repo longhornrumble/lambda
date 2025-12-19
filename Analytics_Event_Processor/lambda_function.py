@@ -1,18 +1,19 @@
 """
 Analytics Event Processor Lambda
 
-Processes analytics events from SQS queue and stores them in DynamoDB.
+Processes analytics events from SQS queue and stores them in S3 for Athena queries.
 
 Architecture:
 - Triggered by SQS: picasso-analytics-events
-- Writes to DynamoDB: picasso-session-events
-- Generates session summaries on WIDGET_CLOSED
+- Decodes tenant_hash → tenant_id via S3 mappings
+- Writes to S3: s3://{bucket}/analytics/tenant_id={}/year={}/month={}/day={}/
+- Athena queries S3 for dashboard analytics
 
 Event Schema (v1.0.0):
 {
     "schema_version": "1.0.0",
     "session_id": "sess_abc123_xyz789",
-    "tenant_id": "fo85e6a06dcdf4",
+    "tenant_id": "fo85e6a06dcdf4",  // Actually tenant_hash from frontend
     "timestamp": "2025-12-19T06:00:00.000Z",
     "step_number": 1,
     "event": {
@@ -21,14 +22,22 @@ Event Schema (v1.0.0):
     },
     "ga_client_id": "123456789.1234567890" (optional)
 }
+
+S3 Partitioning:
+- Partition by tenant_id (decoded from hash), year, month, day
+- JSON format (Athena reads directly, no Glue needed)
+
+Tenant Hash → ID Mapping:
+- Mappings stored in s3://myrecruiter-picasso/mappings/{tenant_hash}.json
+- Cached in Lambda memory for duration of invocation
 """
 
 import json
 import os
 import logging
 import time
-from datetime import datetime, timedelta
-from decimal import Decimal
+import uuid
+from datetime import datetime
 import boto3
 from botocore.exceptions import ClientError
 
@@ -37,24 +46,57 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Environment variables
-EVENTS_TABLE = os.environ.get('EVENTS_TABLE', 'picasso-session-events')
-SUMMARIES_TABLE = os.environ.get('SUMMARIES_TABLE', 'picasso-session-summaries')
+ANALYTICS_BUCKET = os.environ.get('ANALYTICS_BUCKET', 'picasso-analytics')
+MAPPINGS_BUCKET = os.environ.get('MAPPINGS_BUCKET', 'myrecruiter-picasso')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 
 # Initialize AWS clients
-dynamodb = boto3.resource('dynamodb')
-events_table = dynamodb.Table(EVENTS_TABLE)
-summaries_table = dynamodb.Table(SUMMARIES_TABLE)
+s3 = boto3.client('s3')
 
 # Schema version we support
 SUPPORTED_SCHEMA_VERSIONS = ['1.0.0', '1.0']
 
-# Event types that indicate session end
-SESSION_END_EVENTS = ['WIDGET_CLOSED', 'SESSION_ENDED']
+# In-memory cache for tenant mappings (persists across warm Lambda invocations)
+_tenant_mapping_cache = {}
 
-# TTL durations (in seconds)
-EVENTS_TTL_DAYS = 7
-SUMMARIES_TTL_DAYS = 90
+
+def get_tenant_mapping(tenant_hash):
+    """
+    Look up tenant_id from tenant_hash using S3 mappings.
+    Caches results in memory for Lambda lifetime.
+
+    Returns dict with tenant_id, tenant_hash, host, etc.
+    Returns None if mapping not found.
+    """
+    global _tenant_mapping_cache
+
+    # Check cache first
+    if tenant_hash in _tenant_mapping_cache:
+        return _tenant_mapping_cache[tenant_hash]
+
+    # Fetch from S3
+    try:
+        response = s3.get_object(
+            Bucket=MAPPINGS_BUCKET,
+            Key=f'mappings/{tenant_hash}.json'
+        )
+        mapping = json.loads(response['Body'].read().decode('utf-8'))
+
+        # Cache it
+        _tenant_mapping_cache[tenant_hash] = mapping
+        logger.info(f"Loaded mapping: {tenant_hash} → {mapping.get('tenant_id')}")
+
+        return mapping
+
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchKey':
+            logger.warning(f"No mapping found for tenant_hash: {tenant_hash}")
+            # Cache the miss to avoid repeated lookups
+            _tenant_mapping_cache[tenant_hash] = None
+            return None
+        else:
+            logger.error(f"Error fetching mapping for {tenant_hash}: {e}")
+            raise
 
 
 def lambda_handler(event, context):
@@ -67,6 +109,9 @@ def lambda_handler(event, context):
     processed_count = 0
     error_count = 0
 
+    # Collect all events for batch write
+    events_to_write = []
+
     for record in event.get('Records', []):
         try:
             # Parse SQS message body
@@ -76,11 +121,15 @@ def lambda_handler(event, context):
             if body.get('batch'):
                 events = body.get('events', [])
                 for evt in events:
-                    process_single_event(evt)
-                    processed_count += 1
+                    enriched = enrich_event(evt)
+                    if enriched:
+                        events_to_write.append(enriched)
+                        processed_count += 1
             else:
-                process_single_event(body)
-                processed_count += 1
+                enriched = enrich_event(body)
+                if enriched:
+                    events_to_write.append(enriched)
+                    processed_count += 1
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in SQS message: {e}")
@@ -90,6 +139,10 @@ def lambda_handler(event, context):
             error_count += 1
             # Re-raise to trigger DLQ after retries
             raise
+
+    # Write all events to S3
+    if events_to_write:
+        write_events_to_s3(events_to_write)
 
     logger.info(f"Processed: {processed_count}, Errors: {error_count}")
 
@@ -102,15 +155,11 @@ def lambda_handler(event, context):
     }
 
 
-def process_single_event(event_data):
+def enrich_event(event_data):
     """
-    Process a single analytics event.
-
-    Steps:
-    1. Validate schema version
-    2. Enrich with server timestamp
-    3. Write to DynamoDB
-    4. If session end, generate summary
+    Enrich event with server-side metadata.
+    Decodes tenant_hash to tenant_id.
+    Returns None if event is invalid.
     """
     # Validate schema version
     schema_version = event_data.get('schema_version', '1.0')
@@ -119,202 +168,129 @@ def process_single_event(event_data):
 
     # Extract required fields
     session_id = event_data.get('session_id')
-    tenant_id = event_data.get('tenant_id')
-    step_number = event_data.get('step_number', 0)
+    tenant_hash = event_data.get('tenant_id')  # Frontend sends hash as "tenant_id"
     client_timestamp = event_data.get('timestamp')
     event_info = event_data.get('event', {})
     event_type = event_info.get('type', 'UNKNOWN')
-    payload = event_info.get('payload', {})
 
     if not session_id:
         logger.error("Missing session_id, skipping event")
-        return
+        return None
+
+    if not tenant_hash:
+        logger.error("Missing tenant_id (hash), skipping event")
+        return None
+
+    # Decode tenant_hash → tenant_id
+    mapping = get_tenant_mapping(tenant_hash)
+    if mapping:
+        tenant_id = mapping.get('tenant_id', tenant_hash)
+    else:
+        # Fallback: use hash as ID if mapping not found
+        tenant_id = tenant_hash
+        logger.warning(f"Using tenant_hash as tenant_id (no mapping): {tenant_hash}")
 
     # Generate server timestamp
     server_timestamp = datetime.utcnow().isoformat() + 'Z'
-    timestamp_ms = int(time.time() * 1000)
 
-    # Calculate TTL (7 days for events)
-    ttl = int(time.time()) + (EVENTS_TTL_DAYS * 24 * 60 * 60)
-
-    # Build DynamoDB item
-    item = {
-        'PK': f'SESSION#{session_id}',
-        'SK': f'STEP#{step_number:06d}#{timestamp_ms}',
+    # Build enriched event (flat structure for Athena)
+    enriched = {
+        'event_id': str(uuid.uuid4()),
+        'schema_version': schema_version,
         'session_id': session_id,
-        'tenant_id': tenant_id or 'unknown',
-        'step_number': step_number,
+        'tenant_id': tenant_id,        # Decoded tenant ID (e.g., "FOS402334")
+        'tenant_hash': tenant_hash,    # Original hash (e.g., "fo85e6a06dcdf4")
+        'step_number': event_data.get('step_number', 0),
         'event_type': event_type,
-        'payload': convert_floats_to_decimal(payload),
+        'event_payload': event_info.get('payload', {}),
         'client_timestamp': client_timestamp,
         'server_timestamp': server_timestamp,
-        'schema_version': schema_version,
-        'ttl': ttl
+        'environment': ENVIRONMENT
     }
 
     # Add optional fields
     if event_data.get('ga_client_id'):
-        item['ga_client_id'] = event_data['ga_client_id']
+        enriched['ga_client_id'] = event_data['ga_client_id']
 
     if event_data.get('attribution'):
-        item['attribution'] = convert_floats_to_decimal(event_data['attribution'])
+        enriched['attribution'] = event_data['attribution']
 
-    # Write to DynamoDB
-    try:
-        events_table.put_item(Item=item)
-        logger.info(f"Stored event: {session_id}/{event_type}/step_{step_number}")
-    except ClientError as e:
-        logger.error(f"DynamoDB put_item error: {e}")
-        raise
-
-    # Check if this is a session end event
-    if event_type in SESSION_END_EVENTS:
-        generate_session_summary(session_id, tenant_id)
+    return enriched
 
 
-def generate_session_summary(session_id, tenant_id):
+def write_events_to_s3(events):
     """
-    Generate a session summary when the session ends.
+    Write events to S3 with partitioned paths for Athena.
 
-    Queries all events for the session and computes:
-    - Duration
-    - Message count
-    - Outcome (form_completed, left_satisfied, abandoned, etc.)
-    - Topics visited (branch_ids)
+    Path structure:
+    s3://{bucket}/analytics/tenant_id={tenant}/year={Y}/month={M}/day={D}/{batch_id}.json
+
+    Each file contains newline-delimited JSON (NDJSON) for efficient Athena parsing.
     """
-    logger.info(f"Generating summary for session: {session_id}")
+    # Group events by partition (tenant_id + date)
+    partitions = {}
 
-    try:
-        # Query all events for this session
-        response = events_table.query(
-            KeyConditionExpression='PK = :pk',
-            ExpressionAttributeValues={':pk': f'SESSION#{session_id}'},
-            ScanIndexForward=True  # Oldest first
+    for event in events:
+        tenant_id = event['tenant_id']
+
+        # Parse timestamp for partitioning
+        ts = event.get('client_timestamp') or event.get('server_timestamp')
+        if ts:
+            try:
+                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+            except ValueError:
+                dt = datetime.utcnow()
+        else:
+            dt = datetime.utcnow()
+
+        # Create partition key
+        partition_key = (
+            tenant_id,
+            dt.year,
+            dt.month,
+            dt.day
         )
 
-        events = response.get('Items', [])
+        if partition_key not in partitions:
+            partitions[partition_key] = []
+        partitions[partition_key].append(event)
 
-        if not events:
-            logger.warning(f"No events found for session: {session_id}")
-            return
+    # Write each partition
+    for (tenant_id, year, month, day), partition_events in partitions.items():
+        # Generate unique batch ID
+        batch_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
 
-        # Compute summary metrics
-        first_event = events[0]
-        last_event = events[-1]
+        # Build S3 key with Hive-style partitioning
+        s3_key = (
+            f"analytics/"
+            f"tenant_id={tenant_id}/"
+            f"year={year}/"
+            f"month={month:02d}/"
+            f"day={day:02d}/"
+            f"{batch_id}.json"
+        )
 
-        # Parse timestamps
-        start_time = parse_timestamp(first_event.get('client_timestamp') or first_event.get('server_timestamp'))
-        end_time = parse_timestamp(last_event.get('client_timestamp') or last_event.get('server_timestamp'))
+        # Create NDJSON content (newline-delimited JSON)
+        ndjson_content = '\n'.join(json.dumps(e) for e in partition_events)
 
-        # Calculate duration
-        duration_seconds = 0
-        if start_time and end_time:
-            duration_seconds = int((end_time - start_time).total_seconds())
-
-        # Count messages and determine outcome
-        message_count = 0
-        form_started = False
-        form_completed = False
-        topics = set()
-        last_form_id = None
-
-        for evt in events:
-            event_type = evt.get('event_type', '')
-            payload = evt.get('payload', {})
-
-            if event_type == 'MESSAGE_SENT':
-                message_count += 1
-            elif event_type == 'MESSAGE_RECEIVED':
-                message_count += 1
-            elif event_type == 'ACTION_CHIP_CLICKED':
-                topic = payload.get('target_branch') or payload.get('chip_id')
-                if topic:
-                    topics.add(topic)
-            elif event_type == 'FORM_STARTED':
-                form_started = True
-                last_form_id = payload.get('form_id')
-            elif event_type == 'FORM_COMPLETED':
-                form_completed = True
-
-        # Determine outcome
-        outcome = 'abandoned'
-        if form_completed:
-            outcome = 'form_completed'
-        elif message_count > 2:
-            outcome = 'engaged'
-        elif message_count > 0:
-            outcome = 'minimal_engagement'
-
-        # Calculate TTL (90 days for summaries)
-        ttl = int(time.time()) + (SUMMARIES_TTL_DAYS * 24 * 60 * 60)
-
-        # Build summary item
-        summary = {
-            'PK': f'TENANT#{tenant_id}',
-            'SK': f'SESSION#{session_id}',
-            'session_id': session_id,
-            'tenant_id': tenant_id,
-            'started_at': first_event.get('client_timestamp') or first_event.get('server_timestamp'),
-            'ended_at': last_event.get('client_timestamp') or last_event.get('server_timestamp'),
-            'duration_seconds': duration_seconds,
-            'message_count': message_count,
-            'event_count': len(events),
-            'outcome': outcome,
-            'topics': list(topics),
-            'form_started': form_started,
-            'form_completed': form_completed,
-            'last_form_id': last_form_id,
-            'ttl': ttl
-        }
-
-        # Add attribution from first event if available
-        if first_event.get('attribution'):
-            summary['attribution'] = first_event['attribution']
-        if first_event.get('ga_client_id'):
-            summary['ga_client_id'] = first_event['ga_client_id']
-
-        # Write summary to DynamoDB
-        summaries_table.put_item(Item=summary)
-        logger.info(f"Created summary for session {session_id}: {outcome}, {message_count} messages, {duration_seconds}s")
-
-    except ClientError as e:
-        logger.error(f"Error generating session summary: {e}")
-        raise
-
-
-def parse_timestamp(ts_string):
-    """Parse ISO 8601 timestamp string to datetime."""
-    if not ts_string:
-        return None
-    try:
-        # Handle various ISO formats
-        ts_string = ts_string.replace('Z', '+00:00')
-        if '.' in ts_string:
-            return datetime.fromisoformat(ts_string.split('+')[0])
-        return datetime.fromisoformat(ts_string.split('+')[0])
-    except ValueError:
-        return None
-
-
-def convert_floats_to_decimal(obj):
-    """
-    Convert floats to Decimal for DynamoDB compatibility.
-    DynamoDB doesn't support float type, only Decimal.
-    """
-    if isinstance(obj, float):
-        return Decimal(str(obj))
-    elif isinstance(obj, dict):
-        return {k: convert_floats_to_decimal(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_floats_to_decimal(v) for v in obj]
-    return obj
+        try:
+            s3.put_object(
+                Bucket=ANALYTICS_BUCKET,
+                Key=s3_key,
+                Body=ndjson_content.encode('utf-8'),
+                ContentType='application/x-ndjson'
+            )
+            logger.info(f"✅ Wrote {len(partition_events)} events to s3://{ANALYTICS_BUCKET}/{s3_key}")
+        except ClientError as e:
+            logger.error(f"S3 put_object error: {e}")
+            raise
 
 
 # Direct API handler (for non-SQS invocations)
 def api_handler(event, context):
     """
     Handle direct API Gateway invocations.
-    Accepts POST with event data and writes directly to DynamoDB.
+    Accepts POST with event data and writes directly to S3.
 
     This is used when:
     - Full-page mode sends events directly
@@ -326,35 +302,35 @@ def api_handler(event, context):
         if isinstance(body, str):
             body = json.loads(body)
 
+        events_to_write = []
+
         # Handle batch or single event
         if body.get('batch'):
             events = body.get('events', [])
             for evt in events:
-                process_single_event(evt)
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({
-                    'status': 'success',
-                    'processed': len(events)
-                })
-            }
+                enriched = enrich_event(evt)
+                if enriched:
+                    events_to_write.append(enriched)
         else:
-            process_single_event(body)
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({
-                    'status': 'success',
-                    'processed': 1
-                })
-            }
+            enriched = enrich_event(body)
+            if enriched:
+                events_to_write.append(enriched)
+
+        # Write to S3
+        if events_to_write:
+            write_events_to_s3(events_to_write)
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'status': 'success',
+                'processed': len(events_to_write)
+            })
+        }
 
     except Exception as e:
         logger.error(f"API handler error: {e}")
