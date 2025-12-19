@@ -73,6 +73,7 @@
 const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { BedrockAgentRuntimeClient, RetrieveCommand } = require('@aws-sdk/client-bedrock-agent-runtime');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { SQSClient, SendMessageCommand, SendMessageBatchCommand } = require('@aws-sdk/client-sqs');
 const crypto = require('crypto');
 const { enhanceResponse } = require('./response_enhancer');
 const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
@@ -116,6 +117,10 @@ if (streamifyResponse) {
 const bedrock = new BedrockRuntimeClient({ region: 'us-east-1' });
 const bedrockAgent = new BedrockAgentRuntimeClient({ region: 'us-east-1' });
 const s3 = new S3Client({ region: 'us-east-1' });
+const sqs = new SQSClient({ region: 'us-east-1' });
+
+// Analytics SQS queue URL
+const ANALYTICS_QUEUE_URL = process.env.ANALYTICS_QUEUE_URL || 'https://sqs.us-east-1.amazonaws.com/614056832592/picasso-analytics-events';
 
 // In-memory cache
 const KB_CACHE = {};
@@ -1295,6 +1300,112 @@ ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
 }
 
 /**
+ * Analytics event handler - receives events from widget and sends to SQS
+ * Supports both single events and batched events for efficiency
+ *
+ * Request format:
+ * Single event: { schema_version, session_id, tenant_id, timestamp, step_number, event: { type, payload } }
+ * Batch: { batch: true, events: [...] }
+ */
+async function handleAnalyticsEvent(event) {
+  console.log('📊 Analytics event handler invoked');
+
+  try {
+    // Parse request body
+    const body = event.body ? JSON.parse(event.body) : event;
+
+    // Handle batch events
+    if (body.batch && Array.isArray(body.events)) {
+      const events = body.events;
+      console.log(`📊 Processing batch of ${events.length} analytics events`);
+
+      if (events.length === 0) {
+        return {
+          statusCode: 200,
+          headers: {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+          },
+          body: JSON.stringify({ status: 'success', processed: 0 })
+        };
+      }
+
+      // For batches up to 10, use SQS batch send
+      if (events.length <= 10) {
+        const entries = events.map((evt, idx) => ({
+          Id: `msg-${idx}`,
+          MessageBody: JSON.stringify(evt)
+        }));
+
+        await sqs.send(new SendMessageBatchCommand({
+          QueueUrl: ANALYTICS_QUEUE_URL,
+          Entries: entries
+        }));
+
+        console.log(`✅ Sent ${events.length} events to SQS (batch)`);
+      } else {
+        // For larger batches, send as single message with batch flag
+        await sqs.send(new SendMessageCommand({
+          QueueUrl: ANALYTICS_QUEUE_URL,
+          MessageBody: JSON.stringify({ batch: true, events })
+        }));
+
+        console.log(`✅ Sent ${events.length} events to SQS (single batch message)`);
+      }
+
+      return {
+        statusCode: 200,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify({ status: 'success', processed: events.length })
+      };
+    }
+
+    // Handle single event
+    if (!body.session_id || !body.event) {
+      return {
+        statusCode: 400,
+        headers: {
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*'
+        },
+        body: JSON.stringify({ error: 'Missing required fields: session_id, event' })
+      };
+    }
+
+    // Send single event to SQS
+    await sqs.send(new SendMessageCommand({
+      QueueUrl: ANALYTICS_QUEUE_URL,
+      MessageBody: JSON.stringify(body)
+    }));
+
+    console.log(`✅ Sent single event to SQS: ${body.event.type}`);
+
+    return {
+      statusCode: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      },
+      body: JSON.stringify({ status: 'success', processed: 1 })
+    };
+
+  } catch (error) {
+    console.error('❌ Analytics handler error:', error);
+    return {
+      statusCode: 500,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      },
+      body: JSON.stringify({ error: error.message })
+    };
+  }
+}
+
+/**
  * Preview prompt handler - returns the constructed prompt without calling Bedrock
  * This allows the Config Builder UI to preview how prompts will be built
  */
@@ -1396,7 +1507,18 @@ const streamingHandler = async (event, responseStream, context) => {
     responseStream.end();
     return;
   }
-  
+
+  // Route analytics requests (non-streaming) - write JSON response to stream
+  const queryParams = event.queryStringParameters || {};
+  const parsedBody = event.body ? JSON.parse(event.body) : event;
+  if (queryParams.action === 'analytics' || parsedBody.action === 'analytics') {
+    console.log('📊 Routing to analytics handler (via streaming handler)');
+    const result = await handleAnalyticsEvent(event);
+    responseStream.write(JSON.stringify(JSON.parse(result.body)));
+    responseStream.end();
+    return;
+  }
+
   // Track if stream has ended to prevent write-after-end errors
   let streamEnded = false;
   
@@ -1713,6 +1835,12 @@ const bufferedHandler = async (event, context) => {
   if (queryParams.action === 'preview' || body.action === 'preview') {
     console.log('🔍 Routing to preview handler');
     return await handlePromptPreview(event);
+  }
+
+  // Route to analytics handler
+  if (queryParams.action === 'analytics' || body.action === 'analytics') {
+    console.log('📊 Routing to analytics handler');
+    return await handleAnalyticsEvent(event);
   }
 
   console.log('📡 Using buffered SSE handler for streaming');
