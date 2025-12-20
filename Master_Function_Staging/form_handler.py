@@ -30,6 +30,79 @@ SMS_USAGE_TABLE = 'picasso_sms_usage'
 AUDIT_TABLE = 'picasso_audit_logs'
 
 
+def normalize_label(label: str) -> str:
+    """
+    Normalize a label to snake_case
+    "Caregiver's Phone Number" -> "caregivers_phone_number"
+    """
+    import re
+    if not label:
+        return ''
+    result = label.lower()
+    result = re.sub(r"[''']", '', result)          # Remove apostrophes
+    result = re.sub(r'[^a-z0-9]+', '_', result)    # Replace non-alphanumeric with underscore
+    result = re.sub(r'^_+|_+$', '', result)        # Trim leading/trailing underscores
+    result = re.sub(r'_+', '_', result)            # Collapse multiple underscores
+    return result
+
+
+def transform_form_data_to_labels(form_data: Dict[str, Any], form_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Transform form data field IDs to human-readable labels
+    Converts keys like "field_1761666576305.first_name" to "first_name"
+
+    Args:
+        form_data: Raw form responses with field IDs as keys
+        form_config: Form configuration with field definitions
+
+    Returns:
+        Transformed form data with human-readable keys
+    """
+    if not form_data or not form_config.get('fields'):
+        return form_data or {}
+
+    transformed = {}
+    fields = form_config.get('fields', [])
+
+    # Build a lookup map for field IDs to labels
+    field_map = {}
+
+    for field in fields:
+        field_id = field.get('id', '')
+        # Normalize label to snake_case
+        normalized_label = normalize_label(field.get('label', ''))
+
+        # For composite fields with subfields (name, address)
+        subfields = field.get('subfields', [])
+        if subfields:
+            for subfield in subfields:
+                # Subfield ID format: "field_123.first_name"
+                subfield_key = subfield.get('id', '')
+                # Use just the subfield label (e.g., "first_name", "last_name")
+                subfield_label = normalize_label(subfield.get('label', ''))
+                field_map[subfield_key] = subfield_label
+        else:
+            # Simple field - use the field's label
+            field_map[field_id] = normalized_label
+
+    # Transform the form data keys
+    for key, value in form_data.items():
+        if key in field_map:
+            # Use the mapped label
+            transformed[field_map[key]] = value
+        else:
+            # Fallback: try to extract a readable name from the key
+            # e.g., "field_123.first_name" -> "first_name"
+            parts = key.split('.')
+            if len(parts) > 1:
+                transformed[parts[-1]] = value
+            else:
+                # Keep original key if no mapping found
+                transformed[key] = value
+
+    return transformed
+
+
 class FormHandler:
     """Handles conversational form submissions and notifications"""
 
@@ -338,7 +411,14 @@ class FormHandler:
 
     def _send_bubble_webhook(self, form_type: str, responses: Dict[str, Any],
                             submission_id: str, session_id: str, conversation_id: str):
-        """Send form submission to Bubble via Workflow API with pre-extracted fields"""
+        """Send form submission to Bubble via Workflow API
+
+        Uses a standardized schema for multi-tenant SaaS scalability:
+        - Fixed metadata fields at top level (11 fields)
+        - form_data as JSON string for dynamic form fields
+
+        Bubble initializes once with these fields, then parses form_data JSON.
+        """
         import urllib.request
         import urllib.error
         import os
@@ -358,38 +438,33 @@ class FormHandler:
             logger.debug("Bubble webhook URL not configured, skipping")
             return
 
-        # Extract common fields from responses
-        # These will be available directly in Bubble without JSON parsing
-        applicant_email = responses.get('email', '')
-        applicant_first_name = responses.get('first_name', '')
-        applicant_last_name = responses.get('last_name', '')
-        applicant_phone = responses.get('phone', '')
-        program_interest = responses.get('program_interest', '')
-        comments = responses.get('comments', '')
+        # Get form-specific configuration
+        forms_config = self.tenant_config.get('conversational_forms', {})
+        form_config = forms_config.get(form_type, {})
 
-        # Build full name
-        applicant_name = f"{applicant_first_name} {applicant_last_name}".strip()
-
-        # Build payload with structured fields
+        # Build payload with standardized schema for multi-tenant scalability
+        # Bubble initializes once with these 11 fields, then parses form_data JSON
         payload = {
+            # Submission metadata
             'submission_id': submission_id,
-            'tenant_id': self.tenant_id,
-            'form_type': form_type,
             'timestamp': datetime.now(timezone.utc).isoformat(),
+
+            # Tenant metadata (from config root)
+            'tenant_id': self.tenant_id,
+            'tenant_hash': self.tenant_hash or '',
+            'organization_name': self.tenant_config.get('chat_title') or self.tenant_config.get('organization_name') or '',
+
+            # Form metadata (from form definition)
+            'form_id': form_type,
+            'form_title': form_config.get('title') or form_type,
+            'program_id': form_config.get('program') or '',
+
+            # Session tracking
             'session_id': session_id,
             'conversation_id': conversation_id,
 
-            # Pre-extracted fields for easy Bubble mapping
-            'applicant_email': applicant_email,
-            'applicant_first_name': applicant_first_name,
-            'applicant_last_name': applicant_last_name,
-            'applicant_name': applicant_name,
-            'applicant_phone': applicant_phone,
-            'program_interest': program_interest,
-            'comments': comments,
-
-            # Full JSON for reference/archival
-            'responses_json': json.dumps(responses)
+            # All form responses as JSON string with human-readable labels
+            'form_data': json.dumps(transform_form_data_to_labels(responses, form_config))
         }
 
         headers = {

@@ -270,15 +270,17 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   const results = [];
 
   // Bubble integration (always attempted if configured)
-  // Uses top-level properties for easy Bubble workflow mapping
+  // Sends form_data as JSON string for multi-tenant scalability
   const bubbleConfig = config.bubble_integration || {};
+  const formConfig = config.conversational_forms?.[formId] || {};
   if (bubbleConfig.webhook_url || process.env.BUBBLE_WEBHOOK_URL) {
     try {
       const bubbleResult = await sendToBubble(
         bubbleConfig,
         formId,
         formData,
-        config.tenant_id || 'unknown',
+        config,      // Full tenant config for metadata
+        formConfig,  // Form config for title/program
         submissionId,
         sessionId,
         conversationId
@@ -290,8 +292,7 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
     }
   }
 
-  // Check form-specific fulfillment configuration
-  const formConfig = config.conversational_forms?.[formId] || {};
+  // Check form-specific fulfillment configuration (formConfig already defined above)
   const fulfillment = formConfig.fulfillment || config.default_fulfillment || {};
 
   // Validate fulfillment configuration
@@ -626,18 +627,95 @@ async function sendToWebhook(webhookUrl, formId, formData, priority = 'normal', 
 }
 
 /**
+ * Transform form data field IDs to human-readable labels
+ * Converts keys like "field_1761666576305.first_name" to "first_name"
+ *
+ * @param {Object} formData - Raw form responses with field IDs as keys
+ * @param {Object} formConfig - Form configuration with field definitions
+ * @returns {Object} Transformed form data with human-readable keys
+ */
+function transformFormDataToLabels(formData, formConfig) {
+  if (!formData || !formConfig?.fields) {
+    return formData || {};
+  }
+
+  const transformed = {};
+  const fields = formConfig.fields || [];
+
+  // Build a lookup map for field IDs to labels
+  const fieldMap = {};
+
+  for (const field of fields) {
+    const fieldId = field.id;
+    // Normalize label to snake_case
+    const normalizedLabel = normalizeLabel(field.label);
+
+    // For composite fields with subfields (name, address)
+    if (field.subfields && Array.isArray(field.subfields)) {
+      for (const subfield of field.subfields) {
+        // Subfield ID format: "field_123.first_name"
+        const subfieldKey = subfield.id;
+        // Use just the subfield label (e.g., "first_name", "last_name")
+        const subfieldLabel = normalizeLabel(subfield.label);
+        fieldMap[subfieldKey] = subfieldLabel;
+      }
+    } else {
+      // Simple field - use the field's label
+      fieldMap[fieldId] = normalizedLabel;
+    }
+  }
+
+  // Transform the form data keys
+  for (const [key, value] of Object.entries(formData)) {
+    if (fieldMap[key]) {
+      // Use the mapped label
+      transformed[fieldMap[key]] = value;
+    } else {
+      // Fallback: try to extract a readable name from the key
+      // e.g., "field_123.first_name" -> "first_name"
+      const parts = key.split('.');
+      if (parts.length > 1) {
+        transformed[parts[parts.length - 1]] = value;
+      } else {
+        // Keep original key if no mapping found
+        transformed[key] = value;
+      }
+    }
+  }
+
+  return transformed;
+}
+
+/**
+ * Normalize a label to snake_case
+ * "Caregiver's Phone Number" -> "caregivers_phone_number"
+ */
+function normalizeLabel(label) {
+  if (!label) return '';
+  return label
+    .toLowerCase()
+    .replace(/['']/g, '')           // Remove apostrophes
+    .replace(/[^a-z0-9]+/g, '_')    // Replace non-alphanumeric with underscore
+    .replace(/^_+|_+$/g, '')        // Trim leading/trailing underscores
+    .replace(/_+/g, '_');           // Collapse multiple underscores
+}
+
+/**
  * Send form data to Bubble via Workflow API
- * Uses top-level properties for easy field mapping in Bubble
+ * Uses a standardized schema for multi-tenant SaaS scalability:
+ * - Fixed metadata fields at top level (11 fields)
+ * - form_data as JSON string with human-readable field labels
  *
  * @param {Object} bubbleConfig - Bubble integration config { webhook_url, api_key }
  * @param {string} formId - Form identifier
  * @param {Object} formData - Collected form responses
- * @param {string} tenantId - Tenant identifier
+ * @param {Object} tenantConfig - Full tenant configuration
+ * @param {Object} formConfig - Form-specific configuration
  * @param {string} submissionId - Submission ID
  * @param {string} sessionId - Session ID (optional)
  * @param {string} conversationId - Conversation ID (optional)
  */
-async function sendToBubble(bubbleConfig, formId, formData, tenantId, submissionId, sessionId = null, conversationId = null) {
+async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formConfig, submissionId, sessionId = null, conversationId = null) {
   const https = require('https');
 
   const webhookUrl = bubbleConfig.webhook_url || process.env.BUBBLE_WEBHOOK_URL;
@@ -650,20 +728,29 @@ async function sendToBubble(bubbleConfig, formId, formData, tenantId, submission
 
   const url = new URL(webhookUrl);
 
-  // Build payload with TOP-LEVEL PROPERTIES
-  // All form fields are spread directly into the payload for easy Bubble mapping
+  // Build payload with standardized schema for multi-tenant scalability
+  // Bubble initializes once with these 11 fields, then parses form_data JSON
   const payload = JSON.stringify({
-    // Metadata fields
+    // Submission metadata
     submission_id: submissionId,
-    tenant_id: tenantId,
-    form_type: formId,
     timestamp: new Date().toISOString(),
+
+    // Tenant metadata (from config root)
+    tenant_id: tenantConfig.tenant_id || 'unknown',
+    tenant_hash: tenantConfig.tenant_hash || '',
+    organization_name: tenantConfig.chat_title || tenantConfig.organization_name || '',
+
+    // Form metadata (from form definition)
+    form_id: formId,
+    form_title: formConfig.title || formId,
+    program_id: formConfig.program || '',
+
+    // Session tracking
     session_id: sessionId,
     conversation_id: conversationId,
 
-    // ALL form fields as top-level properties
-    // This allows Bubble to access any field directly without JSON parsing
-    ...formData
+    // All form responses as JSON string with human-readable labels
+    form_data: JSON.stringify(transformFormDataToLabels(formData, formConfig))
   });
 
   const headers = {
