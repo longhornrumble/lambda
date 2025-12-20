@@ -829,4 +829,337 @@ describe('Form Handler - Integration', () => {
       status: 'success'
     });
   });
+
+  it('should pass session_id and conversation_id through handleFormMode', async () => {
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+
+    const body = {
+      form_mode: true,
+      action: 'submit_form',
+      form_id: 'volunteer_apply',
+      form_data: mockFormData,
+      session_id: 'test-session-123',
+      conversation_id: 'test-conv-456'
+    };
+
+    const result = await handleFormMode(body, mockTenantConfig);
+
+    expect(result).toMatchObject({
+      type: 'form_complete',
+      status: 'success'
+    });
+  });
+});
+
+describe('Form Handler - Bubble Integration', () => {
+  let httpsRequestMock;
+
+  beforeEach(() => {
+    sesMock.reset();
+    snsMock.reset();
+    dynamoMock.reset();
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+
+    // Mock HTTPS module for Bubble webhook
+    httpsRequestMock = {
+      on: jest.fn().mockReturnThis(),
+      write: jest.fn(),
+      end: jest.fn()
+    };
+
+    const https = require('https');
+    https.request = jest.fn((options, callback) => {
+      // Simulate successful response
+      const mockResponse = {
+        statusCode: 200,
+        on: jest.fn((event, handler) => {
+          if (event === 'data') {
+            // No data
+          }
+          if (event === 'end') {
+            setTimeout(handler, 0);
+          }
+        })
+      };
+      setTimeout(() => callback(mockResponse), 0);
+      return httpsRequestMock;
+    });
+  });
+
+  it('should send form data to Bubble when bubble_integration is configured', async () => {
+    const configWithBubble = {
+      ...mockTenantConfig,
+      bubble_integration: {
+        webhook_url: 'https://myapp.bubbleapps.io/api/1.1/wf/form_submit'
+      }
+    };
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    const result = await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+    expect(result.status).toBe('success');
+    expect(result.fulfillment).toContainEqual(
+      expect.objectContaining({ channel: 'bubble', status: 'sent' })
+    );
+  });
+
+  it('should send form data to Bubble with top-level properties', async () => {
+    const configWithBubble = {
+      ...mockTenantConfig,
+      bubble_integration: {
+        webhook_url: 'https://myapp.bubbleapps.io/api/1.1/wf/form_submit'
+      }
+    };
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+    // Verify the payload was written with top-level properties
+    expect(httpsRequestMock.write).toHaveBeenCalled();
+    const payload = JSON.parse(httpsRequestMock.write.mock.calls[0][0]);
+
+    // Check metadata fields
+    expect(payload.submission_id).toBeDefined();
+    expect(payload.tenant_id).toBe('TEST123');
+    expect(payload.form_type).toBe('volunteer_apply');
+    expect(payload.timestamp).toBeDefined();
+
+    // Check that form fields are TOP-LEVEL (not nested in data or responses_json)
+    expect(payload.first_name).toBe('John');
+    expect(payload.last_name).toBe('Doe');
+    expect(payload.email).toBe('john.doe@example.com');
+    expect(payload.phone).toBe('+1-555-123-4567');
+
+    // Ensure there's no nested data object
+    expect(payload.data).toBeUndefined();
+    expect(payload.responses_json).toBeUndefined();
+  });
+
+  it('should include session_id and conversation_id when provided', async () => {
+    const configWithBubble = {
+      ...mockTenantConfig,
+      bubble_integration: {
+        webhook_url: 'https://myapp.bubbleapps.io/api/1.1/wf/form_submit'
+      }
+    };
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    await submitForm('volunteer_apply', mockFormData, configWithBubble, 'session-123', 'conv-456');
+
+    const payload = JSON.parse(httpsRequestMock.write.mock.calls[0][0]);
+    expect(payload.session_id).toBe('session-123');
+    expect(payload.conversation_id).toBe('conv-456');
+  });
+
+  it('should include Authorization header when api_key is configured', async () => {
+    // Config with ONLY Bubble integration (no other webhooks to avoid confusion)
+    const configWithBubbleAuth = {
+      tenant_id: 'TEST123',
+      chat_title: 'Test Organization',
+      conversational_forms: {
+        volunteer_apply: {
+          form_id: 'volunteer_apply',
+          fulfillment: {
+            email_to: 'test@example.com'
+            // No webhook_url here to avoid multiple webhook calls
+          }
+        }
+      },
+      bubble_integration: {
+        webhook_url: 'https://myapp.bubbleapps.io/api/1.1/wf/form_submit',
+        api_key: 'test-api-key-12345'
+      }
+    };
+
+    const https = require('https');
+    let bubbleCallOptions;
+    https.request = jest.fn((options, callback) => {
+      // Capture the Bubble call (bubbleapps.io hostname)
+      if (options.hostname.includes('bubbleapps.io')) {
+        bubbleCallOptions = options;
+      }
+      const mockResponse = {
+        statusCode: 200,
+        on: jest.fn((event, handler) => {
+          if (event === 'end') setTimeout(handler, 0);
+        })
+      };
+      setTimeout(() => callback(mockResponse), 0);
+      return httpsRequestMock;
+    });
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+    dynamoMock.on(GetCommand).resolves({});
+
+    await submitForm('volunteer_apply', mockFormData, configWithBubbleAuth);
+
+    expect(bubbleCallOptions).toBeDefined();
+    expect(bubbleCallOptions.headers['Authorization']).toBe('Bearer test-api-key-12345');
+  });
+
+  it('should skip Bubble webhook when no webhook_url is configured', async () => {
+    // Config without bubble_integration
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+
+    expect(result.fulfillment).not.toContainEqual(
+      expect.objectContaining({ channel: 'bubble' })
+    );
+  });
+
+  it('should handle Bubble webhook errors gracefully without failing form submission', async () => {
+    const configWithBubble = {
+      ...mockTenantConfig,
+      bubble_integration: {
+        webhook_url: 'https://myapp.bubbleapps.io/api/1.1/wf/form_submit'
+      }
+    };
+
+    // Mock error response
+    const https = require('https');
+    https.request = jest.fn((options, callback) => {
+      const mockResponse = {
+        statusCode: 500,
+        on: jest.fn((event, handler) => {
+          if (event === 'data') handler('Internal Server Error');
+          if (event === 'end') setTimeout(handler, 0);
+        })
+      };
+      setTimeout(() => callback(mockResponse), 0);
+      return httpsRequestMock;
+    });
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    const result = await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+    // Form submission should still succeed
+    expect(result.status).toBe('success');
+    // Bubble fulfillment should show failed
+    expect(result.fulfillment).toContainEqual(
+      expect.objectContaining({ channel: 'bubble', status: 'failed' })
+    );
+  });
+
+  it('should handle Bubble webhook network errors gracefully', async () => {
+    const configWithBubble = {
+      ...mockTenantConfig,
+      bubble_integration: {
+        webhook_url: 'https://myapp.bubbleapps.io/api/1.1/wf/form_submit'
+      }
+    };
+
+    // Mock network error
+    const https = require('https');
+    https.request = jest.fn((options, callback) => {
+      const req = {
+        on: jest.fn((event, handler) => {
+          if (event === 'error') {
+            setTimeout(() => handler(new Error('ECONNREFUSED')), 0);
+          }
+          return req;
+        }),
+        write: jest.fn(),
+        end: jest.fn(),
+        destroy: jest.fn()
+      };
+      return req;
+    });
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    const result = await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+    // Form submission should still succeed
+    expect(result.status).toBe('success');
+  });
+
+  it('should send custom form fields as top-level properties', async () => {
+    const configWithBubble = {
+      ...mockTenantConfig,
+      bubble_integration: {
+        webhook_url: 'https://myapp.bubbleapps.io/api/1.1/wf/form_submit'
+      }
+    };
+
+    // Form data with custom fields specific to this form type
+    const customFormData = {
+      ...mockFormData,
+      availability: 'weekends',
+      has_vehicle: 'yes',
+      foster_experience: '3 years',
+      preferred_age_group: 'toddlers',
+      languages_spoken: 'English, Spanish'
+    };
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    await submitForm('volunteer_apply', customFormData, configWithBubble);
+
+    const payload = JSON.parse(httpsRequestMock.write.mock.calls[0][0]);
+
+    // All custom fields should be top-level
+    expect(payload.availability).toBe('weekends');
+    expect(payload.has_vehicle).toBe('yes');
+    expect(payload.foster_experience).toBe('3 years');
+    expect(payload.preferred_age_group).toBe('toddlers');
+    expect(payload.languages_spoken).toBe('English, Spanish');
+  });
+
+  it('should use environment variable BUBBLE_WEBHOOK_URL when config not set', async () => {
+    process.env.BUBBLE_WEBHOOK_URL = 'https://env-bubble.bubbleapps.io/api/1.1/wf/submit';
+
+    // Config WITHOUT bubble_integration in config (relies on env var)
+    const configWithoutBubble = {
+      tenant_id: 'TEST123',
+      chat_title: 'Test Organization',
+      conversational_forms: {
+        volunteer_apply: {
+          form_id: 'volunteer_apply',
+          fulfillment: {
+            email_to: 'test@example.com'
+            // No webhook_url here
+          }
+        }
+      }
+      // No bubble_integration here - should use env var
+    };
+
+    const https = require('https');
+    let bubbleCallOptions;
+    https.request = jest.fn((options, callback) => {
+      // Capture the Bubble call (env-bubble hostname)
+      if (options.hostname.includes('bubbleapps.io')) {
+        bubbleCallOptions = options;
+      }
+      const mockResponse = {
+        statusCode: 200,
+        on: jest.fn((event, handler) => {
+          if (event === 'end') setTimeout(handler, 0);
+        })
+      };
+      setTimeout(() => callback(mockResponse), 0);
+      return httpsRequestMock;
+    });
+
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+    dynamoMock.on(GetCommand).resolves({});
+
+    const result = await submitForm('volunteer_apply', mockFormData, configWithoutBubble);
+
+    expect(result.fulfillment).toContainEqual(
+      expect.objectContaining({ channel: 'bubble', status: 'sent' })
+    );
+    expect(bubbleCallOptions).toBeDefined();
+    expect(bubbleCallOptions.hostname).toBe('env-bubble.bubbleapps.io');
+
+    delete process.env.BUBBLE_WEBHOOK_URL;
+  });
 });

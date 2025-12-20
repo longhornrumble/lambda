@@ -42,7 +42,9 @@ async function handleFormMode(body, tenantConfig) {
     field_id,
     field_value,
     form_data,
-    action
+    action,
+    session_id,
+    conversation_id
   } = body;
 
   // Handle different form actions
@@ -51,7 +53,7 @@ async function handleFormMode(body, tenantConfig) {
   }
 
   if (action === 'submit_form') {
-    return await submitForm(form_id, form_data, tenantConfig);
+    return await submitForm(form_id, form_data, tenantConfig, session_id, conversation_id);
   }
 
   // Default validation response
@@ -129,9 +131,11 @@ async function validateFormField(fieldId, value, config) {
  * @param {string} formId - Form identifier
  * @param {Object} formData - Collected form data
  * @param {Object} config - Tenant configuration
+ * @param {string} sessionId - Session ID for tracking
+ * @param {string} conversationId - Conversation ID for tracking
  * @returns {Object} Submission result
  */
-async function submitForm(formId, formData, config) {
+async function submitForm(formId, formData, config, sessionId = null, conversationId = null) {
   console.log(`📨 Submitting form ${formId}:`, formData);
 
   try {
@@ -155,7 +159,7 @@ async function submitForm(formId, formData, config) {
     }
 
     // Route to appropriate fulfillment channel
-    const fulfillmentResult = await routeFulfillment(formId, formData, config, submissionId, priority);
+    const fulfillmentResult = await routeFulfillment(formId, formData, config, submissionId, priority, sessionId, conversationId);
 
     // Send confirmation email if configured (non-blocking)
     if (formData.email && config.send_confirmation_email !== false) {
@@ -262,8 +266,29 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
  * Route form to appropriate fulfillment channel
  * Ported from Master's form_handler.py:330-393
  */
-async function routeFulfillment(formId, formData, config, submissionId, priority = 'normal') {
+async function routeFulfillment(formId, formData, config, submissionId, priority = 'normal', sessionId = null, conversationId = null) {
   const results = [];
+
+  // Bubble integration (always attempted if configured)
+  // Uses top-level properties for easy Bubble workflow mapping
+  const bubbleConfig = config.bubble_integration || {};
+  if (bubbleConfig.webhook_url || process.env.BUBBLE_WEBHOOK_URL) {
+    try {
+      const bubbleResult = await sendToBubble(
+        bubbleConfig,
+        formId,
+        formData,
+        config.tenant_id || 'unknown',
+        submissionId,
+        sessionId,
+        conversationId
+      );
+      results.push({ channel: 'bubble', ...bubbleResult });
+    } catch (error) {
+      console.error('Bubble fulfillment failed:', error);
+      results.push({ channel: 'bubble', status: 'failed', error: error.message });
+    }
+  }
 
   // Check form-specific fulfillment configuration
   const formConfig = config.conversational_forms?.[formId] || {};
@@ -595,6 +620,102 @@ async function sendToWebhook(webhookUrl, formId, formData, priority = 'normal', 
     });
 
     req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+/**
+ * Send form data to Bubble via Workflow API
+ * Uses top-level properties for easy field mapping in Bubble
+ *
+ * @param {Object} bubbleConfig - Bubble integration config { webhook_url, api_key }
+ * @param {string} formId - Form identifier
+ * @param {Object} formData - Collected form responses
+ * @param {string} tenantId - Tenant identifier
+ * @param {string} submissionId - Submission ID
+ * @param {string} sessionId - Session ID (optional)
+ * @param {string} conversationId - Conversation ID (optional)
+ */
+async function sendToBubble(bubbleConfig, formId, formData, tenantId, submissionId, sessionId = null, conversationId = null) {
+  const https = require('https');
+
+  const webhookUrl = bubbleConfig.webhook_url || process.env.BUBBLE_WEBHOOK_URL;
+  const apiKey = bubbleConfig.api_key || process.env.BUBBLE_API_KEY;
+
+  if (!webhookUrl) {
+    console.log('⚠️ Bubble webhook URL not configured, skipping');
+    return { status: 'skipped', reason: 'no_webhook_url' };
+  }
+
+  const url = new URL(webhookUrl);
+
+  // Build payload with TOP-LEVEL PROPERTIES
+  // All form fields are spread directly into the payload for easy Bubble mapping
+  const payload = JSON.stringify({
+    // Metadata fields
+    submission_id: submissionId,
+    tenant_id: tenantId,
+    form_type: formId,
+    timestamp: new Date().toISOString(),
+    session_id: sessionId,
+    conversation_id: conversationId,
+
+    // ALL form fields as top-level properties
+    // This allows Bubble to access any field directly without JSON parsing
+    ...formData
+  });
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload)
+  };
+
+  // Add API key if configured
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: headers,
+      timeout: 10000 // 10 second timeout
+    };
+
+    const req = https.request(options, (res) => {
+      let responseData = '';
+
+      res.on('data', (chunk) => {
+        responseData += chunk;
+      });
+
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          console.log(`✅ Bubble webhook success: ${res.statusCode}`);
+          resolve({ status: 'sent', statusCode: res.statusCode });
+        } else {
+          console.error(`❌ Bubble webhook error: ${res.statusCode} - ${responseData}`);
+          resolve({ status: 'failed', statusCode: res.statusCode, error: responseData });
+        }
+      });
+    });
+
+    req.on('error', (error) => {
+      console.error(`❌ Bubble webhook request error: ${error.message}`);
+      // Don't reject - we don't want to fail the form submission
+      resolve({ status: 'failed', error: error.message });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      console.error('❌ Bubble webhook timeout');
+      resolve({ status: 'failed', error: 'timeout' });
+    });
+
     req.write(payload);
     req.end();
   });
