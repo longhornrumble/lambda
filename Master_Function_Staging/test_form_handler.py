@@ -1178,5 +1178,406 @@ class TestBubbleIntegration(unittest.TestCase):
         self.assertEqual(payload['conversation_id'], 'conv_xyz789')
 
 
+# ============================================================================
+# EMAIL DETAILS BUILDER TESTS
+# ============================================================================
+
+# Import the email details builder functions
+from form_handler import (
+    humanize_key,
+    format_value,
+    get_field_priority,
+    build_email_details_text,
+    extract_contact,
+    get_email_subject_suffix
+)
+
+
+class TestHumanizeKey(unittest.TestCase):
+    """Test cases for humanize_key function"""
+
+    def test_snake_case_to_title_case(self):
+        """Test converting snake_case keys to Title Case"""
+        self.assertEqual(humanize_key('first_name'), 'First Name')
+        self.assertEqual(humanize_key('last_name'), 'Last Name')
+        self.assertEqual(humanize_key('email_address'), 'Email Address')
+
+    def test_preserves_acronyms(self):
+        """Test that common acronyms are preserved in uppercase"""
+        self.assertEqual(humanize_key('zip_code'), 'ZIP Code')
+        self.assertEqual(humanize_key('user_id'), 'User ID')
+        self.assertEqual(humanize_key('website_url'), 'Website URL')
+        self.assertEqual(humanize_key('dob'), 'DOB')
+        self.assertEqual(humanize_key('ssn'), 'SSN')
+
+    def test_camel_case_handling(self):
+        """Test handling camelCase keys"""
+        self.assertEqual(humanize_key('firstName'), 'First Name')
+        self.assertEqual(humanize_key('zipCode'), 'ZIP Code')
+
+    def test_empty_key(self):
+        """Test handling empty keys"""
+        self.assertEqual(humanize_key(''), '')
+        self.assertEqual(humanize_key(None), '')
+
+
+class TestFormatValue(unittest.TestCase):
+    """Test cases for format_value function"""
+
+    def test_omits_null_and_empty(self):
+        """Test that null and empty values return None"""
+        self.assertIsNone(format_value(None))
+        self.assertIsNone(format_value(''))
+
+    def test_boolean_formatting(self):
+        """Test that booleans are formatted as Yes/No"""
+        self.assertEqual(format_value(True), 'Yes')
+        self.assertEqual(format_value(False), 'No')
+
+    def test_list_formatting(self):
+        """Test that lists are joined with comma"""
+        self.assertEqual(format_value(['English', 'Spanish', 'French']), 'English, Spanish, French')
+        self.assertEqual(format_value(['Single']), 'Single')
+        self.assertIsNone(format_value([]))
+        self.assertIsNone(format_value([None, '', None]))
+
+    def test_dict_formatting(self):
+        """Test that dicts are stringified"""
+        result = format_value({'street': '123 Main', 'city': 'Austin'})
+        self.assertIn('"street"', result)
+        self.assertIn('"city"', result)
+
+    def test_string_truncation(self):
+        """Test that long strings are truncated"""
+        long_value = 'x' * 2500
+        result = format_value(long_value)
+        self.assertEqual(len(result), 2003)  # 2000 + '...'
+        self.assertTrue(result.endswith('...'))
+
+    def test_number_formatting(self):
+        """Test that numbers are converted to strings"""
+        self.assertEqual(format_value(123), '123')
+        self.assertEqual(format_value(123.45), '123.45')
+
+
+class TestGetFieldPriority(unittest.TestCase):
+    """Test cases for get_field_priority function"""
+
+    def test_name_fields_highest_priority(self):
+        """Test that name fields have highest priority"""
+        self.assertEqual(get_field_priority('first_name'), 0)
+        self.assertEqual(get_field_priority('last_name'), 1)
+        self.assertEqual(get_field_priority('name'), 2)
+
+    def test_email_fields_second_priority(self):
+        """Test that email fields come after name"""
+        self.assertEqual(get_field_priority('email'), 10)
+        self.assertEqual(get_field_priority('email_address'), 10)
+
+    def test_phone_fields_third_priority(self):
+        """Test that phone fields come after email"""
+        self.assertEqual(get_field_priority('phone'), 20)
+        self.assertEqual(get_field_priority('mobile'), 20)
+        self.assertEqual(get_field_priority('cell_phone'), 20)
+
+    def test_address_fields_fourth_priority(self):
+        """Test that address fields come after phone"""
+        self.assertEqual(get_field_priority('street_address'), 30)
+        self.assertEqual(get_field_priority('city'), 32)
+        self.assertEqual(get_field_priority('state'), 33)
+        self.assertEqual(get_field_priority('zip_code'), 34)
+
+    def test_other_fields_lower_priority(self):
+        """Test that other fields have lowest priority"""
+        self.assertEqual(get_field_priority('comments'), 100)
+        self.assertEqual(get_field_priority('availability'), 100)
+
+
+class TestBuildEmailDetailsText(unittest.TestCase):
+    """Test cases for build_email_details_text function"""
+
+    def test_formats_fields_as_label_value(self):
+        """Test that fields are formatted as 'Label: Value' lines"""
+        form_data = json.dumps({
+            'first_name': 'Jane',
+            'last_name': 'Smith',
+            'email': 'jane@example.com'
+        })
+        result = build_email_details_text(form_data)
+
+        self.assertIn('First Name: Jane', result)
+        self.assertIn('Last Name: Smith', result)
+        self.assertIn('Email: jane@example.com', result)
+
+    def test_orders_contact_fields_first(self):
+        """Test that contact fields appear first in output"""
+        form_data = json.dumps({
+            'comments': 'Some comments',
+            'zip_code': '78701',
+            'first_name': 'Jane',
+            'email': 'jane@example.com',
+            'city': 'Austin',
+            'last_name': 'Smith',
+            'phone': '+15551234567'
+        })
+        result = build_email_details_text(form_data)
+        lines = result.split('\n')
+
+        # Find indices
+        first_name_idx = next(i for i, l in enumerate(lines) if l.startswith('First Name:'))
+        email_idx = next(i for i, l in enumerate(lines) if l.startswith('Email:'))
+        phone_idx = next(i for i, l in enumerate(lines) if l.startswith('Phone:'))
+        city_idx = next(i for i, l in enumerate(lines) if l.startswith('City:'))
+        comments_idx = next(i for i, l in enumerate(lines) if l.startswith('Comments:'))
+
+        # Verify order
+        self.assertLess(first_name_idx, email_idx)
+        self.assertLess(email_idx, phone_idx)
+        self.assertLess(phone_idx, city_idx)
+        self.assertLess(city_idx, comments_idx)
+
+    def test_omits_empty_values(self):
+        """Test that empty and null values are omitted"""
+        form_data = json.dumps({
+            'first_name': 'Jane',
+            'last_name': '',
+            'email': None,
+            'notes': 'Some notes'
+        })
+        result = build_email_details_text(form_data)
+
+        self.assertIn('First Name: Jane', result)
+        self.assertIn('Notes: Some notes', result)
+        self.assertNotIn('Last Name:', result)
+        self.assertNotIn('Email:', result)
+
+    def test_handles_invalid_json(self):
+        """Test graceful handling of invalid JSON"""
+        result = build_email_details_text('not valid json')
+        self.assertIn('Unable to parse form data', result)
+        self.assertIn('not valid json', result)
+
+    def test_handles_non_dict_json(self):
+        """Test handling of JSON that's not a dict"""
+        result = build_email_details_text(json.dumps(['array', 'data']))
+        self.assertIn('Unable to parse form data', result)
+
+    def test_boolean_values_formatted_as_yes_no(self):
+        """Test that boolean values show as Yes/No"""
+        form_data = json.dumps({
+            'first_name': 'Jane',
+            'has_children': True,
+            'has_vehicle': False
+        })
+        result = build_email_details_text(form_data)
+
+        self.assertIn('Has Children: Yes', result)
+        self.assertIn('Has Vehicle: No', result)
+
+
+class TestExtractContact(unittest.TestCase):
+    """Test cases for extract_contact function"""
+
+    def test_extracts_name_from_first_and_last(self):
+        """Test extracting name from first_name and last_name"""
+        form_data = {
+            'first_name': 'Jane',
+            'last_name': 'Smith',
+            'email': 'jane@example.com'
+        }
+        contact = extract_contact(form_data)
+        self.assertEqual(contact['name'], 'Jane Smith')
+
+    def test_extracts_email(self):
+        """Test extracting email from email field"""
+        form_data = {
+            'first_name': 'Jane',
+            'email': 'jane@example.com'
+        }
+        contact = extract_contact(form_data)
+        self.assertEqual(contact['email'], 'jane@example.com')
+
+    def test_extracts_phone(self):
+        """Test extracting phone from phone field"""
+        form_data = {
+            'first_name': 'Jane',
+            'phone': '+15551234567'
+        }
+        contact = extract_contact(form_data)
+        self.assertEqual(contact['phone'], '+15551234567')
+
+    def test_extracts_phone_from_mobile(self):
+        """Test extracting phone from mobile field"""
+        form_data = {
+            'first_name': 'Jane',
+            'mobile_number': '+15559876543'
+        }
+        contact = extract_contact(form_data)
+        self.assertEqual(contact['phone'], '+15559876543')
+
+    def test_returns_empty_dict_when_no_contact_fields(self):
+        """Test returning empty dict when no contact fields present"""
+        form_data = {
+            'comments': 'Just a comment',
+            'program': 'lovebox'
+        }
+        contact = extract_contact(form_data)
+        self.assertEqual(contact, {})
+
+    def test_handles_null_input(self):
+        """Test handling null input"""
+        self.assertEqual(extract_contact(None), {})
+        self.assertEqual(extract_contact({}), {})
+
+
+class TestGetEmailSubjectSuffix(unittest.TestCase):
+    """Test cases for get_email_subject_suffix function"""
+
+    def test_returns_full_name(self):
+        """Test returning full name when both names present"""
+        form_data = {
+            'first_name': 'Jane',
+            'last_name': 'Smith'
+        }
+        self.assertEqual(get_email_subject_suffix(form_data), 'Jane Smith')
+
+    def test_returns_first_name_only(self):
+        """Test returning first name when last name missing"""
+        form_data = {'first_name': 'Jane'}
+        self.assertEqual(get_email_subject_suffix(form_data), 'Jane')
+
+    def test_returns_default_when_no_name(self):
+        """Test returning default when no name fields present"""
+        form_data = {'email': 'anon@example.com'}
+        self.assertEqual(get_email_subject_suffix(form_data), 'New submission')
+
+
+class TestBubbleWebhookNewFields(unittest.TestCase):
+    """Test that Bubble webhook includes new email details fields"""
+
+    def setUp(self):
+        """Set up test fixtures"""
+        self.tenant_config = {
+            'tenant_id': 'test_tenant',
+            'tenant_hash': 'abc123',
+            'chat_title': 'Test Organization',
+            'features': {'conversational_forms': True},
+            'bubble_integration': {
+                'webhook_url': 'https://test.bubbleapps.io/api/1.1/wf/form_submit'
+            },
+            'conversational_forms': {
+                'volunteer_signup': {
+                    'title': 'Volunteer Application',
+                    'program': 'lovebox',
+                    'fields': [
+                        {'id': 'first_name', 'label': 'First Name'},
+                        {'id': 'last_name', 'label': 'Last Name'},
+                        {'id': 'email', 'label': 'Email'}
+                    ]
+                }
+            }
+        }
+
+        self.sample_responses = {
+            'first_name': 'Jane',
+            'last_name': 'Smith',
+            'email': 'jane@example.com',
+            'phone': '+15551234567'
+        }
+
+    @patch('urllib.request.urlopen')
+    def test_webhook_includes_email_details_text(self):
+        """Test that webhook payload includes email_details_text"""
+        mock_response = Mock()
+        mock_response.getcode.return_value = 200
+        mock_response.__enter__ = Mock(return_value=mock_response)
+        mock_response.__exit__ = Mock(return_value=False)
+
+        captured_data = {}
+
+        def capture_request(request, timeout=None):
+            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
+            return mock_response
+
+        with patch('urllib.request.urlopen', side_effect=capture_request):
+            handler = FormHandler(self.tenant_config)
+            handler._send_bubble_webhook(
+                form_type='volunteer_signup',
+                responses=self.sample_responses,
+                submission_id='sub_test',
+                session_id='session_123',
+                conversation_id='conv_456'
+            )
+
+        payload = captured_data['payload']
+
+        # Check email_details_text exists and is formatted correctly
+        self.assertIn('email_details_text', payload)
+        self.assertIn('First Name: Jane', payload['email_details_text'])
+        self.assertIn('Last Name: Smith', payload['email_details_text'])
+        self.assertIn('Email: jane@example.com', payload['email_details_text'])
+
+    @patch('urllib.request.urlopen')
+    def test_webhook_includes_email_subject_suffix(self):
+        """Test that webhook payload includes email_subject_suffix"""
+        mock_response = Mock()
+        mock_response.getcode.return_value = 200
+        mock_response.__enter__ = Mock(return_value=mock_response)
+        mock_response.__exit__ = Mock(return_value=False)
+
+        captured_data = {}
+
+        def capture_request(request, timeout=None):
+            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
+            return mock_response
+
+        with patch('urllib.request.urlopen', side_effect=capture_request):
+            handler = FormHandler(self.tenant_config)
+            handler._send_bubble_webhook(
+                form_type='volunteer_signup',
+                responses=self.sample_responses,
+                submission_id='sub_test',
+                session_id='session_123',
+                conversation_id='conv_456'
+            )
+
+        payload = captured_data['payload']
+
+        # Check email_subject_suffix
+        self.assertEqual(payload['email_subject_suffix'], 'Jane Smith')
+
+    @patch('urllib.request.urlopen')
+    def test_webhook_includes_contact_object(self):
+        """Test that webhook payload includes contact object"""
+        mock_response = Mock()
+        mock_response.getcode.return_value = 200
+        mock_response.__enter__ = Mock(return_value=mock_response)
+        mock_response.__exit__ = Mock(return_value=False)
+
+        captured_data = {}
+
+        def capture_request(request, timeout=None):
+            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
+            return mock_response
+
+        with patch('urllib.request.urlopen', side_effect=capture_request):
+            handler = FormHandler(self.tenant_config)
+            handler._send_bubble_webhook(
+                form_type='volunteer_signup',
+                responses=self.sample_responses,
+                submission_id='sub_test',
+                session_id='session_123',
+                conversation_id='conv_456'
+            )
+
+        payload = captured_data['payload']
+
+        # Check contact object
+        self.assertIn('contact', payload)
+        self.assertEqual(payload['contact']['name'], 'Jane Smith')
+        self.assertEqual(payload['contact']['email'], 'jane@example.com')
+        self.assertEqual(payload['contact']['phone'], '+15551234567')
+
+
 if __name__ == '__main__':
     unittest.main()

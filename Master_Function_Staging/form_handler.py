@@ -103,6 +103,262 @@ def transform_form_data_to_labels(form_data: Dict[str, Any], form_config: Dict[s
     return transformed
 
 
+# ============================================================================
+# EMAIL DETAILS BUILDER - Human-readable formatting for Bubble email templates
+# ============================================================================
+
+# Acronyms to preserve in title case (kept uppercase)
+PRESERVED_ACRONYMS = {'ZIP', 'ID', 'URL', 'DOB', 'SSN', 'EIN', 'PO', 'APT', 'LLC', 'INC'}
+
+# Contact field patterns for ordering (processed first in emails)
+CONTACT_FIELD_PATTERNS = {
+    'name': ['name', 'first_name', 'last_name', 'full_name', 'firstname', 'lastname'],
+    'email': ['email', 'e_mail', 'email_address'],
+    'phone': ['phone', 'mobile', 'cell', 'telephone', 'tel'],
+    'address': ['street', 'address', 'city', 'state', 'zip', 'postal', 'country', 'apt', 'unit', 'suite']
+}
+
+
+def humanize_key(key: str) -> str:
+    """
+    Humanize a snake_case or kebab-case key into Title Case.
+    Preserves common acronyms like ZIP, ID, URL, DOB.
+
+    Args:
+        key: The field key (e.g., "zip_code", "user_id")
+
+    Returns:
+        Human-readable label (e.g., "ZIP Code", "User ID")
+    """
+    import re
+    if not key:
+        return ''
+
+    # Split on underscores, hyphens, or camelCase boundaries
+    # First handle camelCase
+    key_spaced = re.sub(r'([a-z])([A-Z])', r'\1 \2', key)
+    # Then split on underscores/hyphens
+    words = re.split(r'[_\-]+', key_spaced)
+
+    result_words = []
+    for word in words:
+        word = word.strip()
+        if not word:
+            continue
+        upper_word = word.upper()
+        # Check if it's a preserved acronym
+        if upper_word in PRESERVED_ACRONYMS:
+            result_words.append(upper_word)
+        else:
+            # Title case: first letter upper, rest lower
+            result_words.append(word.capitalize())
+
+    return ' '.join(result_words)
+
+
+def format_value(value: Any, max_length: int = 2000) -> Optional[str]:
+    """
+    Format a value for display in plain text email.
+    Handles booleans, arrays, objects, and long strings.
+
+    Args:
+        value: The value to format
+        max_length: Maximum length before truncation (default 2000)
+
+    Returns:
+        Formatted string, or None if value should be omitted
+    """
+    # Omit None or empty strings
+    if value is None or value == '':
+        return None
+
+    # Boolean: Yes/No
+    if isinstance(value, bool):
+        return 'Yes' if value else 'No'
+
+    # List: join with comma
+    if isinstance(value, list):
+        filtered = [str(v) for v in value if v is not None and v != '']
+        if not filtered:
+            return None
+        joined = ', '.join(filtered)
+        if len(joined) > max_length:
+            return joined[:max_length] + '...'
+        return joined
+
+    # Dict: stringify as single line
+    if isinstance(value, dict):
+        try:
+            str_val = json.dumps(value)
+            if len(str_val) > max_length:
+                return str_val[:max_length] + '...'
+            return str_val
+        except (TypeError, ValueError):
+            return '[Object]'
+
+    # String or number: convert to string and truncate if needed
+    str_val = str(value)
+    if len(str_val) > max_length:
+        return str_val[:max_length] + '...'
+    return str_val
+
+
+def get_field_priority(key: str) -> int:
+    """
+    Get the priority score for field ordering.
+    Lower score = appears earlier in email.
+
+    Args:
+        key: Field key
+
+    Returns:
+        Priority score (0-999)
+    """
+    lower_key = key.lower()
+
+    # Name fields: highest priority (0-9)
+    for pattern in CONTACT_FIELD_PATTERNS['name']:
+        if lower_key == pattern or pattern in lower_key:
+            if lower_key == 'first_name' or lower_key == 'firstname':
+                return 0
+            if lower_key == 'last_name' or lower_key == 'lastname':
+                return 1
+            if lower_key == 'name' or lower_key == 'full_name':
+                return 2
+            return 9
+
+    # Email fields: second priority (10-19)
+    for pattern in CONTACT_FIELD_PATTERNS['email']:
+        if lower_key == pattern or pattern in lower_key:
+            return 10
+
+    # Phone fields: third priority (20-29)
+    for pattern in CONTACT_FIELD_PATTERNS['phone']:
+        if lower_key == pattern or pattern in lower_key:
+            return 20
+
+    # Address fields: fourth priority (30-49)
+    for pattern in CONTACT_FIELD_PATTERNS['address']:
+        if lower_key == pattern or pattern in lower_key:
+            if 'street' in lower_key or 'address' in lower_key:
+                return 30
+            if 'apt' in lower_key or 'unit' in lower_key or 'suite' in lower_key:
+                return 31
+            if 'city' in lower_key:
+                return 32
+            if 'state' in lower_key:
+                return 33
+            if 'zip' in lower_key or 'postal' in lower_key:
+                return 34
+            if 'country' in lower_key:
+                return 35
+            return 39
+
+    # All other fields: alphabetical (100+)
+    return 100
+
+
+def build_email_details_text(form_data_string: str) -> str:
+    """
+    Build human-readable email details text from form data.
+
+    Args:
+        form_data_string: JSON string of form data
+
+    Returns:
+        Formatted plain text with one "Label: Value" per line
+    """
+    # Parse JSON, handle failure gracefully
+    try:
+        form_data = json.loads(form_data_string)
+    except (json.JSONDecodeError, TypeError):
+        return f"Unable to parse form data. Raw:\n{form_data_string}"
+
+    if not form_data or not isinstance(form_data, dict):
+        return f"Unable to parse form data. Raw:\n{form_data_string}"
+
+    # Build list of (key, label, value, priority)
+    fields = []
+    for key, value in form_data.items():
+        formatted_value = format_value(value)
+        if formatted_value is not None:
+            fields.append({
+                'key': key,
+                'label': humanize_key(key),
+                'value': formatted_value,
+                'priority': get_field_priority(key)
+            })
+
+    # Sort: by priority first, then alphabetically by key
+    fields.sort(key=lambda f: (f['priority'], f['key']))
+
+    # Build output lines
+    lines = [f"{f['label']}: {f['value']}" for f in fields]
+    return '\n'.join(lines)
+
+
+def extract_contact(form_data: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Extract contact information from form data (best-effort).
+
+    Args:
+        form_data: Parsed form data object
+
+    Returns:
+        Contact object { name?, email?, phone? }
+    """
+    if not form_data or not isinstance(form_data, dict):
+        return {}
+
+    contact = {}
+    lower_entries = [(k.lower(), v, k) for k, v in form_data.items()]
+
+    # Extract name
+    first_name = None
+    last_name = None
+    for lower_key, value, original_key in lower_entries:
+        if (lower_key == 'first_name' or lower_key == 'firstname') and value:
+            first_name = str(value).strip()
+        if (lower_key == 'last_name' or lower_key == 'lastname') and value:
+            last_name = str(value).strip()
+        if (lower_key == 'name' or lower_key == 'full_name') and value and not first_name:
+            contact['name'] = str(value).strip()
+
+    if first_name or last_name:
+        contact['name'] = ' '.join(filter(None, [first_name, last_name]))
+
+    # Extract email (first field containing 'email')
+    for lower_key, value, original_key in lower_entries:
+        if 'email' in lower_key and value and isinstance(value, str) and '@' in value:
+            contact['email'] = value.strip()
+            break
+
+    # Extract phone (first field containing 'phone', 'mobile', 'cell')
+    for lower_key, value, original_key in lower_entries:
+        if ('phone' in lower_key or 'mobile' in lower_key or 'cell' in lower_key) and value:
+            contact['phone'] = str(value).strip()
+            break
+
+    return contact
+
+
+def get_email_subject_suffix(form_data: Dict[str, Any]) -> str:
+    """
+    Generate email subject suffix from form data.
+    Returns person's name if available, otherwise "New submission".
+
+    Args:
+        form_data: Parsed form data object
+
+    Returns:
+        Subject suffix (e.g., "Jane Smith" or "New submission")
+    """
+    contact = extract_contact(form_data)
+    if contact.get('name'):
+        return contact['name']
+    return 'New submission'
+
+
 class FormHandler:
     """Handles conversational form submissions and notifications"""
 
@@ -414,8 +670,11 @@ class FormHandler:
         """Send form submission to Bubble via Workflow API
 
         Uses a standardized schema for multi-tenant SaaS scalability:
-        - Fixed metadata fields at top level (11 fields)
+        - Fixed metadata fields at top level (14 fields)
         - form_data as JSON string for dynamic form fields
+        - email_details_text for human-readable email templates
+        - email_subject_suffix for personalized email subjects
+        - contact object for extracted contact info
 
         Bubble initializes once with these fields, then parses form_data JSON.
         """
@@ -443,8 +702,12 @@ class FormHandler:
         forms_config = self.tenant_config.get('conversational_forms', {})
         form_config = forms_config.get(form_type, {})
 
+        # Transform form data to human-readable labels
+        transformed_form_data = transform_form_data_to_labels(responses, form_config)
+        form_data_json_string = json.dumps(transformed_form_data)
+
         # Build payload with standardized schema for multi-tenant scalability
-        # Bubble initializes once with these 11 fields, then parses form_data JSON
+        # Bubble initializes once with these 14 fields, then parses form_data JSON
         payload = {
             # Submission metadata
             'submission_id': submission_id,
@@ -465,7 +728,12 @@ class FormHandler:
             'conversation_id': conversation_id,
 
             # All form responses as JSON string with human-readable labels
-            'form_data': json.dumps(transform_form_data_to_labels(responses, form_config))
+            'form_data': form_data_json_string,
+
+            # NEW: Human-readable fields for Bubble email templates
+            'email_details_text': build_email_details_text(form_data_json_string),
+            'email_subject_suffix': get_email_subject_suffix(transformed_form_data),
+            'contact': extract_contact(transformed_form_data)
         }
 
         headers = {

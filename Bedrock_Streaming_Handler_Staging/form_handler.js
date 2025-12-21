@@ -700,11 +700,274 @@ function normalizeLabel(label) {
     .replace(/_+/g, '_');           // Collapse multiple underscores
 }
 
+// ============================================================================
+// EMAIL DETAILS BUILDER - Human-readable formatting for Bubble email templates
+// ============================================================================
+
+/**
+ * Acronyms to preserve in title case (kept uppercase)
+ */
+const PRESERVED_ACRONYMS = ['ZIP', 'ID', 'URL', 'DOB', 'SSN', 'EIN', 'PO', 'APT', 'LLC', 'INC'];
+
+/**
+ * Contact field patterns for ordering (processed first in emails)
+ */
+const CONTACT_FIELD_PATTERNS = {
+  name: ['name', 'first_name', 'last_name', 'full_name', 'firstname', 'lastname'],
+  email: ['email', 'e_mail', 'email_address'],
+  phone: ['phone', 'mobile', 'cell', 'telephone', 'tel'],
+  address: ['street', 'address', 'city', 'state', 'zip', 'postal', 'country', 'apt', 'unit', 'suite']
+};
+
+/**
+ * Humanize a snake_case or kebab-case key into Title Case
+ * Preserves common acronyms like ZIP, ID, URL, DOB
+ *
+ * @param {string} key - The field key (e.g., "zip_code", "user_id")
+ * @returns {string} Human-readable label (e.g., "ZIP Code", "User ID")
+ */
+function humanizeKey(key) {
+  if (!key) return '';
+
+  // Split on underscores, hyphens, or camelCase boundaries
+  const words = key
+    .replace(/([a-z])([A-Z])/g, '$1 $2')  // camelCase to spaces
+    .replace(/[_-]+/g, ' ')                // underscores/hyphens to spaces
+    .trim()
+    .split(/\s+/);
+
+  return words.map(word => {
+    const upperWord = word.toUpperCase();
+    // Check if it's a preserved acronym
+    if (PRESERVED_ACRONYMS.includes(upperWord)) {
+      return upperWord;
+    }
+    // Title case: first letter upper, rest lower
+    return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+  }).join(' ');
+}
+
+/**
+ * Format a value for display in plain text email
+ * Handles booleans, arrays, objects, and long strings
+ *
+ * @param {any} value - The value to format
+ * @param {number} maxLength - Maximum length before truncation (default 2000)
+ * @returns {string|null} Formatted string, or null if value should be omitted
+ */
+function formatValue(value, maxLength = 2000) {
+  // Omit null, undefined, or empty strings
+  if (value === null || value === undefined || value === '') {
+    return null;
+  }
+
+  // Boolean: Yes/No
+  if (typeof value === 'boolean') {
+    return value ? 'Yes' : 'No';
+  }
+
+  // Array: join with comma
+  if (Array.isArray(value)) {
+    const joined = value
+      .filter(v => v !== null && v !== undefined && v !== '')
+      .join(', ');
+    return joined || null;
+  }
+
+  // Object: stringify as single line
+  if (typeof value === 'object') {
+    try {
+      const str = JSON.stringify(value);
+      if (str.length > maxLength) {
+        return str.substring(0, maxLength) + '...';
+      }
+      return str;
+    } catch (e) {
+      return '[Object]';
+    }
+  }
+
+  // String or number: convert to string and truncate if needed
+  let str = String(value);
+  if (str.length > maxLength) {
+    return str.substring(0, maxLength) + '...';
+  }
+  return str;
+}
+
+/**
+ * Get the priority score for field ordering
+ * Lower score = appears earlier in email
+ *
+ * @param {string} key - Field key
+ * @returns {number} Priority score (0-999)
+ */
+function getFieldPriority(key) {
+  const lowerKey = key.toLowerCase();
+
+  // Name fields: highest priority (0-9)
+  for (const pattern of CONTACT_FIELD_PATTERNS.name) {
+    if (lowerKey === pattern || lowerKey.includes(pattern)) {
+      // Exact matches get lower scores
+      if (lowerKey === 'first_name' || lowerKey === 'firstname') return 0;
+      if (lowerKey === 'last_name' || lowerKey === 'lastname') return 1;
+      if (lowerKey === 'name' || lowerKey === 'full_name') return 2;
+      return 9;
+    }
+  }
+
+  // Email fields: second priority (10-19)
+  for (const pattern of CONTACT_FIELD_PATTERNS.email) {
+    if (lowerKey === pattern || lowerKey.includes(pattern)) {
+      return 10;
+    }
+  }
+
+  // Phone fields: third priority (20-29)
+  for (const pattern of CONTACT_FIELD_PATTERNS.phone) {
+    if (lowerKey === pattern || lowerKey.includes(pattern)) {
+      return 20;
+    }
+  }
+
+  // Address fields: fourth priority (30-49)
+  for (const pattern of CONTACT_FIELD_PATTERNS.address) {
+    if (lowerKey === pattern || lowerKey.includes(pattern)) {
+      // Order: street, city, state, zip, country
+      if (lowerKey.includes('street') || lowerKey.includes('address')) return 30;
+      if (lowerKey.includes('apt') || lowerKey.includes('unit') || lowerKey.includes('suite')) return 31;
+      if (lowerKey.includes('city')) return 32;
+      if (lowerKey.includes('state')) return 33;
+      if (lowerKey.includes('zip') || lowerKey.includes('postal')) return 34;
+      if (lowerKey.includes('country')) return 35;
+      return 39;
+    }
+  }
+
+  // All other fields: alphabetical (100+)
+  return 100;
+}
+
+/**
+ * Build human-readable email details text from form data
+ *
+ * @param {string} formDataString - JSON string of form data
+ * @returns {string} Formatted plain text with one "Label: Value" per line
+ */
+function buildEmailDetailsText(formDataString) {
+  // Parse JSON, handle failure gracefully
+  let formData;
+  try {
+    formData = JSON.parse(formDataString);
+  } catch (e) {
+    return `Unable to parse form data. Raw:\n${formDataString}`;
+  }
+
+  if (!formData || typeof formData !== 'object') {
+    return `Unable to parse form data. Raw:\n${formDataString}`;
+  }
+
+  // Build array of { key, label, value, priority }
+  const fields = [];
+  for (const [key, value] of Object.entries(formData)) {
+    const formattedValue = formatValue(value);
+    if (formattedValue !== null) {
+      fields.push({
+        key,
+        label: humanizeKey(key),
+        value: formattedValue,
+        priority: getFieldPriority(key)
+      });
+    }
+  }
+
+  // Sort: by priority first, then alphabetically by key
+  fields.sort((a, b) => {
+    if (a.priority !== b.priority) {
+      return a.priority - b.priority;
+    }
+    return a.key.localeCompare(b.key);
+  });
+
+  // Build output lines
+  const lines = fields.map(f => `${f.label}: ${f.value}`);
+  return lines.join('\n');
+}
+
+/**
+ * Extract contact information from form data (best-effort)
+ *
+ * @param {Object} formData - Parsed form data object
+ * @returns {Object} Contact object { name?, email?, phone? }
+ */
+function extractContact(formData) {
+  if (!formData || typeof formData !== 'object') {
+    return {};
+  }
+
+  const contact = {};
+  const lowerEntries = Object.entries(formData).map(([k, v]) => [k.toLowerCase(), v, k]);
+
+  // Extract name
+  let firstName = null;
+  let lastName = null;
+  for (const [lowerKey, value, originalKey] of lowerEntries) {
+    if ((lowerKey === 'first_name' || lowerKey === 'firstname') && value) {
+      firstName = String(value).trim();
+    }
+    if ((lowerKey === 'last_name' || lowerKey === 'lastname') && value) {
+      lastName = String(value).trim();
+    }
+    if ((lowerKey === 'name' || lowerKey === 'full_name') && value && !firstName) {
+      contact.name = String(value).trim();
+    }
+  }
+  if (firstName || lastName) {
+    contact.name = [firstName, lastName].filter(Boolean).join(' ');
+  }
+
+  // Extract email (first field containing 'email')
+  for (const [lowerKey, value] of lowerEntries) {
+    if (lowerKey.includes('email') && value && typeof value === 'string' && value.includes('@')) {
+      contact.email = value.trim();
+      break;
+    }
+  }
+
+  // Extract phone (first field containing 'phone', 'mobile', 'cell')
+  for (const [lowerKey, value] of lowerEntries) {
+    if ((lowerKey.includes('phone') || lowerKey.includes('mobile') || lowerKey.includes('cell')) && value) {
+      contact.phone = String(value).trim();
+      break;
+    }
+  }
+
+  return contact;
+}
+
+/**
+ * Generate email subject suffix from form data
+ * Returns person's name if available, otherwise "New submission"
+ *
+ * @param {Object} formData - Parsed form data object
+ * @returns {string} Subject suffix (e.g., "Jane Smith" or "New submission")
+ */
+function getEmailSubjectSuffix(formData) {
+  const contact = extractContact(formData);
+  if (contact.name) {
+    return contact.name;
+  }
+  return 'New submission';
+}
+
 /**
  * Send form data to Bubble via Workflow API
  * Uses a standardized schema for multi-tenant SaaS scalability:
- * - Fixed metadata fields at top level (11 fields)
+ * - Fixed metadata fields at top level (14 fields)
  * - form_data as JSON string with human-readable field labels
+ * - email_details_text for human-readable email templates
+ * - email_subject_suffix for personalized email subjects
+ * - contact object for extracted contact info
  *
  * @param {Object} bubbleConfig - Bubble integration config { webhook_url, api_key }
  * @param {string} formId - Form identifier
@@ -729,8 +992,12 @@ async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formCo
 
   const url = new URL(webhookUrl);
 
+  // Transform form data to human-readable labels
+  const transformedFormData = transformFormDataToLabels(formData, formConfig);
+  const formDataJsonString = JSON.stringify(transformedFormData);
+
   // Build payload with standardized schema for multi-tenant scalability
-  // Bubble initializes once with these 11 fields, then parses form_data JSON
+  // Bubble initializes once with these 14 fields, then parses form_data JSON
   const payload = JSON.stringify({
     // Submission metadata
     submission_id: submissionId,
@@ -751,7 +1018,12 @@ async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formCo
     conversation_id: conversationId,
 
     // All form responses as JSON string with human-readable labels
-    form_data: JSON.stringify(transformFormDataToLabels(formData, formConfig))
+    form_data: formDataJsonString,
+
+    // NEW: Human-readable fields for Bubble email templates
+    email_details_text: buildEmailDetailsText(formDataJsonString),
+    email_subject_suffix: getEmailSubjectSuffix(transformedFormData),
+    contact: extractContact(transformedFormData)
   });
 
   const headers = {

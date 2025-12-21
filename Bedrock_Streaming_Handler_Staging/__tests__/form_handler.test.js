@@ -1163,3 +1163,334 @@ describe('Form Handler - Bubble Integration', () => {
     delete process.env.BUBBLE_WEBHOOK_URL;
   });
 });
+
+// ============================================================================
+// EMAIL DETAILS BUILDER TESTS
+// ============================================================================
+
+// Import internal functions for testing via require
+// Note: These functions need to be exported from form_handler.js for direct testing
+// For now we test them indirectly through the Bubble webhook payload
+
+describe('Email Details Builder - via Bubble Webhook Payload', () => {
+  let httpsRequestMock;
+  let capturedPayload;
+
+  beforeEach(() => {
+    sesMock.reset();
+    snsMock.reset();
+    dynamoMock.reset();
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+
+    capturedPayload = null;
+    httpsRequestMock = {
+      on: jest.fn().mockReturnThis(),
+      write: jest.fn((data) => { capturedPayload = JSON.parse(data); }),
+      end: jest.fn()
+    };
+
+    const https = require('https');
+    https.request = jest.fn((options, callback) => {
+      const mockResponse = {
+        statusCode: 200,
+        on: jest.fn((event, handler) => {
+          if (event === 'end') setTimeout(handler, 0);
+        })
+      };
+      setTimeout(() => callback(mockResponse), 0);
+      return httpsRequestMock;
+    });
+  });
+
+  const configWithBubble = {
+    tenant_id: 'TEST123',
+    tenant_hash: 'abc123',
+    chat_title: 'Test Organization',
+    conversational_forms: {
+      volunteer_apply: {
+        form_id: 'volunteer_apply',
+        title: 'Volunteer Application',
+        program: 'lovebox',
+        fields: [
+          { id: 'first_name', label: 'First Name', type: 'text' },
+          { id: 'last_name', label: 'Last Name', type: 'text' },
+          { id: 'email', label: 'Email', type: 'email' }
+        ],
+        fulfillment: { email_to: 'test@example.com' }
+      }
+    },
+    bubble_integration: {
+      webhook_url: 'https://test.bubbleapps.io/api/1.1/wf/form_submit'
+    }
+  };
+
+  describe('email_details_text field', () => {
+    it('should include email_details_text in payload', async () => {
+      await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toBeDefined();
+      expect(typeof capturedPayload.email_details_text).toBe('string');
+    });
+
+    it('should format fields as "Label: Value" lines', async () => {
+      await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toContain('First Name: John');
+      expect(capturedPayload.email_details_text).toContain('Last Name: Doe');
+      expect(capturedPayload.email_details_text).toContain('Email: john.doe@example.com');
+    });
+
+    it('should humanize snake_case keys to Title Case', async () => {
+      const formData = {
+        first_name: 'Jane',
+        caregivers_phone_number: '+15551234567',
+        description_of_needs: 'Need help with groceries'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toContain('First Name: Jane');
+      expect(capturedPayload.email_details_text).toContain('Caregivers Phone Number: +15551234567');
+      expect(capturedPayload.email_details_text).toContain('Description Of Needs: Need help with groceries');
+    });
+
+    it('should preserve common acronyms (ZIP, ID, URL)', async () => {
+      const formData = {
+        zip_code: '78701',
+        user_id: '12345',
+        website_url: 'https://example.com'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toContain('ZIP Code: 78701');
+      expect(capturedPayload.email_details_text).toContain('User ID: 12345');
+      expect(capturedPayload.email_details_text).toContain('Website URL: https://example.com');
+    });
+
+    it('should order contact fields first (name, email, phone, address)', async () => {
+      const formData = {
+        description: 'Test description',
+        zip_code: '78701',
+        first_name: 'Jane',
+        email: 'jane@example.com',
+        city: 'Austin',
+        last_name: 'Smith',
+        phone: '+15551234567'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      const lines = capturedPayload.email_details_text.split('\n');
+      const firstNameIndex = lines.findIndex(l => l.startsWith('First Name:'));
+      const lastNameIndex = lines.findIndex(l => l.startsWith('Last Name:'));
+      const emailIndex = lines.findIndex(l => l.startsWith('Email:'));
+      const phoneIndex = lines.findIndex(l => l.startsWith('Phone:'));
+      const cityIndex = lines.findIndex(l => l.startsWith('City:'));
+      const descIndex = lines.findIndex(l => l.startsWith('Description:'));
+
+      // Name fields should come before email, email before phone, phone before address
+      expect(firstNameIndex).toBeLessThan(emailIndex);
+      expect(lastNameIndex).toBeLessThan(emailIndex);
+      expect(emailIndex).toBeLessThan(phoneIndex);
+      expect(phoneIndex).toBeLessThan(cityIndex);
+      expect(cityIndex).toBeLessThan(descIndex);
+    });
+
+    it('should omit empty/null values', async () => {
+      const formData = {
+        first_name: 'Jane',
+        last_name: '',
+        email: null,
+        notes: 'Has notes'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toContain('First Name: Jane');
+      expect(capturedPayload.email_details_text).toContain('Notes: Has notes');
+      expect(capturedPayload.email_details_text).not.toContain('Last Name:');
+      expect(capturedPayload.email_details_text).not.toContain('Email:');
+    });
+
+    it('should format boolean values as Yes/No', async () => {
+      const formData = {
+        first_name: 'Jane',
+        has_children: true,
+        has_vehicle: false
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toContain('Has Children: Yes');
+      expect(capturedPayload.email_details_text).toContain('Has Vehicle: No');
+    });
+
+    it('should join array values with comma', async () => {
+      const formData = {
+        first_name: 'Jane',
+        languages: ['English', 'Spanish', 'French']
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toContain('Languages: English, Spanish, French');
+    });
+
+    it('should stringify nested objects', async () => {
+      const formData = {
+        first_name: 'Jane',
+        address: { street: '123 Main', city: 'Austin' }
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_details_text).toContain('Address: {"street":"123 Main","city":"Austin"}');
+    });
+
+    it('should truncate long values at 2000 characters', async () => {
+      const longValue = 'x'.repeat(2500);
+      const formData = {
+        first_name: 'Jane',
+        comments: longValue
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      const commentsLine = capturedPayload.email_details_text.split('\n').find(l => l.startsWith('Comments:'));
+      expect(commentsLine.length).toBeLessThan(2100); // Label + truncated value
+      expect(commentsLine).toContain('...');
+    });
+  });
+
+  describe('email_subject_suffix field', () => {
+    it('should include email_subject_suffix in payload', async () => {
+      await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+      expect(capturedPayload.email_subject_suffix).toBeDefined();
+      expect(typeof capturedPayload.email_subject_suffix).toBe('string');
+    });
+
+    it('should return full name when first_name and last_name present', async () => {
+      const formData = {
+        first_name: 'Jane',
+        last_name: 'Smith',
+        email: 'jane@example.com'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_subject_suffix).toBe('Jane Smith');
+    });
+
+    it('should return just first name when last_name missing', async () => {
+      const formData = {
+        first_name: 'Jane',
+        email: 'jane@example.com'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_subject_suffix).toBe('Jane');
+    });
+
+    it('should return "New submission" when no name fields present', async () => {
+      const formData = {
+        email: 'anon@example.com',
+        comments: 'Just a comment'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.email_subject_suffix).toBe('New submission');
+    });
+  });
+
+  describe('contact field', () => {
+    it('should include contact object in payload', async () => {
+      await submitForm('volunteer_apply', mockFormData, configWithBubble);
+
+      expect(capturedPayload.contact).toBeDefined();
+      expect(typeof capturedPayload.contact).toBe('object');
+    });
+
+    it('should extract name from first_name and last_name', async () => {
+      const formData = {
+        first_name: 'Jane',
+        last_name: 'Smith',
+        email: 'jane@example.com'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.contact.name).toBe('Jane Smith');
+    });
+
+    it('should extract email from email field', async () => {
+      const formData = {
+        first_name: 'Jane',
+        email: 'jane@example.com'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.contact.email).toBe('jane@example.com');
+    });
+
+    it('should extract phone from phone field', async () => {
+      const formData = {
+        first_name: 'Jane',
+        phone: '+15551234567'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.contact.phone).toBe('+15551234567');
+    });
+
+    it('should extract phone from mobile or cell fields', async () => {
+      const formData = {
+        first_name: 'Jane',
+        mobile_number: '+15559876543'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.contact.phone).toBe('+15559876543');
+    });
+
+    it('should return empty object when no contact fields present', async () => {
+      const formData = {
+        comments: 'Just a comment',
+        program: 'lovebox'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      expect(capturedPayload.contact).toEqual({});
+    });
+  });
+
+  describe('graceful error handling', () => {
+    it('should handle invalid JSON in form_data gracefully', async () => {
+      // This test requires modifying the internal buildEmailDetailsText function
+      // Since we can't easily inject invalid JSON through submitForm, we verify
+      // the function handles non-object input by testing with unusual form data
+
+      const formData = {
+        first_name: 123, // Number instead of string
+        last_name: null, // Null
+        valid_field: 'test'
+      };
+
+      await submitForm('volunteer_apply', formData, configWithBubble);
+
+      // Should still produce output without crashing
+      expect(capturedPayload.email_details_text).toBeDefined();
+      expect(capturedPayload.email_details_text).toContain('First Name: 123');
+      expect(capturedPayload.email_details_text).toContain('Valid Field: test');
+    });
+  });
+});
