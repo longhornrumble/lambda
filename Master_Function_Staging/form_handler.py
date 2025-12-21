@@ -12,6 +12,12 @@ from typing import Dict, List, Any, Optional
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
+from contact_extractor import (
+    extract_canonical_contact,
+    filter_sensitive_fields,
+    get_schema_version,
+    SCHEMA_VERSION
+)
 
 # Initialize AWS clients
 dynamodb = boto3.resource('dynamodb')
@@ -706,9 +712,21 @@ class FormHandler:
         transformed_form_data = transform_form_data_to_labels(responses, form_config)
         form_data_json_string = json.dumps(transformed_form_data)
 
+        # Filter sensitive fields for email display
+        filtered_form_data = filter_sensitive_fields(transformed_form_data)
+        filtered_form_data_json_string = json.dumps(filtered_form_data)
+
+        # Extract canonical contact and comments using new extractor
+        extraction_result = extract_canonical_contact(transformed_form_data)
+        canonical_contact = extraction_result['contact']
+        comments = extraction_result['comments']
+
         # Build payload with standardized schema for multi-tenant scalability
-        # Bubble initializes once with these 14 fields, then parses form_data JSON
+        # Schema v2: includes structured contact, comments, and schema_version
         payload = {
+            # Schema version for downstream compatibility
+            'schema_version': SCHEMA_VERSION,
+
             # Submission metadata
             'submission_id': submission_id,
             'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -730,10 +748,15 @@ class FormHandler:
             # All form responses as JSON string with human-readable labels
             'form_data': form_data_json_string,
 
-            # NEW: Human-readable fields for Bubble email templates
-            'email_details_text': build_email_details_text(form_data_json_string),
+            # Human-readable fields for Bubble email templates (sensitive fields filtered)
+            'email_details_text': build_email_details_text(filtered_form_data_json_string),
             'email_subject_suffix': get_email_subject_suffix(transformed_form_data),
-            'contact': extract_contact(transformed_form_data)
+
+            # NEW v2: Canonical structured contact object
+            'contact': canonical_contact,
+
+            # NEW v2: Extracted comments/notes
+            'comments': comments
         }
 
         headers = {

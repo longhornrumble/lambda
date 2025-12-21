@@ -13,6 +13,12 @@ const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const {
+  extractCanonicalContact,
+  filterSensitiveFields,
+  getSchemaVersion,
+  SCHEMA_VERSION
+} = require('./contact_extractor');
 
 // Initialize AWS SDK v3 clients
 const sesClient = new SESClient({ region: process.env.AWS_REGION || 'us-east-1' });
@@ -996,9 +1002,19 @@ async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formCo
   const transformedFormData = transformFormDataToLabels(formData, formConfig);
   const formDataJsonString = JSON.stringify(transformedFormData);
 
+  // Filter sensitive fields for email display
+  const filteredFormData = filterSensitiveFields(transformedFormData);
+  const filteredFormDataJsonString = JSON.stringify(filteredFormData);
+
+  // Extract canonical contact and comments using new extractor
+  const { contact: canonicalContact, comments } = extractCanonicalContact(transformedFormData);
+
   // Build payload with standardized schema for multi-tenant scalability
-  // Bubble initializes once with these 14 fields, then parses form_data JSON
+  // Schema v2: includes structured contact, comments, and schema_version
   const payload = JSON.stringify({
+    // Schema version for downstream compatibility
+    schema_version: SCHEMA_VERSION,
+
     // Submission metadata
     submission_id: submissionId,
     timestamp: new Date().toISOString(),
@@ -1020,10 +1036,15 @@ async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formCo
     // All form responses as JSON string with human-readable labels
     form_data: formDataJsonString,
 
-    // NEW: Human-readable fields for Bubble email templates
-    email_details_text: buildEmailDetailsText(formDataJsonString),
+    // Human-readable fields for Bubble email templates (sensitive fields filtered)
+    email_details_text: buildEmailDetailsText(filteredFormDataJsonString),
     email_subject_suffix: getEmailSubjectSuffix(transformedFormData),
-    contact: extractContact(transformedFormData)
+
+    // NEW v2: Canonical structured contact object
+    contact: canonicalContact,
+
+    // NEW v2: Extracted comments/notes
+    comments: comments
   });
 
   const headers = {
