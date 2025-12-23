@@ -182,8 +182,9 @@ async function loadConfig(tenantHash) {
       }
       
       if (config) {
-        // Add tenant_id to config for downstream use
+        // Add tenant_id and tenant_hash to config for downstream use
         config.tenant_id = mapping.tenant_id;
+        config.tenant_hash = tenantHash;
         CONFIG_CACHE[cacheKey] = { data: config, timestamp: Date.now() };
         console.log(`📋 KB ID in config: ${config?.aws?.knowledge_base_id || 'NOT SET'}`);
         console.log(`📋 Full AWS config:`, JSON.stringify(config?.aws || {}, null, 2));
@@ -1553,8 +1554,10 @@ const streamingHandler = async (event, responseStream, context) => {
     const tenantHash = body.tenant_hash || '';
     const sessionId = body.session_id || 'default';
     const userInput = body.user_input || '';
-    
-    if (!tenantHash || !userInput) {
+    const isFormMode = body.form_mode === true;
+
+    // Form mode requests don't require user_input - they have form_data instead
+    if (!tenantHash || (!userInput && !isFormMode)) {
       const error = !tenantHash ? 'Missing tenant_hash' : 'Missing user_input';
       write(`data: {"type": "error", "error": "${error}"}\n\n`);
       write('data: [DONE]\n\n');

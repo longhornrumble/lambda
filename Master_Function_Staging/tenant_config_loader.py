@@ -255,13 +255,11 @@ def get_config_for_tenant_by_hash(tenant_hash):
         
         log_cache_metrics(tenant_hash, "s3_load", load_time)
         
-        # 🔒 REMOVE TENANT_ID: Strip out tenant_id from config
-        config.pop("tenant_id", None)
-        
         # Ensure the config has all required fields
         config = ensure_frontend_fields_hash_only(config, tenant_hash)
-        
-        # 🔒 HASH-ONLY: Always use hash in config and metadata
+
+        # Set both tenant_id and tenant_hash for downstream use
+        config["tenant_id"] = tenant_id
         config["tenant_hash"] = tenant_hash
         config = add_cloudfront_metadata_hash_only(config, tenant_hash)
         

@@ -158,7 +158,7 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     // Save to DynamoDB
     const submissionId = `${formId}_${Date.now()}`;
     try {
-      await saveFormSubmission(submissionId, formId, formData, config, priority);
+      await saveFormSubmission(submissionId, formId, formData, config, priority, sessionId, conversationId);
     } catch (dbError) {
       console.error('❌ DynamoDB save failed:', dbError);
       // Continue with fulfillment even if DynamoDB save fails
@@ -238,21 +238,93 @@ function determinePriority(formId, formData, formConfig) {
 }
 
 /**
+ * Build labeled form data by mapping field IDs to their labels
+ * @param {Object} formData - Raw form data with field IDs as keys
+ * @param {Object} formConfig - Form configuration with field definitions
+ * @returns {Object} Labeled form data with {label, value, type} for each field
+ */
+function buildLabeledFormData(formData, formConfig) {
+  const labeled = {};
+  const fields = formConfig?.fields || [];
+
+  // Build a lookup map of field ID -> field definition
+  const fieldMap = {};
+  for (const field of fields) {
+    fieldMap[field.id] = field;
+    // Also map subfields for composite fields (name, address)
+    if (field.subfields) {
+      for (const subfield of field.subfields) {
+        fieldMap[subfield.id] = { ...subfield, parentLabel: field.label };
+      }
+    }
+  }
+
+  // Map each form data field to its label
+  for (const [fieldId, value] of Object.entries(formData)) {
+    const fieldDef = fieldMap[fieldId];
+
+    if (fieldDef) {
+      // Handle composite fields (objects with subfield values)
+      if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+        const subfieldLabels = {};
+        for (const [subId, subValue] of Object.entries(value)) {
+          const subFieldDef = fieldMap[subId];
+          if (subFieldDef) {
+            subfieldLabels[subFieldDef.label || subId] = subValue;
+          } else {
+            // Fallback: extract readable name from subfield ID
+            const readableName = subId.split('.').pop().replace(/_/g, ' ');
+            subfieldLabels[readableName] = subValue;
+          }
+        }
+        labeled[fieldDef.label || fieldId] = {
+          type: fieldDef.type || 'composite',
+          value: subfieldLabels
+        };
+      } else {
+        labeled[fieldDef.label || fieldId] = {
+          type: fieldDef.type || 'text',
+          value: value
+        };
+      }
+    } else {
+      // Field not found in config - store with cleaned up ID as label
+      const readableLabel = fieldId.replace(/^field_\d+\.?/, '').replace(/_/g, ' ') || fieldId;
+      labeled[readableLabel] = {
+        type: 'unknown',
+        value: value
+      };
+    }
+  }
+
+  return labeled;
+}
+
+/**
  * Save form submission to DynamoDB
  */
-async function saveFormSubmission(submissionId, formId, formData, config, priority = 'normal') {
+async function saveFormSubmission(submissionId, formId, formData, config, priority = 'normal', sessionId = null, conversationId = null) {
   if (!FORM_SUBMISSIONS_TABLE) {
     console.warn('⚠️ FORM_SUBMISSIONS_TABLE not configured, skipping DynamoDB save');
     return;
   }
+
+  // Get form config for field labels
+  const formConfig = config.conversational_forms?.[formId] || {};
+  const labeledData = buildLabeledFormData(formData, formConfig);
 
   const params = {
     TableName: FORM_SUBMISSIONS_TABLE,
     Item: {
       submission_id: submissionId,
       form_id: formId,
+      form_title: formConfig.title || formId,
       tenant_id: config.tenant_id || 'unknown',
-      form_data: formData,
+      tenant_hash: config.tenant_hash || 'unknown',
+      session_id: sessionId || 'unknown',
+      conversation_id: conversationId || sessionId || 'unknown',
+      form_data: formData,           // Raw data with field IDs
+      form_data_labeled: labeledData, // Human-readable labeled data
       priority: priority,
       submitted_at: new Date().toISOString(),
       status: 'pending_fulfillment'
@@ -987,7 +1059,7 @@ function getEmailSubjectSuffix(formData) {
 async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formConfig, submissionId, sessionId = null, conversationId = null) {
   const https = require('https');
 
-  const defaultWebhookUrl = 'https://hrfx.bubbleapps.io/version-test/api/1.1/wf/form_submission';
+  const defaultWebhookUrl = 'https://hrfx.bubbleapps.io/api/1.1/wf/form_submission';
   const webhookUrl = bubbleConfig.webhook_url || process.env.BUBBLE_WEBHOOK_URL || defaultWebhookUrl;
   const apiKey = bubbleConfig.api_key || process.env.BUBBLE_API_KEY;
 

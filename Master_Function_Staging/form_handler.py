@@ -109,6 +109,74 @@ def transform_form_data_to_labels(form_data: Dict[str, Any], form_config: Dict[s
     return transformed
 
 
+def build_labeled_form_data(form_data: Dict[str, Any], form_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build labeled form data by mapping field IDs to their labels.
+    Matches the Node.js Bedrock_Streaming_Handler format.
+
+    Args:
+        form_data: Raw form data with field IDs as keys
+        form_config: Form configuration with field definitions
+
+    Returns:
+        Labeled form data with {label: {type, value}} structure
+    """
+    labeled = {}
+    fields = form_config.get('fields', [])
+
+    # Build a lookup map of field ID -> field definition
+    field_map = {}
+    for field in fields:
+        field_map[field.get('id', '')] = field
+        # Also map subfields for composite fields (name, address)
+        for subfield in field.get('subfields', []):
+            field_map[subfield.get('id', '')] = {
+                **subfield,
+                'parentLabel': field.get('label', '')
+            }
+
+    # Map each form data field to its label
+    for field_id, value in form_data.items():
+        field_def = field_map.get(field_id)
+
+        if field_def:
+            label = field_def.get('label', field_id)
+            field_type = field_def.get('type', 'text')
+
+            # Handle composite fields (objects with subfield values)
+            if isinstance(value, dict):
+                subfield_labels = {}
+                for sub_id, sub_value in value.items():
+                    sub_field_def = field_map.get(sub_id)
+                    if sub_field_def:
+                        sub_label = sub_field_def.get('label', sub_id)
+                        subfield_labels[sub_label] = sub_value
+                    else:
+                        # Fallback: extract readable name from subfield ID
+                        readable_name = sub_id.split('.')[-1].replace('_', ' ').title()
+                        subfield_labels[readable_name] = sub_value
+
+                labeled[label] = {
+                    'type': field_type,
+                    'value': subfield_labels
+                }
+            else:
+                labeled[label] = {
+                    'type': field_type,
+                    'value': value
+                }
+        else:
+            # Field not found in config - store with cleaned up ID as label
+            import re
+            readable_label = re.sub(r'^field_\d+\.?', '', field_id).replace('_', ' ').title() or field_id
+            labeled[readable_label] = {
+                'type': 'unknown',
+                'value': value
+            }
+
+    return labeled
+
+
 # ============================================================================
 # EMAIL DETAILS BUILDER - Human-readable formatting for Bubble email templates
 # ============================================================================
@@ -409,7 +477,8 @@ class FormHandler:
                 form_type=form_type,
                 responses=responses,
                 session_id=session_id,
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                form_config=form_config
             )
 
             # Send to Bubble webhook if configured
@@ -468,10 +537,16 @@ class FormHandler:
             }
 
     def _store_submission(self, form_type: str, responses: Dict[str, Any],
-                         session_id: str, conversation_id: str) -> str:
+                         session_id: str, conversation_id: str,
+                         form_config: Dict[str, Any] = None) -> str:
         """Store form submission in DynamoDB"""
         submission_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Build labeled form data for human-readable storage
+        form_config = form_config or {}
+        labeled_data = build_labeled_form_data(responses, form_config)
+        form_title = form_config.get('title', form_type)
 
         try:
             table = dynamodb.Table(SUBMISSIONS_TABLE)
@@ -480,15 +555,21 @@ class FormHandler:
                     'submission_id': submission_id,
                     'tenant_id': self.tenant_id,
                     'tenant_hash': self.tenant_hash,
-                    'form_type': form_type,
-                    'responses': responses,
+                    'form_id': form_type,
+                    'form_title': form_title,
+                    'form_type': form_type,  # Keep for backwards compatibility
+                    'form_data': responses,  # Raw data with field IDs
+                    'form_data_labeled': labeled_data,  # Human-readable labeled data
+                    'responses': responses,  # Keep for backwards compatibility
                     'session_id': session_id,
                     'conversation_id': conversation_id,
-                    'timestamp': timestamp,
-                    'status': 'submitted'
+                    'submitted_at': timestamp,
+                    'timestamp': timestamp,  # Keep for backwards compatibility
+                    'status': 'pending_fulfillment',
+                    'priority': 'normal'
                 }
             )
-            logger.info(f"Stored submission: {submission_id}")
+            logger.info(f"Stored submission: {submission_id} with form_title: {form_title}")
             return submission_id
 
         except ClientError as e:
