@@ -113,27 +113,101 @@ if (streamifyResponse) {
   console.log('⚠️ Lambda streaming not available, will use buffered response');
 }
 
-// Initialize AWS clients
-const bedrock = new BedrockRuntimeClient({ region: 'us-east-1' });
-const bedrockAgent = new BedrockAgentRuntimeClient({ region: 'us-east-1' });
-const s3 = new S3Client({ region: 'us-east-1' });
-const sqs = new SQSClient({ region: 'us-east-1' });
+// Initialize AWS clients with configurable region
+const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
+const bedrock = new BedrockRuntimeClient({ region: AWS_REGION });
+const bedrockAgent = new BedrockAgentRuntimeClient({ region: AWS_REGION });
+const s3 = new S3Client({ region: AWS_REGION });
+const sqs = new SQSClient({ region: AWS_REGION });
 
 // Analytics SQS queue URL
 const ANALYTICS_QUEUE_URL = process.env.ANALYTICS_QUEUE_URL || 'https://sqs.us-east-1.amazonaws.com/614056832592/picasso-analytics-events';
 
-// In-memory cache
+// In-memory cache with size limits to prevent memory exhaustion
 const KB_CACHE = {};
 const CONFIG_CACHE = {};
 const CACHE_TTL = 300000; // 5 minutes
+const MAX_CACHE_SIZE = 100; // Maximum entries per cache
+
+// ═══════════════════════════════════════════════════════════════
+// SECURITY: Input sanitization to prevent prompt injection
+// ═══════════════════════════════════════════════════════════════
+const MAX_USER_INPUT_LENGTH = 4000; // Reasonable limit for chat messages
+
+/**
+ * Sanitize user input to prevent prompt injection attacks
+ * Removes control characters and potential injection patterns while preserving normal text
+ * @param {string} input - Raw user input
+ * @returns {string} - Sanitized input safe for prompt inclusion
+ */
+function sanitizeUserInput(input) {
+  if (!input || typeof input !== 'string') {
+    return '';
+  }
+
+  // Truncate to max length
+  let sanitized = input.slice(0, MAX_USER_INPUT_LENGTH);
+
+  // Remove null bytes and other control characters (except newlines and tabs)
+  sanitized = sanitized.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+
+  // Neutralize potential prompt injection patterns by escaping them
+  // These patterns could be used to inject new system instructions
+  const injectionPatterns = [
+    /\n\s*(SYSTEM|ASSISTANT|HUMAN|USER)\s*:/gi,
+    /\n\s*<\|?(system|assistant|human|user|im_start|im_end)\|?>/gi,
+    /\[\s*(INST|\/INST|SYS|\/SYS)\s*\]/gi
+  ];
+
+  for (const pattern of injectionPatterns) {
+    sanitized = sanitized.replace(pattern, (match) => `[FILTERED: ${match.trim()}]`);
+  }
+
+  return sanitized.trim();
+}
+
+/**
+ * Sanitize text for SMS messages - remove special characters that could cause issues
+ * @param {string} text - Raw text
+ * @returns {string} - SMS-safe text
+ */
+function sanitizeForSMS(text) {
+  if (!text || typeof text !== 'string') {
+    return '';
+  }
+  // Keep only alphanumeric, spaces, and basic punctuation
+  return text.replace(/[^\w\s@.-]/g, '').slice(0, 50);
+}
 
 // Helper functions
 function getCacheKey(text, prefix = '') {
-  return `${prefix}:${crypto.createHash('md5').update(text).digest('hex')}`;
+  return `${prefix}:${crypto.createHash('sha256').update(text).digest('hex').slice(0, 32)}`;
 }
 
 function isCacheValid(entry) {
   return entry && (Date.now() - entry.timestamp < CACHE_TTL);
+}
+
+/**
+ * Evict oldest entries if cache exceeds max size (LRU-style)
+ * @param {Object} cache - Cache object to check
+ * @param {number} maxSize - Maximum allowed entries
+ */
+function evictOldestCacheEntries(cache, maxSize = MAX_CACHE_SIZE) {
+  const keys = Object.keys(cache);
+  if (keys.length <= maxSize) return;
+
+  // Sort by timestamp (oldest first) and remove oldest entries
+  const sortedKeys = keys.sort((a, b) => (cache[a]?.timestamp || 0) - (cache[b]?.timestamp || 0));
+  const toRemove = sortedKeys.slice(0, keys.length - maxSize);
+
+  for (const key of toRemove) {
+    delete cache[key];
+  }
+
+  if (toRemove.length > 0) {
+    console.log(`🧹 Evicted ${toRemove.length} old cache entries`);
+  }
 }
 
 async function loadConfig(tenantHash) {
@@ -186,6 +260,7 @@ async function loadConfig(tenantHash) {
         config.tenant_id = mapping.tenant_id;
         config.tenant_hash = tenantHash;
         CONFIG_CACHE[cacheKey] = { data: config, timestamp: Date.now() };
+        evictOldestCacheEntries(CONFIG_CACHE); // Prevent memory exhaustion
         console.log(`📋 KB ID in config: ${config?.aws?.knowledge_base_id || 'NOT SET'}`);
         console.log(`📋 Full AWS config:`, JSON.stringify(config?.aws || {}, null, 2));
         return config;
@@ -239,6 +314,7 @@ async function retrieveKB(userInput, config) {
 
     console.log(`✅ KB context retrieved - ${chunks.length} chars`);
     KB_CACHE[cacheKey] = { data: chunks, timestamp: Date.now() };
+    evictOldestCacheEntries(KB_CACHE); // Prevent memory exhaustion
     return chunks;
 
   } catch (error) {
@@ -1594,10 +1670,12 @@ const streamingHandler = async (event, responseStream, context) => {
       };
     }
 
-    // Support bedrock_instructions_override for testing
-    if (body.bedrock_instructions_override) {
-      console.log('🔧 Applying bedrock_instructions_override from request');
+    // Support bedrock_instructions_override for testing (GATED - requires ENABLE_INSTRUCTION_OVERRIDE=true)
+    if (body.bedrock_instructions_override && process.env.ENABLE_INSTRUCTION_OVERRIDE === 'true') {
+      console.log('🔧 Applying bedrock_instructions_override from request (override enabled via env var)');
       config.bedrock_instructions = body.bedrock_instructions_override;
+    } else if (body.bedrock_instructions_override) {
+      console.log('⚠️ bedrock_instructions_override ignored - ENABLE_INSTRUCTION_OVERRIDE not set');
     }
 
     // Check for form mode - bypass Bedrock for form field collection
@@ -1676,9 +1754,12 @@ const streamingHandler = async (event, responseStream, context) => {
       }
     }
 
+    // Sanitize user input to prevent prompt injection
+    const sanitizedInput = sanitizeUserInput(userInput);
+
     // Get KB context
-    const kbContext = await retrieveKB(userInput, config);
-    const prompt = buildPrompt(userInput, kbContext, config.tone_prompt, conversationHistory, config);
+    const kbContext = await retrieveKB(sanitizedInput, config);
+    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
 
     // Prepare Bedrock request - use config model or default
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
@@ -1915,10 +1996,12 @@ const bufferedHandler = async (event, context) => {
       };
     }
 
-    // Support bedrock_instructions_override for testing
-    if (body.bedrock_instructions_override) {
-      console.log('🔧 Applying bedrock_instructions_override from request');
+    // Support bedrock_instructions_override for testing (GATED - requires ENABLE_INSTRUCTION_OVERRIDE=true)
+    if (body.bedrock_instructions_override && process.env.ENABLE_INSTRUCTION_OVERRIDE === 'true') {
+      console.log('🔧 Applying bedrock_instructions_override from request (override enabled via env var)');
       config.bedrock_instructions = body.bedrock_instructions_override;
+    } else if (body.bedrock_instructions_override) {
+      console.log('⚠️ bedrock_instructions_override ignored - ENABLE_INSTRUCTION_OVERRIDE not set');
     }
 
     // Check for show_showcase action - bypass Bedrock and return showcase card directly
@@ -1979,9 +2062,12 @@ const bufferedHandler = async (event, context) => {
       }
     }
 
+    // Sanitize user input to prevent prompt injection
+    const sanitizedInput = sanitizeUserInput(userInput);
+
     // Get KB context
-    const kbContext = await retrieveKB(userInput, config);
-    const prompt = buildPrompt(userInput, kbContext, config.tone_prompt, conversationHistory, config);
+    const kbContext = await retrieveKB(sanitizedInput, config);
+    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
 
     // Prepare Bedrock request - use config model or default
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;

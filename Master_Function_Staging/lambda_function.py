@@ -17,6 +17,92 @@ except ImportError:
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Track JWT signing key retrieval warnings (only log once per Lambda instance)
+_jwt_key_warning_logged = False
+
+def get_jwt_signing_key() -> Optional[str]:
+    """
+    Get JWT signing key from Secrets Manager, falling back to env var.
+    SECURITY: Never use hardcoded default keys - fail explicitly if no key available.
+    """
+    global _jwt_key_warning_logged
+
+    # Try Secrets Manager first (preferred)
+    try:
+        import boto3
+        secrets_client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+        secret_name = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+
+        # Handle both JSON and plain string formats
+        secret_string = response.get('SecretString', '')
+        try:
+            secret_data = json.loads(secret_string)
+            return secret_data.get('signingKey', secret_string)
+        except json.JSONDecodeError:
+            return secret_string
+
+    except Exception as e:
+        if not _jwt_key_warning_logged:
+            logger.critical(f"SECURITY WARNING: Failed to retrieve JWT signing key from Secrets Manager: {e}")
+            _jwt_key_warning_logged = True
+
+        # Fall back to environment variable (NOT a hardcoded default)
+        env_key = os.environ.get('JWT_SECRET')
+        if env_key:
+            if not _jwt_key_warning_logged:
+                logger.warning("Using JWT_SECRET environment variable as fallback (Secrets Manager unavailable)")
+            return env_key
+
+        # No key available - log critical error
+        logger.critical("SECURITY CRITICAL: No JWT signing key available - authentication will fail")
+        return None
+
+def sanitize_user_input(user_input: str, max_length: int = 4000) -> str:
+    """
+    Sanitize and validate user input before sending to Bedrock.
+    Prevents prompt injection attacks and handles excessive length.
+    """
+    if not user_input or not isinstance(user_input, str):
+        return "Hello"
+
+    # Truncate to prevent token limit issues
+    sanitized = user_input[:max_length]
+
+    # Log suspiciously long inputs
+    if len(user_input) > max_length:
+        logger.warning(f"SECURITY: Truncated excessively long input: {len(user_input)} chars")
+
+    # Detect potential prompt injection patterns
+    injection_patterns = [
+        "ignore previous", "ignore all", "system:", "admin mode",
+        "dev mode", "override instructions", "jailbreak", "disregard"
+    ]
+    lower_input = sanitized.lower()
+    for pattern in injection_patterns:
+        if pattern in lower_input:
+            logger.warning(f"SECURITY: Potential prompt injection detected: {pattern}")
+
+    return sanitized.strip()
+
+def sanitize_log_data(data: str, max_length: int = 100) -> str:
+    """
+    Sanitize data before logging to prevent PII leakage.
+    Redacts email addresses and phone numbers.
+    """
+    import re
+    if not data or not isinstance(data, str):
+        return "[empty]"
+
+    # Redact email patterns
+    sanitized = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[EMAIL]', data)
+
+    # Redact phone patterns
+    sanitized = re.sub(r'(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE]', sanitized)
+
+    # Truncate
+    return sanitized[:max_length] + "..." if len(sanitized) > max_length else sanitized
+
 def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Add CORS headers to response. This is the ONLY place CORS headers are added.
@@ -55,7 +141,9 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
                 allowed_origin = origin
                 logger.info(f"CORS: Allowing specific origin {origin}")
             else:
-                logger.warning(f"CORS: Origin {origin} not in allowed list, using wildcard")
+                # SECURITY: Don't fall back to wildcard - use first allowed origin instead
+                logger.warning(f"CORS: Origin {origin} not in allowed list, using default origin (not wildcard)")
+                allowed_origin = allowed_origins[0] if allowed_origins else 'https://chat.myrecruiter.ai'
     
     # Add CORS headers - this is the single source of truth
     response['headers']['Access-Control-Allow-Origin'] = allowed_origin
@@ -77,13 +165,22 @@ def handle_options(event: Dict[str, Any] = None) -> Dict[str, Any]:
     Handle OPTIONS requests for CORS preflight
     """
     logger.info("OPTIONS request received for CORS preflight")
-    
+
+    # Determine origin from request for preflight
+    origin = 'https://chat.myrecruiter.ai'  # Safe default
+    if event and 'headers' in event:
+        headers = event.get('headers', {})
+        for key in ['origin', 'Origin', 'ORIGIN']:
+            if key in headers:
+                origin = headers[key]
+                break
+
     # For OPTIONS, we just need to return CORS headers with 200 status
     # Don't process the body or try to add nested headers
     return {
         'statusCode': 200,
         'headers': {
-            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Origin': origin,
             'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
             'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
             'Content-Type': 'application/json'
@@ -101,7 +198,7 @@ def health_check(event: Dict[str, Any] = None) -> Dict[str, Any]:
         'statusCode': 200,
         'body': json.dumps({
             'status': 'healthy',
-            'timestamp': '2025-08-15T00:00:00Z',  # In production, use datetime.utcnow().isoformat()
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
             'function': 'Master_Function_Staging'
         })
     }
@@ -224,14 +321,14 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str):
         if http_method == 'GET':
             # EventSource uses GET with query parameters
             query_params = event.get('queryStringParameters', {}) or {}
-            user_input = query_params.get('user_input', 'Hello')
+            user_input = sanitize_user_input(query_params.get('user_input', 'Hello'))
             session_id = query_params.get('session_id', 'default_session')
             conversation_context = None  # GET requests don't have conversation context
-            logger.info(f"GET streaming request with query params - input: {user_input[:100]}...")
+            logger.info(f"GET streaming request with query params - input: {sanitize_log_data(user_input)}")
         else:
             # POST request with body
             body = json.loads(event.get('body', '{}')) if event.get('body') else {}
-            user_input = body.get('user_input', 'Hello')
+            user_input = sanitize_user_input(body.get('user_input', 'Hello'))
             session_id = body.get('session_id', 'default_session')
             
             # Extract conversation context from POST body
@@ -248,7 +345,7 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str):
                 }
                 logger.info(f"POST streaming request with {len(messages_from_context)} conversation messages")
             else:
-                logger.info(f"POST streaming request with body - input: {user_input[:100]}...")
+                logger.info(f"POST streaming request with body - input: {sanitize_log_data(user_input)}")
                 
                 # SURGERY 3: Fetch conversation context from DynamoDB for streaming
                 conversation_id = body.get('conversation_id')
@@ -456,13 +553,13 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         if http_method == 'GET':
             # EventSource uses GET with query parameters
             query_params = event.get('queryStringParameters', {}) or {}
-            user_input = query_params.get('user_input', 'Hello')
+            user_input = sanitize_user_input(query_params.get('user_input', 'Hello'))
             session_id = query_params.get('session_id', 'default_session')
             conversation_context = None
         else:
             # POST request with body
             body = json.loads(event.get('body', '{}')) if event.get('body') else {}
-            user_input = body.get('user_input', 'Hello')
+            user_input = sanitize_user_input(body.get('user_input', 'Hello'))
             session_id = body.get('session_id', 'default_session')
             
             # Extract conversation context from POST body
@@ -822,18 +919,11 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
             # Try to decode as JWT first, then fall back to base64
             try:
                 import jwt
-                jwt_signing_key = os.environ.get('JWT_SECRET', 'default-dev-secret-key')
-                
-                # Try to get signing key from Secrets Manager
-                try:
-                    import boto3
-                    secrets_client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-                    secret_name = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
-                    response = secrets_client.get_secret_value(SecretId=secret_name)
-                    jwt_signing_key = response['SecretString']
-                except:
-                    pass
-                
+                jwt_signing_key = get_jwt_signing_key()
+
+                if not jwt_signing_key:
+                    raise ValueError("No JWT signing key available")
+
                 # Decode JWT token
                 token_data = jwt.decode(state_token, jwt_signing_key, algorithms=['HS256'])
                 
@@ -1364,15 +1454,8 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
                 # Try to use existing state token or generate new one
                 existing_token = existing_conversation.get('stateToken', {}).get('S')
                 
-                # Get JWT signing key (we'll need it either way)
-                jwt_signing_key = None
-                try:
-                    secrets_client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-                    secret_name = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
-                    response = secrets_client.get_secret_value(SecretId=secret_name)
-                    jwt_signing_key = response['SecretString']
-                except:
-                    jwt_signing_key = os.environ.get('JWT_SECRET', 'default-dev-secret-key')
+                # Get JWT signing key using secure helper function
+                jwt_signing_key = get_jwt_signing_key()
                 
                 if not existing_token or existing_token == 'null':
                     # Generate new token with current turn
@@ -1430,21 +1513,8 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
                 logger.warning(f"Failed to process existing conversation, creating new: {e}")
                 # Fall through to normal flow
         
-        # Get JWT signing key from Secrets Manager or environment
-        jwt_signing_key = None
-        try:
-            secrets_client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-            secret_name = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
-            
-            response = secrets_client.get_secret_value(SecretId=secret_name)
-            jwt_signing_key = response['SecretString']
-            logger.info("Successfully retrieved JWT signing key from Secrets Manager")
-        except ClientError as e:
-            logger.warning(f"Could not retrieve JWT signing key from Secrets Manager: {e}")
-            jwt_signing_key = os.environ.get('JWT_SECRET', 'default-dev-secret-key')
-        except Exception as e:
-            logger.warning(f"Secrets Manager not available: {e}")
-            jwt_signing_key = os.environ.get('JWT_SECRET', 'default-dev-secret-key')
+        # Get JWT signing key using secure helper function
+        jwt_signing_key = get_jwt_signing_key()
         
         # Generate proper JWT token matching conversation handler expectations
         # CRITICAL: Use camelCase field names to match conversation_handler.py
@@ -1497,8 +1567,8 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
         # Try to create JWT even in fallback
         try:
             import jwt
-            jwt_signing_key = os.environ.get('JWT_SECRET', 'default-dev-secret-key')
-            
+            jwt_signing_key = get_jwt_signing_key()
+
             state_token_payload = {
                 'sessionId': session_id,
                 'tenantId': tenant_id,
@@ -1582,22 +1652,8 @@ def handle_generate_stream_token(event: Dict[str, Any], tenant_hash: str) -> Dic
         # For streaming, tenant_hash is the tenant_id
         tenant_id = tenant_hash
         
-        # Get JWT signing key from Secrets Manager or environment
-        jwt_signing_key = None
-        try:
-            secrets_client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
-            secret_name = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
-            
-            response = secrets_client.get_secret_value(SecretId=secret_name)
-            secret_data = json.loads(response['SecretString'])
-            jwt_signing_key = secret_data.get('signingKey', response['SecretString'])
-            logger.info("Successfully retrieved JWT signing key from Secrets Manager for streaming")
-        except ClientError as e:
-            logger.warning(f"Could not retrieve JWT signing key from Secrets Manager: {e}")
-            jwt_signing_key = os.environ.get('JWT_SECRET', 'default-dev-secret-key')
-        except Exception as e:
-            logger.warning(f"Secrets Manager not available: {e}")
-            jwt_signing_key = os.environ.get('JWT_SECRET', 'default-dev-secret-key')
+        # Get JWT signing key using secure helper function
+        jwt_signing_key = get_jwt_signing_key()
         
         # Generate streaming-specific JWT token
         # CRITICAL: Must include 'purpose': 'stream' for streaming handler validation

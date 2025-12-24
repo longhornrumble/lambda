@@ -14,6 +14,25 @@ const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' })
 const configCache = {};
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+// Track if we've warned about S3 bucket fallback (only warn once per Lambda instance)
+let s3BucketWarningLogged = false;
+
+/**
+ * Get config bucket name with warning if using fallback
+ * @returns {string} - S3 bucket name
+ */
+function getConfigBucket() {
+  const bucket = process.env.CONFIG_BUCKET || process.env.S3_CONFIG_BUCKET;
+  if (!bucket) {
+    if (!s3BucketWarningLogged) {
+      console.warn('⚠️ CONFIG_BUCKET/S3_CONFIG_BUCKET not set - using fallback myrecruiter-picasso');
+      s3BucketWarningLogged = true;
+    }
+    return 'myrecruiter-picasso';
+  }
+  return bucket;
+}
+
 /**
  * Resolve tenant hash to tenant ID via S3 mapping
  */
@@ -21,7 +40,7 @@ async function resolveTenantHash(tenantHash) {
     try {
         const mappingKey = `mappings/${tenantHash}.json`;
         const command = new GetObjectCommand({
-            Bucket: process.env.CONFIG_BUCKET || process.env.S3_CONFIG_BUCKET || 'myrecruiter-picasso',
+            Bucket: getConfigBucket(),
             Key: mappingKey
         });
 
@@ -60,7 +79,7 @@ async function loadTenantConfig(tenantHash) {
         // Load config from S3
         const configKey = `tenants/${tenantId}/${tenantId}-config.json`;
         const command = new GetObjectCommand({
-            Bucket: process.env.CONFIG_BUCKET || process.env.S3_CONFIG_BUCKET || 'myrecruiter-picasso',
+            Bucket: getConfigBucket(),
             Key: configKey
         });
 

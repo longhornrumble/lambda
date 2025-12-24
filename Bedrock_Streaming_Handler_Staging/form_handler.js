@@ -34,6 +34,39 @@ const SMS_USAGE_TABLE = process.env.SMS_USAGE_TABLE || 'picasso-sms-usage';
 const SMS_MONTHLY_LIMIT = parseInt(process.env.SMS_MONTHLY_LIMIT || '100', 10);
 
 /**
+ * Sanitize text for SMS messages - remove special characters that could cause issues
+ * @param {string} text - Raw text
+ * @param {number} maxLength - Maximum allowed length (default 50)
+ * @returns {string} - SMS-safe text
+ */
+function sanitizeForSMS(text, maxLength = 50) {
+  if (!text || typeof text !== 'string') {
+    return '';
+  }
+  // Keep only alphanumeric, spaces, and basic punctuation safe for SMS
+  return text.replace(/[^\w\s@.\-]/g, '').trim().slice(0, maxLength);
+}
+
+// Track if we've warned about SES fallback (only warn once per Lambda instance)
+let sesEmailWarningLogged = false;
+
+/**
+ * Get SES from email with warning if using fallback
+ * @returns {string} - SES source email address
+ */
+function getSESFromEmail() {
+  const email = process.env.SES_FROM_EMAIL;
+  if (!email) {
+    if (!sesEmailWarningLogged) {
+      console.warn('⚠️ SES_FROM_EMAIL not set - using fallback noreply@picasso.ai (ensure this is verified in SES)');
+      sesEmailWarningLogged = true;
+    }
+    return 'noreply@picasso.ai';
+  }
+  return email;
+}
+
+/**
  * Handle form mode requests (bypass Bedrock)
  * @param {Object} body - Request body
  * @param {Object} tenantConfig - Tenant configuration
@@ -91,14 +124,27 @@ async function validateFormField(fieldId, value, config) {
   // Field-specific validation
   switch (fieldId) {
     case 'email':
-      if (value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
-        errors.push('Please enter a valid email address');
+      // Strengthened email validation with length limits (RFC 5321: max 320 chars)
+      if (value) {
+        if (value.length > 320) {
+          errors.push('Email address is too long');
+        } else if (!/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value)) {
+          errors.push('Please enter a valid email address');
+        }
       }
       break;
 
     case 'phone':
-      if (value && !/^[\d\s\-\(\)\+]+$/.test(value)) {
-        errors.push('Please enter a valid phone number');
+      // Strengthened phone validation: must have at least 7 digits, max 20 chars
+      if (value) {
+        const digitsOnly = value.replace(/\D/g, '');
+        if (value.length > 20) {
+          errors.push('Phone number is too long');
+        } else if (digitsOnly.length < 7) {
+          errors.push('Phone number must have at least 7 digits');
+        } else if (!/^[\d\s\-\(\)\+]+$/.test(value)) {
+          errors.push('Please enter a valid phone number');
+        }
       }
       break;
 
@@ -595,7 +641,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
   `;
 
   const params = {
-    Source: process.env.SES_FROM_EMAIL || 'noreply@picasso.ai',
+    Source: getSESFromEmail(),
     Destination: {
       ToAddresses: Array.isArray(toEmail) ? toEmail : [toEmail]
     },
@@ -629,7 +675,7 @@ async function sendConfirmationEmail(userEmail, formId, config) {
   `;
 
   const params = {
-    Source: process.env.SES_FROM_EMAIL || 'noreply@picasso.ai',
+    Source: getSESFromEmail(),
     Destination: {
       ToAddresses: [userEmail]
     },
@@ -655,7 +701,11 @@ async function sendConfirmationEmail(userEmail, formId, config) {
  */
 async function sendFormSMS(phoneNumber, formId, formData, priority = 'normal') {
   const priorityEmoji = priority === 'high' ? '🚨 ' : priority === 'low' ? '📋 ' : '📝 ';
-  const message = `${priorityEmoji}New ${formId} submission. Name: ${formData.first_name} ${formData.last_name}, Email: ${formData.email}`;
+  // Sanitize user-provided data before SMS interpolation to prevent injection
+  const safeName = `${sanitizeForSMS(formData.first_name, 30)} ${sanitizeForSMS(formData.last_name, 30)}`.trim();
+  const safeEmail = sanitizeForSMS(formData.email, 50);
+  const safeFormId = sanitizeForSMS(formId, 30);
+  const message = `${priorityEmoji}New ${safeFormId} submission. Name: ${safeName}, Email: ${safeEmail}`;
 
   const params = {
     Message: message.substring(0, 160), // SMS character limit
