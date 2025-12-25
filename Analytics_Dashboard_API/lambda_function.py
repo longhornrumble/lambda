@@ -2,13 +2,16 @@
 Analytics Dashboard API Lambda
 
 Provides REST API endpoints for querying analytics data from Athena.
-Used by the Picasso Config Builder dashboard to display tenant metrics.
+Used by the Picasso Analytics Dashboard to display tenant metrics.
 
 Endpoints:
 - GET /analytics/summary    - Overview metrics (sessions, events, forms)
 - GET /analytics/sessions   - Session counts over time
 - GET /analytics/events     - Event breakdown by type
 - GET /analytics/funnel     - Conversion funnel analysis
+- GET /forms/bottlenecks    - Field-level abandonment analysis
+- GET /forms/submissions    - Recent form submissions (paginated)
+- GET /forms/top-performers - Form performance rankings
 
 Authentication:
 - JWT token in Authorization header (Bearer token)
@@ -47,6 +50,10 @@ ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 # AWS clients
 athena = boto3.client('athena')
 secrets_manager = boto3.client('secretsmanager')
+dynamodb = boto3.client('dynamodb')
+
+# DynamoDB table for form submissions (contains PII)
+FORM_SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_submissions')
 
 # Cache for JWT secret
 _jwt_secret_cache = None
@@ -56,8 +63,10 @@ JWT_SECRET_CACHE_TTL = 300  # 5 minutes
 # Security: Allowed event types whitelist
 ALLOWED_EVENT_TYPES = {
     'WIDGET_OPENED', 'WIDGET_CLOSED', 'MESSAGE_SENT', 'FORM_STARTED',
-    'FORM_COMPLETED', 'ACTION_CHIP_CLICKED', 'CTA_CLICKED', 'SESSION_STARTED',
-    'SESSION_ENDED', 'ERROR'
+    'FORM_COMPLETED', 'FORM_ABANDONED', 'FORM_VIEWED', 'FORM_FIELD_SUBMITTED',
+    'ACTION_CHIP_CLICKED', 'CTA_CLICKED', 'LINK_CLICKED', 'HELP_MENU_CLICKED',
+    'SHOWCASE_CTA_CLICKED', 'MESSAGE_RECEIVED', 'CONVERSATION_STARTED',
+    'SESSION_STARTED', 'SESSION_ENDED', 'ERROR'
 }
 
 # Security: Tenant ID validation pattern (alphanumeric, underscore, hyphen only)
@@ -139,8 +148,20 @@ def lambda_handler(event, context):
     params = event.get('queryStringParameters') or {}
 
     # Route to appropriate handler
+    # NOTE: More specific routes must come before generic ones
+    # (e.g., /forms/summary before /summary)
     try:
-        if path.endswith('/summary'):
+        # Forms endpoints (more specific - check first)
+        if path.endswith('/forms/summary'):
+            return handle_form_summary(tenant_id, params)
+        elif path.endswith('/bottlenecks'):
+            return handle_form_bottlenecks(tenant_id, params)
+        elif path.endswith('/submissions'):
+            return handle_form_submissions(tenant_id, params)
+        elif path.endswith('/top-performers'):
+            return handle_form_top_performers(tenant_id, params)
+        # Analytics endpoints (generic)
+        elif path.endswith('/summary'):
             return handle_summary(tenant_id, params)
         elif path.endswith('/sessions'):
             return handle_sessions(tenant_id, params)
@@ -518,6 +539,563 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
 
 
 # =============================================================================
+# Forms Endpoint Handlers
+# =============================================================================
+
+def handle_form_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /forms/summary
+    Returns form-specific summary metrics.
+
+    Query params:
+    - range: Time range (7d, 30d, 90d) - default 30d
+    - form_id: Filter by specific form (optional)
+    """
+    date_range = parse_date_range(params.get('range', '30d'))
+    form_id = params.get('form_id')
+
+    # Build optional form filter
+    form_filter = ""
+    if form_id:
+        if not TENANT_ID_PATTERN.match(form_id):
+            return cors_response(400, {'error': 'Invalid form_id format'})
+        form_filter = f"AND json_extract_scalar(event_payload, '$.form_id') = '{form_id}'"
+
+    # Query for form metrics using a single aggregation query
+    query = f"""
+    SELECT
+        SUM(CASE WHEN event_type = 'FORM_VIEWED' THEN 1 ELSE 0 END) as form_views,
+        SUM(CASE WHEN event_type = 'FORM_STARTED' THEN 1 ELSE 0 END) as forms_started,
+        SUM(CASE WHEN event_type = 'FORM_COMPLETED' THEN 1 ELSE 0 END) as forms_completed,
+        SUM(CASE WHEN event_type = 'FORM_ABANDONED' THEN 1 ELSE 0 END) as forms_abandoned,
+        AVG(CASE WHEN event_type = 'FORM_COMPLETED'
+            THEN CAST(json_extract_scalar(event_payload, '$.duration_seconds') AS DOUBLE)
+            ELSE NULL END) as avg_completion_time
+    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+    WHERE tenant_id = '{tenant_id}'
+      AND event_type IN ('FORM_VIEWED', 'FORM_STARTED', 'FORM_COMPLETED', 'FORM_ABANDONED')
+      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+          >= DATE '{date_range['start_date_iso']}'
+      {form_filter}
+    """
+
+    results = execute_athena_query(query)
+
+    if results and len(results) > 0:
+        row = results[0]
+        form_views = int(row.get('form_views', 0) or 0)
+        forms_started = int(row.get('forms_started', 0) or 0)
+        forms_completed = int(row.get('forms_completed', 0) or 0)
+        forms_abandoned = int(row.get('forms_abandoned', 0) or 0)
+        avg_completion_time = float(row.get('avg_completion_time', 0) or 0)
+
+        # Calculate rates based on total outcomes (completed + abandoned)
+        # This is more accurate than using forms_started because:
+        # 1. Same session can start multiple times (retry after abandon)
+        # 2. Rates should add up to 100% for clarity
+        total_outcomes = forms_completed + forms_abandoned
+        completion_rate = (forms_completed / total_outcomes * 100) if total_outcomes > 0 else 0
+        abandon_rate = (forms_abandoned / total_outcomes * 100) if total_outcomes > 0 else 0
+
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': params.get('range', '30d'),
+            'metrics': {
+                'form_views': form_views,
+                'forms_started': forms_started,
+                'forms_completed': forms_completed,
+                'forms_abandoned': forms_abandoned,
+                'completion_rate': round(completion_rate, 1),
+                'abandon_rate': round(abandon_rate, 1),
+                'avg_completion_time_seconds': round(avg_completion_time)
+            }
+        })
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': params.get('range', '30d'),
+        'metrics': {
+            'form_views': 0,
+            'forms_started': 0,
+            'forms_completed': 0,
+            'forms_abandoned': 0,
+            'completion_rate': 0,
+            'abandon_rate': 0,
+            'avg_completion_time_seconds': 0
+        }
+    })
+
+
+def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /forms/bottlenecks
+    Returns field-level abandonment analysis.
+
+    Shows which form fields cause the most drop-offs.
+
+    Query params:
+    - range: Time range (7d, 30d, 90d) - default 30d
+    - form_id: Filter by specific form (optional)
+    - limit: Number of results (default 5, max 20)
+    """
+    date_range = parse_date_range(params.get('range', '30d'))
+    limit = min(int(params.get('limit', '5')), 20)
+    form_id = params.get('form_id')
+
+    # Build optional form filter
+    form_filter = ""
+    if form_id:
+        # Sanitize form_id (alphanumeric, underscore, hyphen only)
+        if not TENANT_ID_PATTERN.match(form_id):
+            return cors_response(400, {'error': 'Invalid form_id format'})
+        form_filter = f"AND json_extract_scalar(event_payload, '$.form_id') = '{form_id}'"
+
+    # Query FORM_ABANDONED events, group by last_field_id
+    query = f"""
+    SELECT
+        json_extract_scalar(event_payload, '$.last_field_id') as field_id,
+        json_extract_scalar(event_payload, '$.last_field_label') as field_label,
+        json_extract_scalar(event_payload, '$.form_id') as form_id,
+        COUNT(*) as abandon_count
+    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+    WHERE tenant_id = '{tenant_id}'
+      AND event_type = 'FORM_ABANDONED'
+      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+          >= DATE '{date_range['start_date_iso']}'
+      {form_filter}
+    GROUP BY
+        json_extract_scalar(event_payload, '$.last_field_id'),
+        json_extract_scalar(event_payload, '$.last_field_label'),
+        json_extract_scalar(event_payload, '$.form_id')
+    ORDER BY abandon_count DESC
+    LIMIT {limit}
+    """
+
+    results = execute_athena_query(query)
+
+    # Calculate total abandonments for percentage
+    total_query = f"""
+    SELECT COUNT(*) as total
+    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+    WHERE tenant_id = '{tenant_id}'
+      AND event_type = 'FORM_ABANDONED'
+      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+          >= DATE '{date_range['start_date_iso']}'
+      {form_filter}
+    """
+
+    total_result = execute_athena_query(total_query)
+    total_abandons = int(total_result[0].get('total', 0) or 0) if total_result else 0
+
+    # Generate insights based on field characteristics
+    bottlenecks = []
+    for row in (results or []):
+        field_id = row.get('field_id', 'unknown')
+        field_label = row.get('field_label', field_id)
+        abandon_count = int(row.get('abandon_count', 0) or 0)
+        abandon_pct = round((abandon_count / total_abandons * 100) if total_abandons > 0 else 0, 1)
+
+        # Generate insight based on field characteristics
+        insight = generate_field_insight(field_id, field_label)
+
+        bottlenecks.append({
+            'field_id': field_id,
+            'field_label': field_label,
+            'form_id': row.get('form_id'),
+            'abandon_count': abandon_count,
+            'abandon_percentage': abandon_pct,
+            'insight': insight['insight'],
+            'recommendation': insight['recommendation']
+        })
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': params.get('range', '30d'),
+        'bottlenecks': bottlenecks,
+        'total_abandonments': total_abandons
+    })
+
+
+def generate_field_insight(field_id: str, field_label: str) -> Dict[str, str]:
+    """
+    Generate actionable insights based on field characteristics.
+    Rule-based pattern matching for common abandonment reasons.
+    """
+    field_lower = (field_id + ' ' + field_label).lower()
+
+    # Pattern matching for common abandonment reasons
+    if any(word in field_lower for word in ['background', 'check', 'screening']):
+        return {
+            'insight': 'Trust and privacy concerns may cause hesitation at background check fields.',
+            'recommendation': 'Add a trust badge or explanatory text: "Background checks help us ensure safety and are required by regulations."'
+        }
+
+    if any(word in field_lower for word in ['phone', 'tel', 'mobile', 'cell']):
+        return {
+            'insight': 'Phone number requests often trigger privacy concerns.',
+            'recommendation': 'Add reassuring text: "We\'ll only call to schedule your orientation."'
+        }
+
+    if any(word in field_lower for word in ['email', 'e-mail']):
+        return {
+            'insight': 'Email requests may cause spam anxiety.',
+            'recommendation': 'Add text: "We\'ll never share your email or send spam."'
+        }
+
+    if any(word in field_lower for word in ['address', 'street', 'city', 'zip', 'postal']):
+        return {
+            'insight': 'Address fields are perceived as high-friction and raise privacy concerns.',
+            'recommendation': 'Consider if full address is needed upfront, or defer to a follow-up form after initial contact.'
+        }
+
+    if any(word in field_lower for word in ['ssn', 'social security', 'tax', 'ein']):
+        return {
+            'insight': 'Sensitive financial identifiers cause significant abandonment.',
+            'recommendation': 'Move to a later stage after trust is established, or explain why it\'s required with security assurances.'
+        }
+
+    if any(word in field_lower for word in ['reference', 'referral', 'recommend']):
+        return {
+            'insight': 'Reference requirements add friction and require preparation.',
+            'recommendation': 'Consider making optional, or allow submission to be completed later with references.'
+        }
+
+    if any(word in field_lower for word in ['age', 'birth', 'dob', 'date of birth']):
+        return {
+            'insight': 'Age verification may filter out users who don\'t meet requirements.',
+            'recommendation': 'Show age requirements earlier in the process to set expectations.'
+        }
+
+    if any(word in field_lower for word in ['consent', 'agree', 'terms', 'policy']):
+        return {
+            'insight': 'Legal consent fields require users to pause and review terms.',
+            'recommendation': 'Keep consent text brief and scannable. Link to full terms rather than displaying inline.'
+        }
+
+    # Default insight
+    return {
+        'insight': 'This field has elevated abandonment compared to others in the form.',
+        'recommendation': 'Review field placement, wording, and whether it\'s essential at this stage of the process.'
+    }
+
+
+def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /forms/submissions
+    Returns recent form submissions with pagination from DynamoDB.
+
+    This queries the picasso_form_submissions table which contains actual
+    form data including PII (names, emails, etc.).
+
+    Query params:
+    - range: Time range (7d, 30d, 90d) - default 30d
+    - form_id: Filter by specific form (optional)
+    - page: Page number (default 1)
+    - limit: Results per page (default 25, max 100)
+    - search: Search query for name/email (optional)
+    """
+    date_range = parse_date_range(params.get('range', '30d'))
+    page = max(1, int(params.get('page', '1')))
+    limit = min(int(params.get('limit', '25')), 100)
+    form_id_filter = params.get('form_id')
+    search = params.get('search', '').strip().lower()
+
+    # Query DynamoDB using tenant-timestamp-index
+    try:
+        query_params = {
+            'TableName': FORM_SUBMISSIONS_TABLE,
+            'IndexName': 'tenant-timestamp-index',
+            'KeyConditionExpression': 'tenant_id = :tid AND #ts >= :start_date',
+            'ExpressionAttributeNames': {'#ts': 'timestamp'},
+            'ExpressionAttributeValues': {
+                ':tid': {'S': tenant_id},
+                ':start_date': {'S': date_range['start_date_iso']}
+            },
+            'ScanIndexForward': False,  # Descending order (newest first)
+            'Limit': 200  # Get more items to allow for filtering
+        }
+
+        # Add form_id filter if specified
+        if form_id_filter:
+            if not TENANT_ID_PATTERN.match(form_id_filter):
+                return cors_response(400, {'error': 'Invalid form_id format'})
+            query_params['FilterExpression'] = 'form_id = :fid'
+            query_params['ExpressionAttributeValues'][':fid'] = {'S': form_id_filter}
+
+        response = dynamodb.query(**query_params)
+        items = response.get('Items', [])
+
+    except Exception as e:
+        logger.error(f"DynamoDB query error: {e}")
+        return cors_response(500, {'error': 'Failed to query submissions'})
+
+    # Process and filter submissions
+    all_submissions = []
+    for item in items:
+        # Extract basic fields
+        submission_id = item.get('submission_id', {}).get('S', '')
+        session_id = item.get('session_id', {}).get('S', '')
+        form_id = item.get('form_id', {}).get('S', '')
+        form_title = item.get('form_title', {}).get('S', form_id)
+        submitted_at = item.get('submitted_at', {}).get('S', '')
+
+        # Extract name and email from form_data
+        name, email = extract_name_email_from_form_data(item.get('form_data', {}))
+
+        # Apply search filter
+        if search:
+            search_fields = f"{name} {email} {form_title}".lower()
+            if search not in search_fields:
+                continue
+
+        # Format date
+        try:
+            dt = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+            formatted_date = dt.strftime('%b %d')
+        except (ValueError, AttributeError):
+            formatted_date = submitted_at[:10] if submitted_at else 'Unknown'
+
+        all_submissions.append({
+            'submission_id': submission_id,
+            'session_id': session_id,
+            'form_id': form_id,
+            'form_label': form_title,
+            'submitted_at': submitted_at,
+            'submitted_date': formatted_date,
+            'duration_seconds': 0,  # Not stored in DynamoDB
+            'fields_completed': 0,  # Not stored in DynamoDB
+            'fields': {
+                'name': name,
+                'email': email
+            }
+        })
+
+    # Apply pagination
+    total_count = len(all_submissions)
+    total_pages = (total_count + limit - 1) // limit if limit > 0 else 0
+    start_idx = (page - 1) * limit
+    end_idx = start_idx + limit
+    paginated_submissions = all_submissions[start_idx:end_idx]
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': params.get('range', '30d'),
+        'submissions': paginated_submissions,
+        'pagination': {
+            'total_count': total_count,
+            'page': page,
+            'limit': limit,
+            'total_pages': total_pages,
+            'has_next_page': page < total_pages,
+            'has_previous_page': page > 1
+        }
+    })
+
+
+def extract_name_email_from_form_data(form_data: Dict) -> tuple:
+    """
+    Extract name and email from DynamoDB form_data structure.
+    Form data contains nested field values with dynamic field IDs.
+    """
+    name_parts = []
+    email = ''
+
+    # Get the nested map
+    data_map = form_data.get('M', {})
+
+    for field_id, field_value in data_map.items():
+        if not isinstance(field_value, dict):
+            continue
+
+        # Check for nested map (compound fields like name with first/last)
+        if 'M' in field_value:
+            nested_map = field_value['M']
+            for sub_key, sub_val in nested_map.items():
+                if isinstance(sub_val, dict) and 'S' in sub_val:
+                    val = sub_val['S']
+                    sub_key_lower = sub_key.lower()
+                    if 'first_name' in sub_key_lower:
+                        name_parts.insert(0, val)  # First name at start
+                    elif 'last_name' in sub_key_lower:
+                        name_parts.append(val)  # Last name at end
+                    elif 'name' in sub_key_lower and val:
+                        name_parts.append(val)
+
+        # Check for simple string value
+        elif 'S' in field_value:
+            val = field_value['S']
+            field_id_lower = field_id.lower()
+
+            # Look for email
+            if '@' in val and '.' in val:
+                email = val
+            # Look for name fields by field ID pattern
+            elif 'name' in field_id_lower and not name_parts:
+                name_parts.append(val)
+
+    name = ' '.join(filter(None, name_parts)).strip()
+    return (name if name else 'Anonymous', email)
+
+
+def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /forms/top-performers
+    Returns form performance rankings by conversion rate.
+
+    Query params:
+    - range: Time range (7d, 30d, 90d) - default 30d
+    - limit: Number of results (default 5, max 20)
+    - sort_by: Sort field (conversion_rate, completions, avg_time) - default conversion_rate
+    """
+    date_range = parse_date_range(params.get('range', '30d'))
+    limit = min(int(params.get('limit', '5')), 20)
+    sort_by = params.get('sort_by', 'conversion_rate')
+
+    # Validate sort_by
+    valid_sorts = {'conversion_rate', 'completions', 'avg_time'}
+    if sort_by not in valid_sorts:
+        sort_by = 'conversion_rate'
+
+    # Map sort field to SQL column
+    sort_column = {
+        'conversion_rate': 'conversion_rate',
+        'completions': 'completions',
+        'avg_time': 'avg_completion_time'
+    }.get(sort_by, 'conversion_rate')
+
+    # Query form stats - get views, starts, completions, and abandons per form
+    query = f"""
+    WITH form_starts AS (
+        SELECT
+            json_extract_scalar(event_payload, '$.form_id') as form_id,
+            COUNT(*) as started
+        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+        WHERE tenant_id = '{tenant_id}'
+          AND event_type = 'FORM_STARTED'
+          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+              >= DATE '{date_range['start_date_iso']}'
+        GROUP BY json_extract_scalar(event_payload, '$.form_id')
+    ),
+    form_completions AS (
+        SELECT
+            json_extract_scalar(event_payload, '$.form_id') as form_id,
+            json_extract_scalar(event_payload, '$.form_label') as form_label,
+            COUNT(*) as completions,
+            AVG(CAST(json_extract_scalar(event_payload, '$.duration_seconds') AS DOUBLE)) as avg_duration
+        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+        WHERE tenant_id = '{tenant_id}'
+          AND event_type = 'FORM_COMPLETED'
+          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+              >= DATE '{date_range['start_date_iso']}'
+        GROUP BY
+            json_extract_scalar(event_payload, '$.form_id'),
+            json_extract_scalar(event_payload, '$.form_label')
+    ),
+    form_abandons AS (
+        SELECT
+            json_extract_scalar(event_payload, '$.form_id') as form_id,
+            COUNT(*) as abandons
+        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+        WHERE tenant_id = '{tenant_id}'
+          AND event_type = 'FORM_ABANDONED'
+          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+              >= DATE '{date_range['start_date_iso']}'
+        GROUP BY json_extract_scalar(event_payload, '$.form_id')
+    ),
+    form_views AS (
+        SELECT
+            json_extract_scalar(event_payload, '$.form_id') as form_id,
+            COUNT(*) as views
+        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+        WHERE tenant_id = '{tenant_id}'
+          AND event_type = 'FORM_VIEWED'
+          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
+                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
+                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
+              >= DATE '{date_range['start_date_iso']}'
+        GROUP BY json_extract_scalar(event_payload, '$.form_id')
+    )
+    SELECT
+        COALESCE(c.form_id, s.form_id, a.form_id, v.form_id) as form_id,
+        c.form_label,
+        COALESCE(v.views, 0) as views,
+        COALESCE(s.started, 0) as started,
+        COALESCE(c.completions, 0) as completions,
+        COALESCE(a.abandons, 0) as abandons,
+        COALESCE(c.avg_duration, 0) as avg_completion_time,
+        CASE
+            WHEN (COALESCE(c.completions, 0) + COALESCE(a.abandons, 0)) > 0
+            THEN ROUND(CAST(COALESCE(c.completions, 0) AS DOUBLE) / CAST(COALESCE(c.completions, 0) + COALESCE(a.abandons, 0) AS DOUBLE) * 100, 1)
+            ELSE 0
+        END as conversion_rate,
+        CASE
+            WHEN (COALESCE(c.completions, 0) + COALESCE(a.abandons, 0)) > 0
+            THEN ROUND(CAST(COALESCE(a.abandons, 0) AS DOUBLE) / CAST(COALESCE(c.completions, 0) + COALESCE(a.abandons, 0) AS DOUBLE) * 100, 1)
+            ELSE 0
+        END as abandon_rate
+    FROM form_completions c
+    FULL OUTER JOIN form_starts s ON c.form_id = s.form_id
+    FULL OUTER JOIN form_abandons a ON COALESCE(c.form_id, s.form_id) = a.form_id
+    FULL OUTER JOIN form_views v ON COALESCE(c.form_id, s.form_id, a.form_id) = v.form_id
+    WHERE COALESCE(c.form_id, s.form_id, a.form_id, v.form_id) IS NOT NULL
+    ORDER BY {sort_column} DESC
+    LIMIT {limit}
+    """
+
+    results = execute_athena_query(query)
+
+    # Calculate totals
+    total_completions = 0
+    forms = []
+    for row in (results or []):
+        completions = int(row.get('completions', 0) or 0)
+        total_completions += completions
+
+        avg_time = float(row.get('avg_completion_time', 0) or 0)
+        conversion_rate = float(row.get('conversion_rate', 0) or 0)
+
+        # Determine trend indicator (would need historical comparison for real trends)
+        # For now, use conversion rate thresholds
+        if conversion_rate >= 70:
+            trend = 'trending'
+        elif conversion_rate >= 40:
+            trend = 'stable'
+        else:
+            trend = 'low'
+
+        forms.append({
+            'form_id': row.get('form_id', ''),
+            'form_label': row.get('form_label', row.get('form_id', 'Unknown Form')),
+            'views': int(row.get('views', 0) or 0),
+            'started': int(row.get('started', 0) or 0),
+            'completions': completions,
+            'conversion_rate': conversion_rate,
+            'abandon_rate': float(row.get('abandon_rate', 0) or 0),
+            'avg_completion_time_seconds': round(avg_time),
+            'trend': trend
+        })
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': params.get('range', '30d'),
+        'forms': forms,
+        'total_completions': total_completions
+    })
+
+
+# =============================================================================
 # Athena Query Helpers
 # =============================================================================
 
@@ -609,14 +1187,13 @@ def parse_date_range(range_str: str) -> Dict[str, Any]:
 # =============================================================================
 
 def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
-    """Build response with CORS headers."""
+    """Build response with JSON content type.
+    CORS headers are handled by Lambda Function URL configuration.
+    """
     return {
         'statusCode': status_code,
         'headers': {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+            'Content-Type': 'application/json'
         },
         'body': json.dumps(body)
     }
