@@ -7,8 +7,8 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
-    "@aws-sdk/client-bedrock-agent-runtime": "^3.600.0",
-    "@aws-sdk/client-bedrock-runtime": "^3.600.0",
+    "@aws-sdk/client-bedrock-agent-runtime": "^3.958.0",
+    "@aws-sdk/client-bedrock-runtime": "^3.958.0",
     "@aws-sdk/client-dynamodb": "^3.600.0",
     "@aws-sdk/client-lambda": "^3.600.0",
     "@aws-sdk/client-s3": "^3.600.0",
@@ -17,8 +17,8 @@
     "@aws-sdk/lib-dynamodb": "^3.600.0"
   },
   "scripts": {
-    "build": "npm ci --production",
-    "package": "zip -r deployment.zip index.js response_enhancer.js form_handler.js node_modules package.json",
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js response_enhancer.js form_handler.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
@@ -30,6 +30,7 @@
     "@types/jest": "^30.0.0",
     "aws-sdk-client-mock": "^4.1.0",
     "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.2",
     "jest": "^30.2.0"
   }
 }
