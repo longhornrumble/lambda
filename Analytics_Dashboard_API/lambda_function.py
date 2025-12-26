@@ -1,8 +1,14 @@
 """
 Analytics Dashboard API Lambda
 
-Provides REST API endpoints for querying analytics data from Athena.
-Used by the Picasso Analytics Dashboard to display tenant metrics.
+Provides REST API endpoints for querying analytics data.
+**HOT PATH**: Reads pre-computed aggregates from DynamoDB for sub-100ms responses.
+**COLD PATH**: Falls back to Athena for real-time queries if DynamoDB cache is stale.
+
+Architecture:
+- DynamoDB Table: picasso-dashboard-aggregates (pre-computed by Analytics_Aggregator Lambda)
+- Athena: Fallback for fresh queries, historical data >90 days
+- Pre-computed aggregates refreshed hourly by EventBridge-triggered Aggregator
 
 Endpoints:
 - GET /analytics/summary    - Overview metrics (sessions, events, forms)
@@ -12,6 +18,8 @@ Endpoints:
 - GET /forms/bottlenecks    - Field-level abandonment analysis
 - GET /forms/submissions    - Recent form submissions (paginated)
 - GET /forms/top-performers - Form performance rankings
+- GET /sessions/{session_id} - Full session timeline (User Journey)
+- GET /sessions/list        - Paginated session list with filters (User Journey)
 
 Authentication:
 - JWT token in Authorization header (Bearer token)
@@ -21,6 +29,10 @@ Environment Variables:
 - ATHENA_DATABASE: Athena database name (default: picasso_analytics)
 - ATHENA_OUTPUT_LOCATION: S3 location for query results
 - JWT_SECRET_KEY_NAME: Secrets Manager key name for JWT secret
+- AGGREGATES_TABLE: DynamoDB table for pre-computed aggregates (default: picasso-dashboard-aggregates)
+- USE_DYNAMO_CACHE: Enable DynamoDB hot path (default: true)
+- SESSION_EVENTS_TABLE: DynamoDB table for session events (default: picasso-session-events)
+- SESSION_SUMMARIES_TABLE: DynamoDB table for session summaries (default: picasso-session-summaries)
 """
 
 import json
@@ -33,7 +45,9 @@ import hashlib
 import hmac
 import base64
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
+from decimal import Decimal
 from botocore.exceptions import ClientError
 
 # Configure logging
@@ -47,13 +61,26 @@ ATHENA_OUTPUT_LOCATION = os.environ.get('ATHENA_OUTPUT_LOCATION', 's3://picasso-
 JWT_SECRET_KEY_NAME = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/staging/jwt/signing-key')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 
+# DynamoDB hot path configuration
+AGGREGATES_TABLE = os.environ.get('AGGREGATES_TABLE', 'picasso-dashboard-aggregates')
+USE_DYNAMO_CACHE = os.environ.get('USE_DYNAMO_CACHE', 'true').lower() == 'true'
+CACHE_MAX_AGE_HOURS = int(os.environ.get('CACHE_MAX_AGE_HOURS', '2'))  # Consider stale after 2 hours
+
 # AWS clients
 athena = boto3.client('athena')
 secrets_manager = boto3.client('secretsmanager')
 dynamodb = boto3.client('dynamodb')
+dynamodb_resource = boto3.resource('dynamodb')
+
+# DynamoDB tables
+aggregates_table = dynamodb_resource.Table(AGGREGATES_TABLE)
 
 # DynamoDB table for form submissions (contains PII)
 FORM_SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_submissions')
+
+# DynamoDB Session Tables (User Journey Analytics)
+SESSION_EVENTS_TABLE = os.environ.get('SESSION_EVENTS_TABLE', 'picasso-session-events')
+SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries')
 
 # Cache for JWT secret
 _jwt_secret_cache = None
@@ -151,8 +178,19 @@ def lambda_handler(event, context):
     # NOTE: More specific routes must come before generic ones
     # (e.g., /forms/summary before /summary)
     try:
-        # Forms endpoints (more specific - check first)
-        if path.endswith('/forms/summary'):
+        # Conversations endpoints (most specific - check first)
+        if path.endswith('/conversations/summary'):
+            return handle_conversation_summary(tenant_id, params)
+        elif path.endswith('/conversations/heatmap'):
+            return handle_conversation_heatmap(tenant_id, params)
+        elif path.endswith('/conversations/top-questions'):
+            return handle_top_questions(tenant_id, params)
+        elif path.endswith('/conversations/recent'):
+            return handle_recent_conversations(tenant_id, params)
+        elif path.endswith('/conversations/trend'):
+            return handle_conversation_trend(tenant_id, params)
+        # Forms endpoints (more specific - check second)
+        elif path.endswith('/forms/summary'):
             return handle_form_summary(tenant_id, params)
         elif path.endswith('/bottlenecks'):
             return handle_form_bottlenecks(tenant_id, params)
@@ -160,6 +198,14 @@ def lambda_handler(event, context):
             return handle_form_submissions(tenant_id, params)
         elif path.endswith('/top-performers'):
             return handle_form_top_performers(tenant_id, params)
+        # Session detail endpoints (User Journey Analytics)
+        elif path.endswith('/sessions/list'):
+            return handle_sessions_list(tenant_id, params)
+        elif '/sessions/' in path and not path.endswith('/sessions'):
+            # Extract session_id from path like /sessions/{session_id}
+            session_id = path.split('/sessions/')[-1].split('/')[0]
+            if session_id and session_id != 'list':
+                return handle_session_detail(tenant_id, session_id, params)
         # Analytics endpoints (generic)
         elif path.endswith('/summary'):
             return handle_summary(tenant_id, params)
@@ -279,6 +325,168 @@ def validate_jwt(token: str) -> Dict[str, Any]:
 
 
 # =============================================================================
+# DynamoDB Hot Path Cache Functions
+# =============================================================================
+
+def get_cached_metric(tenant_id: str, metric_key: str) -> Optional[Dict[str, Any]]:
+    """
+    Get pre-computed metric from DynamoDB cache.
+    Returns None if cache miss, stale, or disabled.
+
+    Performance: ~5-20ms vs 5-30s for Athena
+    """
+    if not USE_DYNAMO_CACHE:
+        return None
+
+    try:
+        response = aggregates_table.get_item(
+            Key={
+                'pk': f'TENANT#{tenant_id}',
+                'sk': f'METRIC#{metric_key}'
+            }
+        )
+
+        item = response.get('Item')
+        if not item:
+            logger.debug(f"Cache miss for {metric_key}")
+            return None
+
+        # Check freshness
+        updated_at = item.get('updated_at', '')
+        if updated_at:
+            try:
+                update_time = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                age_hours = (datetime.now(timezone.utc) - update_time).total_seconds() / 3600
+
+                if age_hours > CACHE_MAX_AGE_HOURS:
+                    logger.info(f"Cache stale for {metric_key} (age: {age_hours:.1f}h)")
+                    return None
+            except (ValueError, TypeError):
+                pass
+
+        # Convert Decimal to float for JSON serialization
+        data = convert_decimal_to_float(item.get('data', {}))
+        logger.info(f"Cache hit for {metric_key}")
+        return data
+
+    except Exception as e:
+        logger.warning(f"Cache error for {metric_key}: {e}")
+        return None
+
+
+def convert_decimal_to_float(obj):
+    """
+    Recursively convert Decimal to float for JSON serialization.
+    """
+    if isinstance(obj, Decimal):
+        return float(obj)
+    elif isinstance(obj, dict):
+        return {k: convert_decimal_to_float(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_decimal_to_float(item) for item in obj]
+    return obj
+
+
+# =============================================================================
+# DynamoDB Session Summaries Query Functions (Hot Path)
+# =============================================================================
+
+def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit: int = 1000) -> List[Dict[str, Any]]:
+    """
+    Fetch all session summaries from DynamoDB for a tenant within a date range.
+
+    This queries the picasso-session-summaries table directly for hot data (<90 days).
+    Returns raw session data for aggregation.
+
+    Performance: ~50-200ms for most tenants (vs 5-60s for Athena)
+
+    Args:
+        tenant_hash: Tenant hash (e.g., 'fo85e6a06dcdf4')
+        date_range: Dict with 'start_date_iso' key (e.g., '2025-12-01')
+        limit: Max sessions to fetch (default 1000, paginate if more)
+
+    Returns:
+        List of session summary dictionaries
+    """
+    # SK format is now SESSION#{session_id} (no timestamp)
+    # Filter by started_at attribute instead
+    start_date = date_range['start_date_iso']
+
+    sessions = []
+    last_evaluated_key = None
+
+    try:
+        while True:
+            query_params = {
+                'TableName': SESSION_SUMMARIES_TABLE,
+                'KeyConditionExpression': 'pk = :pk AND begins_with(sk, :sk_prefix)',
+                'FilterExpression': 'started_at >= :start_date',
+                'ExpressionAttributeValues': {
+                    ':pk': {'S': f'TENANT#{tenant_hash}'},
+                    ':sk_prefix': {'S': 'SESSION#'},
+                    ':start_date': {'S': start_date}
+                },
+                'Limit': min(limit - len(sessions), 1000)  # DynamoDB max page size
+            }
+
+            if last_evaluated_key:
+                query_params['ExclusiveStartKey'] = last_evaluated_key
+
+            response = dynamodb.query(**query_params)
+            items = response.get('Items', [])
+
+            for item in items:
+                # Parse session data - SK format: SESSION#{session_id}
+                sk = item.get('sk', {}).get('S', '')
+                sk_parts = sk.split('#')
+                session_id = sk_parts[1] if len(sk_parts) >= 2 else ''
+
+                started_at = item.get('started_at', {}).get('S', '')
+                ended_at = item.get('ended_at', {}).get('S', started_at)
+
+                # Calculate duration
+                duration_seconds = 0
+                if started_at and ended_at:
+                    try:
+                        start_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                        end_dt = datetime.fromisoformat(ended_at.replace('Z', '+00:00'))
+                        duration_seconds = int((end_dt - start_dt).total_seconds())
+                    except (ValueError, TypeError):
+                        pass
+
+                sessions.append({
+                    'session_id': session_id,
+                    'started_at': started_at,
+                    'ended_at': ended_at,
+                    'duration_seconds': duration_seconds,
+                    'outcome': item.get('outcome', {}).get('S', 'browsing'),
+                    'message_count': int(item.get('message_count', {}).get('N', 0)),
+                    'user_message_count': int(item.get('user_message_count', {}).get('N', 0)),
+                    'bot_message_count': int(item.get('bot_message_count', {}).get('N', 0)),
+                    'first_question': item.get('first_question', {}).get('S', ''),
+                    'form_id': item.get('form_id', {}).get('S', ''),
+                    # Response time tracking (sum/count for averaging)
+                    'total_response_time_ms': int(item.get('total_response_time_ms', {}).get('N', 0)),
+                    'response_count': int(item.get('response_count', {}).get('N', 0))
+                })
+
+            # Check if we have more pages and haven't hit the limit
+            last_evaluated_key = response.get('LastEvaluatedKey')
+            if not last_evaluated_key or len(sessions) >= limit:
+                break
+
+        logger.info(f"Fetched {len(sessions)} sessions from DynamoDB for tenant {tenant_hash}")
+        return sessions
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error fetching sessions: {e}")
+        return []
+    except Exception as e:
+        logger.exception(f"Error fetching sessions: {e}")
+        return []
+
+
+# =============================================================================
 # Endpoint Handlers
 # =============================================================================
 
@@ -290,7 +498,21 @@ def handle_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     Query params:
     - range: Time range (7d, 30d, 90d) - default 30d
     """
-    date_range = parse_date_range(params.get('range', '30d'))
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
+
+    # Try DynamoDB cache first (sub-100ms)
+    cached = get_cached_metric(tenant_id, f'analytics_summary#{range_str}')
+    if cached:
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'metrics': cached,
+            'source': 'cache'
+        })
+
+    # Fallback to Athena (5-30s)
+    logger.info(f"Cache miss - querying Athena for analytics_summary#{range_str}")
 
     # Use ISO date comparison for proper cross-month-boundary filtering
     query = f"""
@@ -474,7 +696,22 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     Query params:
     - range: Time range (7d, 30d, 90d) - default 30d
     """
-    date_range = parse_date_range(params.get('range', '30d'))
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
+
+    # Try DynamoDB cache first (sub-100ms)
+    cached = get_cached_metric(tenant_id, f'analytics_funnel#{range_str}')
+    if cached:
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'funnel': cached.get('funnel', []),
+            'overall_conversion': cached.get('overall_conversion', 0),
+            'source': 'cache'
+        })
+
+    # Fallback to Athena (5-30s)
+    logger.info(f"Cache miss - querying Athena for analytics_funnel#{range_str}")
 
     # Use ISO date comparison for proper cross-month-boundary filtering
     query = f"""
@@ -551,8 +788,23 @@ def handle_form_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any
     - range: Time range (7d, 30d, 90d) - default 30d
     - form_id: Filter by specific form (optional)
     """
-    date_range = parse_date_range(params.get('range', '30d'))
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
     form_id = params.get('form_id')
+
+    # Try DynamoDB cache first (sub-100ms) - only if no form_id filter
+    if not form_id:
+        cached = get_cached_metric(tenant_id, f'forms_summary#{range_str}')
+        if cached:
+            return cors_response(200, {
+                'tenant_id': tenant_id,
+                'range': range_str,
+                'metrics': cached,
+                'source': 'cache'
+            })
+
+    # Fallback to Athena (5-30s)
+    logger.info(f"Cache miss - querying Athena for forms_summary#{range_str}")
 
     # Build optional form filter
     form_filter = ""
@@ -640,9 +892,26 @@ def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     - form_id: Filter by specific form (optional)
     - limit: Number of results (default 5, max 20)
     """
-    date_range = parse_date_range(params.get('range', '30d'))
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
     limit = min(int(params.get('limit', '5')), 20)
     form_id = params.get('form_id')
+
+    # Try DynamoDB cache first (sub-100ms) - only if no form_id filter
+    if not form_id:
+        cached = get_cached_metric(tenant_id, f'forms_bottlenecks#{range_str}')
+        if cached:
+            bottlenecks = cached.get('bottlenecks', [])[:limit]
+            return cors_response(200, {
+                'tenant_id': tenant_id,
+                'range': range_str,
+                'bottlenecks': bottlenecks,
+                'total_abandonments': cached.get('total_abandonments', 0),
+                'source': 'cache'
+            })
+
+    # Fallback to Athena (5-30s)
+    logger.info(f"Cache miss - querying Athena for forms_bottlenecks#{range_str}")
 
     # Build optional form filter
     form_filter = ""
@@ -953,9 +1222,25 @@ def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[s
     - limit: Number of results (default 5, max 20)
     - sort_by: Sort field (conversion_rate, completions, avg_time) - default conversion_rate
     """
-    date_range = parse_date_range(params.get('range', '30d'))
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
     limit = min(int(params.get('limit', '5')), 20)
     sort_by = params.get('sort_by', 'conversion_rate')
+
+    # Try DynamoDB cache first (sub-100ms)
+    cached = get_cached_metric(tenant_id, f'forms_top_performers#{range_str}')
+    if cached:
+        forms = cached.get('forms', [])[:limit]
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'forms': forms,
+            'total_completions': cached.get('total_completions', 0),
+            'source': 'cache'
+        })
+
+    # Fallback to Athena (5-30s)
+    logger.info(f"Cache miss - querying Athena for forms_top_performers#{range_str}")
 
     # Validate sort_by
     valid_sorts = {'conversion_rate', 'completions', 'avg_time'}
@@ -1197,3 +1482,746 @@ def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
         },
         'body': json.dumps(body)
     }
+
+
+# =============================================================================
+# Conversations Endpoint Handlers
+# =============================================================================
+
+def handle_conversation_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /conversations/summary
+    Returns conversation metrics: total conversations, messages, response time, after-hours %.
+
+    HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
+
+    Query params:
+    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    """
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
+    tenant_hash = get_tenant_hash(tenant_id)
+
+    logger.info(f"Fetching conversation summary from DynamoDB for tenant: {tenant_hash}, range: {range_str}")
+
+    # Query DynamoDB directly (hot path)
+    sessions = fetch_session_summaries(tenant_hash, date_range)
+
+    # Aggregate metrics from sessions
+    total_conversations = len(sessions)
+    total_messages = sum(s.get('message_count', 0) for s in sessions)
+
+    # Calculate average response time from running totals
+    # Each session stores total_response_time_ms and response_count
+    total_response_ms = 0
+    total_response_count = 0
+    for s in sessions:
+        total_response_ms += s.get('total_response_time_ms', 0)
+        total_response_count += s.get('response_count', 0)
+    avg_response_time_seconds = (total_response_ms / total_response_count / 1000) if total_response_count > 0 else 0
+
+    # Calculate after-hours percentage (sessions started outside 9am-5pm in local timezone)
+    # Default to America/Chicago (Central Time)
+    tz_param = params.get('timezone', 'America/Chicago')
+    try:
+        local_tz = ZoneInfo(tz_param)
+    except Exception:
+        local_tz = ZoneInfo('America/Chicago')
+
+    after_hours_count = 0
+    for session in sessions:
+        started_at = session.get('started_at', '')
+        if started_at:
+            try:
+                start_dt_utc = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                start_dt = start_dt_utc.astimezone(local_tz)
+                hour = start_dt.hour
+                if hour < 9 or hour >= 17:
+                    after_hours_count += 1
+            except (ValueError, TypeError):
+                pass
+
+    after_hours_percentage = (after_hours_count / total_conversations * 100) if total_conversations > 0 else 0
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': range_str,
+        'metrics': {
+            'total_conversations': total_conversations,
+            'total_messages': total_messages,
+            'avg_response_time_seconds': round(avg_response_time_seconds, 1),
+            'after_hours_percentage': round(after_hours_percentage, 1)
+        },
+        'source': 'dynamodb',
+        'date_range': {
+            'start': date_range['start_date_iso'],
+            'end': datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        }
+    })
+
+
+def handle_conversation_heatmap(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /conversations/heatmap
+    Returns day × hour grid for conversation volume.
+
+    HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
+
+    Query params:
+    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - timezone: IANA timezone (e.g., America/Chicago) - default UTC
+    """
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
+    tenant_hash = get_tenant_hash(tenant_id)
+
+    # Get timezone parameter - default to America/Chicago (Central Time)
+    # Common US timezones: America/New_York, America/Chicago, America/Denver, America/Los_Angeles
+    tz_param = params.get('timezone', 'America/Chicago')
+    if not re.match(r'^[A-Za-z0-9_/]+$', tz_param):
+        tz_param = 'America/Chicago'
+
+    # Parse timezone - fall back to Chicago if invalid
+    try:
+        local_tz = ZoneInfo(tz_param)
+    except Exception:
+        logger.warning(f"Invalid timezone '{tz_param}', falling back to America/Chicago")
+        local_tz = ZoneInfo('America/Chicago')
+
+    logger.info(f"Fetching conversation heatmap from DynamoDB for tenant: {tenant_hash}, range: {range_str}, timezone: {tz_param}")
+
+    # Query DynamoDB directly (hot path)
+    sessions = fetch_session_summaries(tenant_hash, date_range)
+
+    # Build heatmap structure
+    days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    hour_blocks = ['12AM', '3AM', '6AM', '9AM', '12PM', '3PM', '6PM', '9PM']
+
+    # Initialize grid
+    grid = {hb: {d: 0 for d in days} for hb in hour_blocks}
+    total_conversations = 0
+    peak = {'day': None, 'hour_block': None, 'count': 0}
+
+    # Aggregate sessions into heatmap grid
+    for session in sessions:
+        started_at = session.get('started_at', '')
+        if not started_at:
+            continue
+
+        try:
+            # Parse UTC timestamp and convert to local timezone
+            start_dt_utc = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+            start_dt = start_dt_utc.astimezone(local_tz)
+
+            # Get day of week (0 = Monday) in LOCAL timezone
+            day_idx = start_dt.weekday()
+            day_name = days[day_idx]
+
+            # Get hour block (3-hour windows) in LOCAL timezone
+            hour = start_dt.hour
+            if hour < 3:
+                hour_block = '12AM'
+            elif hour < 6:
+                hour_block = '3AM'
+            elif hour < 9:
+                hour_block = '6AM'
+            elif hour < 12:
+                hour_block = '9AM'
+            elif hour < 15:
+                hour_block = '12PM'
+            elif hour < 18:
+                hour_block = '3PM'
+            elif hour < 21:
+                hour_block = '6PM'
+            else:
+                hour_block = '9PM'
+
+            grid[hour_block][day_name] += 1
+            total_conversations += 1
+
+            if grid[hour_block][day_name] > peak['count']:
+                peak = {'day': day_name, 'hour_block': hour_block, 'count': grid[hour_block][day_name]}
+
+        except (ValueError, TypeError):
+            continue
+
+    # Convert to API response format
+    heatmap = []
+    for hb in hour_blocks:
+        heatmap.append({
+            'hour_block': hb,
+            'data': [{'day': d, 'value': grid[hb][d]} for d in days]
+        })
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': range_str,
+        'timezone': tz_param,
+        'heatmap': heatmap,
+        'peak': peak if peak['day'] else None,
+        'total_conversations': total_conversations,
+        'source': 'dynamodb'
+    })
+
+
+def handle_top_questions(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /conversations/top-questions
+    Returns most frequently asked questions.
+
+    HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
+
+    Query params:
+    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - limit: Number of questions (default 5, max 10)
+    """
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
+    limit = min(int(params.get('limit', '5')), 10)
+    tenant_hash = get_tenant_hash(tenant_id)
+
+    logger.info(f"Fetching top questions from DynamoDB for tenant: {tenant_hash}, range: {range_str}")
+
+    # Query DynamoDB directly (hot path)
+    sessions = fetch_session_summaries(tenant_hash, date_range)
+
+    # Count occurrences of each first_question
+    question_counts = {}
+    for session in sessions:
+        first_question = session.get('first_question', '').strip()
+        if first_question:
+            # Truncate to 100 chars for grouping
+            key = first_question[:100]
+            question_counts[key] = question_counts.get(key, 0) + 1
+
+    # Sort by count descending and take top N
+    sorted_questions = sorted(question_counts.items(), key=lambda x: x[1], reverse=True)[:limit]
+
+    total_questions = len(sessions)
+
+    questions = []
+    for question_text, count in sorted_questions:
+        percentage = round((count / total_questions * 100) if total_questions > 0 else 0, 1)
+        questions.append({
+            'question_text': question_text,
+            'count': count,
+            'percentage': percentage
+        })
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': range_str,
+        'questions': questions,
+        'total_questions': total_questions,
+        'source': 'dynamodb'
+    })
+
+
+def handle_recent_conversations(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /conversations/recent
+    Returns recent conversations with Q&A pairs.
+
+    HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
+
+    Query params:
+    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - page: Page number (default 1)
+    - limit: Results per page (default 10, max 25)
+    """
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
+    page = max(1, int(params.get('page', '1')))
+    limit = min(int(params.get('limit', '10')), 25)
+    offset = (page - 1) * limit
+    tenant_hash = get_tenant_hash(tenant_id)
+
+    logger.info(f"Fetching recent conversations from DynamoDB for tenant: {tenant_hash}, range: {range_str}")
+
+    # Query DynamoDB directly (hot path) - get more than needed for pagination
+    all_sessions = fetch_session_summaries(tenant_hash, date_range, limit=offset + limit + 1)
+
+    # Sort by started_at descending (most recent first)
+    all_sessions.sort(key=lambda x: x.get('started_at', ''), reverse=True)
+
+    total_count = len(all_sessions)
+
+    # Apply pagination
+    paginated_sessions = all_sessions[offset:offset + limit]
+
+    # Categorize questions into topics
+    def categorize_question(question: str) -> str:
+        q = (question or '').lower()
+        if 'volunteer' in q:
+            return 'Volunteer'
+        if 'donate' in q or 'donation' in q:
+            return 'Donation'
+        if 'event' in q or 'gathering' in q:
+            return 'Events'
+        if 'service' in q or 'help' in q:
+            return 'Services'
+        if 'supplies' in q or 'request' in q:
+            return 'Supplies'
+        return 'General'
+
+    conversations = []
+    for session in paginated_sessions:
+        question = session.get('first_question', '')
+        conversations.append({
+            'session_id': session.get('session_id', ''),
+            'started_at': session.get('started_at', ''),
+            'topic': categorize_question(question),
+            'first_question': question or '',
+            'first_answer': '',  # Not stored in session summary - would need session events lookup
+            'response_time_seconds': round(session.get('avg_response_time_ms', 0) / 1000, 1),
+            'message_count': session.get('message_count', 0),
+            'outcome': session.get('outcome')
+        })
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': range_str,
+        'conversations': conversations,
+        'pagination': {
+            'total_count': total_count,
+            'page': page,
+            'limit': limit,
+            'has_next': (page * limit) < total_count
+        },
+        'source': 'dynamodb'
+    })
+
+
+def handle_conversation_trend(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /conversations/trend
+    Returns conversation counts over time for trend chart.
+
+    HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
+
+    Query params:
+    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - granularity: 'hour' or 'day' - default based on range
+    """
+    range_str = params.get('range', '30d')
+    date_range = parse_date_range(range_str)
+    granularity = params.get('granularity', 'hour' if date_range['days'] <= 1 else 'day')
+    tenant_hash = get_tenant_hash(tenant_id)
+
+    logger.info(f"Fetching conversation trend from DynamoDB for tenant: {tenant_hash}, range: {range_str}")
+
+    # Query DynamoDB directly (hot path)
+    sessions = fetch_session_summaries(tenant_hash, date_range)
+
+    # Aggregate sessions by time period
+    period_counts = {}
+
+    for session in sessions:
+        started_at = session.get('started_at', '')
+        if not started_at:
+            continue
+
+        try:
+            start_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+
+            if granularity == 'hour':
+                # Group by hour for 1-day view
+                hour = start_dt.hour
+                suffix = 'am' if hour < 12 else 'pm'
+                display_hour = hour if hour <= 12 else hour - 12
+                if display_hour == 0:
+                    display_hour = 12
+                period = f"{display_hour}{suffix}"
+                sort_key = hour
+            else:
+                # Group by day for week/month views
+                period = start_dt.strftime('%b %d')  # e.g., "Dec 26"
+                sort_key = start_dt.strftime('%Y-%m-%d')
+
+            if period not in period_counts:
+                period_counts[period] = {'count': 0, 'sort_key': sort_key}
+            period_counts[period]['count'] += 1
+
+        except (ValueError, TypeError):
+            continue
+
+    # Sort by sort_key and build trend array
+    sorted_periods = sorted(period_counts.items(), key=lambda x: x[1]['sort_key'])
+
+    trend = []
+    for period, data in sorted_periods:
+        trend.append({
+            'period': period,
+            'value': data['count']
+        })
+
+    legend = 'Questions per hour' if granularity == 'hour' else 'Questions per day'
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'range': range_str,
+        'trend': trend,
+        'legend': legend,
+        'source': 'dynamodb'
+    })
+
+
+# =============================================================================
+# Session Detail Endpoint Handlers (User Journey Analytics)
+# =============================================================================
+
+# Cache for tenant_id → tenant_hash reverse lookups
+_tenant_hash_cache = {}
+_tenant_hash_cache_time = 0
+TENANT_HASH_CACHE_TTL = 300  # 5 minutes
+
+# S3 bucket for tenant mappings
+MAPPINGS_BUCKET = os.environ.get('MAPPINGS_BUCKET', 'myrecruiter-picasso')
+
+# S3 client
+s3 = boto3.client('s3')
+
+
+def get_tenant_hash(tenant_id: str) -> str:
+    """
+    Look up tenant_hash from S3 mappings for a given tenant_id.
+
+    Mappings are stored at s3://myrecruiter-picasso/mappings/{tenant_hash}.json
+    Each file contains {"tenant_id": "...", "tenant_hash": "...", ...}
+
+    This performs a reverse lookup by listing mapping files and finding
+    the one with matching tenant_id. Results are cached for performance.
+
+    Returns the tenant_hash if found, or None if not found.
+    """
+    global _tenant_hash_cache, _tenant_hash_cache_time
+
+    # Check cache first
+    now = time.time()
+    if tenant_id in _tenant_hash_cache and (now - _tenant_hash_cache_time) < TENANT_HASH_CACHE_TTL:
+        return _tenant_hash_cache[tenant_id]
+
+    # List mapping files and find the one with matching tenant_id
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        pages = paginator.paginate(Bucket=MAPPINGS_BUCKET, Prefix='mappings/')
+
+        for page in pages:
+            for obj in page.get('Contents', []):
+                key = obj['Key']
+                if not key.endswith('.json'):
+                    continue
+
+                # Extract hash from filename (mappings/{hash}.json)
+                filename = key.split('/')[-1]
+                candidate_hash = filename.replace('.json', '')
+
+                # Fetch and check the mapping
+                try:
+                    response = s3.get_object(Bucket=MAPPINGS_BUCKET, Key=key)
+                    mapping = json.loads(response['Body'].read().decode('utf-8'))
+
+                    # Cache all mappings we see for future lookups
+                    mapping_tenant_id = mapping.get('tenant_id')
+                    mapping_tenant_hash = mapping.get('tenant_hash', candidate_hash)
+                    if mapping_tenant_id:
+                        _tenant_hash_cache[mapping_tenant_id] = mapping_tenant_hash
+
+                    if mapping_tenant_id == tenant_id:
+                        _tenant_hash_cache_time = now
+                        logger.info(f"Found tenant_hash for {tenant_id}: {mapping_tenant_hash}")
+                        return mapping_tenant_hash
+
+                except Exception as e:
+                    logger.warning(f"Error reading mapping {key}: {e}")
+                    continue
+
+        logger.warning(f"No mapping found for tenant_id: {tenant_id}")
+        return None
+
+    except Exception as e:
+        logger.error(f"Error looking up tenant_hash for {tenant_id}: {e}")
+        return None
+
+
+def handle_session_detail(tenant_id: str, session_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /sessions/{session_id}
+    Returns full session timeline with all events for session reconstruction.
+
+    This queries the picasso-session-events table using the session_id.
+    Events are returned in step order for timeline visualization.
+
+    URL params:
+    - session_id: The session ID to retrieve
+
+    Returns:
+    - Session metadata (session_id, started_at, ended_at, duration)
+    - Events array with all steps in order
+    - Summary metrics (message_count, outcome, etc.)
+    """
+    if not session_id:
+        return cors_response(400, {'error': 'session_id is required'})
+
+    # Sanitize session_id (alphanumeric, underscore, hyphen only)
+    if not re.match(r'^[A-Za-z0-9_-]+$', session_id):
+        return cors_response(400, {'error': 'Invalid session_id format'})
+
+    tenant_hash = get_tenant_hash(tenant_id)
+    logger.info(f"Fetching session detail: {session_id} for tenant: {tenant_hash}")
+
+    try:
+        # Query session events from DynamoDB
+        response = dynamodb.query(
+            TableName=SESSION_EVENTS_TABLE,
+            KeyConditionExpression='pk = :pk',
+            ExpressionAttributeValues={
+                ':pk': {'S': f'SESSION#{session_id}'}
+            },
+            ScanIndexForward=True  # Ascending order by step_number
+        )
+
+        items = response.get('Items', [])
+
+        if not items:
+            return cors_response(404, {'error': 'Session not found'})
+
+        # Verify tenant access - first event should have matching tenant_hash
+        first_event = items[0]
+        event_tenant_hash = first_event.get('tenant_hash', {}).get('S', '')
+        if event_tenant_hash != tenant_hash:
+            logger.warning(f"Tenant mismatch: {tenant_hash} != {event_tenant_hash}")
+            return cors_response(403, {'error': 'Access denied to this session'})
+
+        # Parse events
+        events = []
+        started_at = None
+        ended_at = None
+        message_count = 0
+        user_message_count = 0
+        bot_message_count = 0
+        outcome = None
+        first_question = None
+
+        for item in items:
+            event_type = item.get('event_type', {}).get('S', '')
+            timestamp = item.get('timestamp', {}).get('S', '')
+            step_number = int(item.get('step_number', {}).get('N', 0))
+
+            # Parse event_payload if present
+            payload = {}
+            if 'event_payload' in item:
+                try:
+                    payload_str = item['event_payload'].get('S', '{}')
+                    payload = json.loads(payload_str)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # Track session boundaries
+            if not started_at or timestamp < started_at:
+                started_at = timestamp
+            if not ended_at or timestamp > ended_at:
+                ended_at = timestamp
+
+            # Track message counts
+            if event_type == 'MESSAGE_SENT':
+                message_count += 1
+                user_message_count += 1
+                if not first_question:
+                    first_question = payload.get('content_preview', '')[:100]
+            elif event_type == 'MESSAGE_RECEIVED':
+                message_count += 1
+                bot_message_count += 1
+
+            # Track outcome (stronger outcomes override weaker)
+            if event_type == 'FORM_COMPLETED':
+                outcome = 'form_completed'
+            elif event_type == 'LINK_CLICKED' and outcome != 'form_completed':
+                outcome = 'link_clicked'
+            elif event_type == 'CTA_CLICKED' and outcome not in ('form_completed', 'link_clicked'):
+                outcome = 'cta_clicked'
+
+            events.append({
+                'step_number': step_number,
+                'event_type': event_type,
+                'timestamp': timestamp,
+                'payload': payload
+            })
+
+        # Calculate duration
+        duration_seconds = 0
+        if started_at and ended_at:
+            try:
+                start_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                end_dt = datetime.fromisoformat(ended_at.replace('Z', '+00:00'))
+                duration_seconds = int((end_dt - start_dt).total_seconds())
+            except (ValueError, TypeError):
+                pass
+
+        return cors_response(200, {
+            'session_id': session_id,
+            'tenant_id': tenant_id,
+            'started_at': started_at,
+            'ended_at': ended_at,
+            'duration_seconds': duration_seconds,
+            'summary': {
+                'message_count': message_count,
+                'user_message_count': user_message_count,
+                'bot_message_count': bot_message_count,
+                'outcome': outcome or 'browsing',
+                'first_question': first_question
+            },
+            'events': events,
+            'event_count': len(events)
+        })
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error fetching session: {e}")
+        return cors_response(500, {'error': 'Failed to fetch session'})
+    except Exception as e:
+        logger.exception(f"Error fetching session detail: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /sessions/list
+    Returns paginated list of sessions for the tenant with summary metrics.
+
+    This queries the picasso-session-summaries table.
+    Uses SK format SESSION#{started_at}#{session_id} for time-based queries.
+
+    Query params:
+    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - limit: Results per page (1-100) - default 25
+    - cursor: Pagination cursor for next page
+    - outcome: Filter by outcome (form_completed, link_clicked, abandoned, browsing)
+
+    Returns:
+    - List of session summaries
+    - Pagination cursor for next page
+    - Total count (estimated)
+    """
+    range_str = params.get('range', '30d')
+    limit = min(max(1, int(params.get('limit', '25'))), 100)
+    cursor = params.get('cursor')
+    outcome_filter = params.get('outcome')
+
+    # Validate outcome filter
+    valid_outcomes = {'form_completed', 'link_clicked', 'abandoned', 'browsing', 'cta_clicked'}
+    if outcome_filter and outcome_filter not in valid_outcomes:
+        return cors_response(400, {
+            'error': 'Invalid outcome filter',
+            'valid_outcomes': list(valid_outcomes)
+        })
+
+    tenant_hash = get_tenant_hash(tenant_id)
+    date_range = parse_date_range(range_str)
+
+    # SK format is now SESSION#{session_id} (no timestamp)
+    # Filter by started_at attribute instead
+    start_date = date_range['start_date_iso']
+
+    logger.info(f"Fetching sessions list for tenant: {tenant_hash}, range: {range_str}")
+
+    try:
+        # Build query parameters
+        query_params = {
+            'TableName': SESSION_SUMMARIES_TABLE,
+            'KeyConditionExpression': 'pk = :pk AND begins_with(sk, :sk_prefix)',
+            'FilterExpression': 'started_at >= :start_date',
+            'ExpressionAttributeValues': {
+                ':pk': {'S': f'TENANT#{tenant_hash}'},
+                ':sk_prefix': {'S': 'SESSION#'},
+                ':start_date': {'S': start_date}
+            },
+            'ScanIndexForward': False,  # Most recent first
+            'Limit': limit
+        }
+
+        # Add outcome filter if specified
+        if outcome_filter:
+            query_params['FilterExpression'] += ' AND #outcome = :outcome'
+            query_params['ExpressionAttributeNames'] = {'#outcome': 'outcome'}
+            query_params['ExpressionAttributeValues'][':outcome'] = {'S': outcome_filter}
+
+        # Add pagination cursor if provided
+        if cursor:
+            try:
+                cursor_data = json.loads(base64.urlsafe_b64decode(cursor).decode('utf-8'))
+                query_params['ExclusiveStartKey'] = cursor_data
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Invalid cursor: {e}")
+                return cors_response(400, {'error': 'Invalid pagination cursor'})
+
+        response = dynamodb.query(**query_params)
+        items = response.get('Items', [])
+
+        # Parse session summaries
+        sessions = []
+        for item in items:
+            sk = item.get('sk', {}).get('S', '')
+            # Parse session_id from SK format: SESSION#{session_id}
+            sk_parts = sk.split('#')
+            session_id = sk_parts[1] if len(sk_parts) >= 2 else ''
+
+            # Extract fields with defaults
+            started_at = item.get('started_at', {}).get('S', '')
+            ended_at = item.get('ended_at', {}).get('S', started_at)
+            outcome = item.get('outcome', {}).get('S', 'browsing')
+            message_count = int(item.get('message_count', {}).get('N', 0))
+            user_message_count = int(item.get('user_message_count', {}).get('N', 0))
+            bot_message_count = int(item.get('bot_message_count', {}).get('N', 0))
+            first_question = item.get('first_question', {}).get('S', '')
+            form_id = item.get('form_id', {}).get('S', '')
+
+            # Calculate duration
+            duration_seconds = 0
+            if started_at and ended_at:
+                try:
+                    start_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                    end_dt = datetime.fromisoformat(ended_at.replace('Z', '+00:00'))
+                    duration_seconds = int((end_dt - start_dt).total_seconds())
+                except (ValueError, TypeError):
+                    pass
+
+            sessions.append({
+                'session_id': session_id,
+                'started_at': started_at,
+                'ended_at': ended_at,
+                'duration_seconds': duration_seconds,
+                'outcome': outcome,
+                'message_count': message_count,
+                'user_message_count': user_message_count,
+                'bot_message_count': bot_message_count,
+                'first_question': first_question[:100] if first_question else '',
+                'form_id': form_id if form_id else None
+            })
+
+        # Build next page cursor
+        next_cursor = None
+        if 'LastEvaluatedKey' in response:
+            cursor_json = json.dumps(response['LastEvaluatedKey'])
+            next_cursor = base64.urlsafe_b64encode(cursor_json.encode('utf-8')).decode('utf-8')
+
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'sessions': sessions,
+            'pagination': {
+                'limit': limit,
+                'count': len(sessions),
+                'next_cursor': next_cursor,
+                'has_more': next_cursor is not None
+            },
+            'filters': {
+                'outcome': outcome_filter
+            } if outcome_filter else {}
+        })
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error listing sessions: {e}")
+        return cors_response(500, {'error': 'Failed to list sessions'})
+    except Exception as e:
+        logger.exception(f"Error listing sessions: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
