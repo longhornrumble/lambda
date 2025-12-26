@@ -1854,6 +1854,10 @@ const streamingHandler = async (event, responseStream, context) => {
           answer_length: responseBuffer.length
         }
       }));
+
+      // NOTE: MESSAGE_SENT and MESSAGE_RECEIVED events are now emitted by the frontend
+      // (StreamingChatProvider.jsx and HTTPChatProvider.jsx) via the analytics pipeline.
+      // This ensures reliable delivery since the frontend knows exactly when messages are sent/received.
     }
 
     // Enhance response with CTAs after streaming is complete
@@ -2140,6 +2144,10 @@ const bufferedHandler = async (event, context) => {
           answer_length: responseBuffer.length
         }
       }));
+
+      // NOTE: MESSAGE_SENT and MESSAGE_RECEIVED events are now emitted by the frontend
+      // (StreamingChatProvider.jsx and HTTPChatProvider.jsx) via the analytics pipeline.
+      // This ensures reliable delivery since the frontend knows exactly when messages are sent/received.
     }
 
     // Enhance response with CTAs after generation is complete
