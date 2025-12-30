@@ -705,7 +705,29 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
     for config_key, bubble_key in feature_mappings.items():
         if bubble_data.get(bubble_key) is not None:
             features[config_key] = parse_bubble_boolean(bubble_data.get(bubble_key))
-    
+
+    # Dashboard feature flags - based on subscription tier
+    # FREE tier: conversations only
+    # Standard/Premium tier: all dashboards
+    subscription_tier = bubble_data.get("subscription_tier", "").lower()
+    is_premium = subscription_tier in ["standard", "premium", "enterprise"]
+
+    # Allow explicit overrides from Bubble, otherwise use tier-based defaults
+    if bubble_data.get("dashboard_conversations") is not None:
+        features["dashboard_conversations"] = parse_bubble_boolean(bubble_data.get("dashboard_conversations"))
+    else:
+        features["dashboard_conversations"] = True  # Always enabled (FREE tier)
+
+    if bubble_data.get("dashboard_forms") is not None:
+        features["dashboard_forms"] = parse_bubble_boolean(bubble_data.get("dashboard_forms"))
+    else:
+        features["dashboard_forms"] = is_premium  # Premium only
+
+    if bubble_data.get("dashboard_attribution") is not None:
+        features["dashboard_attribution"] = parse_bubble_boolean(bubble_data.get("dashboard_attribution"))
+    else:
+        features["dashboard_attribution"] = is_premium  # Premium only
+
     # Enhanced callout support for nested structure
     # Only create callout config if Bubble sends callout fields
     callout_fields_sent = any([

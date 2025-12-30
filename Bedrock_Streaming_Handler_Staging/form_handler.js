@@ -348,6 +348,7 @@ function buildLabeledFormData(formData, formConfig) {
 
 /**
  * Save form submission to DynamoDB
+ * Includes Lead Workspace fields for pipeline processing
  */
 async function saveFormSubmission(submissionId, formId, formData, config, priority = 'normal', sessionId = null, conversationId = null) {
   if (!FORM_SUBMISSIONS_TABLE) {
@@ -359,27 +360,51 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
   const formConfig = config.conversational_forms?.[formId] || {};
   const labeledData = buildLabeledFormData(formData, formConfig);
 
+  // Transform to human-readable labels for contact extraction
+  const transformedFormData = transformFormDataToLabels(formData, formConfig);
+
+  // Extract canonical contact info (same data sent to Bubble)
+  const { contact: canonicalContact, comments } = extractCanonicalContact(transformedFormData);
+
+  const now = new Date().toISOString();
+  const tenantId = config.tenant_id || 'unknown';
+
   const params = {
     TableName: FORM_SUBMISSIONS_TABLE,
     Item: {
+      // Core submission fields
       submission_id: submissionId,
       form_id: formId,
       form_title: formConfig.title || formId,
-      tenant_id: config.tenant_id || 'unknown',
+      tenant_id: tenantId,
       tenant_hash: config.tenant_hash || 'unknown',
       session_id: sessionId || 'unknown',
       conversation_id: conversationId || sessionId || 'unknown',
       form_data: formData,           // Raw data with field IDs
       form_data_labeled: labeledData, // Human-readable labeled data
       priority: priority,
-      submitted_at: new Date().toISOString(),
-      status: 'pending_fulfillment'
+      submitted_at: now,
+      timestamp: now,                // Required for tenant-timestamp-index GSI
+      status: 'pending_fulfillment',
+
+      // Canonical contact info (matches Bubble webhook schema)
+      contact: canonicalContact,     // { first_name, last_name, email, phone, address, ... }
+      comments: comments,            // Extracted comments/notes text
+
+      // Lead Workspace fields for pipeline processing
+      pipeline_status: 'new',
+      tenant_pipeline_key: `${tenantId}#new`,  // Composite key for tenant-pipeline-index GSI
+      internal_notes: '',
+      processed_by: null,
+      contacted_at: null,
+      archived_at: null,
+      updated_at: now
     }
   };
 
   try {
     await dynamodb.send(new PutCommand(params));
-    console.log(`✅ Form saved to DynamoDB with priority: ${priority}`);
+    console.log(`✅ Form saved to DynamoDB with pipeline_status: new, priority: ${priority}`);
   } catch (error) {
     console.error('Error saving to DynamoDB:', error);
     // Don't fail the submission if DynamoDB fails

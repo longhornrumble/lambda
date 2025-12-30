@@ -1649,17 +1649,34 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
         form_title = item.get('form_title', {}).get('S', form_id)
         submitted_at = item.get('submitted_at', {}).get('S', '')
 
-        # Extract name and email - prefer form_data_labeled (human-readable)
-        # Fall back to form_data (cryptic field IDs) for backwards compatibility
-        form_data_labeled = item.get('form_data_labeled', {})
-        if form_data_labeled and form_data_labeled.get('M'):
-            name, email = extract_name_email_from_form_data_labeled(form_data_labeled)
+        # Extract contact info - prefer canonical contact object (new schema)
+        # Fall back to form_data_labeled, then form_data for backwards compatibility
+        contact = item.get('contact', {})
+        comments_field = item.get('comments', {})
+
+        if contact and contact.get('M'):
+            # New schema: use canonical contact object
+            contact_map = contact.get('M', {})
+            first_name = contact_map.get('first_name', {}).get('S', '') or ''
+            last_name = contact_map.get('last_name', {}).get('S', '') or ''
+            name = f"{first_name} {last_name}".strip() or 'Anonymous'
+            email = contact_map.get('email', {}).get('S', '') or ''
+            phone = contact_map.get('phone', {}).get('S', '') or ''
+            comments = comments_field.get('S', '') if comments_field else ''
+            fields = {'name': name, 'email': email, 'phone': phone, 'comments': comments}
         else:
-            name, email = extract_name_email_from_form_data(item.get('form_data', {}))
+            # Fall back to form_data_labeled extraction
+            form_data_labeled = item.get('form_data_labeled', {})
+            if form_data_labeled and form_data_labeled.get('M'):
+                fields = extract_all_fields_from_form_data_labeled(form_data_labeled)
+            else:
+                # Legacy fallback - only has name/email
+                name, email = extract_name_email_from_form_data(item.get('form_data', {}))
+                fields = {'name': name, 'email': email, 'phone': '', 'comments': ''}
 
         # Apply search filter
         if search:
-            search_fields = f"{name} {email} {form_title}".lower()
+            search_fields = f"{fields['name']} {fields['email']} {form_title}".lower()
             if search not in search_fields:
                 continue
 
@@ -1679,10 +1696,7 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
             'submitted_date': formatted_date,
             'duration_seconds': 0,  # Not stored in DynamoDB
             'fields_completed': 0,  # Not stored in DynamoDB
-            'fields': {
-                'name': name,
-                'email': email
-            }
+            'fields': fields
         })
 
     # Apply pagination
@@ -1759,6 +1773,72 @@ def extract_name_email_from_form_data_labeled(form_data_labeled: Dict) -> tuple:
 
     name = ' '.join(filter(None, name_parts)).strip()
     return (name if name else 'Anonymous', email)
+
+
+def extract_all_fields_from_form_data_labeled(form_data_labeled: Dict) -> Dict[str, str]:
+    """
+    Extract all common form fields from DynamoDB form_data_labeled structure.
+    Returns a dict with: name, email, phone, comments
+    """
+    fields = {
+        'name': '',
+        'email': '',
+        'phone': '',
+        'comments': ''
+    }
+    name_parts = []
+
+    # Get the nested map from DynamoDB format
+    data_map = form_data_labeled.get('M', {})
+
+    for field_label, field_wrapper in data_map.items():
+        if not isinstance(field_wrapper, dict) or 'M' not in field_wrapper:
+            continue
+
+        field_obj = field_wrapper['M']
+        field_type = field_obj.get('type', {}).get('S', 'text')
+        value_obj = field_obj.get('value', {})
+
+        label_lower = field_label.lower()
+
+        # Handle email field
+        if 'email' in label_lower or field_type == 'email':
+            if 'S' in value_obj:
+                fields['email'] = value_obj['S']
+
+        # Handle phone field
+        elif 'phone' in label_lower or 'mobile' in label_lower or 'cell' in label_lower or field_type == 'phone':
+            if 'S' in value_obj:
+                fields['phone'] = value_obj['S']
+
+        # Handle comments/message field (includes "about" for "About You" type fields)
+        elif any(kw in label_lower for kw in ['comment', 'message', 'note', 'question', 'additional', 'tell us', 'about']):
+            if 'S' in value_obj:
+                fields['comments'] = value_obj['S']
+
+        # Handle name field (could be simple string or composite with First/Last)
+        elif 'name' in label_lower:
+            if 'S' in value_obj:
+                # Simple string name
+                name_parts.append(value_obj['S'])
+            elif 'M' in value_obj:
+                # Composite name with First Name / Last Name subfields
+                nested = value_obj['M']
+                first = ''
+                last = ''
+                for sub_key, sub_val in nested.items():
+                    if isinstance(sub_val, dict) and 'S' in sub_val:
+                        val = sub_val['S']
+                        sub_key_lower = sub_key.lower()
+                        if 'first' in sub_key_lower:
+                            first = val
+                        elif 'last' in sub_key_lower:
+                            last = val
+                if first or last:
+                    name_parts = [first, last]
+
+    fields['name'] = ' '.join(filter(None, name_parts)).strip() or 'Anonymous'
+    return fields
 
 
 def extract_name_email_from_form_data(form_data: Dict) -> tuple:
