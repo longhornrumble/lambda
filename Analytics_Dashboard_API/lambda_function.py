@@ -2869,7 +2869,7 @@ def handle_lead_detail(tenant_id: str, submission_id: str) -> Dict[str, Any]:
 def parse_lead_from_dynamodb(item: Dict) -> Dict[str, Any]:
     """
     Parse DynamoDB item into LeadWorkspaceData format.
-    Flattens form_data_labeled into fields object.
+    Uses pre-computed form_data_display if available, falls back to form_data_labeled.
     """
     submission_id = item.get('submission_id', {}).get('S', '')
     submitted_at = item.get('submitted_at', {}).get('S', '')
@@ -2882,40 +2882,51 @@ def parse_lead_from_dynamodb(item: Dict) -> Dict[str, Any]:
     except (ValueError, AttributeError):
         submitted_date = submitted_at[:10] if submitted_at else 'Unknown'
 
-    # Parse form_data_labeled into flat fields object
+    # Prefer pre-computed form_data_display (flat key-value structure)
     fields = {}
-    form_data_labeled = item.get('form_data_labeled', {}).get('M', {})
+    form_data_display = item.get('form_data_display', {}).get('M', {})
 
-    for field_label, field_wrapper in form_data_labeled.items():
-        if not isinstance(field_wrapper, dict) or 'M' not in field_wrapper:
-            continue
+    if form_data_display:
+        # Use the pre-computed display format directly
+        for label, value_obj in form_data_display.items():
+            if isinstance(value_obj, dict) and 'S' in value_obj:
+                fields[label] = value_obj['S']
+            elif isinstance(value_obj, dict) and 'NULL' in value_obj:
+                fields[label] = ''  # Skip null values
+    else:
+        # Fall back to parsing form_data_labeled (legacy records)
+        form_data_labeled = item.get('form_data_labeled', {}).get('M', {})
 
-        field_obj = field_wrapper['M']
-        value_obj = field_obj.get('value', {})
+        for field_label, field_wrapper in form_data_labeled.items():
+            if not isinstance(field_wrapper, dict) or 'M' not in field_wrapper:
+                continue
 
-        # Convert label to snake_case key
-        field_key = field_label.lower().replace(' ', '_')
+            field_obj = field_wrapper['M']
+            value_obj = field_obj.get('value', {})
 
-        # Handle different value types
-        if 'S' in value_obj:
-            fields[field_key] = value_obj['S']
-        elif 'M' in value_obj:
-            # Composite field (e.g., Name with First/Last)
-            nested = value_obj['M']
-            parts = []
-            for sub_key, sub_val in nested.items():
-                if isinstance(sub_val, dict) and 'S' in sub_val:
-                    parts.append(sub_val['S'])
-            fields[field_key] = ' '.join(parts)
-        elif 'BOOL' in value_obj:
-            fields[field_key] = 'Yes' if value_obj['BOOL'] else 'No'
-        elif 'L' in value_obj:
-            # List value
-            list_items = []
-            for list_item in value_obj['L']:
-                if 'S' in list_item:
-                    list_items.append(list_item['S'])
-            fields[field_key] = ', '.join(list_items)
+            # Convert label to snake_case key
+            field_key = field_label.lower().replace(' ', '_')
+
+            # Handle different value types
+            if 'S' in value_obj:
+                fields[field_key] = value_obj['S']
+            elif 'M' in value_obj:
+                # Composite field (e.g., Name with First/Last)
+                nested = value_obj['M']
+                parts = []
+                for sub_key, sub_val in nested.items():
+                    if isinstance(sub_val, dict) and 'S' in sub_val:
+                        parts.append(sub_val['S'])
+                fields[field_key] = ' '.join(parts)
+            elif 'BOOL' in value_obj:
+                fields[field_key] = 'Yes' if value_obj['BOOL'] else 'No'
+            elif 'L' in value_obj:
+                # List value
+                list_items = []
+                for list_item in value_obj['L']:
+                    if 'S' in list_item:
+                        list_items.append(list_item['S'])
+                fields[field_key] = ', '.join(list_items)
 
     # Infer submission type from form_id
     submission_type = 'general'
