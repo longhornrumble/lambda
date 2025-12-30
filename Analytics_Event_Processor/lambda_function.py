@@ -554,6 +554,13 @@ def update_session_summary(event):
         expression_names['#outcome'] = 'outcome'
         expression_values[':outcome'] = {'S': 'cta_clicked'}
 
+    elif event_type == 'SESSION_END':
+        # Session ended - set default outcome if no conversion occurred
+        # This ensures all sessions have an explicit outcome for filtering
+        update_parts.append("#outcome = if_not_exists(#outcome, :outcome)")
+        expression_names['#outcome'] = 'outcome'
+        expression_values[':outcome'] = {'S': 'conversation'}
+
     # Build final update expression
     update_expression = ', '.join(update_parts)
 
