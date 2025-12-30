@@ -2628,9 +2628,12 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
 
         # Add outcome filter if specified
         if outcome_filter:
-            # Backwards compatibility: 'conversation' also matches legacy 'browsing' records
+            # Backwards compatibility: 'conversation' also matches:
+            # - Records with outcome='conversation'
+            # - Records with outcome='browsing' (legacy)
+            # - Records with no outcome attribute (default = conversation)
             if outcome_filter == 'conversation':
-                query_params['FilterExpression'] += ' AND (#outcome = :outcome OR #outcome = :outcome_legacy)'
+                query_params['FilterExpression'] += ' AND (#outcome = :outcome OR #outcome = :outcome_legacy OR attribute_not_exists(#outcome))'
                 query_params['ExpressionAttributeNames'] = {'#outcome': 'outcome'}
                 query_params['ExpressionAttributeValues'][':outcome'] = {'S': 'conversation'}
                 query_params['ExpressionAttributeValues'][':outcome_legacy'] = {'S': 'browsing'}
