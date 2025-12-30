@@ -672,6 +672,9 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
 
                 started_at = item.get('started_at', {}).get('S', '')
                 ended_at = item.get('ended_at', {}).get('S', started_at)
+                # Normalize legacy 'browsing' to 'conversation'
+                raw_outcome = item.get('outcome', {}).get('S', 'conversation')
+                outcome = 'conversation' if raw_outcome == 'browsing' else raw_outcome
 
                 # Calculate duration
                 duration_seconds = 0
@@ -688,7 +691,7 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
                     'started_at': started_at,
                     'ended_at': ended_at,
                     'duration_seconds': duration_seconds,
-                    'outcome': item.get('outcome', {}).get('S', 'conversation'),
+                    'outcome': outcome,
                     'message_count': int(item.get('message_count', {}).get('N', 0)),
                     'user_message_count': int(item.get('user_message_count', {}).get('N', 0)),
                     'bot_message_count': int(item.get('bot_message_count', {}).get('N', 0)),
@@ -2625,9 +2628,16 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
 
         # Add outcome filter if specified
         if outcome_filter:
-            query_params['FilterExpression'] += ' AND #outcome = :outcome'
-            query_params['ExpressionAttributeNames'] = {'#outcome': 'outcome'}
-            query_params['ExpressionAttributeValues'][':outcome'] = {'S': outcome_filter}
+            # Backwards compatibility: 'conversation' also matches legacy 'browsing' records
+            if outcome_filter == 'conversation':
+                query_params['FilterExpression'] += ' AND (#outcome = :outcome OR #outcome = :outcome_legacy)'
+                query_params['ExpressionAttributeNames'] = {'#outcome': 'outcome'}
+                query_params['ExpressionAttributeValues'][':outcome'] = {'S': 'conversation'}
+                query_params['ExpressionAttributeValues'][':outcome_legacy'] = {'S': 'browsing'}
+            else:
+                query_params['FilterExpression'] += ' AND #outcome = :outcome'
+                query_params['ExpressionAttributeNames'] = {'#outcome': 'outcome'}
+                query_params['ExpressionAttributeValues'][':outcome'] = {'S': outcome_filter}
 
         # Add pagination cursor if provided
         if cursor:
@@ -2652,7 +2662,9 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
             # Extract fields with defaults
             started_at = item.get('started_at', {}).get('S', '')
             ended_at = item.get('ended_at', {}).get('S', started_at)
-            outcome = item.get('outcome', {}).get('S', 'conversation')
+            # Normalize legacy 'browsing' to 'conversation'
+            raw_outcome = item.get('outcome', {}).get('S', 'conversation')
+            outcome = 'conversation' if raw_outcome == 'browsing' else raw_outcome
             message_count = int(item.get('message_count', {}).get('N', 0))
             user_message_count = int(item.get('user_message_count', {}).get('N', 0))
             bot_message_count = int(item.get('bot_message_count', {}).get('N', 0))
