@@ -20,6 +20,7 @@ Endpoints:
 - GET /forms/top-performers - Form performance rankings
 - GET /sessions/{session_id} - Full session timeline (User Journey)
 - GET /sessions/list        - Paginated session list with filters (User Journey)
+- GET /features             - Dashboard feature flags for tenant
 
 Authentication:
 - JWT token in Authorization header (Bearer token)
@@ -33,6 +34,7 @@ Environment Variables:
 - USE_DYNAMO_CACHE: Enable DynamoDB hot path (default: true)
 - SESSION_EVENTS_TABLE: DynamoDB table for session events (default: picasso-session-events)
 - SESSION_SUMMARIES_TABLE: DynamoDB table for session summaries (default: picasso-session-summaries)
+- S3_CONFIG_BUCKET: S3 bucket for tenant configurations (default: picasso-configs)
 """
 
 import json
@@ -82,6 +84,17 @@ FORM_SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_
 SESSION_EVENTS_TABLE = os.environ.get('SESSION_EVENTS_TABLE', 'picasso-session-events')
 SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries')
 
+# S3 Tenant Configuration
+S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
+
+# S3 client
+s3 = boto3.client('s3')
+
+# Cache for tenant configs (TTL: 5 minutes)
+_tenant_config_cache: Dict[str, Dict[str, Any]] = {}
+_tenant_config_cache_time: Dict[str, float] = {}
+TENANT_CONFIG_CACHE_TTL = 300  # 5 minutes
+
 # Cache for JWT secret
 _jwt_secret_cache = None
 _jwt_secret_cache_time = 0
@@ -100,10 +113,14 @@ ALLOWED_EVENT_TYPES = {
 TENANT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
 
 
-def sanitize_tenant_id(tenant_id: str) -> str:
+def sanitize_tenant_id(tenant_id: str, for_sql: bool = False) -> str:
     """
     Validate tenant_id is safe for SQL interpolation.
     Prevents SQL injection by ensuring only alphanumeric characters.
+
+    Args:
+        tenant_id: The tenant ID to validate
+        for_sql: If True, also applies SQL escaping for defense-in-depth
 
     Raises ValueError if tenant_id is invalid.
     """
@@ -115,6 +132,11 @@ def sanitize_tenant_id(tenant_id: str) -> str:
 
     if not TENANT_ID_PATTERN.match(tenant_id):
         raise ValueError(f"Invalid tenant_id format: must be alphanumeric")
+
+    # Defense-in-depth: escape SQL special chars if for SQL use
+    # Note: TENANT_ID_PATTERN already prevents quotes, but this is extra safety
+    if for_sql:
+        return tenant_id.replace("'", "''").replace("\\", "\\\\")
 
     return tenant_id
 
@@ -133,6 +155,77 @@ def sanitize_event_type(event_type: str) -> str:
         raise ValueError(f"Invalid event type: {event_type}")
 
     return event_type
+
+
+# =============================================================================
+# PII Redaction Utilities (GDPR/CCPA Compliance)
+# =============================================================================
+# These functions redact PII for CloudWatch logs while preserving enough info
+# for debugging. Full PII is preserved in DynamoDB and API responses.
+
+def redact_email(email: str) -> str:
+    """
+    Redact email for safe logging.
+    user@domain.com -> u***@d***.com
+    """
+    if not email or '@' not in email:
+        return '[invalid-email]'
+
+    try:
+        local, domain = email.split('@', 1)
+        domain_parts = domain.rsplit('.', 1)
+        if len(domain_parts) == 2:
+            domain_name, tld = domain_parts
+            return f"{local[0]}***@{domain_name[0]}***.{tld}"
+        return f"{local[0]}***@{domain[0]}***"
+    except (ValueError, IndexError):
+        return '[redacted-email]'
+
+
+def redact_name(name: str) -> str:
+    """
+    Redact name for safe logging.
+    John Smith -> J*** S***
+    """
+    if not name:
+        return '[no-name]'
+
+    parts = name.strip().split()
+    redacted_parts = []
+    for part in parts:
+        if len(part) > 0:
+            redacted_parts.append(f"{part[0]}***")
+
+    return ' '.join(redacted_parts) if redacted_parts else '[redacted]'
+
+
+def redact_tenant_id(tenant_id: str) -> str:
+    """
+    Redact tenant_id for logging - show only first 8 chars.
+    AUS123456789 -> AUS12345...
+    """
+    if not tenant_id:
+        return '[no-tenant]'
+
+    if len(tenant_id) <= 8:
+        return tenant_id
+
+    return f"{tenant_id[:8]}..."
+
+
+def safe_sql_string(value: str) -> str:
+    """
+    Additional SQL injection protection layer.
+    Escapes single quotes for SQL string interpolation.
+
+    NOTE: This is defense-in-depth. Primary protection is sanitize_tenant_id()
+    which validates against alphanumeric pattern. This function handles edge cases.
+    """
+    if not value:
+        return ''
+
+    # Escape single quotes (SQL standard: '' for literal single quote)
+    return value.replace("'", "''")
 
 
 def lambda_handler(event, context):
@@ -168,6 +261,9 @@ def lambda_handler(event, context):
     except ValueError as e:
         logger.warning(f"Invalid tenant_id in token: {e}")
         return cors_response(400, {'error': str(e)})
+
+    # Extract user email for audit purposes
+    user_email = auth_result.get('email', 'unknown')
 
     logger.info(f"Authenticated request for tenant: {tenant_id[:8]}...")
 
@@ -215,6 +311,33 @@ def lambda_handler(event, context):
             return handle_events(tenant_id, params)
         elif path.endswith('/funnel'):
             return handle_funnel(tenant_id, params)
+        # Feature flags endpoint
+        elif path.endswith('/features'):
+            return handle_features(tenant_id)
+
+        # Lead Workspace endpoints
+        elif path == '/leads/queue' and method == 'GET':
+            return handle_lead_queue(tenant_id, params)
+        elif '/leads/' in path and '/status' in path and method == 'PATCH':
+            # PATCH /leads/{submission_id}/status
+            submission_id = path.split('/leads/')[1].split('/status')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_lead_status_update(tenant_id, submission_id, body, user_email)
+        elif '/leads/' in path and '/notes' in path and method == 'PATCH':
+            # PATCH /leads/{submission_id}/notes
+            submission_id = path.split('/leads/')[1].split('/notes')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_lead_notes_update(tenant_id, submission_id, body, user_email)
+        elif '/leads/' in path and '/reactivate' in path and method == 'PATCH':
+            # PATCH /leads/{submission_id}/reactivate
+            submission_id = path.split('/leads/')[1].split('/reactivate')[0]
+            return handle_lead_reactivate(tenant_id, submission_id, user_email)
+        elif '/leads/' in path and method == 'GET':
+            # GET /leads/{submission_id}
+            submission_id = path.split('/leads/')[1].split('/')[0]
+            if submission_id and submission_id != 'queue':
+                return handle_lead_detail(tenant_id, submission_id)
+
         else:
             return cors_response(404, {'error': f'Unknown endpoint: {path}'})
 
@@ -230,7 +353,7 @@ def lambda_handler(event, context):
 def authenticate_request(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     Authenticate request using JWT token from Authorization header.
-    Returns {'success': True, 'tenant_id': '...'} or {'success': False, 'error': '...'}
+    Returns {'success': True, 'tenant_id': '...', 'email': '...'} or {'success': False, 'error': '...'}
     """
     # Get Authorization header
     headers = event.get('headers', {}) or {}
@@ -253,7 +376,10 @@ def authenticate_request(event: Dict[str, Any]) -> Dict[str, Any]:
         if not tenant_id:
             return {'success': False, 'error': 'Token missing tenant_id'}
 
-        return {'success': True, 'tenant_id': tenant_id}
+        # Extract email for audit purposes
+        email = payload.get('email', 'unknown')
+
+        return {'success': True, 'tenant_id': tenant_id, 'email': email}
 
     except Exception as e:
         logger.warning(f"JWT validation failed: {e}")
@@ -322,6 +448,109 @@ def validate_jwt(token: str) -> Dict[str, Any]:
         raise ValueError('Invalid signature')
 
     return payload
+
+
+# =============================================================================
+# Tenant Configuration & Feature Flags
+# =============================================================================
+
+def get_tenant_config(tenant_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch tenant configuration from S3 with caching.
+    Returns None if config not found.
+    """
+    global _tenant_config_cache, _tenant_config_cache_time
+
+    now = time.time()
+
+    # Check cache
+    if tenant_id in _tenant_config_cache:
+        if (now - _tenant_config_cache_time.get(tenant_id, 0)) < TENANT_CONFIG_CACHE_TTL:
+            return _tenant_config_cache[tenant_id]
+
+    try:
+        key = f"tenants/{tenant_id}/config.json"
+        response = s3.get_object(Bucket=S3_CONFIG_BUCKET, Key=key)
+        config = json.loads(response['Body'].read().decode('utf-8'))
+
+        # Cache the config
+        _tenant_config_cache[tenant_id] = config
+        _tenant_config_cache_time[tenant_id] = now
+
+        logger.info(f"Loaded tenant config for {tenant_id[:8]}...")
+        return config
+
+    except s3.exceptions.NoSuchKey:
+        logger.warning(f"No config found for tenant {tenant_id[:8]}...")
+        return None
+    except ClientError as e:
+        logger.error(f"Error fetching tenant config: {e}")
+        return None
+
+
+def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
+    """
+    Get dashboard feature flags for a tenant.
+    Returns safe defaults if config not found or flags missing.
+
+    Defaults:
+    - dashboard_conversations: True (FREE tier)
+    - dashboard_forms: True (legacy tenant support)
+    - dashboard_attribution: False (PREMIUM only)
+    """
+    config = get_tenant_config(tenant_id)
+
+    if not config:
+        # No config = legacy tenant, give them conversations + forms
+        return {
+            'dashboard_conversations': True,
+            'dashboard_forms': True,
+            'dashboard_attribution': False,
+        }
+
+    features = config.get('features', {})
+
+    return {
+        'dashboard_conversations': features.get('dashboard_conversations', True),
+        'dashboard_forms': features.get('dashboard_forms', True),
+        'dashboard_attribution': features.get('dashboard_attribution', False),
+    }
+
+
+def handle_features(tenant_id: str) -> Dict[str, Any]:
+    """
+    Handle GET /features endpoint.
+    Returns dashboard feature flags for the authenticated tenant.
+    """
+    features = get_tenant_features(tenant_id)
+
+    return cors_response(200, {
+        'tenant_id': tenant_id,
+        'features': features,
+    })
+
+
+def validate_feature_access(tenant_id: str, required_feature: str) -> Optional[Dict[str, Any]]:
+    """
+    Validate that tenant has access to a premium feature.
+    Returns None if access granted, or a 403 error response if denied.
+
+    Usage:
+        error = validate_feature_access(tenant_id, 'dashboard_forms')
+        if error:
+            return error
+    """
+    features = get_tenant_features(tenant_id)
+
+    if not features.get(required_feature, False):
+        logger.warning(f"Access denied: {tenant_id[:8]}... lacks {required_feature}")
+        return cors_response(403, {
+            'error': 'Feature not available',
+            'message': f'Your subscription does not include access to this feature. Please upgrade to access {required_feature.replace("dashboard_", "")} analytics.',
+            'feature': required_feature,
+        })
+
+    return None
 
 
 # =============================================================================
@@ -459,7 +688,7 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
                     'started_at': started_at,
                     'ended_at': ended_at,
                     'duration_seconds': duration_seconds,
-                    'outcome': item.get('outcome', {}).get('S', 'browsing'),
+                    'outcome': item.get('outcome', {}).get('S', 'conversation'),
                     'message_count': int(item.get('message_count', {}).get('N', 0)),
                     'user_message_count': int(item.get('user_message_count', {}).get('N', 0)),
                     'bot_message_count': int(item.get('bot_message_count', {}).get('N', 0)),
@@ -484,6 +713,384 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
     except Exception as e:
         logger.exception(f"Error fetching sessions: {e}")
         return []
+
+
+# =============================================================================
+# DynamoDB Form Events Query Functions (Hot Path)
+# =============================================================================
+
+def fetch_form_events_from_dynamo(tenant_hash: str, date_range: Dict[str, str], form_id: str = None) -> List[Dict[str, Any]]:
+    """
+    Fetch form events from picasso-session-events table using tenant-date-index GSI.
+
+    Queries for FORM_VIEWED, FORM_STARTED, FORM_COMPLETED, FORM_ABANDONED events.
+    Uses FilterExpression for event_type filtering (acceptable at current scale of ~100 events/day).
+
+    Args:
+        tenant_hash: Tenant hash (e.g., 'auc5b0ecb0adcb')
+        date_range: Dict with 'start_date_iso' key
+        form_id: Optional form_id filter
+
+    Returns:
+        List of form event dictionaries
+    """
+    start_date = date_range['start_date_iso']
+
+    # Build filter expression for form event types
+    filter_expr = 'event_type IN (:t1, :t2, :t3, :t4)'
+    expr_values = {
+        ':th': {'S': tenant_hash},
+        ':start': {'S': start_date},
+        ':t1': {'S': 'FORM_VIEWED'},
+        ':t2': {'S': 'FORM_STARTED'},
+        ':t3': {'S': 'FORM_COMPLETED'},
+        ':t4': {'S': 'FORM_ABANDONED'}
+    }
+
+    # Add optional form_id filter
+    if form_id:
+        filter_expr += ' AND contains(event_payload, :form_id)'
+        expr_values[':form_id'] = {'S': f'"form_id": "{form_id}"'}
+
+    events = []
+    last_key = None
+
+    try:
+        while True:
+            query_params = {
+                'TableName': SESSION_EVENTS_TABLE,
+                'IndexName': 'tenant-date-index',
+                'KeyConditionExpression': 'tenant_hash = :th AND #ts >= :start',
+                'FilterExpression': filter_expr,
+                'ExpressionAttributeNames': {'#ts': 'timestamp'},
+                'ExpressionAttributeValues': expr_values
+            }
+
+            if last_key:
+                query_params['ExclusiveStartKey'] = last_key
+
+            response = dynamodb.query(**query_params)
+            items = response.get('Items', [])
+
+            for item in items:
+                event_type = item.get('event_type', {}).get('S', '')
+                timestamp = item.get('timestamp', {}).get('S', '')
+
+                # Parse event_payload
+                payload = {}
+                if 'event_payload' in item:
+                    try:
+                        payload_str = item['event_payload'].get('S', '{}')
+                        payload = json.loads(payload_str)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                events.append({
+                    'event_type': event_type,
+                    'timestamp': timestamp,
+                    'payload': payload
+                })
+
+            last_key = response.get('LastEvaluatedKey')
+            if not last_key:
+                break
+
+        logger.info(f"Fetched {len(events)} form events from DynamoDB for tenant {tenant_hash}")
+        return events
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error fetching form events: {e}")
+        return []
+    except Exception as e:
+        logger.exception(f"Error fetching form events: {e}")
+        return []
+
+
+def fetch_form_summary_from_dynamo(tenant_hash: str, date_range: Dict[str, str], form_id: str = None) -> Dict[str, Any]:
+    """
+    Calculate form summary metrics from DynamoDB session events.
+
+    Replaces Athena query for /forms/summary endpoint.
+    Performance: ~100-500ms (vs 5-30s for Athena)
+
+    Args:
+        tenant_hash: Tenant hash
+        date_range: Dict with 'start_date_iso'
+        form_id: Optional form filter
+
+    Returns:
+        Dict with form metrics (views, starts, completes, abandons, rates, avg_time)
+    """
+    events = fetch_form_events_from_dynamo(tenant_hash, date_range, form_id)
+
+    # Aggregate counts
+    counts = {
+        'FORM_VIEWED': 0,
+        'FORM_STARTED': 0,
+        'FORM_COMPLETED': 0,
+        'FORM_ABANDONED': 0
+    }
+    completion_times = []
+
+    for event in events:
+        event_type = event.get('event_type', '')
+        if event_type in counts:
+            counts[event_type] += 1
+
+        # Extract completion time for FORM_COMPLETED events
+        if event_type == 'FORM_COMPLETED':
+            duration = event.get('payload', {}).get('duration_seconds')
+            if duration and isinstance(duration, (int, float)) and duration > 0:
+                completion_times.append(duration)
+
+    # Calculate rates based on outcomes (completed + abandoned)
+    total_outcomes = counts['FORM_COMPLETED'] + counts['FORM_ABANDONED']
+    completion_rate = (counts['FORM_COMPLETED'] / total_outcomes * 100) if total_outcomes > 0 else 0
+    abandon_rate = (counts['FORM_ABANDONED'] / total_outcomes * 100) if total_outcomes > 0 else 0
+    avg_time = sum(completion_times) / len(completion_times) if completion_times else 0
+
+    return {
+        'form_views': counts['FORM_VIEWED'],
+        'forms_started': counts['FORM_STARTED'],
+        'forms_completed': counts['FORM_COMPLETED'],
+        'forms_abandoned': counts['FORM_ABANDONED'],
+        'completion_rate': round(completion_rate, 1),
+        'abandon_rate': round(abandon_rate, 1),
+        'avg_completion_time_seconds': round(avg_time)
+    }
+
+
+def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, str], form_id: str = None, limit: int = 5) -> Dict[str, Any]:
+    """
+    Calculate form bottlenecks (field-level abandonment) from DynamoDB session events.
+
+    Replaces Athena query for /forms/bottlenecks endpoint.
+    Performance: ~100-500ms (vs 5-30s for Athena)
+
+    Args:
+        tenant_hash: Tenant hash
+        date_range: Dict with 'start_date_iso'
+        form_id: Optional form filter
+        limit: Maximum number of bottlenecks to return
+
+    Returns:
+        Dict with bottlenecks list and total_abandonments count
+    """
+    start_date = date_range['start_date_iso']
+
+    # Query only FORM_ABANDONED events
+    filter_expr = 'event_type = :t1'
+    expr_values = {
+        ':th': {'S': tenant_hash},
+        ':start': {'S': start_date},
+        ':t1': {'S': 'FORM_ABANDONED'}
+    }
+
+    # Add optional form_id filter
+    if form_id:
+        filter_expr += ' AND contains(event_payload, :form_id)'
+        expr_values[':form_id'] = {'S': f'"form_id": "{form_id}"'}
+
+    events = []
+    last_key = None
+
+    try:
+        while True:
+            query_params = {
+                'TableName': SESSION_EVENTS_TABLE,
+                'IndexName': 'tenant-date-index',
+                'KeyConditionExpression': 'tenant_hash = :th AND #ts >= :start',
+                'FilterExpression': filter_expr,
+                'ExpressionAttributeNames': {'#ts': 'timestamp'},
+                'ExpressionAttributeValues': expr_values
+            }
+
+            if last_key:
+                query_params['ExclusiveStartKey'] = last_key
+
+            response = dynamodb.query(**query_params)
+            items = response.get('Items', [])
+
+            for item in items:
+                # Parse event_payload
+                payload = {}
+                if 'event_payload' in item:
+                    try:
+                        payload_str = item['event_payload'].get('S', '{}')
+                        payload = json.loads(payload_str)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                events.append(payload)
+
+            last_key = response.get('LastEvaluatedKey')
+            if not last_key:
+                break
+
+        logger.info(f"Fetched {len(events)} FORM_ABANDONED events from DynamoDB for tenant {tenant_hash}")
+
+        # Aggregate by last_field_id
+        field_abandons = {}  # field_id -> {'count': N, 'label': '...', 'form_id': '...'}
+
+        for event in events:
+            field_id = event.get('last_field_id', 'unknown')
+            field_label = event.get('last_field_label', field_id)
+            event_form_id = event.get('form_id')
+
+            if field_id not in field_abandons:
+                field_abandons[field_id] = {
+                    'count': 0,
+                    'label': field_label,
+                    'form_id': event_form_id
+                }
+            field_abandons[field_id]['count'] += 1
+
+        # Calculate total and sort by count descending
+        total_abandons = len(events)
+        sorted_fields = sorted(
+            field_abandons.items(),
+            key=lambda x: x[1]['count'],
+            reverse=True
+        )[:limit]
+
+        # Build bottlenecks list with insights
+        bottlenecks = []
+        for field_id, data in sorted_fields:
+            abandon_count = data['count']
+            abandon_pct = round((abandon_count / total_abandons * 100) if total_abandons > 0 else 0, 1)
+
+            # Generate insight based on field characteristics
+            insight = generate_field_insight(field_id, data['label'])
+
+            bottlenecks.append({
+                'field_id': field_id,
+                'field_label': data['label'],
+                'form_id': data['form_id'],
+                'abandon_count': abandon_count,
+                'abandon_percentage': abandon_pct,
+                'insight': insight['insight'],
+                'recommendation': insight['recommendation']
+            })
+
+        return {
+            'bottlenecks': bottlenecks,
+            'total_abandonments': total_abandons
+        }
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error fetching form bottlenecks: {e}")
+        return {'bottlenecks': [], 'total_abandonments': 0}
+    except Exception as e:
+        logger.exception(f"Error fetching form bottlenecks: {e}")
+        return {'bottlenecks': [], 'total_abandonments': 0}
+
+
+def fetch_form_top_performers_from_dynamo(tenant_hash: str, date_range: Dict[str, str], limit: int = 5, sort_by: str = 'conversion_rate') -> Dict[str, Any]:
+    """
+    Calculate form performance rankings from DynamoDB session events.
+
+    Replaces Athena query for /forms/top-performers endpoint.
+    Performance: ~100-500ms (vs 5-30s for Athena)
+
+    Args:
+        tenant_hash: Tenant hash
+        date_range: Dict with 'start_date_iso'
+        limit: Maximum number of forms to return
+        sort_by: Sort field (conversion_rate, completions, avg_time)
+
+    Returns:
+        Dict with forms list and total_completions count
+    """
+    # Reuse existing function to get all form events
+    events = fetch_form_events_from_dynamo(tenant_hash, date_range)
+
+    # Aggregate per form_id
+    form_stats = {}  # form_id -> {views, started, completions, abandons, durations[], label}
+
+    for event in events:
+        event_type = event.get('event_type', '')
+        payload = event.get('payload', {})
+        form_id = payload.get('form_id', 'unknown')
+        form_label = payload.get('form_label', form_id)
+
+        if form_id not in form_stats:
+            form_stats[form_id] = {
+                'views': 0,
+                'started': 0,
+                'completions': 0,
+                'abandons': 0,
+                'durations': [],
+                'label': form_label
+            }
+
+        if event_type == 'FORM_VIEWED':
+            form_stats[form_id]['views'] += 1
+        elif event_type == 'FORM_STARTED':
+            form_stats[form_id]['started'] += 1
+        elif event_type == 'FORM_COMPLETED':
+            form_stats[form_id]['completions'] += 1
+            # Collect duration for average
+            duration = payload.get('duration_seconds')
+            if duration and isinstance(duration, (int, float)) and duration > 0:
+                form_stats[form_id]['durations'].append(duration)
+            # Update label if available
+            if form_label and form_label != 'unknown':
+                form_stats[form_id]['label'] = form_label
+        elif event_type == 'FORM_ABANDONED':
+            form_stats[form_id]['abandons'] += 1
+
+    # Calculate metrics for each form
+    forms_list = []
+    total_completions = 0
+
+    for form_id, stats in form_stats.items():
+        completions = stats['completions']
+        abandons = stats['abandons']
+        total_outcomes = completions + abandons
+        total_completions += completions
+
+        conversion_rate = (completions / total_outcomes * 100) if total_outcomes > 0 else 0
+        abandon_rate = (abandons / total_outcomes * 100) if total_outcomes > 0 else 0
+        avg_time = sum(stats['durations']) / len(stats['durations']) if stats['durations'] else 0
+
+        # Determine trend indicator based on conversion rate thresholds
+        if conversion_rate >= 70:
+            trend = 'trending'
+        elif conversion_rate >= 40:
+            trend = 'stable'
+        else:
+            trend = 'low'
+
+        forms_list.append({
+            'form_id': form_id,
+            'form_label': stats['label'] if stats['label'] != 'unknown' else form_id,
+            'views': stats['views'],
+            'started': stats['started'],
+            'completions': completions,
+            'conversion_rate': round(conversion_rate, 1),
+            'abandon_rate': round(abandon_rate, 1),
+            'avg_completion_time_seconds': round(avg_time),
+            'trend': trend
+        })
+
+    # Sort by requested field
+    sort_key_map = {
+        'conversion_rate': lambda x: x['conversion_rate'],
+        'completions': lambda x: x['completions'],
+        'avg_time': lambda x: x['avg_completion_time_seconds']
+    }
+    sort_key = sort_key_map.get(sort_by, sort_key_map['conversion_rate'])
+
+    # Sort descending and limit
+    forms_list.sort(key=sort_key, reverse=True)
+    forms_list = forms_list[:limit]
+
+    logger.info(f"Calculated top performers for {len(form_stats)} forms from DynamoDB for tenant {tenant_hash}")
+
+    return {
+        'forms': forms_list,
+        'total_completions': total_completions
+    }
 
 
 # =============================================================================
@@ -515,6 +1122,8 @@ def handle_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     logger.info(f"Cache miss - querying Athena for analytics_summary#{range_str}")
 
     # Use ISO date comparison for proper cross-month-boundary filtering
+    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
+    safe_tenant = safe_sql_string(tenant_id)
     query = f"""
     SELECT
         COUNT(DISTINCT session_id) as total_sessions,
@@ -525,7 +1134,7 @@ def handle_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         COUNT(CASE WHEN event_type = 'ACTION_CHIP_CLICKED' THEN 1 END) as chip_clicks,
         COUNT(CASE WHEN event_type = 'CTA_CLICKED' THEN 1 END) as cta_clicks
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{tenant_id}'
+    WHERE tenant_id = '{safe_tenant}'
       AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
                LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
                LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
@@ -596,13 +1205,15 @@ def handle_sessions(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         select_date = "CAST(year AS VARCHAR) || '-' || LPAD(CAST(month AS VARCHAR), 2, '0') || '-' || LPAD(CAST(day AS VARCHAR), 2, '0') as period"
 
     # Use ISO date comparison for proper cross-month-boundary filtering
+    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
+    safe_tenant = safe_sql_string(tenant_id)
     query = f"""
     SELECT
         {select_date},
         COUNT(DISTINCT session_id) as sessions,
         COUNT(*) as events
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{tenant_id}'
+    WHERE tenant_id = '{safe_tenant}'
       AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
                LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
                LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
@@ -650,13 +1261,15 @@ def handle_events(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     type_clause = f"AND event_type = '{event_type_filter}'" if event_type_filter else ""
 
     # Use ISO date comparison for proper cross-month-boundary filtering
+    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
+    safe_tenant = safe_sql_string(tenant_id)
     query = f"""
     SELECT
         event_type,
         COUNT(*) as count,
         COUNT(DISTINCT session_id) as unique_sessions
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{tenant_id}'
+    WHERE tenant_id = '{safe_tenant}'
       AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
                LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
                LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
@@ -714,6 +1327,8 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     logger.info(f"Cache miss - querying Athena for analytics_funnel#{range_str}")
 
     # Use ISO date comparison for proper cross-month-boundary filtering
+    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
+    safe_tenant = safe_sql_string(tenant_id)
     query = f"""
     SELECT
         COUNT(DISTINCT CASE WHEN event_type = 'WIDGET_OPENED' THEN session_id END) as stage1_widget_opened,
@@ -721,7 +1336,7 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
         COUNT(DISTINCT CASE WHEN event_type = 'FORM_STARTED' THEN session_id END) as stage3_form_started,
         COUNT(DISTINCT CASE WHEN event_type = 'FORM_COMPLETED' THEN session_id END) as stage4_form_completed
     FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{tenant_id}'
+    WHERE tenant_id = '{safe_tenant}'
       AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
                LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
                LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
@@ -782,108 +1397,70 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
 def handle_form_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
     GET /forms/summary
-    Returns form-specific summary metrics.
+    Returns form-specific summary metrics from DynamoDB.
 
     Query params:
     - range: Time range (7d, 30d, 90d) - default 30d
     - form_id: Filter by specific form (optional)
+
+    Data source: picasso-session-events table via tenant-date-index GSI
+    Performance: ~100-500ms (vs 5-30s for Athena)
     """
+    # Validate premium feature access
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
     range_str = params.get('range', '30d')
     date_range = parse_date_range(range_str)
     form_id = params.get('form_id')
 
-    # Try DynamoDB cache first (sub-100ms) - only if no form_id filter
-    if not form_id:
-        cached = get_cached_metric(tenant_id, f'forms_summary#{range_str}')
-        if cached:
-            return cors_response(200, {
-                'tenant_id': tenant_id,
-                'range': range_str,
-                'metrics': cached,
-                'source': 'cache'
-            })
+    # Validate form_id if provided
+    if form_id and not TENANT_ID_PATTERN.match(form_id):
+        return cors_response(400, {'error': 'Invalid form_id format'})
 
-    # Fallback to Athena (5-30s)
-    logger.info(f"Cache miss - querying Athena for forms_summary#{range_str}")
+    # Get tenant_hash for DynamoDB query
+    tenant_hash = get_tenant_hash(tenant_id)
+    if not tenant_hash:
+        logger.error(f"Could not resolve tenant_hash for tenant_id: {redact_tenant_id(tenant_id)}")
+        return cors_response(500, {'error': 'Could not resolve tenant configuration'})
 
-    # Build optional form filter
-    form_filter = ""
-    if form_id:
-        if not TENANT_ID_PATTERN.match(form_id):
-            return cors_response(400, {'error': 'Invalid form_id format'})
-        form_filter = f"AND json_extract_scalar(event_payload, '$.form_id') = '{form_id}'"
+    logger.info(f"Querying DynamoDB for forms_summary: tenant={tenant_hash}, range={range_str}, form_id={form_id}")
 
-    # Query for form metrics using a single aggregation query
-    query = f"""
-    SELECT
-        SUM(CASE WHEN event_type = 'FORM_VIEWED' THEN 1 ELSE 0 END) as form_views,
-        SUM(CASE WHEN event_type = 'FORM_STARTED' THEN 1 ELSE 0 END) as forms_started,
-        SUM(CASE WHEN event_type = 'FORM_COMPLETED' THEN 1 ELSE 0 END) as forms_completed,
-        SUM(CASE WHEN event_type = 'FORM_ABANDONED' THEN 1 ELSE 0 END) as forms_abandoned,
-        AVG(CASE WHEN event_type = 'FORM_COMPLETED'
-            THEN CAST(json_extract_scalar(event_payload, '$.duration_seconds') AS DOUBLE)
-            ELSE NULL END) as avg_completion_time
-    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{tenant_id}'
-      AND event_type IN ('FORM_VIEWED', 'FORM_STARTED', 'FORM_COMPLETED', 'FORM_ABANDONED')
-      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-          >= DATE '{date_range['start_date_iso']}'
-      {form_filter}
-    """
-
-    results = execute_athena_query(query)
-
-    if results and len(results) > 0:
-        row = results[0]
-        form_views = int(row.get('form_views', 0) or 0)
-        forms_started = int(row.get('forms_started', 0) or 0)
-        forms_completed = int(row.get('forms_completed', 0) or 0)
-        forms_abandoned = int(row.get('forms_abandoned', 0) or 0)
-        avg_completion_time = float(row.get('avg_completion_time', 0) or 0)
-
-        # Calculate rates based on total outcomes (completed + abandoned)
-        # This is more accurate than using forms_started because:
-        # 1. Same session can start multiple times (retry after abandon)
-        # 2. Rates should add up to 100% for clarity
-        total_outcomes = forms_completed + forms_abandoned
-        completion_rate = (forms_completed / total_outcomes * 100) if total_outcomes > 0 else 0
-        abandon_rate = (forms_abandoned / total_outcomes * 100) if total_outcomes > 0 else 0
+    try:
+        # Query DynamoDB directly (no Athena fallback)
+        metrics = fetch_form_summary_from_dynamo(tenant_hash, date_range, form_id)
 
         return cors_response(200, {
             'tenant_id': tenant_id,
-            'range': params.get('range', '30d'),
-            'metrics': {
-                'form_views': form_views,
-                'forms_started': forms_started,
-                'forms_completed': forms_completed,
-                'forms_abandoned': forms_abandoned,
-                'completion_rate': round(completion_rate, 1),
-                'abandon_rate': round(abandon_rate, 1),
-                'avg_completion_time_seconds': round(avg_completion_time)
-            }
+            'range': range_str,
+            'metrics': metrics,
+            'source': 'dynamodb'
         })
 
-    return cors_response(200, {
-        'tenant_id': tenant_id,
-        'range': params.get('range', '30d'),
-        'metrics': {
-            'form_views': 0,
-            'forms_started': 0,
-            'forms_completed': 0,
-            'forms_abandoned': 0,
-            'completion_rate': 0,
-            'abandon_rate': 0,
-            'avg_completion_time_seconds': 0
-        }
-    })
+    except Exception as e:
+        logger.exception(f"Error fetching form summary from DynamoDB: {e}")
+        # Return empty metrics on error rather than failing
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'metrics': {
+                'form_views': 0,
+                'forms_started': 0,
+                'forms_completed': 0,
+                'forms_abandoned': 0,
+                'completion_rate': 0,
+                'abandon_rate': 0,
+                'avg_completion_time_seconds': 0
+            },
+            'source': 'error_fallback'
+        })
 
 
 def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
     GET /forms/bottlenecks
-    Returns field-level abandonment analysis.
+    Returns field-level abandonment analysis from DynamoDB.
 
     Shows which form fields cause the most drop-offs.
 
@@ -891,104 +1468,54 @@ def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     - range: Time range (7d, 30d, 90d) - default 30d
     - form_id: Filter by specific form (optional)
     - limit: Number of results (default 5, max 20)
+
+    Data source: picasso-session-events table via tenant-date-index GSI
+    Performance: ~100-500ms (vs 5-30s for Athena)
     """
+    # Validate premium feature access
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
     range_str = params.get('range', '30d')
     date_range = parse_date_range(range_str)
     limit = min(int(params.get('limit', '5')), 20)
     form_id = params.get('form_id')
 
-    # Try DynamoDB cache first (sub-100ms) - only if no form_id filter
-    if not form_id:
-        cached = get_cached_metric(tenant_id, f'forms_bottlenecks#{range_str}')
-        if cached:
-            bottlenecks = cached.get('bottlenecks', [])[:limit]
-            return cors_response(200, {
-                'tenant_id': tenant_id,
-                'range': range_str,
-                'bottlenecks': bottlenecks,
-                'total_abandonments': cached.get('total_abandonments', 0),
-                'source': 'cache'
-            })
+    # Validate form_id if provided
+    if form_id and not TENANT_ID_PATTERN.match(form_id):
+        return cors_response(400, {'error': 'Invalid form_id format'})
 
-    # Fallback to Athena (5-30s)
-    logger.info(f"Cache miss - querying Athena for forms_bottlenecks#{range_str}")
+    # Get tenant_hash for DynamoDB query
+    tenant_hash = get_tenant_hash(tenant_id)
+    if not tenant_hash:
+        logger.error(f"Could not resolve tenant_hash for tenant_id: {redact_tenant_id(tenant_id)}")
+        return cors_response(500, {'error': 'Could not resolve tenant configuration'})
 
-    # Build optional form filter
-    form_filter = ""
-    if form_id:
-        # Sanitize form_id (alphanumeric, underscore, hyphen only)
-        if not TENANT_ID_PATTERN.match(form_id):
-            return cors_response(400, {'error': 'Invalid form_id format'})
-        form_filter = f"AND json_extract_scalar(event_payload, '$.form_id') = '{form_id}'"
+    logger.info(f"Querying DynamoDB for forms_bottlenecks: tenant={tenant_hash}, range={range_str}, form_id={form_id}")
 
-    # Query FORM_ABANDONED events, group by last_field_id
-    query = f"""
-    SELECT
-        json_extract_scalar(event_payload, '$.last_field_id') as field_id,
-        json_extract_scalar(event_payload, '$.last_field_label') as field_label,
-        json_extract_scalar(event_payload, '$.form_id') as form_id,
-        COUNT(*) as abandon_count
-    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{tenant_id}'
-      AND event_type = 'FORM_ABANDONED'
-      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-          >= DATE '{date_range['start_date_iso']}'
-      {form_filter}
-    GROUP BY
-        json_extract_scalar(event_payload, '$.last_field_id'),
-        json_extract_scalar(event_payload, '$.last_field_label'),
-        json_extract_scalar(event_payload, '$.form_id')
-    ORDER BY abandon_count DESC
-    LIMIT {limit}
-    """
+    try:
+        # Query DynamoDB directly (no Athena fallback)
+        result = fetch_form_bottlenecks_from_dynamo(tenant_hash, date_range, form_id, limit)
 
-    results = execute_athena_query(query)
-
-    # Calculate total abandonments for percentage
-    total_query = f"""
-    SELECT COUNT(*) as total
-    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{tenant_id}'
-      AND event_type = 'FORM_ABANDONED'
-      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-          >= DATE '{date_range['start_date_iso']}'
-      {form_filter}
-    """
-
-    total_result = execute_athena_query(total_query)
-    total_abandons = int(total_result[0].get('total', 0) or 0) if total_result else 0
-
-    # Generate insights based on field characteristics
-    bottlenecks = []
-    for row in (results or []):
-        field_id = row.get('field_id', 'unknown')
-        field_label = row.get('field_label', field_id)
-        abandon_count = int(row.get('abandon_count', 0) or 0)
-        abandon_pct = round((abandon_count / total_abandons * 100) if total_abandons > 0 else 0, 1)
-
-        # Generate insight based on field characteristics
-        insight = generate_field_insight(field_id, field_label)
-
-        bottlenecks.append({
-            'field_id': field_id,
-            'field_label': field_label,
-            'form_id': row.get('form_id'),
-            'abandon_count': abandon_count,
-            'abandon_percentage': abandon_pct,
-            'insight': insight['insight'],
-            'recommendation': insight['recommendation']
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'bottlenecks': result['bottlenecks'],
+            'total_abandonments': result['total_abandonments'],
+            'source': 'dynamodb'
         })
 
-    return cors_response(200, {
-        'tenant_id': tenant_id,
-        'range': params.get('range', '30d'),
-        'bottlenecks': bottlenecks,
-        'total_abandonments': total_abandons
-    })
+    except Exception as e:
+        logger.exception(f"Error fetching form bottlenecks from DynamoDB: {e}")
+        # Return empty data on error rather than failing
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'bottlenecks': [],
+            'total_abandonments': 0,
+            'source': 'error_fallback'
+        })
 
 
 def generate_field_insight(field_id: str, field_label: str) -> Dict[str, str]:
@@ -1069,6 +1596,11 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     - limit: Results per page (default 25, max 100)
     - search: Search query for name/email (optional)
     """
+    # Validate premium feature access
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
     date_range = parse_date_range(params.get('range', '30d'))
     page = max(1, int(params.get('page', '1')))
     limit = min(int(params.get('limit', '25')), 100)
@@ -1114,8 +1646,13 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
         form_title = item.get('form_title', {}).get('S', form_id)
         submitted_at = item.get('submitted_at', {}).get('S', '')
 
-        # Extract name and email from form_data
-        name, email = extract_name_email_from_form_data(item.get('form_data', {}))
+        # Extract name and email - prefer form_data_labeled (human-readable)
+        # Fall back to form_data (cryptic field IDs) for backwards compatibility
+        form_data_labeled = item.get('form_data_labeled', {})
+        if form_data_labeled and form_data_labeled.get('M'):
+            name, email = extract_name_email_from_form_data_labeled(form_data_labeled)
+        else:
+            name, email = extract_name_email_from_form_data(item.get('form_data', {}))
 
         # Apply search filter
         if search:
@@ -1167,9 +1704,64 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     })
 
 
+def extract_name_email_from_form_data_labeled(form_data_labeled: Dict) -> tuple:
+    """
+    Extract name and email from DynamoDB form_data_labeled structure.
+    This uses human-readable field labels (e.g., "Name", "Email") instead of
+    cryptic field IDs (e.g., "field_1762286136120").
+
+    Structure: {label: {label, value, type}} where value can be string or nested object
+    """
+    name_parts = []
+    email = ''
+
+    # Get the nested map from DynamoDB format
+    data_map = form_data_labeled.get('M', {})
+
+    for field_label, field_wrapper in data_map.items():
+        if not isinstance(field_wrapper, dict) or 'M' not in field_wrapper:
+            continue
+
+        field_obj = field_wrapper['M']
+        field_type = field_obj.get('type', {}).get('S', 'text')
+        value_obj = field_obj.get('value', {})
+
+        label_lower = field_label.lower()
+
+        # Handle email field
+        if 'email' in label_lower or field_type == 'email':
+            if 'S' in value_obj:
+                email = value_obj['S']
+
+        # Handle name field (could be simple string or composite with First/Last)
+        elif 'name' in label_lower:
+            if 'S' in value_obj:
+                # Simple string name
+                name_parts.append(value_obj['S'])
+            elif 'M' in value_obj:
+                # Composite name with First Name / Last Name subfields
+                nested = value_obj['M']
+                first = ''
+                last = ''
+                for sub_key, sub_val in nested.items():
+                    if isinstance(sub_val, dict) and 'S' in sub_val:
+                        val = sub_val['S']
+                        sub_key_lower = sub_key.lower()
+                        if 'first' in sub_key_lower:
+                            first = val
+                        elif 'last' in sub_key_lower:
+                            last = val
+                if first or last:
+                    name_parts = [first, last]
+
+    name = ' '.join(filter(None, name_parts)).strip()
+    return (name if name else 'Anonymous', email)
+
+
 def extract_name_email_from_form_data(form_data: Dict) -> tuple:
     """
-    Extract name and email from DynamoDB form_data structure.
+    LEGACY: Extract name and email from DynamoDB form_data structure.
+    Used for backwards compatibility with old submissions that don't have form_data_labeled.
     Form data contains nested field values with dynamic field IDs.
     """
     name_parts = []
@@ -1215,169 +1807,61 @@ def extract_name_email_from_form_data(form_data: Dict) -> tuple:
 def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
     GET /forms/top-performers
-    Returns form performance rankings by conversion rate.
+    Returns form performance rankings by conversion rate from DynamoDB.
 
     Query params:
     - range: Time range (7d, 30d, 90d) - default 30d
     - limit: Number of results (default 5, max 20)
     - sort_by: Sort field (conversion_rate, completions, avg_time) - default conversion_rate
+
+    Data source: picasso-session-events table via tenant-date-index GSI
+    Performance: ~100-500ms (vs 5-30s for Athena)
     """
+    # Validate premium feature access
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
     range_str = params.get('range', '30d')
     date_range = parse_date_range(range_str)
     limit = min(int(params.get('limit', '5')), 20)
     sort_by = params.get('sort_by', 'conversion_rate')
-
-    # Try DynamoDB cache first (sub-100ms)
-    cached = get_cached_metric(tenant_id, f'forms_top_performers#{range_str}')
-    if cached:
-        forms = cached.get('forms', [])[:limit]
-        return cors_response(200, {
-            'tenant_id': tenant_id,
-            'range': range_str,
-            'forms': forms,
-            'total_completions': cached.get('total_completions', 0),
-            'source': 'cache'
-        })
-
-    # Fallback to Athena (5-30s)
-    logger.info(f"Cache miss - querying Athena for forms_top_performers#{range_str}")
 
     # Validate sort_by
     valid_sorts = {'conversion_rate', 'completions', 'avg_time'}
     if sort_by not in valid_sorts:
         sort_by = 'conversion_rate'
 
-    # Map sort field to SQL column
-    sort_column = {
-        'conversion_rate': 'conversion_rate',
-        'completions': 'completions',
-        'avg_time': 'avg_completion_time'
-    }.get(sort_by, 'conversion_rate')
+    # Get tenant_hash for DynamoDB query
+    tenant_hash = get_tenant_hash(tenant_id)
+    if not tenant_hash:
+        logger.error(f"Could not resolve tenant_hash for tenant_id: {redact_tenant_id(tenant_id)}")
+        return cors_response(500, {'error': 'Could not resolve tenant configuration'})
 
-    # Query form stats - get views, starts, completions, and abandons per form
-    query = f"""
-    WITH form_starts AS (
-        SELECT
-            json_extract_scalar(event_payload, '$.form_id') as form_id,
-            COUNT(*) as started
-        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-        WHERE tenant_id = '{tenant_id}'
-          AND event_type = 'FORM_STARTED'
-          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-              >= DATE '{date_range['start_date_iso']}'
-        GROUP BY json_extract_scalar(event_payload, '$.form_id')
-    ),
-    form_completions AS (
-        SELECT
-            json_extract_scalar(event_payload, '$.form_id') as form_id,
-            json_extract_scalar(event_payload, '$.form_label') as form_label,
-            COUNT(*) as completions,
-            AVG(CAST(json_extract_scalar(event_payload, '$.duration_seconds') AS DOUBLE)) as avg_duration
-        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-        WHERE tenant_id = '{tenant_id}'
-          AND event_type = 'FORM_COMPLETED'
-          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-              >= DATE '{date_range['start_date_iso']}'
-        GROUP BY
-            json_extract_scalar(event_payload, '$.form_id'),
-            json_extract_scalar(event_payload, '$.form_label')
-    ),
-    form_abandons AS (
-        SELECT
-            json_extract_scalar(event_payload, '$.form_id') as form_id,
-            COUNT(*) as abandons
-        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-        WHERE tenant_id = '{tenant_id}'
-          AND event_type = 'FORM_ABANDONED'
-          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-              >= DATE '{date_range['start_date_iso']}'
-        GROUP BY json_extract_scalar(event_payload, '$.form_id')
-    ),
-    form_views AS (
-        SELECT
-            json_extract_scalar(event_payload, '$.form_id') as form_id,
-            COUNT(*) as views
-        FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-        WHERE tenant_id = '{tenant_id}'
-          AND event_type = 'FORM_VIEWED'
-          AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-                   LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-                   LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-              >= DATE '{date_range['start_date_iso']}'
-        GROUP BY json_extract_scalar(event_payload, '$.form_id')
-    )
-    SELECT
-        COALESCE(c.form_id, s.form_id, a.form_id, v.form_id) as form_id,
-        c.form_label,
-        COALESCE(v.views, 0) as views,
-        COALESCE(s.started, 0) as started,
-        COALESCE(c.completions, 0) as completions,
-        COALESCE(a.abandons, 0) as abandons,
-        COALESCE(c.avg_duration, 0) as avg_completion_time,
-        CASE
-            WHEN (COALESCE(c.completions, 0) + COALESCE(a.abandons, 0)) > 0
-            THEN ROUND(CAST(COALESCE(c.completions, 0) AS DOUBLE) / CAST(COALESCE(c.completions, 0) + COALESCE(a.abandons, 0) AS DOUBLE) * 100, 1)
-            ELSE 0
-        END as conversion_rate,
-        CASE
-            WHEN (COALESCE(c.completions, 0) + COALESCE(a.abandons, 0)) > 0
-            THEN ROUND(CAST(COALESCE(a.abandons, 0) AS DOUBLE) / CAST(COALESCE(c.completions, 0) + COALESCE(a.abandons, 0) AS DOUBLE) * 100, 1)
-            ELSE 0
-        END as abandon_rate
-    FROM form_completions c
-    FULL OUTER JOIN form_starts s ON c.form_id = s.form_id
-    FULL OUTER JOIN form_abandons a ON COALESCE(c.form_id, s.form_id) = a.form_id
-    FULL OUTER JOIN form_views v ON COALESCE(c.form_id, s.form_id, a.form_id) = v.form_id
-    WHERE COALESCE(c.form_id, s.form_id, a.form_id, v.form_id) IS NOT NULL
-    ORDER BY {sort_column} DESC
-    LIMIT {limit}
-    """
+    logger.info(f"Querying DynamoDB for forms_top_performers: tenant={tenant_hash}, range={range_str}, sort_by={sort_by}")
 
-    results = execute_athena_query(query)
+    try:
+        # Query DynamoDB directly (no Athena fallback)
+        result = fetch_form_top_performers_from_dynamo(tenant_hash, date_range, limit, sort_by)
 
-    # Calculate totals
-    total_completions = 0
-    forms = []
-    for row in (results or []):
-        completions = int(row.get('completions', 0) or 0)
-        total_completions += completions
-
-        avg_time = float(row.get('avg_completion_time', 0) or 0)
-        conversion_rate = float(row.get('conversion_rate', 0) or 0)
-
-        # Determine trend indicator (would need historical comparison for real trends)
-        # For now, use conversion rate thresholds
-        if conversion_rate >= 70:
-            trend = 'trending'
-        elif conversion_rate >= 40:
-            trend = 'stable'
-        else:
-            trend = 'low'
-
-        forms.append({
-            'form_id': row.get('form_id', ''),
-            'form_label': row.get('form_label', row.get('form_id', 'Unknown Form')),
-            'views': int(row.get('views', 0) or 0),
-            'started': int(row.get('started', 0) or 0),
-            'completions': completions,
-            'conversion_rate': conversion_rate,
-            'abandon_rate': float(row.get('abandon_rate', 0) or 0),
-            'avg_completion_time_seconds': round(avg_time),
-            'trend': trend
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'forms': result['forms'],
+            'total_completions': result['total_completions'],
+            'source': 'dynamodb'
         })
 
-    return cors_response(200, {
-        'tenant_id': tenant_id,
-        'range': params.get('range', '30d'),
-        'forms': forms,
-        'total_completions': total_completions
-    })
+    except Exception as e:
+        logger.exception(f"Error fetching form top performers from DynamoDB: {e}")
+        # Return empty data on error rather than failing
+        return cors_response(200, {
+            'tenant_id': tenant_id,
+            'range': range_str,
+            'forms': [],
+            'total_completions': 0,
+            'source': 'error_fallback'
+        })
 
 
 # =============================================================================
@@ -1929,18 +2413,18 @@ def get_tenant_hash(tenant_id: str) -> str:
 
                     if mapping_tenant_id == tenant_id:
                         _tenant_hash_cache_time = now
-                        logger.info(f"Found tenant_hash for {tenant_id}: {mapping_tenant_hash}")
+                        logger.info(f"Found tenant_hash for {redact_tenant_id(tenant_id)}: {mapping_tenant_hash}")
                         return mapping_tenant_hash
 
                 except Exception as e:
                     logger.warning(f"Error reading mapping {key}: {e}")
                     continue
 
-        logger.warning(f"No mapping found for tenant_id: {tenant_id}")
+        logger.warning(f"No mapping found for tenant_id: {redact_tenant_id(tenant_id)}")
         return None
 
     except Exception as e:
-        logger.error(f"Error looking up tenant_hash for {tenant_id}: {e}")
+        logger.error(f"Error looking up tenant_hash for {redact_tenant_id(tenant_id)}: {e}")
         return None
 
 
@@ -2068,7 +2552,7 @@ def handle_session_detail(tenant_id: str, session_id: str, params: Dict[str, str
                 'message_count': message_count,
                 'user_message_count': user_message_count,
                 'bot_message_count': bot_message_count,
-                'outcome': outcome or 'browsing',
+                'outcome': outcome or 'conversation',
                 'first_question': first_question
             },
             'events': events,
@@ -2095,7 +2579,7 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
     - range: Time range (1d, 7d, 30d, 90d) - default 30d
     - limit: Results per page (1-100) - default 25
     - cursor: Pagination cursor for next page
-    - outcome: Filter by outcome (form_completed, link_clicked, abandoned, browsing)
+    - outcome: Filter by outcome (form_completed, link_clicked, abandoned, conversation)
 
     Returns:
     - List of session summaries
@@ -2108,7 +2592,7 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
     outcome_filter = params.get('outcome')
 
     # Validate outcome filter
-    valid_outcomes = {'form_completed', 'link_clicked', 'abandoned', 'browsing', 'cta_clicked'}
+    valid_outcomes = {'form_completed', 'link_clicked', 'abandoned', 'conversation', 'cta_clicked'}
     if outcome_filter and outcome_filter not in valid_outcomes:
         return cors_response(400, {
             'error': 'Invalid outcome filter',
@@ -2168,7 +2652,7 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
             # Extract fields with defaults
             started_at = item.get('started_at', {}).get('S', '')
             ended_at = item.get('ended_at', {}).get('S', started_at)
-            outcome = item.get('outcome', {}).get('S', 'browsing')
+            outcome = item.get('outcome', {}).get('S', 'conversation')
             message_count = int(item.get('message_count', {}).get('N', 0))
             user_message_count = int(item.get('user_message_count', {}).get('N', 0))
             bot_message_count = int(item.get('bot_message_count', {}).get('N', 0))
@@ -2224,4 +2708,498 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
         return cors_response(500, {'error': 'Failed to list sessions'})
     except Exception as e:
         logger.exception(f"Error listing sessions: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+# =============================================================================
+# Lead Workspace Endpoints
+# =============================================================================
+
+# Valid pipeline status values
+VALID_PIPELINE_STATUSES = {'new', 'reviewing', 'contacted', 'archived'}
+
+# Submission ID validation pattern
+SUBMISSION_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_\-]+$')
+
+
+def handle_lead_detail(tenant_id: str, submission_id: str) -> Dict[str, Any]:
+    """
+    GET /leads/{submission_id}
+    Returns full lead details for the workspace drawer.
+    """
+    # Validate feature access
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
+    # Validate submission_id format
+    if not submission_id or not SUBMISSION_ID_PATTERN.match(submission_id):
+        return cors_response(400, {'error': 'Invalid submission_id format'})
+
+    try:
+        # Direct GetItem by primary key
+        response = dynamodb.get_item(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            Key={'submission_id': {'S': submission_id}}
+        )
+
+        item = response.get('Item')
+        if not item:
+            return cors_response(404, {'error': 'Lead not found'})
+
+        # Verify tenant ownership
+        item_tenant = item.get('tenant_id', {}).get('S', '')
+        if item_tenant != tenant_id:
+            return cors_response(403, {'error': 'Access denied'})
+
+        # Parse the lead data
+        lead = parse_lead_from_dynamodb(item)
+
+        # Get tenant name from config cache
+        tenant_name = get_tenant_display_name(tenant_id)
+
+        return cors_response(200, {
+            'lead': lead,
+            'tenant_name': tenant_name
+        })
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error fetching lead detail: {e}")
+        return cors_response(500, {'error': 'Failed to fetch lead'})
+    except Exception as e:
+        logger.exception(f"Error fetching lead detail: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def parse_lead_from_dynamodb(item: Dict) -> Dict[str, Any]:
+    """
+    Parse DynamoDB item into LeadWorkspaceData format.
+    Flattens form_data_labeled into fields object.
+    """
+    submission_id = item.get('submission_id', {}).get('S', '')
+    submitted_at = item.get('submitted_at', {}).get('S', '')
+    form_id = item.get('form_id', {}).get('S', '')
+
+    # Format date
+    try:
+        dt = datetime.fromisoformat(submitted_at.replace('Z', '+00:00'))
+        submitted_date = dt.strftime('%b %d')
+    except (ValueError, AttributeError):
+        submitted_date = submitted_at[:10] if submitted_at else 'Unknown'
+
+    # Parse form_data_labeled into flat fields object
+    fields = {}
+    form_data_labeled = item.get('form_data_labeled', {}).get('M', {})
+
+    for field_label, field_wrapper in form_data_labeled.items():
+        if not isinstance(field_wrapper, dict) or 'M' not in field_wrapper:
+            continue
+
+        field_obj = field_wrapper['M']
+        value_obj = field_obj.get('value', {})
+
+        # Convert label to snake_case key
+        field_key = field_label.lower().replace(' ', '_')
+
+        # Handle different value types
+        if 'S' in value_obj:
+            fields[field_key] = value_obj['S']
+        elif 'M' in value_obj:
+            # Composite field (e.g., Name with First/Last)
+            nested = value_obj['M']
+            parts = []
+            for sub_key, sub_val in nested.items():
+                if isinstance(sub_val, dict) and 'S' in sub_val:
+                    parts.append(sub_val['S'])
+            fields[field_key] = ' '.join(parts)
+        elif 'BOOL' in value_obj:
+            fields[field_key] = 'Yes' if value_obj['BOOL'] else 'No'
+        elif 'L' in value_obj:
+            # List value
+            list_items = []
+            for list_item in value_obj['L']:
+                if 'S' in list_item:
+                    list_items.append(list_item['S'])
+            fields[field_key] = ', '.join(list_items)
+
+    # Infer submission type from form_id
+    submission_type = 'general'
+    if 'volunteer' in form_id.lower() or 'mentor' in form_id.lower():
+        submission_type = 'volunteer'
+    elif 'donor' in form_id.lower() or 'donate' in form_id.lower():
+        submission_type = 'donor'
+
+    return {
+        'submission_id': submission_id,
+        'session_id': item.get('session_id', {}).get('S', ''),
+        'form_id': form_id,
+        'form_label': item.get('form_title', {}).get('S', form_id),
+        'submitted_at': submitted_at,
+        'submitted_date': submitted_date,
+        'duration_seconds': 0,  # Not tracked
+        'fields_completed': len(fields),
+        'fields': fields,
+        'pipeline_status': item.get('pipeline_status', {}).get('S', 'new'),
+        'internal_notes': item.get('internal_notes', {}).get('S', ''),
+        'processed_by': item.get('processed_by', {}).get('S'),
+        'contacted_at': item.get('contacted_at', {}).get('S'),
+        'archived_at': item.get('archived_at', {}).get('S'),
+        'submission_type': submission_type,
+        'program_id': form_id,
+        'zip_code': fields.get('zip_code') or fields.get('zip') or fields.get('postal_code', '')
+    }
+
+
+def get_tenant_display_name(tenant_id: str) -> str:
+    """Get tenant display name from cached config."""
+    try:
+        config = load_tenant_config(tenant_id)
+        if config:
+            return config.get('chat_title', config.get('organization_name', tenant_id))
+        return tenant_id
+    except Exception:
+        return tenant_id
+
+
+def handle_lead_status_update(
+    tenant_id: str,
+    submission_id: str,
+    body: Dict,
+    user_email: str
+) -> Dict[str, Any]:
+    """
+    PATCH /leads/{submission_id}/status
+    Update lead pipeline status.
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
+    # Validate submission_id format
+    if not submission_id or not SUBMISSION_ID_PATTERN.match(submission_id):
+        return cors_response(400, {'error': 'Invalid submission_id format'})
+
+    # Validate request body
+    new_status = body.get('pipeline_status')
+    if not new_status or new_status not in VALID_PIPELINE_STATUSES:
+        return cors_response(400, {
+            'error': f'Invalid pipeline_status. Must be one of: {", ".join(sorted(VALID_PIPELINE_STATUSES))}'
+        })
+
+    try:
+        # First, verify the lead exists and belongs to tenant
+        response = dynamodb.get_item(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            Key={'submission_id': {'S': submission_id}},
+            ProjectionExpression='tenant_id, pipeline_status'
+        )
+
+        item = response.get('Item')
+        if not item:
+            return cors_response(404, {'error': 'Lead not found'})
+
+        if item.get('tenant_id', {}).get('S') != tenant_id:
+            return cors_response(403, {'error': 'Access denied'})
+
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        # Build update expression
+        update_expr = 'SET pipeline_status = :status, tenant_pipeline_key = :tpk, updated_at = :now, processed_by = :user'
+        expr_values = {
+            ':status': {'S': new_status},
+            ':tpk': {'S': f'{tenant_id}#{new_status}'},
+            ':now': {'S': now},
+            ':user': {'S': user_email or 'unknown'}
+        }
+        expr_names = {}
+
+        # Add timestamp for status-specific fields
+        if new_status == 'contacted':
+            update_expr += ', contacted_at = :contacted'
+            expr_values[':contacted'] = {'S': now}
+        elif new_status == 'archived':
+            update_expr += ', archived_at = :archived'
+            expr_values[':archived'] = {'S': now}
+            # Set TTL for 1 year
+            ttl = int((datetime.utcnow() + timedelta(days=365)).timestamp())
+            update_expr += ', #ttl = :ttl'
+            expr_values[':ttl'] = {'N': str(ttl)}
+            expr_names['#ttl'] = 'ttl'
+
+        # Perform update
+        update_params = {
+            'TableName': FORM_SUBMISSIONS_TABLE,
+            'Key': {'submission_id': {'S': submission_id}},
+            'UpdateExpression': update_expr,
+            'ExpressionAttributeValues': expr_values
+        }
+        if expr_names:
+            update_params['ExpressionAttributeNames'] = expr_names
+
+        dynamodb.update_item(**update_params)
+
+        logger.info(f"Lead {submission_id} status updated to {new_status} by {user_email}")
+
+        return cors_response(200, {
+            'submission_id': submission_id,
+            'pipeline_status': new_status,
+            'updated_at': now
+        })
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error updating lead status: {e}")
+        return cors_response(500, {'error': 'Failed to update status'})
+    except Exception as e:
+        logger.exception(f"Error updating lead status: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_lead_notes_update(
+    tenant_id: str,
+    submission_id: str,
+    body: Dict,
+    user_email: str
+) -> Dict[str, Any]:
+    """
+    PATCH /leads/{submission_id}/notes
+    Update lead internal notes.
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
+    # Validate submission_id format
+    if not submission_id or not SUBMISSION_ID_PATTERN.match(submission_id):
+        return cors_response(400, {'error': 'Invalid submission_id format'})
+
+    # Validate request body
+    notes = body.get('internal_notes')
+    if notes is None:
+        return cors_response(400, {'error': 'internal_notes field required'})
+
+    # Limit notes length
+    if len(notes) > 10000:
+        return cors_response(400, {'error': 'Notes too long (max 10000 characters)'})
+
+    try:
+        # Verify lead exists and belongs to tenant
+        response = dynamodb.get_item(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            Key={'submission_id': {'S': submission_id}},
+            ProjectionExpression='tenant_id'
+        )
+
+        item = response.get('Item')
+        if not item:
+            return cors_response(404, {'error': 'Lead not found'})
+
+        if item.get('tenant_id', {}).get('S') != tenant_id:
+            return cors_response(403, {'error': 'Access denied'})
+
+        now = datetime.utcnow().isoformat() + 'Z'
+
+        # Update notes
+        dynamodb.update_item(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            Key={'submission_id': {'S': submission_id}},
+            UpdateExpression='SET internal_notes = :notes, updated_at = :now, processed_by = :user',
+            ExpressionAttributeValues={
+                ':notes': {'S': notes},
+                ':now': {'S': now},
+                ':user': {'S': user_email or 'unknown'}
+            }
+        )
+
+        logger.info(f"Lead {submission_id} notes updated by {user_email}")
+
+        return cors_response(200, {
+            'submission_id': submission_id,
+            'internal_notes': notes,
+            'updated_at': now
+        })
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error updating lead notes: {e}")
+        return cors_response(500, {'error': 'Failed to update notes'})
+    except Exception as e:
+        logger.exception(f"Error updating lead notes: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_lead_reactivate(
+    tenant_id: str,
+    submission_id: str,
+    user_email: str
+) -> Dict[str, Any]:
+    """
+    PATCH /leads/{submission_id}/reactivate
+    Reactivate an archived lead, resetting status to 'new' and prepending system note.
+
+    Per PRD: Emerald Lead Reactivation Engine v4.2.1
+    - Idempotency: No-op if lead is already active
+    - Audit Trail: Prepends [System] restoration note to internal_notes
+    - State Reset: Returns lead to 'new' status
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
+    # Validate submission_id format
+    if not submission_id or not SUBMISSION_ID_PATTERN.match(submission_id):
+        return cors_response(400, {'error': 'Invalid submission_id format'})
+
+    try:
+        # Fetch current lead state
+        response = dynamodb.get_item(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            Key={'submission_id': {'S': submission_id}},
+            ProjectionExpression='tenant_id, pipeline_status, internal_notes'
+        )
+
+        item = response.get('Item')
+        if not item:
+            return cors_response(404, {'error': 'Lead not found'})
+
+        if item.get('tenant_id', {}).get('S') != tenant_id:
+            return cors_response(403, {'error': 'Access denied'})
+
+        current_status = item.get('pipeline_status', {}).get('S', 'new')
+
+        # Idempotency check: if not archived, no-op
+        if current_status != 'archived':
+            logger.info(f"Lead {submission_id} is already active (status: {current_status}), skipping reactivation")
+            return cors_response(200, {
+                'submission_id': submission_id,
+                'pipeline_status': current_status,
+                'reactivated': False,
+                'message': 'Lead is already active'
+            })
+
+        now = datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
+
+        # Build system note (per PRD audit trail requirements)
+        system_note = f"[System] Restored from Archive at {now}\n---\n"
+
+        # Prepend to existing notes (preserve history)
+        existing_notes = item.get('internal_notes', {}).get('S', '')
+        new_notes = system_note + existing_notes
+
+        # Build update expression
+        # - Reset status to 'new'
+        # - Update tenant_pipeline_key for GSI
+        # - Prepend system note
+        # - Remove archived_at and ttl (un-archiving)
+        update_expr = '''
+            SET pipeline_status = :status,
+                tenant_pipeline_key = :tpk,
+                internal_notes = :notes,
+                updated_at = :now,
+                processed_by = :user,
+                reactivated_at = :now
+            REMOVE archived_at, #ttl
+        '''
+
+        expr_values = {
+            ':status': {'S': 'new'},
+            ':tpk': {'S': f'{tenant_id}#new'},
+            ':notes': {'S': new_notes},
+            ':now': {'S': now},
+            ':user': {'S': user_email or 'unknown'}
+        }
+
+        expr_names = {
+            '#ttl': 'ttl'  # ttl is a reserved word
+        }
+
+        dynamodb.update_item(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            Key={'submission_id': {'S': submission_id}},
+            UpdateExpression=update_expr,
+            ExpressionAttributeValues=expr_values,
+            ExpressionAttributeNames=expr_names
+        )
+
+        logger.info(f"Lead {submission_id} reactivated from archive by {user_email}")
+
+        return cors_response(200, {
+            'submission_id': submission_id,
+            'pipeline_status': 'new',
+            'reactivated': True,
+            'reactivated_at': now,
+            'message': 'Lead restored from archive'
+        })
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error reactivating lead: {e}")
+        return cors_response(500, {'error': 'Failed to reactivate lead'})
+    except Exception as e:
+        logger.exception(f"Error reactivating lead: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_lead_queue(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /leads/queue
+    Get next lead in queue and total count.
+
+    Query params:
+    - status: Filter by pipeline status (default: 'new')
+    - current_id: Current submission_id to find next after
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    if access_error:
+        return access_error
+
+    status_filter = params.get('status', 'new')
+    current_id = params.get('current_id')
+
+    if status_filter not in VALID_PIPELINE_STATUSES:
+        return cors_response(400, {'error': f'Invalid status. Must be one of: {", ".join(sorted(VALID_PIPELINE_STATUSES))}'})
+
+    try:
+        # Query using the tenant-pipeline-index GSI
+        tenant_pipeline_key = f'{tenant_id}#{status_filter}'
+
+        response = dynamodb.query(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            IndexName='tenant-pipeline-index',
+            KeyConditionExpression='tenant_pipeline_key = :tpk',
+            ExpressionAttributeValues={
+                ':tpk': {'S': tenant_pipeline_key}
+            },
+            ScanIndexForward=True,  # Oldest first (FIFO)
+            ProjectionExpression='submission_id, submitted_at'
+        )
+
+        items = response.get('Items', [])
+        queue_count = len(items)
+
+        # Find next lead after current_id
+        next_lead_id = None
+        if items:
+            if current_id:
+                # Find position of current lead and return next
+                for i, item in enumerate(items):
+                    if item.get('submission_id', {}).get('S') == current_id:
+                        if i + 1 < len(items):
+                            next_lead_id = items[i + 1].get('submission_id', {}).get('S')
+                        break
+                # If current not found or was last, return first
+                if next_lead_id is None and items:
+                    next_lead_id = items[0].get('submission_id', {}).get('S')
+            else:
+                # No current, return first in queue
+                next_lead_id = items[0].get('submission_id', {}).get('S')
+
+        return cors_response(200, {
+            'next_lead_id': next_lead_id,
+            'queue_count': queue_count,
+            'status': status_filter
+        })
+
+    except ClientError as e:
+        logger.error(f"DynamoDB error fetching lead queue: {e}")
+        return cors_response(500, {'error': 'Failed to fetch queue'})
+    except Exception as e:
+        logger.exception(f"Error fetching lead queue: {e}")
         return cors_response(500, {'error': 'Internal server error'})
