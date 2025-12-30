@@ -366,6 +366,9 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
   // Extract canonical contact info (same data sent to Bubble)
   const { contact: canonicalContact, comments } = extractCanonicalContact(transformedFormData);
 
+  // Build display-ready form data (flat key-value for Lead Workspace drawer)
+  const formDataDisplay = buildFormDataDisplay(formData, formConfig);
+
   const now = new Date().toISOString();
   const tenantId = config.tenant_id || 'unknown';
 
@@ -381,7 +384,8 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
       session_id: sessionId || 'unknown',
       conversation_id: conversationId || sessionId || 'unknown',
       form_data: formData,           // Raw data with field IDs
-      form_data_labeled: labeledData, // Human-readable labeled data
+      form_data_labeled: labeledData, // Human-readable labeled data (nested)
+      form_data_display: formDataDisplay, // Flat key-value for UI display
       priority: priority,
       submitted_at: now,
       timestamp: now,                // Required for tenant-timestamp-index GSI
@@ -851,6 +855,87 @@ function normalizeLabel(label) {
     .replace(/[^a-z0-9]+/g, '_')    // Replace non-alphanumeric with underscore
     .replace(/^_+|_+$/g, '')        // Trim leading/trailing underscores
     .replace(/_+/g, '_');           // Collapse multiple underscores
+}
+
+/**
+ * Build display-ready form data with human-readable labels and flat values
+ * Used for Lead Workspace drawer display
+ *
+ * @param {Object} formData - Raw form data with field IDs
+ * @param {Object} formConfig - Form configuration with field definitions
+ * @returns {Object} { "Name": "John Doe", "Email": "john@example.com", ... }
+ */
+function buildFormDataDisplay(formData, formConfig) {
+  if (!formData) return {};
+
+  const display = {};
+  const fields = formConfig?.fields || [];
+
+  // Build lookup map: fieldId -> { label, type, subfields }
+  const fieldMap = {};
+  for (const field of fields) {
+    fieldMap[field.id] = field;
+  }
+
+  // Process each form data entry
+  for (const [fieldId, value] of Object.entries(formData)) {
+    const fieldDef = fieldMap[fieldId];
+
+    if (!fieldDef) {
+      // Unknown field - try to make key readable
+      const readableKey = fieldId.split('.').pop().replace(/_/g, ' ');
+      display[toTitleCase(readableKey)] = String(value || '');
+      continue;
+    }
+
+    const label = fieldDef.label || fieldId;
+
+    // Handle composite fields (name, address)
+    if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      // Flatten composite field to single string
+      if (fieldDef.type === 'name') {
+        // Name field: combine first/middle/last
+        const parts = [];
+        for (const subfield of (fieldDef.subfields || [])) {
+          const subValue = value[subfield.id];
+          if (subValue) parts.push(subValue);
+        }
+        display[label] = parts.join(' ');
+      } else if (fieldDef.type === 'address') {
+        // Address field: format as single line
+        const addr = [];
+        const subfieldOrder = ['street', 'unit', 'city', 'state', 'zip', 'zip_code'];
+        for (const key of subfieldOrder) {
+          // Find subfield by checking if key is in subfield id
+          for (const subfield of (fieldDef.subfields || [])) {
+            if (subfield.id.toLowerCase().includes(key) && value[subfield.id]) {
+              addr.push(value[subfield.id]);
+              break;
+            }
+          }
+        }
+        display[label] = addr.join(' ');
+      } else {
+        // Generic composite: join values
+        const parts = Object.values(value).filter(v => v);
+        display[label] = parts.join(' ');
+      }
+    } else {
+      // Simple field
+      display[label] = String(value || '');
+    }
+  }
+
+  return display;
+}
+
+/**
+ * Convert string to Title Case
+ * "first name" -> "First Name"
+ */
+function toTitleCase(str) {
+  if (!str) return '';
+  return str.replace(/\b\w/g, c => c.toUpperCase());
 }
 
 // ============================================================================
