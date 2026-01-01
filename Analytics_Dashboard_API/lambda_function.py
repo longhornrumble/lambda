@@ -631,7 +631,7 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
 
     Args:
         tenant_hash: Tenant hash (e.g., 'fo85e6a06dcdf4')
-        date_range: Dict with 'start_date_iso' key (e.g., '2025-12-01')
+        date_range: Dict with 'start_date_iso' and optionally 'end_date_iso' keys
         limit: Max sessions to fetch (default 1000, paginate if more)
 
     Returns:
@@ -640,21 +640,34 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
     # SK format is now SESSION#{session_id} (no timestamp)
     # Filter by started_at attribute instead
     start_date = date_range['start_date_iso']
+    end_date = date_range.get('end_date_iso')
 
     sessions = []
     last_evaluated_key = None
 
     try:
         while True:
+            # Build filter expression - always filter by start date
+            filter_expression = 'started_at >= :start_date'
+            expression_values = {
+                ':pk': {'S': f'TENANT#{tenant_hash}'},
+                ':sk_prefix': {'S': 'SESSION#'},
+                ':start_date': {'S': start_date}
+            }
+
+            # Add end date filter if provided (for custom date ranges)
+            if end_date:
+                # Add 1 day to end_date for inclusive range (end_date is YYYY-MM-DD)
+                filter_expression += ' AND started_at < :end_date'
+                # Use end_date + 1 day at midnight for inclusive filtering
+                end_date_inclusive = (datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+                expression_values[':end_date'] = {'S': end_date_inclusive}
+
             query_params = {
                 'TableName': SESSION_SUMMARIES_TABLE,
                 'KeyConditionExpression': 'pk = :pk AND begins_with(sk, :sk_prefix)',
-                'FilterExpression': 'started_at >= :start_date',
-                'ExpressionAttributeValues': {
-                    ':pk': {'S': f'TENANT#{tenant_hash}'},
-                    ':sk_prefix': {'S': 'SESSION#'},
-                    ':start_date': {'S': start_date}
-                },
+                'FilterExpression': filter_expression,
+                'ExpressionAttributeValues': expression_values,
                 'Limit': min(limit - len(sessions), 1000)  # DynamoDB max page size
             }
 
@@ -2011,11 +2024,32 @@ def execute_athena_query(query: str, timeout: int = 30) -> Optional[List[Dict[st
         return None
 
 
-def parse_date_range(range_str: str) -> Dict[str, Any]:
+def parse_date_range(range_str: str, start_date_param: str = None, end_date_param: str = None) -> Dict[str, Any]:
     """
-    Parse date range string (7d, 30d, 90d) into date components.
-    Returns ISO date string for proper cross-month-boundary filtering.
+    Parse date range string (1d, 7d, 30d, 90d, custom) into date components.
+    Returns ISO date strings for proper cross-month-boundary filtering.
+
+    For 'custom' range, uses start_date_param and end_date_param (YYYY-MM-DD format).
     """
+    # Handle custom date range
+    if range_str == 'custom' and start_date_param and end_date_param:
+        try:
+            start_date = datetime.strptime(start_date_param, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            end_date = datetime.strptime(end_date_param, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+            days = (end_date - start_date).days + 1
+            return {
+                'start_year': start_date.year,
+                'start_month': start_date.month,
+                'start_day': start_date.day,
+                'start_date_iso': start_date.strftime('%Y-%m-%d'),
+                'end_date_iso': end_date.strftime('%Y-%m-%d'),
+                'days': days,
+                'is_custom': True
+            }
+        except ValueError as e:
+            logger.warning(f"Invalid custom date format: {e}, falling back to 30d")
+
+    # Standard range parsing (7d, 30d, 90d)
     days = 30  # default
     if range_str.endswith('d'):
         try:
@@ -2024,13 +2058,16 @@ def parse_date_range(range_str: str) -> Dict[str, Any]:
             pass
 
     start_date = datetime.now(timezone.utc) - timedelta(days=days)
+    end_date = datetime.now(timezone.utc)
 
     return {
         'start_year': start_date.year,
         'start_month': start_date.month,
         'start_day': start_date.day,
         'start_date_iso': start_date.strftime('%Y-%m-%d'),
-        'days': days
+        'end_date_iso': end_date.strftime('%Y-%m-%d'),
+        'days': days,
+        'is_custom': False
     }
 
 
@@ -2063,10 +2100,14 @@ def handle_conversation_summary(tenant_id: str, params: Dict[str, str]) -> Dict[
     HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
 
     Query params:
-    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - range: Time range (1d, 7d, 30d, 90d, custom) - default 30d
+    - start_date: Start date for custom range (YYYY-MM-DD)
+    - end_date: End date for custom range (YYYY-MM-DD)
     """
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     tenant_hash = get_tenant_hash(tenant_id)
 
     logger.info(f"Fetching conversation summary from DynamoDB for tenant: {tenant_hash}, range: {range_str}")
@@ -2135,11 +2176,15 @@ def handle_conversation_heatmap(tenant_id: str, params: Dict[str, str]) -> Dict[
     HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
 
     Query params:
-    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - range: Time range (1d, 7d, 30d, 90d, custom) - default 30d
+    - start_date: Start date for custom range (YYYY-MM-DD)
+    - end_date: End date for custom range (YYYY-MM-DD)
     - timezone: IANA timezone (e.g., America/Chicago) - default UTC
     """
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     tenant_hash = get_tenant_hash(tenant_id)
 
     # Get timezone parameter - default to America/Chicago (Central Time)
@@ -2239,11 +2284,15 @@ def handle_top_questions(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
     HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
 
     Query params:
-    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - range: Time range (1d, 7d, 30d, 90d, custom) - default 30d
+    - start_date: Start date for custom range (YYYY-MM-DD)
+    - end_date: End date for custom range (YYYY-MM-DD)
     - limit: Number of questions (default 5, max 10)
     """
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     limit = min(int(params.get('limit', '5')), 10)
     tenant_hash = get_tenant_hash(tenant_id)
 
@@ -2292,12 +2341,16 @@ def handle_recent_conversations(tenant_id: str, params: Dict[str, str]) -> Dict[
     HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
 
     Query params:
-    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - range: Time range (1d, 7d, 30d, 90d, custom) - default 30d
+    - start_date: Start date for custom range (YYYY-MM-DD)
+    - end_date: End date for custom range (YYYY-MM-DD)
     - page: Page number (default 1)
     - limit: Results per page (default 10, max 25)
     """
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     page = max(1, int(params.get('page', '1')))
     limit = min(int(params.get('limit', '10')), 25)
     offset = (page - 1) * limit
@@ -2367,11 +2420,15 @@ def handle_conversation_trend(tenant_id: str, params: Dict[str, str]) -> Dict[st
     HOT PATH: Queries DynamoDB session-summaries directly (~50-200ms)
 
     Query params:
-    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - range: Time range (1d, 7d, 30d, 90d, custom) - default 30d
+    - start_date: Start date for custom range (YYYY-MM-DD)
+    - end_date: End date for custom range (YYYY-MM-DD)
     - granularity: 'hour' or 'day' - default based on range
     """
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     granularity = params.get('granularity', 'hour' if date_range['days'] <= 1 else 'day')
     tenant_hash = get_tenant_hash(tenant_id)
 
@@ -2659,7 +2716,9 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
     Uses SK format SESSION#{started_at}#{session_id} for time-based queries.
 
     Query params:
-    - range: Time range (1d, 7d, 30d, 90d) - default 30d
+    - range: Time range (1d, 7d, 30d, 90d, custom) - default 30d
+    - start_date: Start date for custom range (YYYY-MM-DD)
+    - end_date: End date for custom range (YYYY-MM-DD)
     - limit: Results per page (1-100) - default 25
     - cursor: Pagination cursor for next page
     - outcome: Filter by outcome (form_completed, link_clicked, abandoned, conversation)
@@ -2670,6 +2729,8 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
     - Total count (estimated)
     """
     range_str = params.get('range', '30d')
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
     limit = min(max(1, int(params.get('limit', '25'))), 100)
     cursor = params.get('cursor')
     outcome_filter = params.get('outcome')
@@ -2683,25 +2744,37 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
         })
 
     tenant_hash = get_tenant_hash(tenant_id)
-    date_range = parse_date_range(range_str)
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
 
     # SK format is now SESSION#{session_id} (no timestamp)
     # Filter by started_at attribute instead
     start_date = date_range['start_date_iso']
+    end_date = date_range.get('end_date_iso')
 
     logger.info(f"Fetching sessions list for tenant: {tenant_hash}, range: {range_str}")
 
     try:
+        # Build filter expression - always filter by start date
+        filter_expression = 'started_at >= :start_date'
+        expression_values = {
+            ':pk': {'S': f'TENANT#{tenant_hash}'},
+            ':sk_prefix': {'S': 'SESSION#'},
+            ':start_date': {'S': start_date}
+        }
+
+        # Add end date filter if provided (for custom date ranges)
+        if end_date:
+            filter_expression += ' AND started_at < :end_date'
+            # Use end_date + 1 day at midnight for inclusive filtering
+            end_date_inclusive = (datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+            expression_values[':end_date'] = {'S': end_date_inclusive}
+
         # Build query parameters
         query_params = {
             'TableName': SESSION_SUMMARIES_TABLE,
             'KeyConditionExpression': 'pk = :pk AND begins_with(sk, :sk_prefix)',
-            'FilterExpression': 'started_at >= :start_date',
-            'ExpressionAttributeValues': {
-                ':pk': {'S': f'TENANT#{tenant_hash}'},
-                ':sk_prefix': {'S': 'SESSION#'},
-                ':start_date': {'S': start_date}
-            },
+            'FilterExpression': filter_expression,
+            'ExpressionAttributeValues': expression_values,
             'ScanIndexForward': False,  # Most recent first
             'Limit': limit
         }
