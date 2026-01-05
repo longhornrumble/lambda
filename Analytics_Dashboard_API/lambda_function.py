@@ -1667,12 +1667,24 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
         contact = item.get('contact', {})
         comments_field = item.get('comments', {})
 
+        # Check if contact has actual non-null values (not just NULL placeholders)
+        contact_has_values = False
         if contact and contact.get('M'):
+            contact_map = contact.get('M', {})
+            # Check if any key field has an actual value (not NULL)
+            for key in ['first_name', 'last_name', 'full_name', 'email']:
+                field_val = contact_map.get(key, {})
+                if field_val.get('S') or (not field_val.get('NULL')):
+                    contact_has_values = True
+                    break
+
+        if contact_has_values:
             # New schema: use canonical contact object
             contact_map = contact.get('M', {})
             first_name = contact_map.get('first_name', {}).get('S', '') or ''
             last_name = contact_map.get('last_name', {}).get('S', '') or ''
-            name = f"{first_name} {last_name}".strip() or 'Anonymous'
+            full_name = contact_map.get('full_name', {}).get('S', '') or ''
+            name = full_name or f"{first_name} {last_name}".strip() or 'Anonymous'
             email = contact_map.get('email', {}).get('S', '') or ''
             phone = contact_map.get('phone', {}).get('S', '') or ''
             comments = comments_field.get('S', '') if comments_field else ''
@@ -2568,6 +2580,84 @@ def get_tenant_hash(tenant_id: str) -> str:
         return None
 
 
+def enrich_sessions_with_events(session_ids: List[str], tenant_hash: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Enrich sessions with event data (event_count, computed_outcome).
+
+    Queries the picasso-session-events table for each session to get accurate
+    event counts and compute outcomes from the actual event stream.
+
+    Args:
+        session_ids: List of session IDs to enrich
+        tenant_hash: Tenant hash for access validation
+
+    Returns:
+        Dict mapping session_id to {event_count: int, outcome: str}
+    """
+    enriched = {}
+
+    for session_id in session_ids:
+        try:
+            # Query session events from DynamoDB
+            response = dynamodb.query(
+                TableName=SESSION_EVENTS_TABLE,
+                KeyConditionExpression='pk = :pk',
+                ExpressionAttributeValues={
+                    ':pk': {'S': f'SESSION#{session_id}'}
+                },
+                Select='ALL_ATTRIBUTES'
+            )
+
+            items = response.get('Items', [])
+
+            if not items:
+                # No events found - use defaults
+                enriched[session_id] = {
+                    'event_count': 0,
+                    'outcome': 'conversation'
+                }
+                continue
+
+            # Verify tenant access
+            first_event = items[0]
+            event_tenant_hash = first_event.get('tenant_hash', {}).get('S', '')
+            if event_tenant_hash != tenant_hash:
+                # Tenant mismatch - skip this session
+                continue
+
+            # Compute outcome from events (stronger outcomes override weaker)
+            outcome = None
+            for item in items:
+                event_type = item.get('event_type', {}).get('S', '')
+
+                if event_type == 'FORM_COMPLETED':
+                    outcome = 'form_completed'
+                elif event_type == 'LINK_CLICKED' and outcome != 'form_completed':
+                    outcome = 'link_clicked'
+                elif event_type == 'CTA_CLICKED' and outcome not in ('form_completed', 'link_clicked'):
+                    outcome = 'cta_clicked'
+
+            enriched[session_id] = {
+                'event_count': len(items),
+                'outcome': outcome or 'conversation'
+            }
+
+        except ClientError as e:
+            logger.warning(f"Error fetching events for session {session_id}: {e}")
+            enriched[session_id] = {
+                'event_count': 0,
+                'outcome': 'conversation'
+            }
+        except Exception as e:
+            logger.warning(f"Unexpected error enriching session {session_id}: {e}")
+            enriched[session_id] = {
+                'event_count': 0,
+                'outcome': 'conversation'
+            }
+
+    return enriched
+
+
 def handle_session_detail(tenant_id: str, session_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
     GET /sessions/{session_id}
@@ -2770,30 +2860,23 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
             expression_values[':end_date'] = {'S': end_date_inclusive}
 
         # Build query parameters
+        # NOTE: We fetch more sessions than requested when filtering by outcome,
+        # because outcome is computed from events (not stored in summaries table).
+        # The filter is applied AFTER enrichment with accurate outcomes.
+        fetch_limit = limit * 3 if outcome_filter else limit
+
         query_params = {
             'TableName': SESSION_SUMMARIES_TABLE,
             'KeyConditionExpression': 'pk = :pk AND begins_with(sk, :sk_prefix)',
             'FilterExpression': filter_expression,
             'ExpressionAttributeValues': expression_values,
             'ScanIndexForward': False,  # Most recent first
-            'Limit': limit
+            'Limit': fetch_limit
         }
 
-        # Add outcome filter if specified
-        if outcome_filter:
-            # Backwards compatibility: 'conversation' also matches:
-            # - Records with outcome='conversation'
-            # - Records with outcome='browsing' (legacy)
-            # - Records with no outcome attribute (default = conversation)
-            if outcome_filter == 'conversation':
-                query_params['FilterExpression'] += ' AND (#outcome = :outcome OR #outcome = :outcome_legacy OR attribute_not_exists(#outcome))'
-                query_params['ExpressionAttributeNames'] = {'#outcome': 'outcome'}
-                query_params['ExpressionAttributeValues'][':outcome'] = {'S': 'conversation'}
-                query_params['ExpressionAttributeValues'][':outcome_legacy'] = {'S': 'browsing'}
-            else:
-                query_params['FilterExpression'] += ' AND #outcome = :outcome'
-                query_params['ExpressionAttributeNames'] = {'#outcome': 'outcome'}
-                query_params['ExpressionAttributeValues'][':outcome'] = {'S': outcome_filter}
+        # NOTE: Outcome filter is now applied AFTER enrichment (see below)
+        # because the stored outcome in session-summaries may be stale.
+        # The accurate outcome is computed from the events table.
 
         # Add pagination cursor if provided
         if cursor:
@@ -2842,17 +2925,37 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
                 'started_at': started_at,
                 'ended_at': ended_at,
                 'duration_seconds': duration_seconds,
-                'outcome': outcome,
+                'outcome': outcome,  # Will be overridden by enrichment
                 'message_count': message_count,
                 'user_message_count': user_message_count,
                 'bot_message_count': bot_message_count,
                 'first_question': first_question[:100] if first_question else '',
-                'form_id': form_id if form_id else None
+                'form_id': form_id if form_id else None,
+                'event_count': 0  # Will be set by enrichment
             })
+
+        # Enrich sessions with accurate outcomes and event counts from events table
+        if sessions:
+            session_ids = [s['session_id'] for s in sessions]
+            enriched = enrich_sessions_with_events(session_ids, tenant_hash)
+
+            for session in sessions:
+                sid = session['session_id']
+                if sid in enriched:
+                    session['outcome'] = enriched[sid]['outcome']
+                    session['event_count'] = enriched[sid]['event_count']
+
+        # Apply outcome filter AFTER enrichment (computed outcomes are accurate)
+        if outcome_filter and sessions:
+            sessions = [s for s in sessions if s['outcome'] == outcome_filter]
+
+        # Limit to requested number after filtering
+        has_more_after_filter = len(sessions) > limit
+        sessions = sessions[:limit]
 
         # Build next page cursor
         next_cursor = None
-        if 'LastEvaluatedKey' in response:
+        if 'LastEvaluatedKey' in response and (has_more_after_filter or not outcome_filter):
             cursor_json = json.dumps(response['LastEvaluatedKey'])
             next_cursor = base64.urlsafe_b64encode(cursor_json.encode('utf-8')).decode('utf-8')
 
