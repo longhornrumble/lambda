@@ -262,10 +262,23 @@ def lambda_handler(event, context):
         logger.warning(f"Invalid tenant_id in token: {e}")
         return cors_response(400, {'error': str(e)})
 
-    # Extract user email for audit purposes
+    # Extract user email and role for audit purposes
     user_email = auth_result.get('email', 'unknown')
+    user_role = auth_result.get('role')
 
-    logger.info(f"Authenticated request for tenant: {tenant_id[:8]}...")
+    # Super admin tenant override - allows viewing other tenants' data
+    headers = event.get('headers', {}) or {}
+    tenant_override = headers.get('X-Tenant-Override') or headers.get('x-tenant-override')
+
+    if tenant_override and user_role == 'super_admin':
+        try:
+            tenant_id = sanitize_tenant_id(tenant_override)
+            logger.info(f"[Super Admin] {user_email} switched to tenant: {tenant_id[:8]}...")
+        except ValueError as e:
+            logger.warning(f"Invalid tenant override: {e}")
+            return cors_response(400, {'error': f'Invalid tenant override: {str(e)}'})
+    else:
+        logger.info(f"Authenticated request for tenant: {tenant_id[:8]}...")
 
     # Parse query parameters
     params = event.get('queryStringParameters') or {}
@@ -338,6 +351,10 @@ def lambda_handler(event, context):
             if submission_id and submission_id != 'queue':
                 return handle_lead_detail(tenant_id, submission_id)
 
+        # Admin endpoints (super_admin only)
+        elif path.endswith('/admin/tenants') and method == 'GET':
+            return handle_admin_tenants(auth_result.get('role'))
+
         else:
             return cors_response(404, {'error': f'Unknown endpoint: {path}'})
 
@@ -353,7 +370,7 @@ def lambda_handler(event, context):
 def authenticate_request(event: Dict[str, Any]) -> Dict[str, Any]:
     """
     Authenticate request using JWT token from Authorization header.
-    Returns {'success': True, 'tenant_id': '...', 'email': '...'} or {'success': False, 'error': '...'}
+    Returns {'success': True, 'tenant_id': '...', 'email': '...', 'role': '...'} or {'success': False, 'error': '...'}
     """
     # Get Authorization header
     headers = event.get('headers', {}) or {}
@@ -379,7 +396,11 @@ def authenticate_request(event: Dict[str, Any]) -> Dict[str, Any]:
         # Extract email for audit purposes
         email = payload.get('email', 'unknown')
 
-        return {'success': True, 'tenant_id': tenant_id, 'email': email}
+        # Extract role for authorization (normalize to lowercase with underscores)
+        raw_role = payload.get('role', '')
+        role = raw_role.lower().replace(' ', '_') if raw_role else None
+
+        return {'success': True, 'tenant_id': tenant_id, 'email': email, 'role': role}
 
     except Exception as e:
         logger.warning(f"JWT validation failed: {e}")
@@ -528,6 +549,76 @@ def handle_features(tenant_id: str) -> Dict[str, Any]:
         'tenant_id': tenant_id,
         'features': features,
     })
+
+
+# Bubble webhook configuration for tenant list
+BUBBLE_TENANTS_WEBHOOK_URL = 'https://hrfx.bubbleapps.io/api/1.1/wf/get_active_tenants'
+BUBBLE_API_KEY = '42912eddcbd001abdcee706cb12fd711'
+
+
+def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
+    """
+    Handle GET /admin/tenants endpoint.
+    Returns list of active tenants for super_admin users.
+    Fetches from Bubble webhook (source of truth).
+    """
+    # Validate super_admin role
+    if user_role != 'super_admin':
+        return cors_response(403, {'error': 'Forbidden: super_admin role required'})
+
+    try:
+        # Call Bubble webhook
+        import urllib.request
+        import urllib.error
+
+        req = urllib.request.Request(
+            BUBBLE_TENANTS_WEBHOOK_URL,
+            method='POST',
+            headers={
+                'Content-Type': 'application/json',
+                'Authorization': f'Bearer {BUBBLE_API_KEY}'
+            },
+            data=b'{}'
+        )
+
+        with urllib.request.urlopen(req, timeout=10) as response:
+            bubble_response = json.loads(response.read().decode('utf-8'))
+
+        # Extract tenants string from Bubble response
+        tenants_str = bubble_response.get('response', {}).get('tenants', '')
+
+        if not tenants_str:
+            return cors_response(200, {'tenants': []})
+
+        # Fix Bubble's JSON format: "[{...}],[{...}]" -> "[{...},{...}]"
+        # Replace "],[" with "," to merge into single array
+        fixed_json = tenants_str.replace('],[', ',')
+
+        # Ensure it starts with [ and ends with ]
+        if not fixed_json.startswith('['):
+            fixed_json = '[' + fixed_json
+        if not fixed_json.endswith(']'):
+            fixed_json = fixed_json + ']'
+
+        # Parse the fixed JSON
+        tenants = json.loads(fixed_json)
+
+        # Filter out tenants with empty tenant_hash (they won't work for API calls)
+        valid_tenants = [t for t in tenants if t.get('tenant_hash')]
+
+        logger.info(f"Returning {len(valid_tenants)} active tenants for super_admin")
+
+        return cors_response(200, {'tenants': valid_tenants})
+
+    except urllib.error.URLError as e:
+        logger.error(f"Failed to fetch tenants from Bubble: {e}")
+        return cors_response(502, {'error': 'Failed to fetch tenant list from Bubble'})
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Bubble response: {e}")
+        return cors_response(500, {'error': 'Invalid response from tenant service'})
+    except Exception as e:
+        logger.exception(f"Error fetching admin tenants: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
 
 
 def validate_feature_access(tenant_id: str, required_feature: str) -> Optional[Dict[str, Any]]:
@@ -859,17 +950,20 @@ def fetch_form_summary_from_dynamo(tenant_hash: str, date_range: Dict[str, str],
             if duration and isinstance(duration, (int, float)) and duration > 0:
                 completion_times.append(duration)
 
-    # Calculate rates based on outcomes (completed + abandoned)
-    total_outcomes = counts['FORM_COMPLETED'] + counts['FORM_ABANDONED']
-    completion_rate = (counts['FORM_COMPLETED'] / total_outcomes * 100) if total_outcomes > 0 else 0
-    abandon_rate = (counts['FORM_ABANDONED'] / total_outcomes * 100) if total_outcomes > 0 else 0
+    # Calculate abandoned as started - completed (FORM_ABANDONED events are not emitted by widget)
+    forms_abandoned = max(0, counts['FORM_STARTED'] - counts['FORM_COMPLETED'])
+
+    # Calculate rates based on forms_started (not total_outcomes)
+    forms_started = counts['FORM_STARTED']
+    completion_rate = (counts['FORM_COMPLETED'] / forms_started * 100) if forms_started > 0 else 0
+    abandon_rate = (forms_abandoned / forms_started * 100) if forms_started > 0 else 0
     avg_time = sum(completion_times) / len(completion_times) if completion_times else 0
 
     return {
         'form_views': counts['FORM_VIEWED'],
         'forms_started': counts['FORM_STARTED'],
         'forms_completed': counts['FORM_COMPLETED'],
-        'forms_abandoned': counts['FORM_ABANDONED'],
+        'forms_abandoned': forms_abandoned,
         'completion_rate': round(completion_rate, 1),
         'abandon_rate': round(abandon_rate, 1),
         'avg_completion_time_seconds': round(avg_time)
@@ -880,8 +974,10 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
     """
     Calculate form bottlenecks (field-level abandonment) from DynamoDB session events.
 
-    Replaces Athena query for /forms/bottlenecks endpoint.
-    Performance: ~100-500ms (vs 5-30s for Athena)
+    Since FORM_ABANDONED events are not emitted by the widget, this function:
+    1. Finds sessions with FORM_STARTED but no FORM_COMPLETED
+    2. For each abandoned session, finds the last FORM_FIELD_SUBMITTED event
+    3. Aggregates by field to identify drop-off points
 
     Args:
         tenant_hash: Tenant hash
@@ -894,12 +990,14 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
     """
     start_date = date_range['start_date_iso']
 
-    # Query only FORM_ABANDONED events
-    filter_expr = 'event_type = :t1'
+    # Query form-related events: FORM_STARTED, FORM_COMPLETED, FORM_FIELD_SUBMITTED
+    filter_expr = 'event_type IN (:t1, :t2, :t3)'
     expr_values = {
         ':th': {'S': tenant_hash},
         ':start': {'S': start_date},
-        ':t1': {'S': 'FORM_ABANDONED'}
+        ':t1': {'S': 'FORM_STARTED'},
+        ':t2': {'S': 'FORM_COMPLETED'},
+        ':t3': {'S': 'FORM_FIELD_SUBMITTED'}
     }
 
     # Add optional form_id filter
@@ -907,7 +1005,8 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
         filter_expr += ' AND contains(event_payload, :form_id)'
         expr_values[':form_id'] = {'S': f'"form_id": "{form_id}"'}
 
-    events = []
+    # Group events by session
+    session_events = {}  # session_id -> {'started': bool, 'completed': bool, 'last_field': {...}}
     last_key = None
 
     try:
@@ -928,6 +1027,10 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
             items = response.get('Items', [])
 
             for item in items:
+                session_id = item.get('session_id', {}).get('S', 'unknown')
+                event_type = item.get('event_type', {}).get('S', '')
+                timestamp = item.get('timestamp', {}).get('S', '')
+
                 # Parse event_payload
                 payload = {}
                 if 'event_payload' in item:
@@ -937,21 +1040,49 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
                     except (json.JSONDecodeError, TypeError):
                         pass
 
-                events.append(payload)
+                # Initialize session if not seen
+                if session_id not in session_events:
+                    session_events[session_id] = {
+                        'started': False,
+                        'completed': False,
+                        'last_field': None,
+                        'last_field_timestamp': ''
+                    }
+
+                if event_type == 'FORM_STARTED':
+                    session_events[session_id]['started'] = True
+                elif event_type == 'FORM_COMPLETED':
+                    session_events[session_id]['completed'] = True
+                elif event_type == 'FORM_FIELD_SUBMITTED':
+                    # Track the most recent field submitted (by timestamp)
+                    if timestamp > session_events[session_id]['last_field_timestamp']:
+                        session_events[session_id]['last_field'] = {
+                            'field_id': payload.get('field_id', 'unknown'),
+                            'field_label': payload.get('field_label', 'Unknown Field'),
+                            'form_id': payload.get('form_id', '')
+                        }
+                        session_events[session_id]['last_field_timestamp'] = timestamp
 
             last_key = response.get('LastEvaluatedKey')
             if not last_key:
                 break
 
-        logger.info(f"Fetched {len(events)} FORM_ABANDONED events from DynamoDB for tenant {tenant_hash}")
+        # Find abandoned sessions: started but not completed
+        abandoned_sessions = [
+            data for sid, data in session_events.items()
+            if data['started'] and not data['completed'] and data['last_field']
+        ]
 
-        # Aggregate by last_field_id
+        logger.info(f"Found {len(abandoned_sessions)} abandoned form sessions for tenant {tenant_hash}")
+
+        # Aggregate by last field
         field_abandons = {}  # field_id -> {'count': N, 'label': '...', 'form_id': '...'}
 
-        for event in events:
-            field_id = event.get('last_field_id', 'unknown')
-            field_label = event.get('last_field_label', field_id)
-            event_form_id = event.get('form_id')
+        for session in abandoned_sessions:
+            field_data = session['last_field']
+            field_id = field_data['field_id']
+            field_label = field_data['field_label']
+            event_form_id = field_data['form_id']
 
             if field_id not in field_abandons:
                 field_abandons[field_id] = {
@@ -962,7 +1093,7 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
             field_abandons[field_id]['count'] += 1
 
         # Calculate total and sort by count descending
-        total_abandons = len(events)
+        total_abandons = len(abandoned_sessions)
         sorted_fields = sorted(
             field_abandons.items(),
             key=lambda x: x[1]['count'],
