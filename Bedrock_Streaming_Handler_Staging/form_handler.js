@@ -16,6 +16,7 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const {
   extractCanonicalContact,
   filterSensitiveFields,
+  flattenCompositeFields,
   getSchemaVersion,
   SCHEMA_VERSION
 } = require('./contact_extractor');
@@ -1234,8 +1235,12 @@ async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formCo
   const transformedFormData = transformFormDataToLabels(formData, formConfig);
   const formDataJsonString = JSON.stringify(transformedFormData);
 
+  // Flatten composite fields (name, address) for email display
+  // This extracts nested subfields like {"field_123.first_name": "John"} into {"first_name": "John"}
+  const flattenedFormData = flattenCompositeFields(transformedFormData);
+
   // Filter sensitive fields for email display
-  const filteredFormData = filterSensitiveFields(transformedFormData);
+  const filteredFormData = filterSensitiveFields(flattenedFormData);
   const filteredFormDataJsonString = JSON.stringify(filteredFormData);
 
   // Extract canonical contact and comments using new extractor
