@@ -9,6 +9,7 @@ import json
 import boto3
 import logging
 import os
+import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -27,44 +28,87 @@ DEFAULT_SENDER = os.environ.get('DEFAULT_SENDER', 'notify@myrecruiter.ai')
 CONFIGURATION_SET = os.environ.get('CONFIGURATION_SET', 'picasso-emails')
 
 
+def fix_bubble_json(raw_body):
+    """
+    Fix common JSON issues from Bubble's :formatted as JSON-safe.
+    
+    Bubble's JSON-safe adds quotes around values, but when inserted into
+    a template that already has quotes, we get double-quoted strings like:
+    "html_body": ""<html>content</html>""
+    
+    This function fixes those patterns.
+    """
+    if not raw_body:
+        return raw_body
+    
+    # Log the problematic area for debugging
+    logger.info(f"Raw body length: {len(raw_body)}")
+    
+    # Pattern 1: Fix double-quoted strings: "key": ""value"" -> "key": "value"
+    # This needs to handle nested escaped quotes too
+    fixed = raw_body
+    
+    # Replace all occurrences of "": with ": (double-quote-colon to single)
+    # and "" at the end of values with "
+    # More aggressive approach: find "": " and replace with ": "
+    
+    # Handle pattern: "key": ""content"",  -> "key": "content",
+    fixed = re.sub(r'""([^"]*?)""', r'"\1"', fixed)
+    
+    # Handle escaped newlines that might not be properly escaped
+    # Bubble might send actual newlines instead of \n
+    fixed = fixed.replace('\r\n', '\\n').replace('\r', '\\n')
+    
+    # Handle case where there are unescaped newlines inside strings
+    # This is tricky - we need to be careful not to break valid JSON
+    
+    return fixed
+
+
 def lambda_handler(event, context):
     """
     Handle email send requests from Bubble.
-
-    Expected body format:
-    {
-        "to": ["recipient@example.com"],
-        "subject": "Your subject line",
-        "html_body": "<html>...</html>",
-        "text_body": "Plain text version (optional)",
-        "from": "sender@myrecruiter.ai (optional)",
-        "cc": ["cc@example.com"] (optional),
-        "bcc": ["bcc@example.com"] (optional),
-        "reply_to": ["reply@example.com"] (optional),
-        "attachments": [
-            {
-                "filename": "report.pdf",
-                "content_base64": "JVBERi0xLjQK...",
-                "content_type": "application/pdf"
-            }
-        ] (optional),
-        "tags": {
-            "tenant_id": "FOS402334",
-            "email_type": "form_notification"
-        } (optional)
-    }
     """
     # Handle CORS preflight
     if event.get('httpMethod') == 'OPTIONS' or event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
         return cors_response(200, {'message': 'OK'})
 
     try:
-        # Debug: Log raw body to see what Bubble is sending
+        # Debug: Log raw body - log more for debugging
         raw_body = event.get('body', '{}')
-        logger.info(f"Raw body received: {raw_body[:500] if raw_body else 'None'}")
+        logger.info(f"Raw body received (first 1000 chars): {raw_body[:1000] if raw_body else 'None'}")
+        
+        # Log around the error position
+        if len(raw_body) > 500:
+            logger.info(f"Raw body chars 500-800: {repr(raw_body[500:800])}")
 
-        # Parse request body
-        body = json.loads(raw_body)
+        # Try to parse request body
+        body = None
+        parse_error = None
+
+        # First attempt: parse as-is
+        try:
+            body = json.loads(raw_body)
+        except json.JSONDecodeError as e:
+            parse_error = e
+            logger.warning(f"Initial JSON parse failed at position {e.pos}: {str(e)}")
+            logger.info(f"Context around error: {repr(raw_body[max(0,e.pos-50):e.pos+50])}")
+
+            # Second attempt: fix Bubble's double-quoted strings
+            try:
+                fixed_body = fix_bubble_json(raw_body)
+                if fixed_body != raw_body:
+                    logger.info("Applied Bubble JSON fix")
+                    logger.info(f"Fixed body chars 500-800: {repr(fixed_body[500:800])}")
+                body = json.loads(fixed_body)
+                parse_error = None
+            except json.JSONDecodeError as e2:
+                parse_error = e2
+                logger.error(f"JSON parse still failed at position {e2.pos}: {str(e2)}")
+                logger.info(f"Context around error: {repr(fixed_body[max(0,e2.pos-50):e2.pos+50])}")
+
+        if parse_error:
+            raise parse_error
 
         # Validate required fields
         to_addresses = body.get('to', [])
@@ -143,12 +187,7 @@ def lambda_handler(event, context):
 
 
 def send_email(sender, to, cc, bcc, reply_to, subject, html_body, text_body, attachments, tags):
-    """
-    Build MIME message and send via SES SendRawEmail.
-
-    Returns the SES MessageId.
-    """
-    # Create the root MIME message
+    """Build MIME message and send via SES SendRawEmail."""
     msg = MIMEMultipart('mixed')
     msg['Subject'] = subject
     msg['From'] = sender
@@ -159,58 +198,41 @@ def send_email(sender, to, cc, bcc, reply_to, subject, html_body, text_body, att
     if reply_to:
         msg['Reply-To'] = ', '.join(reply_to)
 
-    # Create body part (multipart/alternative for HTML + text)
     body_part = MIMEMultipart('alternative')
 
-    # Add text body first (email clients show the last part by default)
     if text_body:
         text_mime = MIMEText(text_body, 'plain', 'utf-8')
         body_part.attach(text_mime)
 
-    # Add HTML body
     if html_body:
         html_mime = MIMEText(html_body, 'html', 'utf-8')
         body_part.attach(html_mime)
 
     msg.attach(body_part)
 
-    # Add attachments
     for att in attachments:
         try:
             filename = att.get('filename', 'attachment')
             content_base64 = att.get('content_base64', '')
             content_type = att.get('content_type', 'application/octet-stream')
-
-            # Decode base64 content
             content = base64.b64decode(content_base64)
-
-            # Create attachment part
             attachment_part = MIMEApplication(content)
-            attachment_part.add_header(
-                'Content-Disposition',
-                'attachment',
-                filename=filename
-            )
+            attachment_part.add_header('Content-Disposition', 'attachment', filename=filename)
             attachment_part.add_header('Content-Type', content_type)
-
             msg.attach(attachment_part)
             logger.info(f"Added attachment: {filename} ({len(content)} bytes)")
-
         except Exception as e:
             logger.error(f"Error processing attachment {att.get('filename', 'unknown')}: {str(e)}")
             raise ValueError(f"Invalid attachment: {str(e)}")
 
-    # Build destination list
     destinations = list(to)
     if cc:
         destinations.extend(cc)
     if bcc:
         destinations.extend(bcc)
 
-    # Build message tags for SES tracking
     message_tags = [{'Name': k, 'Value': str(v)[:256]} for k, v in tags.items()]
 
-    # Send via SES
     response = ses.send_raw_email(
         Source=sender,
         Destinations=destinations,
@@ -221,7 +243,6 @@ def send_email(sender, to, cc, bcc, reply_to, subject, html_body, text_body, att
 
     message_id = response['MessageId']
     logger.info(f"Email sent: {message_id} to {destinations} with {len(attachments)} attachment(s)")
-
     return message_id
 
 
