@@ -1102,6 +1102,15 @@ IMPORTANT: Short responses are ALWAYS about continuing the previous conversation
  * @returns {string} - Prompt section for branch suggestions, or empty string if no branches
  */
 function buildBranchPromptSection(config) {
+  const ctaSettings = config?.cta_settings || {};
+
+  // If no fallback_branch is configured, user wants explicit routing only (Tier 1-3)
+  // This respects the Config Builder's "None (no CTAs shown when no match)" setting
+  if (!ctaSettings.fallback_branch) {
+    console.log('ℹ️ No fallback_branch configured - Tier 4 AI routing disabled (explicit routing only)');
+    return '';
+  }
+
   const branches = config?.conversation_branches || {};
   const ctaDefinitions = config?.cta_definitions || {};
 

@@ -693,12 +693,20 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         // ============================================================================
         // TIER 4: AI-Suggested Branch Routing (Free-flow conversations)
         // ============================================================================
+        // Skip Tier 4 if no fallback_branch configured - user wants explicit routing only
+        // This respects the Config Builder's "None (no CTAs shown when no match)" setting
+        const ctaSettings = config.cta_settings || {};
+        const tier4Enabled = !!ctaSettings.fallback_branch;
+
+        if (!tier4Enabled) {
+            console.log('[Tier 4] Skipped - no fallback_branch configured (explicit routing only)');
+        }
+
         // Parse branch hint from model response (<!-- BRANCH: xxx -->)
         const { branch: suggestedBranch, cleanedResponse } = parseBranchHint(bedrockResponse);
 
-        if (suggestedBranch) {
+        if (tier4Enabled && suggestedBranch) {
             const branches = config.conversation_branches || {};
-            const ctaSettings = config.cta_settings || {};
 
             // Validate suggested branch exists
             if (branches[suggestedBranch]) {
