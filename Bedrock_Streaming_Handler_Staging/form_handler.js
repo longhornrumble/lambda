@@ -825,6 +825,12 @@ function transformFormDataToLabels(formData, formConfig) {
 
   // Transform the form data keys
   for (const [key, value] of Object.entries(formData)) {
+    // Skip composite parent fields (e.g., "field_1761666576305" with object value)
+    // These are redundant - the individual subfields are already being processed
+    if (/^field_\d+$/.test(key) && typeof value === 'object' && value !== null) {
+      continue;
+    }
+
     if (fieldMap[key]) {
       // Use the mapped label
       transformed[fieldMap[key]] = value;

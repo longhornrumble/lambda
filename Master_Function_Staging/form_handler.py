@@ -64,6 +64,8 @@ def transform_form_data_to_labels(form_data: Dict[str, Any], form_config: Dict[s
     Returns:
         Transformed form data with human-readable keys
     """
+    import re
+
     if not form_data or not form_config.get('fields'):
         return form_data or {}
 
@@ -93,6 +95,11 @@ def transform_form_data_to_labels(form_data: Dict[str, Any], form_config: Dict[s
 
     # Transform the form data keys
     for key, value in form_data.items():
+        # Skip composite parent fields (e.g., "field_1761666576305" with dict value)
+        # These are redundant - the individual subfields are already being processed
+        if re.match(r'^field_\d+$', key) and isinstance(value, dict):
+            continue
+
         if key in field_map:
             # Use the mapped label
             transformed[field_map[key]] = value
