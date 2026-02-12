@@ -274,3 +274,27 @@ export async function listBackups(tenantId) {
     throw new Error(`Failed to list backups: ${error.message}`);
   }
 }
+
+/**
+ * Store tenant ID to hash mapping
+ * @param {string} tenantId - The tenant ID
+ * @param {string} tenantHash - The generated tenant hash
+ * @returns {Promise<Object>} The mapping object
+ */
+export async function storeTenantMapping(tenantId, tenantHash) {
+  const mapping = {
+    tenant_id: tenantId,
+    tenant_hash: tenantHash,
+    created_at: new Date().toISOString(),
+  };
+
+  const params = {
+    Bucket: BUCKET,
+    Key: `mappings/${tenantHash}.json`,
+    Body: JSON.stringify(mapping, null, 2),
+    ContentType: 'application/json',
+  };
+
+  await s3Client.send(new PutObjectCommand(params));
+  return mapping;
+}

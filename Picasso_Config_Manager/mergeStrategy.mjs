@@ -13,18 +13,19 @@ const EDITABLE_SECTIONS = [
   'conversation_branches',
   'content_showcase',
   'cta_settings',
-];
-
-/**
- * Read-only sections that should be preserved during merge
- */
-const READ_ONLY_SECTIONS = [
   'branding',
   'features',
   'quick_help',
   'action_chips',
   'widget_behavior',
   'aws',
+  'bedrock_instructions',
+];
+
+/**
+ * Read-only sections that should be preserved during merge
+ */
+const READ_ONLY_SECTIONS = [
   'card_inventory',
 ];
 
@@ -37,6 +38,12 @@ const METADATA_FIELDS = [
   'chat_title',
   'company_name',
   'last_updated',
+  'chat_subtitle',
+  'welcome_message',
+  'subscription_tier',
+  'tone_prompt',
+  'model_id',
+  'callout_text',
 ];
 
 /**
