@@ -14,13 +14,80 @@
   },
   "programs": {},
   "conversational_forms": {},
-  "cta_definitions": {},
-  "conversation_branches": {},
-  "_available_actions_disabled": "Temporarily disabled to test CHIPS in isolation",
+  "cta_definitions": {
+    "lb_start_application": {
+      "label": "Start Love Box Application",
+      "action": "start_form",
+      "formId": "lb_apply"
+    },
+    "lb_schedule_discovery": {
+      "label": "Schedule a Discovery Session",
+      "action": "external_link",
+      "url": "https://atlantaangels.org/discovery"
+    },
+    "dd_learn_more": {
+      "label": "Learn About Dare to Dream",
+      "action": "show_info",
+      "prompt": "Dare to Dream pairs adult mentors with youth aging out of foster care. Mentors meet with their mentee regularly to provide guidance on life skills, education, and career planning.",
+      "target_branch": "daretodream_info"
+    },
+    "dd_start_application": {
+      "label": "Start Dare to Dream Application",
+      "action": "start_form",
+      "formId": "dd_apply"
+    },
+    "dd_schedule_discovery": {
+      "label": "Schedule a Discovery Session",
+      "action": "external_link",
+      "url": "https://atlantaangels.org/discovery"
+    },
+    "lb_learn_more": {
+      "label": "Learn About Love Box",
+      "action": "show_info",
+      "prompt": "Love Box is a monthly care package delivery program for children in foster care. Volunteers commit to preparing and delivering personalized boxes to their assigned child each month.",
+      "target_branch": "lovebox_info"
+    }
+  },
+  "conversation_branches": {
+    "lovebox_info": {
+      "available_ctas": {
+        "primary": "lb_start_application",
+        "secondary": ["lb_schedule_discovery", "dd_learn_more"]
+      }
+    },
+    "daretodream_info": {
+      "available_ctas": {
+        "primary": "dd_start_application",
+        "secondary": ["dd_schedule_discovery", "lb_learn_more"]
+      }
+    }
+  },
   "available_actions": {
-    "forms": {},
+    "forms": {
+      "lb_apply": {
+        "label": "Apply to Love Box",
+        "description": "Volunteer application for the Love Box program",
+        "direct_cta": true,
+        "show_info": true,
+        "prompt": "Love Box is a monthly care package delivery program for children in foster care. Volunteers commit to preparing and delivering personalized boxes to their assigned child each month. The process starts with a discovery session where we learn about your interests and availability.",
+        "target_branch": "lovebox_info"
+      },
+      "dd_apply": {
+        "label": "Apply to Dare to Dream",
+        "description": "Mentor application for the Dare to Dream program",
+        "direct_cta": true,
+        "show_info": true,
+        "prompt": "Dare to Dream pairs adult mentors with youth aging out of foster care. Mentors meet with their mentee regularly to provide guidance on life skills, education, and career planning. The commitment is typically one year with weekly or bi-weekly meetings.",
+        "target_branch": "daretodream_info"
+      }
+    },
     "queries": {},
-    "links": {}
+    "links": {
+      "donate": {
+        "label": "Make a Donation",
+        "url": "https://atlantaangels.org/donate"
+      }
+    }
   },
   "content_showcase": [],
   "branding": {

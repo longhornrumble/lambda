@@ -1828,23 +1828,23 @@ function mapNextTagsToActions(nextIds, config, sessionContext) {
       if (!completedForms.includes(programKey)) {
         const formInfo = availableActions.forms?.[formId];
         if (formInfo) {
-          actions.push({
-            label: formInfo.label || 'Apply',
-            action: 'start_form',
-            formId: formId
-          });
+          if (formInfo.show_info === true) {
+            // Guided path: show_info with optional branch CTAs
+            actions.push({
+              label: formInfo.label || 'Learn More',
+              action: 'show_info',
+              prompt: formInfo.prompt || formInfo.description || '',
+              target_branch: formInfo.target_branch || null
+            });
+          } else {
+            // Direct form: start conversational form immediately
+            actions.push({
+              label: formInfo.label || 'Apply',
+              action: 'start_form',
+              formId: formId
+            });
+          }
         }
-      }
-    }
-    else if (trimmed.startsWith('query:')) {
-      const queryId = trimmed.slice(6);
-      const queryInfo = availableActions.queries?.[queryId];
-      if (queryInfo) {
-        actions.push({
-          label: queryInfo.label || queryId,
-          action: 'send_query',
-          query: queryInfo.query || queryInfo.label
-        });
       }
     }
     else if (trimmed.startsWith('link:')) {
@@ -1937,14 +1937,6 @@ function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, 
     }
   }
 
-  // Build query entries (predefined send_query actions)
-  const queryEntries = [];
-  if (availableActions.queries && Object.keys(availableActions.queries).length > 0) {
-    for (const [queryId, info] of Object.entries(availableActions.queries)) {
-      queryEntries.push({ queryId, label: info.label || queryId });
-    }
-  }
-
   // Build link entries
   const linkEntries = [];
   if (availableActions.links && Object.keys(availableActions.links).length > 0) {
@@ -1956,7 +1948,7 @@ function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, 
   // ── BUILD ACTION VOCABULARY (all predefined IDs) ──
   let vocabBlock = '';
   const directCtaForms = formEntries.filter(f => f.directCta);
-  if (formEntries.length > 0 || queryEntries.length > 0 || linkEntries.length > 0) {
+  if (formEntries.length > 0 || linkEntries.length > 0) {
     vocabBlock = '\n━━━ NEXT STEPS YOU CAN OFFER (pick 2-3) ━━━\n';
     if (formEntries.length > 0) {
       vocabBlock += 'Explore:\n';
@@ -1971,12 +1963,6 @@ function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, 
           vocabBlock += `  apply:${f.formId} — Get started with ${name}\n`;
         });
       }
-    }
-    if (queryEntries.length > 0) {
-      vocabBlock += 'Ask:\n';
-      queryEntries.forEach(q => {
-        vocabBlock += `  query:${q.queryId} — ${q.label}\n`;
-      });
     }
     if (linkEntries.length > 0) {
       vocabBlock += 'Links:\n';
