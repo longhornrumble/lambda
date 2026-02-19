@@ -61,7 +61,13 @@ def lambda_handler(event, context):
         "tenant_id": "MYR384719",
         "tenant_hash": "my87674d777bf9",
         "email": "user@example.com",
-        "name": "John Doe" (optional)
+        "name": "John Doe" (optional),
+        "role": "super_admin" (optional),
+        "company": "MyRecruiter" (optional),
+        "tenants": [...] (optional, for super_admin tenant switching),
+        "dashboard_conversations": true (optional),
+        "dashboard_forms": true (optional),
+        "dashboard_attribution": false (optional)
     }
 
     Returns:
@@ -117,6 +123,28 @@ def lambda_handler(event, context):
         # Add optional fields
         if body.get('name'):
             payload['name'] = body['name']
+
+        if body.get('role'):
+            payload['role'] = body['role']
+
+        if body.get('company'):
+            payload['company'] = body['company']
+
+        # Add tenant list for super_admin users (for tenant switching dropdown)
+        if body.get('tenants') and isinstance(body['tenants'], list):
+            payload['tenants'] = body['tenants']
+
+        # Add dashboard features if any are provided
+        features = {}
+        if 'dashboard_conversations' in body:
+            features['dashboard_conversations'] = body['dashboard_conversations']
+        if 'dashboard_forms' in body:
+            features['dashboard_forms'] = body['dashboard_forms']
+        if 'dashboard_attribution' in body:
+            features['dashboard_attribution'] = body['dashboard_attribution']
+
+        if features:
+            payload['features'] = features
 
         # Generate token
         signing_key = get_signing_key()

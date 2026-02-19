@@ -293,7 +293,7 @@ def extract_canonical_contact(form_data: Dict[str, Any]) -> Dict[str, Any]:
         'first_name': first_name,
         'middle_name': middle_name,
         'last_name': last_name,
-        'name_full': name_full,
+        'full_name': name_full,  # Dashboard expects full_name, not name_full
         'email': email,
         'phone': phone,
         'address': {
@@ -323,7 +323,7 @@ def create_empty_contact() -> Dict[str, Any]:
         'first_name': None,
         'middle_name': None,
         'last_name': None,
-        'name_full': None,
+        'full_name': None,
         'email': None,
         'phone': None,
         'address': {

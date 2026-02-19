@@ -31,37 +31,42 @@ CONFIGURATION_SET = os.environ.get('CONFIGURATION_SET', 'picasso-emails')
 def fix_bubble_json(raw_body):
     """
     Fix common JSON issues from Bubble's :formatted as JSON-safe.
-    
+
     Bubble's JSON-safe adds quotes around values, but when inserted into
     a template that already has quotes, we get double-quoted strings like:
     "html_body": ""<html>content</html>""
-    
+
     This function fixes those patterns.
     """
     if not raw_body:
         return raw_body
-    
+
     # Log the problematic area for debugging
     logger.info(f"Raw body length: {len(raw_body)}")
-    
-    # Pattern 1: Fix double-quoted strings: "key": ""value"" -> "key": "value"
-    # This needs to handle nested escaped quotes too
+
     fixed = raw_body
-    
-    # Replace all occurrences of "": with ": (double-quote-colon to single)
-    # and "" at the end of values with "
-    # More aggressive approach: find "": " and replace with ": "
-    
-    # Handle pattern: "key": ""content"",  -> "key": "content",
-    fixed = re.sub(r'""([^"]*?)""', r'"\1"', fixed)
-    
+
     # Handle escaped newlines that might not be properly escaped
     # Bubble might send actual newlines instead of \n
     fixed = fixed.replace('\r\n', '\\n').replace('\r', '\\n')
-    
-    # Handle case where there are unescaped newlines inside strings
-    # This is tricky - we need to be careful not to break valid JSON
-    
+
+    # Fix double-quoted strings from Bubble
+    # Pattern: "key": ""content"" -> "key": "content"
+    # The content can contain quotes, so we can't use a simple regex
+    # Instead, we look for the specific pattern: ": "" followed later by "",
+
+    # Step 1: Fix opening double-quotes after colon
+    # Pattern: ": "" -> ": "
+    fixed = re.sub(r':\s*""(?!")', ': "', fixed)
+
+    # Step 2: Fix closing double-quotes before comma, closing brace, or end
+    # Pattern: "", -> ",  and ""} -> "}  and ""\n -> "\n
+    fixed = re.sub(r'""(\s*[,}\]])', r'"\1', fixed)
+
+    # Step 3: Handle case where the value ends with "" at the very end of JSON
+    # Pattern: ""\s*$ -> "
+    fixed = re.sub(r'""\s*$', '"', fixed)
+
     return fixed
 
 

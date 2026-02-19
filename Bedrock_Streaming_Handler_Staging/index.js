@@ -80,13 +80,13 @@ const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
 
 // Default model configuration - single source of truth
 // Upgraded to Haiku 4.5 for better instruction following (2025-11-26)
-const DEFAULT_MODEL_ID = 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
+const DEFAULT_MODEL_ID = 'us.anthropic.claude-haiku-4-5-20251001-v1:0';
 const DEFAULT_MAX_TOKENS = 1000;
-const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
+const DEFAULT_TEMPERATURE = 0.2; // Slight variation for natural responses (v3.5: simpler prompt reduces confusion risk)
 const DEFAULT_TONE = 'You are a helpful assistant.';
 
 // Prompt version tracking for tenant customization
-const PROMPT_VERSION = '2.8.0';
+const PROMPT_VERSION = '3.5.0';
 
 // Default Bedrock instructions when config doesn't specify custom ones
 const DEFAULT_BEDROCK_INSTRUCTIONS = {
@@ -128,6 +128,132 @@ const KB_CACHE = {};
 const CONFIG_CACHE = {};
 const CACHE_TTL = 300000; // 5 minutes
 const MAX_CACHE_SIZE = 100; // Maximum entries per cache
+
+// ═══════════════════════════════════════════════════════════════
+// EVOLUTION v3.0: Streaming tag stripper for <thought> tags
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Creates a stateful thought-tag stripper for streaming contexts.
+ * Handles partial tags across chunk boundaries.
+ *
+ * Usage:
+ *   const stripper = createThoughtTagStripper();
+ *   const visibleText = stripper.process(chunk);  // returns text with <thought>...</thought> removed
+ *   const fullText = stripper.getFullBuffer();     // returns unprocessed original text
+ *
+ * States: NORMAL → MAYBE_OPEN → INSIDE → MAYBE_CLOSE → NORMAL
+ */
+function createThoughtTagStripper() {
+  let state = 'NORMAL'; // NORMAL | MAYBE_OPEN | INSIDE | MAYBE_CLOSE
+  let pendingBuffer = ''; // holds partial tag content while we determine if it's a tag
+  let fullBuffer = ''; // complete unprocessed text for post-processing
+
+  return {
+    /**
+     * Process a chunk of streaming text, stripping <thought>...</thought> content.
+     * @param {string} chunk - Raw text chunk from Bedrock stream
+     * @returns {string} - Text safe to send to the client (thought content removed)
+     */
+    process(chunk) {
+      fullBuffer += chunk;
+      let output = '';
+
+      for (let i = 0; i < chunk.length; i++) {
+        const char = chunk[i];
+
+        switch (state) {
+          case 'NORMAL':
+            if (char === '<') {
+              // Might be start of <thought>
+              pendingBuffer = '<';
+              state = 'MAYBE_OPEN';
+            } else {
+              output += char;
+            }
+            break;
+
+          case 'MAYBE_OPEN':
+            pendingBuffer += char;
+            // Check if we're building toward "<thought>"
+            if ('<thought>'.startsWith(pendingBuffer.toLowerCase())) {
+              if (pendingBuffer.toLowerCase() === '<thought>') {
+                // Full opening tag matched — enter INSIDE state, discard tag
+                pendingBuffer = '';
+                state = 'INSIDE';
+              }
+              // else: still accumulating, stay in MAYBE_OPEN
+            } else {
+              // Not a thought tag — flush pending buffer as normal text
+              output += pendingBuffer;
+              pendingBuffer = '';
+              state = 'NORMAL';
+            }
+            break;
+
+          case 'INSIDE':
+            // Inside thought content — don't output anything
+            if (char === '<') {
+              // Might be start of </thought>
+              pendingBuffer = '<';
+              state = 'MAYBE_CLOSE';
+            }
+            // else: discard character (it's thought content)
+            break;
+
+          case 'MAYBE_CLOSE':
+            pendingBuffer += char;
+            if ('</thought>'.startsWith(pendingBuffer.toLowerCase())) {
+              if (pendingBuffer.toLowerCase() === '</thought>') {
+                // Full closing tag matched — return to NORMAL
+                pendingBuffer = '';
+                state = 'NORMAL';
+              }
+              // else: still accumulating, stay in MAYBE_CLOSE
+            } else {
+              // Not a closing tag — discard (still inside thought)
+              pendingBuffer = '';
+              state = 'INSIDE';
+            }
+            break;
+        }
+      }
+
+      return output;
+    },
+
+    /**
+     * Get the full unprocessed buffer (includes thought tags).
+     * Used for QA_COMPLETE logging and post-processing.
+     */
+    getFullBuffer() {
+      return fullBuffer;
+    },
+
+    /**
+     * Check if currently inside a thought tag.
+     * If true at end of stream, there's an unclosed thought tag.
+     */
+    isInsideThought() {
+      return state === 'INSIDE' || state === 'MAYBE_CLOSE';
+    },
+
+    /**
+     * Flush any pending buffer as output (call at end of stream).
+     * Returns any incomplete tag text that wasn't a valid thought tag.
+     */
+    flush() {
+      if (state === 'MAYBE_OPEN') {
+        // Partial opening tag that never completed — it's just regular text
+        const flushed = pendingBuffer;
+        pendingBuffer = '';
+        state = 'NORMAL';
+        return flushed;
+      }
+      return '';
+    }
+  };
+}
 
 // ═══════════════════════════════════════════════════════════════
 // SECURITY: Input sanitization to prevent prompt injection
@@ -274,7 +400,103 @@ async function loadConfig(tenantHash) {
   return null;
 }
 
-async function retrieveKB(userInput, config) {
+/**
+ * Build an enriched KB search query using conversation context.
+ * For short/ambiguous inputs like "yes", "sure", "tell me more", "1",
+ * we look at the last assistant message to understand what the user
+ * is actually asking about and build a better search query.
+ *
+ * @param {string} userInput - Raw user input
+ * @param {Array} conversationHistory - Recent conversation messages
+ * @returns {string} - Enriched search query for KB retrieval
+ */
+function buildKBSearchQuery(userInput, conversationHistory) {
+  const trimmed = userInput.trim().toLowerCase();
+  const wordCount = userInput.trim().split(/\s+/).length;
+
+  // Short/ambiguous patterns that need enrichment (affirmations, single words)
+  const isAmbiguous = (
+    wordCount <= 3 &&
+    /^(yes|yeah|yep|sure|okay|ok|no|nah|1|2|3|4|tell me more|go on|please|thanks|thank you|absolutely|definitely|of course|why not|sounds good|let's do it|i'm interested|interested)$/i.test(trimmed)
+  );
+
+  // Topic-continuation queries: generic questions that implicitly refer to the active topic
+  // e.g., "What are the requirements?" after discussing Love Box → "Love Box requirements"
+  const topicContinuationWords = /\b(requirements?|cost|how much|time commitment|how long|process|steps|schedule|training|qualifications?|eligibility|apply|sign up|get started|involved)\b/i;
+  const isTopicContinuation = !isAmbiguous && wordCount <= 8 && topicContinuationWords.test(trimmed);
+
+  const needsEnrichment = isAmbiguous || isTopicContinuation;
+
+  if (!needsEnrichment || !conversationHistory || conversationHistory.length === 0) {
+    return userInput; // Normal query — use as-is
+  }
+
+  // Find the last assistant message to extract active topic
+  const lastAssistant = [...conversationHistory]
+    .reverse()
+    .find(m => m.role === 'assistant' || m.role === 'bot');
+
+  if (!lastAssistant) {
+    return userInput;
+  }
+
+  const assistantText = (lastAssistant.content || lastAssistant.text || '').trim();
+  if (!assistantText) {
+    return userInput;
+  }
+
+  const sentences = assistantText.split(/[.!?]+/).map(s => s.trim()).filter(Boolean);
+
+  // For topic-continuation queries, prepend the active topic to the user's query
+  if (isTopicContinuation) {
+    // Extract the main topic/program name from the last assistant response
+    // Look for program names, proper nouns, or key phrases in the first 2 sentences
+    const topicContext = sentences.slice(0, 2).join('. ');
+    // Common program name patterns
+    const programMatch = topicContext.match(/\b(Love Box|Dare to Dream|Angel Alliance|Foster Care|Discovery Session)\b/i);
+    if (programMatch) {
+      const enriched = `${programMatch[1]} ${userInput.trim()}`;
+      console.log(`🔄 KB query enriched (topic continuation): "${userInput}" → "${enriched}"`);
+      return enriched;
+    }
+    // Fallback: prepend first sentence as context
+    if (sentences[0] && sentences[0].length > 10) {
+      const enriched = `${sentences[0].slice(0, 100)} - ${userInput.trim()}`;
+      console.log(`🔄 KB query enriched (context prefix): "${userInput}" → "${enriched.substring(0, 80)}..."`);
+      return enriched;
+    }
+  }
+
+  // For ambiguous inputs: Strategy 1 — extract topic from the assistant's last question
+  const lastQuestion = [...sentences].reverse().find(s =>
+    assistantText.includes(s + '?')
+  );
+
+  if (lastQuestion) {
+    const enriched = lastQuestion
+      .replace(/^(would you like to|do you want to|shall i|can i|should i|want to)\s*/i, '')
+      .replace(/^(know|learn|hear|find out)\s*(more\s*)?(about\s*)?/i, '')
+      .replace(/\?$/, '')
+      .trim();
+
+    if (enriched.length > 10) {
+      console.log(`🔄 KB query enriched from question: "${userInput}" → "${enriched}"`);
+      return enriched;
+    }
+  }
+
+  // Strategy 2: Use the main topic from the last assistant message
+  const topicSentences = sentences.slice(0, 2).join('. ');
+  if (topicSentences.length > 20) {
+    const enriched = topicSentences.slice(0, 200);
+    console.log(`🔄 KB query enriched from topic: "${userInput}" → "${enriched.substring(0, 60)}..."`);
+    return enriched;
+  }
+
+  return userInput;
+}
+
+async function retrieveKB(userInput, config, conversationHistory) {
   const kbId = config?.aws?.knowledge_base_id;
   console.log(`🔍 KB Retrieval - KB ID: ${kbId || 'NOT SET'}`);
   console.log(`🔍 User input: "${userInput.substring(0, 50)}..."`);
@@ -284,8 +506,11 @@ async function retrieveKB(userInput, config) {
     return '';
   }
 
+  // Enrich short/ambiguous queries with conversation context
+  const searchQuery = buildKBSearchQuery(userInput, conversationHistory);
+
   try {
-    const cacheKey = getCacheKey(userInput, `kb:${kbId}`);
+    const cacheKey = getCacheKey(searchQuery, `kb:${kbId}`);
     if (KB_CACHE[cacheKey] && isCacheValid(KB_CACHE[cacheKey])) {
       console.log(`✅ KB cache hit`);
       const cachedData = KB_CACHE[cacheKey].data;
@@ -293,12 +518,12 @@ async function retrieveKB(userInput, config) {
       return cachedData;
     }
 
-    console.log(`📚 Retrieving from KB: ${kbId}`);
+    console.log(`📚 Retrieving from KB: ${kbId} (query: "${searchQuery.substring(0, 80)}...")`);
     const response = await bedrockAgent.send(new RetrieveCommand({
       knowledgeBaseId: kbId,
-      retrievalQuery: { text: userInput },
+      retrievalQuery: { text: searchQuery },
       retrievalConfiguration: {
-        vectorSearchConfiguration: { numberOfResults: 5 } // Increased from 3 to capture more comprehensive context
+        vectorSearchConfiguration: { numberOfResults: 5 }
       }
     }));
 
@@ -854,7 +1079,15 @@ function getCustomConstraints(config) {
 
   if (instructions && validateBedrockInstructions(instructions) &&
       instructions.custom_constraints && instructions.custom_constraints.length > 0) {
-    return '\n\nCUSTOM INSTRUCTIONS:\n' + instructions.custom_constraints.map(c => `- ${c}`).join('\n');
+    let result = '\n\nCUSTOM INSTRUCTIONS:\n' + instructions.custom_constraints.map(c => `- ${c}`).join('\n');
+
+    // When DYNAMIC_ACTIONS is on, override the "always ask a follow-up" pattern
+    // to allow progression toward action after deep exploration
+    if (isFeatureEnabled('DYNAMIC_ACTIONS', config)) {
+      result += '\n- IMPORTANT OVERRIDE: After 3+ exchanges on the same topic, your follow-up should invite the user to TAKE ACTION (apply, sign up, get started) rather than asking another informational question. The system will provide action buttons — your job is to naturally close the loop.';
+    }
+
+    return result;
   }
 
   return '';
@@ -1092,11 +1325,268 @@ Examples of how to interpret short responses:
 IMPORTANT: Short responses are ALWAYS about continuing the previous conversation topic. Never treat them as new, unrelated questions.`;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// FEATURE FLAGS - Per-tenant and environment variable resolution
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Check if a feature flag is enabled
+ * Resolution order: tenant config → environment variable → default (off)
+ */
+function isFeatureEnabled(flagName, config) {
+  // 1. Tenant config override (highest priority)
+  if (config?.feature_flags?.[flagName] !== undefined) {
+    return config.feature_flags[flagName];
+  }
+  // 2. Environment variable (PICASSO_DYNAMIC_ACTIONS, etc.)
+  const envVar = process.env[`PICASSO_${flagName}`];
+  if (envVar !== undefined) {
+    return envVar === 'true';
+  }
+  // 3. Default: off
+  return false;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EVOLUTION v3.0: Internal Monologue + Anti-Robot Guardrails
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Build the internal monologue (thought layer) prompt section.
+ * Forces the model to reason about intent, context, and transitions
+ * BEFORE generating its response. <thought> tags are stripped server-side.
+ */
+function buildThoughtLayerSection() {
+  return `
+INTERNAL REASONING (required before every response):
+Before writing your response, you MUST include a brief reasoning step inside <thought> tags.
+This is hidden from the user and helps you plan a natural, human-like response.
+
+In your <thought> tags, work through these 5 steps:
+1. WHAT DID THE USER ASK? What is the user actually asking or feeling?
+2. WHAT DID I ALREADY TELL THEM? List the key facts I've already covered in this conversation (time, cost, requirements, etc.)
+3. WHAT'S NEW TO SHARE? What information would actually be NEW and useful — not a repeat?
+4. HOW DEEP ARE WE? How many turns on this topic? If 3+, I should guide toward action, not more facts.
+5. CHIP PLAN: What question will I end with? The chips must be the 2-3 most likely answers the user would give to that question.
+
+If the user's input is very short ("yes", "sure", "tell me more"):
+- Do NOT recap or acknowledge the "yes"
+- Continue directly as if you're finishing a thought you started
+
+CONVERSATION PROGRESSION:
+- After 2-3 exchanges on the same topic, shift from informing to inviting action.
+- Instead of "Would you like to know more about X?", say "Ready to take the next step?" or "Want me to help you get started?"
+- NEVER repeat information you already provided.
+
+Example:
+<thought>1. User asked about Love Box requirements. 2. I already told them: one-year commitment, 2-3 hours monthly, $75/$25 budget, background check. 3. NEW info I can share: what the training covers, how matching works. 4. This is turn 4 on Love Box — time to nudge toward action. 5. CHIP PLAN: My response will cover training briefly then invite them to apply. Chips should NOT be about time/cost/requirements (already covered). Good chips: "How do I apply?" or "Tell me about Dare to Dream".</thought>`;
+}
+
+/**
+ * Build anti-robot guardrails prompt section.
+ * Explicit rules for human-like interaction patterns.
+ */
+function buildAntiRobotSection() {
+  return `
+HUMAN INTERACTION RULES:
+- NEVER reference source materials, databases, or files. Treat all knowledge as your own experience.
+- NEVER use phrases like "Based on our previous conversation", "According to the information", "I found that", or "As mentioned earlier"
+- Use natural conversational transitions: "Actually, there's another part to this...", "You know, one of the things people love most is...", "I'm glad you asked about that..."
+- When the user shows excitement or interest, match their energy. Don't flatten emotion with clinical language.
+- Treat every user input as a continuation of the conversation, not a new search query.
+- If you just shared a fact, your next response should give the "why" or "how" behind it — not repeat it.
+- End with engagement that invites deeper exploration, NOT generic "Is there anything else I can help with?"`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EVOLUTION v3.0: Dynamic Action Context + Chips
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Build the dynamic action context section for the prompt.
+ * Tells the model what forms and links are available so it can generate
+ * contextual CTAs via <!-- ACTIONS: [...] --> tags.
+ *
+ * @param {Object} config - Tenant configuration
+ * @param {Array} completedForms - List of completed form program IDs
+ * @returns {string} - Prompt section for action generation, or empty string
+ */
+function buildActionContextSection(config, completedForms = []) {
+  if (!isFeatureEnabled('DYNAMIC_ACTIONS', config)) {
+    return '';
+  }
+
+  const parts = [];
+  parts.push(`
+DYNAMIC RESPONSE ACTIONS:
+After your response, if contextual next steps would help the user, append an HTML comment
+with 1-3 action buttons. These are HIDDEN from the user and parsed by the system.`);
+
+  // Build available actions from config
+  const availableActions = config.available_actions || {};
+  const conversationalForms = config.conversational_forms || {};
+  const ctaDefinitions = config.cta_definitions || {};
+
+  // Forms section - pull from available_actions OR conversational_forms
+  const formEntries = [];
+  if (availableActions.forms && Object.keys(availableActions.forms).length > 0) {
+    // Use explicit available_actions.forms
+    for (const [formId, formInfo] of Object.entries(availableActions.forms)) {
+      formEntries.push(`- formId "${formId}": ${formInfo.description || formInfo.label || formId}`);
+    }
+  } else if (Object.keys(conversationalForms).length > 0) {
+    // Fallback: auto-generate from conversational_forms config
+    for (const [key, formConfig] of Object.entries(conversationalForms)) {
+      if (formConfig.enabled !== false) {
+        const formId = formConfig.form_id || key;
+        const desc = formConfig.title || formConfig.description || key;
+        formEntries.push(`- formId "${formId}": ${desc}`);
+      }
+    }
+  }
+
+  if (formEntries.length > 0) {
+    parts.push(`
+AVAILABLE FORMS (use action "start_form"):
+${formEntries.join('\n')}`);
+  }
+
+  // Links section - pull from available_actions.links OR cta_definitions with external_link
+  const linkEntries = [];
+  if (availableActions.links && Object.keys(availableActions.links).length > 0) {
+    for (const [linkId, linkInfo] of Object.entries(availableActions.links)) {
+      linkEntries.push(`- "${linkInfo.label || linkId}": ${linkInfo.url}`);
+    }
+  } else {
+    // Fallback: extract external_link CTAs from cta_definitions
+    for (const [ctaId, ctaDef] of Object.entries(ctaDefinitions)) {
+      if (ctaDef.action === 'external_link' && ctaDef.url) {
+        linkEntries.push(`- "${ctaDef.label || ctaId}": ${ctaDef.url}`);
+      }
+    }
+  }
+
+  if (linkEntries.length > 0) {
+    parts.push(`
+AVAILABLE LINKS (use action "external_link"):
+${linkEntries.join('\n')}`);
+  }
+
+  // Query shortcuts explanation
+  parts.push(`
+QUERY SHORTCUTS (use action "send_query"):
+- Generate contextual follow-up questions the user might want to ask
+- The "query" field should be a natural question, NOT a keyword`);
+
+  // Completed forms
+  if (completedForms.length > 0) {
+    parts.push(`
+USER HAS COMPLETED: [${completedForms.join(', ')}] — do NOT suggest these forms.`);
+  }
+
+  // Format instructions
+  parts.push(`
+FORMAT (append at the very end of your response, after all visible text):
+<!-- ACTIONS: [{"label":"Apply Now","action":"start_form","formId":"lb_apply"},{"label":"What's the time commitment?","action":"send_query","query":"What is the time commitment for Love Box?"}] -->
+
+RULES:
+- Only suggest actions that are contextually relevant to THIS response
+- Do NOT suggest forms the user has already completed (listed above)
+- Include 0-3 actions (0 is fine — don't force actions when none are relevant)
+- "send_query" actions should be natural follow-up questions, not generic
+- Always include formId for "start_form" actions (must match available forms above)
+- Always include url for "external_link" actions
+- Always include query for "send_query" actions
+
+PROGRESSION RULES:
+- After 3+ turns on the same topic, prioritize ACTION buttons over info queries
+- If the user has been exploring a program in depth, suggest "Get Started" or "Schedule a Call" type actions, not more "Learn About..." buttons
+- Do NOT generate send_query actions for questions already answered in the conversation
+- Vary your action labels — don't repeat "Learn About Volunteering" across multiple responses`);
+
+  console.log(`✅ Built dynamic action context section (${formEntries.length} forms, ${linkEntries.length} links)`);
+  return parts.join('\n');
+}
+
+/**
+ * Build the suggested chips section for the prompt.
+ * Instructs the model to generate follow-up question chips.
+ *
+ * @param {Object} config - Tenant configuration
+ * @returns {string} - Prompt section for chip generation, or empty string
+ */
+function buildChipSection(config, turnCount = 0) {
+  if (!isFeatureEnabled('DYNAMIC_CHIPS', config)) {
+    return '';
+  }
+
+  const maxChips = config?.suggested_chips?.max_chips || 3;
+
+  return `
+SUGGESTED FOLLOW-UP CHIPS:
+Your response ends with a question. Generate ${maxChips} chips that are the most likely answers the user would give to YOUR closing question.
+
+FORMAT (append after NEXT tag if present, or at the very end):
+<!-- CHIPS: ["answer option 1", "answer option 2", "answer option 3"] -->
+
+RULES:
+- ${maxChips} chips, each under 50 chars
+- Each chip answers YOUR closing question from the user's perspective
+- Write them as the user would say them: "Tell me about Love Box", "Yes, I'd like to apply", "Not sure yet"
+
+Example: If you end with "Are you leaning toward Dare to Dream, or would you like to explore Love Box?"
+→ <!-- CHIPS: ["I'm interested in Dare to Dream", "Tell me about Love Box", "I'm not sure yet"] -->`;
+}
+
+/**
+ * Build guidance module section based on conversation context.
+ * Injects topic-specific tone/behavior instructions when relevant.
+ *
+ * @param {Object} config - Tenant configuration
+ * @param {Array} conversationHistory - Recent conversation messages
+ * @returns {string} - Guidance section, or empty string
+ */
+function buildGuidanceSection(config, conversationHistory) {
+  if (!isFeatureEnabled('GUIDANCE_MODULES', config)) {
+    return '';
+  }
+
+  const guidanceModules = config.guidance_modules;
+  if (!guidanceModules || Object.keys(guidanceModules).length === 0) {
+    return '';
+  }
+
+  // Simple topic detection from recent messages (last 3)
+  const recentText = (conversationHistory || [])
+    .slice(-3)
+    .map(m => (m.content || m.text || '').toLowerCase())
+    .join(' ');
+
+  const matchedModules = [];
+  for (const [key, module] of Object.entries(guidanceModules)) {
+    if (module.enabled === false) continue;
+    // Check if the topic keyword appears in recent conversation
+    if (recentText.includes(key.toLowerCase())) {
+      matchedModules.push(module);
+    }
+  }
+
+  if (matchedModules.length === 0) {
+    return '';
+  }
+
+  const sections = matchedModules.map(m =>
+    `- ${m.title || 'Guidance'}: ${m.content}`
+  ).join('\n');
+
+  console.log(`✅ Injected ${matchedModules.length} guidance module(s)`);
+  return `\nTOPIC-SPECIFIC GUIDANCE (apply to your response):\n${sections}`;
+}
+
 /**
  * Build branch prompt section for Tier 4 AI-suggested routing
- *
- * Generates a prompt section that tells the model which conversation branches
- * are available and how to suggest one by appending <!-- BRANCH: xxx --> to the response.
+ * DEPRECATED: Replaced by buildActionContextSection() in v3.0
+ * Kept for backward compatibility when DYNAMIC_ACTIONS feature flag is off.
  *
  * @param {Object} config - Tenant configuration
  * @returns {string} - Prompt section for branch suggestions, or empty string if no branches
@@ -1251,21 +1741,353 @@ function detectFollowUpQuestionResponse(userInput, conversationHistory) {
   return null;
 }
 
-function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
+// ═══════════════════════════════════════════════════════════════
+// EVOLUTION v3.5: W5 Framework + Tag & Map Hybrid
+//
+// DESIGN PRINCIPLES:
+// 1. W5 thought framework (Who, What, When, Where, Why) replaces rigid rules
+// 2. Tag & Map: Haiku picks simple IDs, code maps to full action JSON
+// 3. Sanitized persona: keeps tenant personality, strips link/CTA instructions
+// 4. All action IDs are predefined in config — no freeform generation
+// 5. CHIPS = AI-creative conversation flow, NEXT = deterministic hard actions
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Sanitize tone_prompt to remove sentences that conflict with button-based CTAs.
+ * Keeps the tenant's personality and warmth, strips instructions about inline links/CTAs.
+ */
+function sanitizeTonePrompt(tonePrompt) {
+  if (!tonePrompt) return '';
+  const blocked = ['inline link', 'calls to action', 'contact information, or calls', 'include relevant'];
+  return tonePrompt
+    .split('.')
+    .filter(sentence => {
+      const lower = sentence.toLowerCase();
+      return !blocked.some(phrase => lower.includes(phrase));
+    })
+    .join('.')
+    .trim();
+}
+
+/**
+ * Parse <!-- NEXT: id | id | id --> tags from Bedrock response.
+ * Returns parsed IDs and cleaned response with tag stripped.
+ */
+function parseNextTags(response) {
+  if (!response || typeof response !== 'string') {
+    return { nextIds: [], cleanedResponse: response || '' };
+  }
+
+  const pattern = /<!--\s*NEXT:\s*(.*?)\s*-->/i;
+  const match = response.match(pattern);
+
+  if (!match) {
+    return { nextIds: [], cleanedResponse: response };
+  }
+
+  const ids = match[1].split('|').map(id => id.trim()).filter(Boolean);
+  const cleanedResponse = response.replace(pattern, '').trim();
+
+  console.log(`[v3.5] Parsed ${ids.length} NEXT tags: ${ids.join(', ')}`);
+  return { nextIds: ids, cleanedResponse };
+}
+
+/**
+ * Map NEXT tag IDs to full action objects using tenant config.
+ * All IDs are deterministic — mapped from available_actions in config.
+ *
+ * Supported prefixes:
+ *   learn:formId  → send_query "Tell me more about..."
+ *   apply:formId  → start_form (filtered if already completed)
+ *   query:queryId → send_query from config.available_actions.queries
+ *   link:linkId   → external_link from config.available_actions.links
+ */
+function mapNextTagsToActions(nextIds, config, sessionContext) {
+  const availableActions = config.available_actions || {};
+  const completedForms = sessionContext?.completed_forms || [];
+  const actions = [];
+
+  for (const id of nextIds) {
+    const trimmed = id.trim();
+
+    if (trimmed.startsWith('learn:')) {
+      const formId = trimmed.slice(6);
+      const formInfo = availableActions.forms?.[formId];
+      if (formInfo) {
+        const programName = (formInfo.label || formId).replace(/^Apply to /i, '');
+        actions.push({
+          label: `Learn About ${programName}`,
+          action: 'send_query',
+          query: `Tell me more about the ${programName} program`
+        });
+      }
+    }
+    else if (trimmed.startsWith('apply:')) {
+      const formId = trimmed.slice(6);
+      const programKey = formId === 'lb_apply' ? 'lovebox' : formId === 'dd_apply' ? 'daretodream' : formId;
+      if (!completedForms.includes(programKey)) {
+        const formInfo = availableActions.forms?.[formId];
+        if (formInfo) {
+          actions.push({
+            label: formInfo.label || 'Apply',
+            action: 'start_form',
+            formId: formId
+          });
+        }
+      }
+    }
+    else if (trimmed.startsWith('query:')) {
+      const queryId = trimmed.slice(6);
+      const queryInfo = availableActions.queries?.[queryId];
+      if (queryInfo) {
+        actions.push({
+          label: queryInfo.label || queryId,
+          action: 'send_query',
+          query: queryInfo.query || queryInfo.label
+        });
+      }
+    }
+    else if (trimmed.startsWith('link:')) {
+      const linkId = trimmed.slice(5);
+      const linkInfo = availableActions.links?.[linkId];
+      if (linkInfo) {
+        actions.push({
+          label: linkInfo.label || linkId,
+          action: 'external_link',
+          url: linkInfo.url
+        });
+      }
+    }
+    else {
+      console.log(`[v3.5] Unknown NEXT tag prefix: ${trimmed}`);
+    }
+  }
+
+  console.log(`[v3.5] Mapped ${actions.length}/${nextIds.length} NEXT tags to actions`);
+  return actions.slice(0, 3);
+}
+
+function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, sessionContext = {}) {
+  console.log(`🎯 Building V3.5 prompt (W5 + Tag & Map)`);
+
+  const chatTitle = config?.chat_title || 'our organization';
+  const completedForms = sessionContext?.completed_forms || [];
+  const turnCount = (conversationHistory || []).filter(m => m.role === 'user').length;
+
+  // ── SANITIZED PERSONA (keep tenant personality, strip link/CTA instructions) ──
+  const rawPersona = config?.tone_prompt || tone ||
+    `You are a friendly team member at ${chatTitle} who genuinely cares about helping people.`;
+  const persona = sanitizeTonePrompt(rawPersona) +
+    `\nButtons appear below your message, so never put links or CTAs in your text.`;
+
+  // ── CONVERSATION HISTORY (smart compression: all user messages + last 2 assistant responses) ──
+  let historyBlock = '';
+  if (conversationHistory && conversationHistory.length > 0) {
+    const recentCutoff = conversationHistory.length - 4; // Last 2 exchanges kept in full
+    const lines = [];
+
+    for (let i = 0; i < conversationHistory.length; i++) {
+      const msg = conversationHistory[i];
+      const content = (msg.content || msg.text || '').trim();
+      if (!content) continue;
+
+      if (msg.role === 'user') {
+        // Always keep user messages — they contain personal details and context
+        lines.push(`User: ${content}`);
+      } else if (i >= recentCutoff) {
+        // Recent assistant responses — keep in full for immediate context
+        lines.push(`You: ${content}`);
+      }
+      // Earlier assistant responses are dropped — they're the bulk of prompt size
+    }
+
+    historyBlock = `\n━━━ CONVERSATION HISTORY ━━━\n${lines.join('\n')}\n`;
+  }
+
+  // ── KNOWLEDGE BASE ──
+  let kbBlock = '';
+  if (kbContext) {
+    kbBlock = `\n━━━ KNOWLEDGE BASE ━━━\nUse ONLY this information to answer. Never invent details.\n\n${kbContext}\n`;
+  } else {
+    const fallback = config?.bedrock_instructions?.fallback_message ||
+      "I don't have specific information about that. Let me help you with something else, or I can connect you with someone who can help.";
+    kbBlock = `\n━━━ NO KNOWLEDGE BASE RESULTS ━━━\nRespond with: "${fallback}"\n`;
+  }
+
+  // ── BUILD VOCABULARY ENTRIES from config ──
+  const availableActions = config.available_actions || {};
+  const conversationalForms = config.conversational_forms || {};
+
+  // Build form entries
+  const formEntries = [];
+  if (availableActions.forms && Object.keys(availableActions.forms).length > 0) {
+    for (const [formId, info] of Object.entries(availableActions.forms)) {
+      if (!completedForms.includes(formId)) {
+        formEntries.push({ formId, label: info.label || formId, directCta: info.direct_cta === true });
+      }
+    }
+  } else if (Object.keys(conversationalForms).length > 0) {
+    for (const [key, formConfig] of Object.entries(conversationalForms)) {
+      if (formConfig.enabled !== false) {
+        const formId = formConfig.form_id || key;
+        if (!completedForms.includes(formId)) {
+          formEntries.push({ formId, label: formConfig.title || key, directCta: formConfig.direct_cta === true });
+        }
+      }
+    }
+  }
+
+  // Build query entries (predefined send_query actions)
+  const queryEntries = [];
+  if (availableActions.queries && Object.keys(availableActions.queries).length > 0) {
+    for (const [queryId, info] of Object.entries(availableActions.queries)) {
+      queryEntries.push({ queryId, label: info.label || queryId });
+    }
+  }
+
+  // Build link entries
+  const linkEntries = [];
+  if (availableActions.links && Object.keys(availableActions.links).length > 0) {
+    for (const [linkId, info] of Object.entries(availableActions.links)) {
+      linkEntries.push({ linkId, label: info.label || linkId, url: info.url });
+    }
+  }
+
+  // ── BUILD ACTION VOCABULARY (all predefined IDs) ──
+  let vocabBlock = '';
+  const directCtaForms = formEntries.filter(f => f.directCta);
+  if (formEntries.length > 0 || queryEntries.length > 0 || linkEntries.length > 0) {
+    vocabBlock = '\n━━━ NEXT STEPS YOU CAN OFFER (pick 2-3) ━━━\n';
+    if (formEntries.length > 0) {
+      vocabBlock += 'Explore:\n';
+      formEntries.forEach(f => {
+        const name = (f.label || f.formId).replace(/^Apply to /i, '');
+        vocabBlock += `  learn:${f.formId} — Tell them more about ${name}\n`;
+      });
+      if (directCtaForms.length > 0) {
+        vocabBlock += 'Commit (offer these after you\'ve explained a program):\n';
+        directCtaForms.forEach(f => {
+          const name = (f.label || f.formId).replace(/^Apply to /i, '');
+          vocabBlock += `  apply:${f.formId} — Get started with ${name}\n`;
+        });
+      }
+    }
+    if (queryEntries.length > 0) {
+      vocabBlock += 'Ask:\n';
+      queryEntries.forEach(q => {
+        vocabBlock += `  query:${q.queryId} — ${q.label}\n`;
+      });
+    }
+    if (linkEntries.length > 0) {
+      vocabBlock += 'Links:\n';
+      linkEntries.forEach(l => {
+        vocabBlock += `  link:${l.linkId} — ${l.label}\n`;
+      });
+    }
+    vocabBlock += '\nRULES:';
+    if (directCtaForms.length > 0) {
+      vocabBlock += '\n• After you explain a program → include apply: for it. That\'s the natural next step.';
+    }
+    vocabBlock += '\n• learn: is ONLY for programs NOT yet discussed.';
+    vocabBlock += '\n• After explaining a program, move forward — don\'t offer learn: again for that program.';
+    vocabBlock += '\n• Stay on the user\'s topic. If they\'re asking about Love Box, buttons should be about Love Box.';
+    vocabBlock += '\n• Always pick 2-3 buttons. One is not enough.';
+  }
+
+  // ── GUIDANCE MODULES ──
+  let guidanceBlock = '';
+  if (isFeatureEnabled('GUIDANCE_MODULES', config) && config.guidance_modules) {
+    const recentText = (conversationHistory || [])
+      .slice(-3)
+      .map(m => (m.content || m.text || '').toLowerCase())
+      .join(' ');
+    for (const [key, module] of Object.entries(config.guidance_modules)) {
+      if (module.enabled !== false && recentText.includes(key.toLowerCase())) {
+        guidanceBlock += `\n━━━ GUIDANCE: ${key.toUpperCase()} ━━━\n${module.content}\n`;
+      }
+    }
+  }
+
+  // ── FILTERED CUSTOM CONSTRAINTS ──
+  // Remove "follow-up question" rules — W5 WHERE handles conversation flow
+  let constraintsBlock = '';
+  const instructions = config?.bedrock_instructions;
+  if (instructions && instructions.custom_constraints && instructions.custom_constraints.length > 0) {
+    const filtered = instructions.custom_constraints.filter(c => {
+      const lower = c.toLowerCase();
+      return !lower.includes('follow-up question') && !lower.includes('follow up question');
+    });
+    if (filtered.length > 0) {
+      constraintsBlock = '\n━━━ ADDITIONAL RULES ━━━\n' +
+        filtered.map(c => `- ${c}`).join('\n') + '\n';
+    }
+  }
+
+  // ── BUILD THE PROMPT ──
+  const chipsEnabled = isFeatureEnabled('DYNAMIC_CHIPS', config);
+  const chipSection = buildChipSection(config, turnCount);
+  const prompt = `${persona}
+${historyBlock}
+${kbBlock}
+${vocabBlock}
+${guidanceBlock}
+${constraintsBlock}
+${chipSection}
+
+━━━ USER'S MESSAGE ━━━
+${userInput}
+
+━━━ RESPOND ━━━
+
+CONSIDER before responding (do NOT write your thinking):
+  WHO — Is this person exploring, learning, or ready to act?
+  WHAT — What specific topic are they asking about? Stay on their path.
+  WHEN — Turn ${turnCount + 1}. What have I already explained? (Don't re-explain or offer learn: for it.)
+  WHERE — Momentum check: Did I explain a program? Move forward — offer the next step, not learn: again.
+  WHY — For each button: why would they click it given what they already know?
+
+WRITE your response:
+  - 2-4 sentences using ONLY facts from the knowledge base
+  - Sound human: contractions, warmth, no robotic phrasing
+  - Stay on the user's topic — if they're asking about one program, answer about THAT program
+  - End by guiding them forward — a question or invitation
+  - Never repeat info from earlier turns
+  - Never put links in your text
+
+PICK 2-3 next steps from the vocabulary above (pipe-separated):
+<!-- NEXT: id | id | id -->
+
+${chipsEnabled ? `<!-- CHIPS: ["...", "..."] -->` : ''}
+
+OUTPUT FORMAT (no thinking, just respond):
+[response]
+<!-- NEXT: ... -->
+${chipsEnabled ? '<!-- CHIPS: [...] -->' : ''}`;
+
+  console.log(`📝 V3.5 prompt length: ${prompt.length} chars`);
+  console.log(`   Turn: ${turnCount + 1}, Forms: ${formEntries.length}, Queries: ${queryEntries.length}, Links: ${linkEntries.length}`);
+  return prompt;
+}
+
+function buildPrompt(userInput, kbContext, tone, conversationHistory, config, sessionContext = {}) {
+  // V3.0: Use completely new prompt when DYNAMIC_ACTIONS is enabled
+  if (isFeatureEnabled('DYNAMIC_ACTIONS', config)) {
+    return buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, sessionContext);
+  }
+
+  // Legacy prompt for tenants without DYNAMIC_ACTIONS
   // Log prompt build metadata
   console.log(`🎯 Building prompt v${PROMPT_VERSION}`);
   console.log(`📋 Config has bedrock_instructions: ${config?.bedrock_instructions ? 'YES' : 'NO'}`);
   console.log(`🎯 KB context: ${kbContext ? kbContext.length + ' chars' : 'NONE'}`);
   console.log(`💬 Conversation history: ${conversationHistory ? conversationHistory.length + ' messages' : 'NONE'}`);
+  console.log(`🚩 Feature flags: DYNAMIC_ACTIONS=${isFeatureEnabled('DYNAMIC_ACTIONS', config)}, DYNAMIC_CHIPS=${isFeatureEnabled('DYNAMIC_CHIPS', config)}, GUIDANCE_MODULES=${isFeatureEnabled('GUIDANCE_MODULES', config)}`);
 
   const parts = [];
 
   // Use bedrock_instructions.role_instructions as master, fallback to tone_prompt for backward compatibility
   const personalityPrompt = getRoleInstructions(config, tone);
   parts.push(personalityPrompt);
-
-  // Detect if user is responding to a follow-up question
-  const followUpDetection = detectFollowUpQuestionResponse(userInput, conversationHistory);
 
   // Add conversation history if provided
   if (conversationHistory && conversationHistory.length > 0) {
@@ -1280,15 +2102,12 @@ function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
     parts.push('\nREMEMBER: The user\'s name and any personal information they\'ve shared should be remembered and used in your response when appropriate.\n');
     console.log(`✅ Added ${conversationHistory.length} messages from history`);
 
-    // Add explicit follow-up question directive if detected
-    if (followUpDetection) {
-      if (followUpDetection.topic) {
-        parts.push(`\n🎯 CRITICAL CONTEXT: The user just said "${userInput}" in response to your question about "${followUpDetection.topic}". You MUST now provide detailed information about ${followUpDetection.topic}. Do NOT acknowledge their "yes" - just answer the question directly as if they asked "${followUpDetection.topic}" themselves.\n`);
-      } else {
-        parts.push(`\n🎯 CRITICAL CONTEXT: The user just said "${userInput}" in response to your question: "${followUpDetection.originalQuestion}". You MUST now answer that question directly. Do NOT acknowledge their response - just provide the information you offered to share.\n`);
-      }
-      console.log(`✅ Added explicit follow-up question directive`);
-    }
+    // ═══════════════════════════════════════════════════════════════
+    // EVOLUTION v3.0: Internal Monologue + Anti-Robot Guardrails
+    // ═══════════════════════════════════════════════════════════════
+    parts.push('\n' + buildThoughtLayerSection());
+    parts.push('\n' + buildAntiRobotSection());
+    console.log(`✅ Added thought layer and anti-robot guardrails`);
 
     // Add LOCKED sections (never customizable)
     parts.push('\n' + getContextInterpretationRules());
@@ -1324,6 +2143,14 @@ ${kbContext}`);
     console.log(`⚠️ No KB context - using fallback message`);
   }
 
+  // ═══════════════════════════════════════════════════════════════
+  // EVOLUTION v3.0: Guidance Modules (topic-specific tone)
+  // ═══════════════════════════════════════════════════════════════
+  const guidanceSection = buildGuidanceSection(config, conversationHistory);
+  if (guidanceSection) {
+    parts.push(guidanceSection);
+  }
+
   // Add custom constraints if configured
   const customConstraints = getCustomConstraints(config);
   if (customConstraints) {
@@ -1343,12 +2170,15 @@ ${kbContext}`);
 4. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
 5. If the URL appears as a markdown link [text](url), preserve the markdown format
 
-ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
-6. DO NOT EVER include action-oriented call-to-action links or phrases in your response
-7. NEVER write things like "Join our [program] →", "Apply here →", "Check out...", "Want to learn more?", "Ready to get started?", "Sign up for..."
-8. If the knowledge base contains action links (like "Join our Love Box training program →"), DO NOT INCLUDE THEM in your response
-9. Remove ANY action-oriented links from your response - they will be provided as separate buttons
-10. Your response should end with a CONTEXTUAL FOLLOW-UP QUESTION that invites deeper exploration of the topic (e.g., "Would you like to know more about the partnership requirements?")
+ABSOLUTELY CRITICAL - NO ACTION LINKS IN TEXT:
+6. DO NOT include clickable action links like "Join our [program] →", "Apply here →" or markdown action links in your response text
+7. If the knowledge base contains action links (like "Join our Love Box training program →"), DO NOT INCLUDE THEM — action buttons are provided separately by the system
+8. Remove ANY action-oriented links from your response
+
+CLOSING YOUR RESPONSE:
+9. For the FIRST 2-3 exchanges on a topic: end with a follow-up question that invites deeper exploration (e.g., "Would you like to know about the training process?")
+10. After 3+ exchanges on the SAME topic: shift to an action invitation instead (e.g., "Ready to take the next step?", "Want me to help you get started?", "Would you like to apply?")
+11. The goal is to MOVE THE CONVERSATION FORWARD — don't keep offering more info when the user has enough to take action
 
 🚨 CRITICAL - ANSWERING FOLLOW-UP QUESTIONS 🚨
 11. If your PREVIOUS message asked a question (like "Would you like to learn more about X?") and the user says "yes", "sure", "okay", etc.:
@@ -1361,13 +2191,27 @@ ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
     RIGHT: [Directly answer the question you asked, e.g., "Our mentorship approach supports foster youth through..."]`);
 
     // ═══════════════════════════════════════════════════════════════
-    // TIER 4: BRANCH ROUTING SUGGESTIONS
+    // EVOLUTION v3.0: DYNAMIC ACTIONS + CHIPS (replaces Tier 4 branch routing)
     // ═══════════════════════════════════════════════════════════════
-    // Inject branch suggestions for free-flow conversations
-    const branchPromptSection = buildBranchPromptSection(config);
-    if (branchPromptSection) {
-      parts.push(branchPromptSection);
-      console.log(`✅ Injected Tier 4 branch routing prompt`);
+    const completedForms = sessionContext?.completed_forms || [];
+    const actionContextSection = buildActionContextSection(config, completedForms);
+    if (actionContextSection) {
+      parts.push(actionContextSection);
+      console.log(`✅ Injected dynamic action context`);
+    } else {
+      // Fallback to legacy branch routing if DYNAMIC_ACTIONS is off
+      const branchPromptSection = buildBranchPromptSection(config);
+      if (branchPromptSection) {
+        parts.push(branchPromptSection);
+        console.log(`✅ Injected legacy Tier 4 branch routing prompt (DYNAMIC_ACTIONS off)`);
+      }
+    }
+
+    const legacyTurnCount = (conversationHistory || []).filter(m => m.role === 'user').length;
+    const chipSection = buildChipSection(config, legacyTurnCount);
+    if (chipSection) {
+      parts.push(chipSection);
+      console.log(`✅ Injected dynamic chip generation prompt`);
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1766,15 +2610,18 @@ const streamingHandler = async (event, responseStream, context) => {
     // Sanitize user input to prevent prompt injection
     const sanitizedInput = sanitizeUserInput(userInput);
 
+    // Extract session context for form tracking and dynamic actions
+    const sessionContext = body.session_context || {};
+
     // Get KB context
-    const kbContext = await retrieveKB(sanitizedInput, config);
-    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
+    const kbContext = await retrieveKB(sanitizedInput, config, conversationHistory);
+    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config, sessionContext);
 
     // Prepare Bedrock request - use config model or default
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
     const temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
-    
+
     console.log(`🚀 Invoking Bedrock with model: ${modelId}`);
     
     const command = new InvokeModelWithResponseStreamCommand({
@@ -1790,15 +2637,18 @@ const streamingHandler = async (event, responseStream, context) => {
     });
     
     const response = await bedrock.send(command);
-    
+
     let firstTokenTime = null;
     let tokenCount = 0;
-    
-    // Stream the response - NO BUFFERING!
+
+    // Initialize thought-tag stripper for real-time <thought> removal
+    const thoughtStripper = createThoughtTagStripper();
+
+    // Stream the response - strip <thought> tags before sending to client
     for await (const event of response.body) {
       if (event.chunk?.bytes) {
         const chunkData = JSON.parse(new TextDecoder().decode(event.chunk.bytes));
-        
+
         if (chunkData.type === 'content_block_start') {
           // Nudge client: ensure at least one data frame precedes first text delta
           write('data: {"type":"stream_start"}\n\n');
@@ -1811,56 +2661,116 @@ const streamingHandler = async (event, responseStream, context) => {
               write(`: x-first-token-ms=${firstTokenTime}\n\n`);
               console.log(`⚡ First token in ${firstTokenTime}ms`);
             }
-            
-            // Stream to client immediately - NO DELAY
-            const sseData = JSON.stringify({
-              type: 'text',
-              content: delta.text,
-              session_id: sessionId
-            });
-            write(`data: ${sseData}\n\n`);
-            
-            // Also append to buffer in parallel (microseconds, no blocking)
+
+            // Strip <thought> tags from streamed text before sending to client
+            const visibleText = thoughtStripper.process(delta.text);
+
+            if (visibleText) {
+              // Stream visible text to client immediately
+              const sseData = JSON.stringify({
+                type: 'text',
+                content: visibleText,
+                session_id: sessionId
+              });
+              write(`data: ${sseData}\n\n`);
+            }
+
+            // Append raw text to buffer for post-processing (includes thought tags)
             responseBuffer += delta.text;
           }
         } else if (chunkData.type === 'message_stop') {
+          // Flush any remaining pending buffer from the stripper
+          const remaining = thoughtStripper.flush();
+          if (remaining) {
+            const sseData = JSON.stringify({
+              type: 'text',
+              content: remaining,
+              session_id: sessionId
+            });
+            write(`data: ${sseData}\n\n`);
+          }
           console.log('✅ Bedrock stream complete');
           break;
         }
       }
     }
-    
+
     // Send completion metadata
     const totalTime = Date.now() - startTime;
     write(`: x-total-tokens=${tokenCount}\n`);
     write(`: x-total-time-ms=${totalTime}\n`);
     console.log(`✅ Complete - ${tokenCount} tokens in ${totalTime}ms`);
-    
+
+    // ═══════════════════════════════════════════════════════════════
+    // EVOLUTION v3.5: Parse hidden tags from response buffer
+    // Supports both v3.5 NEXT tags and v3.0 ACTIONS tags (fallback)
+    // ═══════════════════════════════════════════════════════════════
+    const { parseAiActions, parseChips } = require('./response_enhancer');
+
+    // Extract thought content for logging (before stripping)
+    const thoughtMatch = responseBuffer.match(/<thought>([\s\S]*?)<\/thought>/i);
+    const thoughtContent = thoughtMatch ? thoughtMatch[1].trim() : null;
+
+    // Strip thought tags from buffer
+    let cleanBuffer = responseBuffer.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
+
+    // v3.5: Try NEXT tags first, fall back to ACTIONS tags
+    let parsedActions = [];
+    let afterActions = cleanBuffer;
+
+    const { nextIds, cleanedResponse: afterNext } = parseNextTags(cleanBuffer);
+    if (nextIds.length > 0) {
+      // v3.5 Tag & Map: map IDs to full action objects
+      parsedActions = mapNextTagsToActions(nextIds, config, sessionContext);
+      // Cap link CTAs to max 1 — prioritize learn/query actions over links
+      const nonLinks = parsedActions.filter(a => a.action !== 'external_link');
+      const links = parsedActions.filter(a => a.action === 'external_link');
+      parsedActions = [...nonLinks, ...links.slice(0, 1)];
+      afterActions = afterNext;
+      console.log(`[v3.5] Mapped NEXT tags → ${parsedActions.length} actions: ${parsedActions.map(a => a.label).join(', ')}`);
+    } else {
+      // v3.0 fallback: parse full JSON actions
+      const legacy = parseAiActions(cleanBuffer);
+      parsedActions = legacy.actions;
+      afterActions = legacy.cleanedResponse;
+      if (parsedActions.length > 0) {
+        console.log(`[v3.0 fallback] Parsed ${parsedActions.length} legacy ACTIONS`);
+      }
+    }
+
+    const { chips: parsedChips, cleanedResponse: cleanResponse } = parseChips(afterActions);
+    // Use clean response (no hidden tags) for logging
+    const logBuffer = cleanResponse;
+
     // Log complete Q&A pair AFTER streaming is done (no impact on user experience)
-    if (questionBuffer && responseBuffer) {
+    if (questionBuffer && logBuffer) {
       console.log('📝 Q&A Pair Captured:');
       console.log(`  Session: ${sessionId}`);
       console.log(`  Tenant: ${tenantHash.substring(0, 8)}...`);
       console.log(`  Question: "${questionBuffer.substring(0, 100)}${questionBuffer.length > 100 ? '...' : ''}"`);
-      console.log(`  Answer: "${responseBuffer.substring(0, 200)}${responseBuffer.length > 200 ? '...' : ''}"`);
+      console.log(`  Answer: "${logBuffer.substring(0, 200)}${logBuffer.length > 200 ? '...' : ''}"`);
       console.log(`  Full Q Length: ${questionBuffer.length} chars`);
-      console.log(`  Full A Length: ${responseBuffer.length} chars`);
-      
+      console.log(`  Full A Length: ${logBuffer.length} chars`);
+
       // Log full Q&A in structured format for analytics
       console.log(JSON.stringify({
         type: 'QA_COMPLETE',
         timestamp: new Date().toISOString(),
         session_id: sessionId,
         tenant_hash: tenantHash,
-        tenant_id: config?.tenant_id || null,  // Add tenant_id from config
-        conversation_id: body.conversation_id || sessionId,  // Add conversation_id
+        tenant_id: config?.tenant_id || null,
+        conversation_id: body.conversation_id || sessionId,
         question: questionBuffer,
-        answer: responseBuffer,
+        answer: logBuffer,
+        thought: thoughtContent,
+        next_tags: nextIds.length > 0 ? nextIds : undefined,
+        ai_actions: parsedActions.length > 0 ? parsedActions : undefined,
+        suggested_chips: parsedChips.length > 0 ? parsedChips : undefined,
         metrics: {
           first_token_ms: firstTokenTime,
           total_tokens: tokenCount,
           total_time_ms: totalTime,
-          answer_length: responseBuffer.length
+          answer_length: logBuffer.length
         }
       }));
 
@@ -1877,14 +2787,22 @@ const streamingHandler = async (event, responseStream, context) => {
       const routingMetadata = body.routing_metadata || {};
 
       const enhancedData = await enhanceResponse(
-        responseBuffer,  // The complete Bedrock response
-        userInput,       // The user's message
-        tenantHash,      // Tenant identifier
-        body.session_context || {}, // Session context for form tracking
-        routingMetadata  // Routing metadata for explicit routing (action chips, CTAs, fallback)
+        cleanResponse,   // The clean Bedrock response (hidden tags stripped)
+        userInput,        // The user's message
+        tenantHash,       // Tenant identifier
+        sessionContext,   // Session context for form tracking
+        routingMetadata,  // Routing metadata for explicit routing (action chips, CTAs, fallback)
+        parsedActions     // AI-generated actions (from NEXT tags or legacy ACTIONS tag)
       );
 
       if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+        // Sort CTAs: form actions first, then queries, then links
+        const ctaPriority = { 'start_form': 0, 'send_query': 1, 'external_link': 2 };
+        enhancedData.ctaButtons.sort((a, b) => (ctaPriority[a.action] ?? 9) - (ctaPriority[b.action] ?? 9));
+        // Mark first CTA as primary, rest as secondary (drives frontend styling)
+        enhancedData.ctaButtons.forEach((cta, i) => {
+          cta._position = i === 0 ? 'primary' : 'secondary';
+        });
         // Send CTAs as a separate SSE event
         const ctaData = JSON.stringify({
           type: 'cta_buttons',
@@ -1893,11 +2811,36 @@ const streamingHandler = async (event, responseStream, context) => {
           session_id: sessionId
         });
         write(`data: ${ctaData}\n\n`);
-        console.log(`🎯 Sent ${enhancedData.ctaButtons.length} CTA buttons for branch: ${enhancedData.metadata?.branch_detected || 'form'}`);
+        console.log(`🎯 Sent ${enhancedData.ctaButtons.length} CTA buttons (${enhancedData.metadata?.routing_tier || 'dynamic'})`);
+      }
+
+      // Send showcase card if present
+      if (enhancedData.showcaseCard) {
+        const showcaseData = JSON.stringify({
+          type: 'showcase_card',
+          showcaseCard: enhancedData.showcaseCard,
+          session_id: sessionId,
+          metadata: enhancedData.metadata
+        });
+        write(`data: ${showcaseData}\n\n`);
+        console.log(`🎯 Sent showcase card: ${enhancedData.showcaseCard.id}`);
       }
     } catch (enhanceError) {
       console.error('❌ CTA enhancement error:', enhanceError);
       // Don't fail the response if CTA enhancement fails
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // EVOLUTION v3.0: Send suggested chips as separate SSE event
+    // ═══════════════════════════════════════════════════════════════
+    if (parsedChips.length > 0 && isFeatureEnabled('DYNAMIC_CHIPS', config)) {
+      const chipData = JSON.stringify({
+        type: 'suggested_chips',
+        chips: parsedChips,
+        session_id: sessionId
+      });
+      write(`data: ${chipData}\n\n`);
+      console.log(`💡 Sent ${parsedChips.length} suggested chips`);
     }
 
   } catch (error) {
@@ -2078,9 +3021,12 @@ const bufferedHandler = async (event, context) => {
     // Sanitize user input to prevent prompt injection
     const sanitizedInput = sanitizeUserInput(userInput);
 
+    // Extract session context for form tracking and dynamic actions
+    const sessionContext = body.session_context || {};
+
     // Get KB context
-    const kbContext = await retrieveKB(sanitizedInput, config);
-    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
+    const kbContext = await retrieveKB(sanitizedInput, config, conversationHistory);
+    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config, sessionContext);
 
     // Prepare Bedrock request - use config model or default
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
@@ -2227,3 +3173,19 @@ const bufferedHandler = async (event, context) => {
 
 // Export the appropriate handler based on streaming support
 exports.handler = streamifyResponse ? streamifyResponse(streamingHandler) : bufferedHandler;
+
+// Test-only exports (not used by Lambda runtime)
+if (process.env.NODE_ENV === 'test' || process.env.PICASSO_TEST_MODE === 'true') {
+  exports._test = {
+    buildPrompt,
+    buildV3Prompt,
+    buildKBSearchQuery,
+    isFeatureEnabled,
+    createThoughtTagStripper,
+    buildActionContextSection,
+    buildChipSection,
+    buildThoughtLayerSection,
+    buildAntiRobotSection,
+    buildGuidanceSection,
+  };
+}

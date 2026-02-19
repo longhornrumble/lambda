@@ -1,8 +1,11 @@
 /**
- * Response Enhancer for Conversational Form CTAs
+ * Response Enhancer for Conversational CTAs
  *
- * Simple context bridge that detects conversation topics and injects
- * appropriate CTAs based on configuration. No complex scoring or strategies.
+ * v3.0 Evolution: Supports AI-generated dynamic actions alongside
+ * legacy explicit routing (Tier 1-2 action chips preserved).
+ *
+ * New: parseAiActions(), parseChips() for extracting AI-generated
+ * hidden tags from Bedrock responses.
  */
 
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
@@ -16,6 +19,192 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 // Track if we've warned about S3 bucket fallback (only warn once per Lambda instance)
 let s3BucketWarningLogged = false;
+
+// ═══════════════════════════════════════════════════════════════
+// EVOLUTION v3.0: AI-Generated Action & Chip Parsers
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Parse AI-generated actions from Bedrock response.
+ * Extracts <!-- ACTIONS: [...] --> hidden tag and returns parsed actions.
+ *
+ * @param {string} response - Bedrock response text (may include hidden tags)
+ * @returns {{ actions: Array, cleanedResponse: string }}
+ */
+function parseAiActions(response) {
+    if (!response || typeof response !== 'string') {
+        return { actions: [], cleanedResponse: response || '' };
+    }
+
+    const pattern = /<!--\s*ACTIONS:\s*(\[[\s\S]*?\])\s*-->/i;
+    const match = response.match(pattern);
+
+    if (!match) {
+        return { actions: [], cleanedResponse: response };
+    }
+
+    try {
+        const actions = JSON.parse(match[1]);
+        const cleanedResponse = response.replace(pattern, '').trim();
+        console.log(`[v3.0] Parsed ${actions.length} AI-generated actions`);
+        return { actions: Array.isArray(actions) ? actions : [], cleanedResponse };
+    } catch (parseError) {
+        console.error('[v3.0] Failed to parse AI-generated actions:', parseError.message);
+        // Strip the malformed tag but return no actions
+        const cleanedResponse = response.replace(pattern, '').trim();
+        return { actions: [], cleanedResponse };
+    }
+}
+
+/**
+ * Parse suggested chips from Bedrock response.
+ * Extracts <!-- CHIPS: [...] --> hidden tag and returns chip strings.
+ *
+ * @param {string} response - Bedrock response text (may include hidden tags)
+ * @returns {{ chips: Array<string>, cleanedResponse: string }}
+ */
+function parseChips(response) {
+    if (!response || typeof response !== 'string') {
+        return { chips: [], cleanedResponse: response || '' };
+    }
+
+    const pattern = /<!--\s*CHIPS:\s*(\[[\s\S]*?\])\s*-->/i;
+    const match = response.match(pattern);
+
+    if (!match) {
+        return { chips: [], cleanedResponse: response };
+    }
+
+    try {
+        const chips = JSON.parse(match[1]);
+        const cleanedResponse = response.replace(pattern, '').trim();
+        // Validate: must be array of strings, max 3, max 50 chars each
+        const validChips = (Array.isArray(chips) ? chips : [])
+            .filter(c => typeof c === 'string' && c.trim().length > 0)
+            .map(c => c.trim().slice(0, 50))
+            .slice(0, 3);
+        console.log(`[v3.0] Parsed ${validChips.length} suggested chips`);
+        return { chips: validChips, cleanedResponse };
+    } catch (parseError) {
+        console.error('[v3.0] Failed to parse suggested chips:', parseError.message);
+        const cleanedResponse = response.replace(pattern, '').trim();
+        return { chips: [], cleanedResponse };
+    }
+}
+
+/**
+ * Validate and filter AI-generated actions against tenant config.
+ * Ensures formIds exist, URLs are valid, and completed forms are excluded.
+ *
+ * @param {Array} actions - Raw AI-generated actions
+ * @param {Object} config - Tenant configuration
+ * @param {Array} completedForms - List of completed form program IDs
+ * @returns {Array} - Validated CTA buttons ready for frontend
+ */
+function validateAiActions(actions, config, completedForms = []) {
+    if (!actions || !Array.isArray(actions) || actions.length === 0) {
+        return [];
+    }
+
+    const conversationalForms = config.conversational_forms || {};
+    const availableActions = config.available_actions || {};
+    const availableForms = availableActions.forms || {};
+    const availableLinks = availableActions.links || {};
+    const validated = [];
+
+    for (const action of actions.slice(0, 3)) {
+        // Must have label and action type
+        if (!action.label || !action.action) {
+            console.log(`[v3.0] Skipping action without label/action:`, action);
+            continue;
+        }
+
+        if (action.action === 'start_form') {
+            // Validate formId exists in config
+            const formId = action.formId || action.form_id;
+            if (!formId) {
+                console.log(`[v3.0] Skipping start_form action without formId`);
+                continue;
+            }
+
+            // Check available_actions.forms first, then conversational_forms
+            let formFound = false;
+            let program = formId;
+
+            if (availableForms[formId]) {
+                formFound = true;
+                program = formId;
+            } else {
+                for (const [key, formConfig] of Object.entries(conversationalForms)) {
+                    if (formConfig.form_id === formId || key === formId) {
+                        formFound = true;
+                        program = formConfig.program || formConfig.form_id || key;
+                        break;
+                    }
+                }
+            }
+
+            if (!formFound) {
+                console.log(`[v3.0] Skipping start_form - formId "${formId}" not in config`);
+                continue;
+            }
+
+            // Filter completed forms
+            let programKey = program;
+            if (formId === 'lb_apply') programKey = 'lovebox';
+            else if (formId === 'dd_apply') programKey = 'daretodream';
+
+            if (completedForms.includes(programKey)) {
+                console.log(`[v3.0] Filtering completed program: ${programKey} (formId: ${formId})`);
+                continue;
+            }
+
+            validated.push({
+                type: 'form_cta',
+                label: action.label,
+                action: 'start_form',
+                formId: formId
+            });
+
+        } else if (action.action === 'external_link') {
+            // Validate URL exists and looks legitimate
+            if (!action.url || typeof action.url !== 'string') {
+                console.log(`[v3.0] Skipping external_link without url`);
+                continue;
+            }
+
+            // Basic URL validation — must start with http
+            if (!action.url.startsWith('http')) {
+                console.log(`[v3.0] Skipping external_link with invalid url: "${action.url}"`);
+                continue;
+            }
+
+            validated.push({
+                label: action.label,
+                action: 'external_link',
+                url: action.url
+            });
+
+        } else if (action.action === 'send_query') {
+            // Validate query exists
+            if (!action.query || typeof action.query !== 'string') {
+                console.log(`[v3.0] Skipping send_query without query`);
+                continue;
+            }
+            validated.push({
+                label: action.label,
+                action: 'send_query',
+                query: action.query
+            });
+
+        } else {
+            console.log(`[v3.0] Skipping unknown action type: ${action.action}`);
+        }
+    }
+
+    console.log(`[v3.0] Validated ${validated.length}/${actions.length} AI-generated actions`);
+    return validated;
+}
 
 /**
  * Get config bucket name with warning if using fallback
@@ -92,7 +281,8 @@ async function loadTenantConfig(tenantHash) {
             cta_definitions: config.cta_definitions || {},
             conversational_forms: config.conversational_forms || {},
             cta_settings: config.cta_settings || {},  // Required for Tier 3 fallback routing
-            content_showcase: config.content_showcase || []  // Required for showcase items
+            content_showcase: config.content_showcase || [],  // Required for showcase items
+            available_actions: config.available_actions || {}  // Required for v3.5 NEXT tag validation
         };
 
         // Cache the config
@@ -140,7 +330,15 @@ function getConversationBranch(routingMetadata, config) {
 
     // TIER 2: Explicit CTA routing
     if (routingMetadata.cta_triggered) {
-        const targetBranch = routingMetadata.target_branch;
+        // Try target_branch from metadata first, then look up from cta_definitions by cta_id
+        let targetBranch = routingMetadata.target_branch;
+        if (!targetBranch && routingMetadata.cta_id) {
+            const ctaDefs = config.cta_definitions || {};
+            targetBranch = ctaDefs[routingMetadata.cta_id]?.target_branch;
+            if (targetBranch) {
+                console.log(`[Tier 2] Resolved target_branch from cta_definitions[${routingMetadata.cta_id}]: ${targetBranch}`);
+            }
+        }
         if (targetBranch && branches[targetBranch]) {
             console.log(`[Tier 2] Routing via CTA to branch: ${targetBranch}`);
             return targetBranch;
@@ -609,7 +807,7 @@ function checkFormTriggers(bedrockResponse, userQuery, config) {
 /**
  * Main enhancement function - adds CTAs to Bedrock response
  */
-async function enhanceResponse(bedrockResponse, userMessage, tenantHash, sessionContext = {}, routingMetadata = {}) {
+async function enhanceResponse(bedrockResponse, userMessage, tenantHash, sessionContext = {}, routingMetadata = {}, parsedActions = null) {
     console.log('🔍 enhanceResponse called with:', {
         responseLength: bedrockResponse?.length,
         userMessage,
@@ -619,6 +817,8 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         completedForms: sessionContext.completed_forms || [],
         suspendedForms: sessionContext.suspended_forms || [],
         programInterest: sessionContext.program_interest,
+        hasParsedActions: parsedActions && parsedActions.length > 0,
+        parsedActionCount: parsedActions?.length || 0,
         responseSnippet: bedrockResponse?.substring(0, 100)
     });
 
@@ -900,6 +1100,61 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
             };
         }
 
+        // ============================================================================
+        // EVOLUTION v3.0: AI-Generated Dynamic Actions
+        // ============================================================================
+        // If the model generated actions via <!-- ACTIONS: [...] -->, validate and use them
+        if (parsedActions && parsedActions.length > 0) {
+            console.log(`[v3.0] Processing ${parsedActions.length} AI-generated actions`);
+            const validatedActions = validateAiActions(parsedActions, config, completedForms);
+
+            if (validatedActions.length > 0) {
+                return {
+                    message: bedrockResponse,
+                    ctaButtons: validatedActions,
+                    metadata: {
+                        enhanced: true,
+                        routing_tier: 'v3_dynamic',
+                        routing_method: 'ai_generated',
+                        actions_proposed: parsedActions.length,
+                        actions_validated: validatedActions.length
+                    }
+                };
+            }
+            // If all actions were filtered/invalid, return with no CTAs (don't fall to legacy)
+            console.log(`[v3.0] All AI-generated actions filtered — returning without CTAs`);
+            return {
+                message: bedrockResponse,
+                ctaButtons: [],
+                metadata: {
+                    enhanced: false,
+                    routing_tier: 'v3_dynamic',
+                    routing_method: 'ai_generated_none_valid',
+                    actions_proposed: parsedActions.length,
+                    actions_validated: 0
+                }
+            };
+        }
+
+        // When DYNAMIC_ACTIONS is on but no actions were parsed, skip legacy entirely
+        if (config?.feature_flags?.DYNAMIC_ACTIONS) {
+            console.log(`[v3.0] DYNAMIC_ACTIONS enabled — skipping legacy keyword detection`);
+            return {
+                message: bedrockResponse,
+                ctaButtons: [],
+                metadata: {
+                    enhanced: false,
+                    routing_tier: 'v3_dynamic',
+                    routing_method: 'no_actions_generated'
+                }
+            };
+        }
+
+        // ============================================================================
+        // LEGACY: Keyword-based form triggers and branch detection
+        // Active ONLY when DYNAMIC_ACTIONS feature flag is off
+        // ============================================================================
+
         // Check for form triggers first (highest priority)
         const formTrigger = checkFormTriggers(bedrockResponse, userMessage, config);
         if (formTrigger) {
@@ -1065,10 +1320,15 @@ function getShowcaseById(showcaseId, config) {
 module.exports = {
     enhanceResponse,
     loadTenantConfig,
-    detectConversationBranch,  // DEPRECATED - kept for backward compatibility
+    // v3.0 Evolution - AI-generated action/chip parsers
+    parseAiActions,
+    parseChips,
+    validateAiActions,
+    // Legacy - kept for backward compatibility
+    detectConversationBranch,   // DEPRECATED - keyword-based branch detection
     getConversationBranch,      // Tier 1-3 explicit routing
     buildCtasFromBranch,        // Explicit CTA building from branch
-    parseBranchHint,            // Tier 4 - AI-suggested branch parsing
+    parseBranchHint,            // Tier 4 - AI-suggested branch parsing (legacy)
     getShowcaseForBranch,       // Phase 2.3 - Showcase items lookup
     resolveShowcaseCTAs,        // Phase 2.3 - Showcase CTA resolution
     getShowcaseById             // Action chip → showcase direct routing
