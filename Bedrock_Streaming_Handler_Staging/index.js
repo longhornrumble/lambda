@@ -70,7 +70,7 @@
  *   - Should achieve 95%+ style differentiation accuracy
  */
 
-const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
+const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { BedrockAgentRuntimeClient, RetrieveCommand } = require('@aws-sdk/client-bedrock-agent-runtime');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { SQSClient, SendMessageCommand, SendMessageBatchCommand } = require('@aws-sdk/client-sqs');
@@ -1422,25 +1422,38 @@ DYNAMIC RESPONSE ACTIONS:
 After your response, if contextual next steps would help the user, append an HTML comment
 with 1-3 action buttons. These are HIDDEN from the user and parsed by the system.`);
 
-  // Build available actions from config
-  const availableActions = config.available_actions || {};
-  const conversationalForms = config.conversational_forms || {};
+  // Build available actions from cta_definitions (ai_available CTAs)
   const ctaDefinitions = config.cta_definitions || {};
-
-  // Forms section - pull from available_actions OR conversational_forms
   const formEntries = [];
-  if (availableActions.forms && Object.keys(availableActions.forms).length > 0) {
-    // Use explicit available_actions.forms
-    for (const [formId, formInfo] of Object.entries(availableActions.forms)) {
-      formEntries.push(`- formId "${formId}": ${formInfo.description || formInfo.label || formId}`);
+  const linkEntries = [];
+  const infoCtas = [];
+
+  for (const [ctaId, cta] of Object.entries(ctaDefinitions)) {
+    if (cta.ai_available !== true) continue;
+
+    if (cta.action === 'start_form' && cta.formId) {
+      if (!completedForms.includes(cta.formId)) {
+        formEntries.push(`- "${cta.label || ctaId}" (formId: "${cta.formId}")`);
+      }
+    } else if (cta.action === 'external_link' && cta.url) {
+      linkEntries.push(`- "${cta.label || ctaId}": ${cta.url}`);
+    } else if (cta.action === 'show_info') {
+      infoCtas.push(`- "${cta.label || ctaId}": Guided exploration with branch CTAs`);
     }
-  } else if (Object.keys(conversationalForms).length > 0) {
-    // Fallback: auto-generate from conversational_forms config
-    for (const [key, formConfig] of Object.entries(conversationalForms)) {
-      if (formConfig.enabled !== false) {
-        const formId = formConfig.form_id || key;
-        const desc = formConfig.title || formConfig.description || key;
-        formEntries.push(`- formId "${formId}": ${desc}`);
+  }
+
+  // Legacy fallback: if no ai_available CTAs, try available_actions
+  if (formEntries.length === 0 && linkEntries.length === 0 && infoCtas.length === 0 && config.available_actions) {
+    console.log('[v3.5] buildActionContextSection: falling back to available_actions');
+    const availableActions = config.available_actions;
+    if (availableActions.forms) {
+      for (const [formId, formInfo] of Object.entries(availableActions.forms)) {
+        formEntries.push(`- formId "${formId}": ${formInfo.description || formInfo.label || formId}`);
+      }
+    }
+    if (availableActions.links) {
+      for (const [linkId, linkInfo] of Object.entries(availableActions.links)) {
+        linkEntries.push(`- "${linkInfo.label || linkId}": ${linkInfo.url}`);
       }
     }
   }
@@ -1451,32 +1464,17 @@ AVAILABLE FORMS (use action "start_form"):
 ${formEntries.join('\n')}`);
   }
 
-  // Links section - pull from available_actions.links OR cta_definitions with external_link
-  const linkEntries = [];
-  if (availableActions.links && Object.keys(availableActions.links).length > 0) {
-    for (const [linkId, linkInfo] of Object.entries(availableActions.links)) {
-      linkEntries.push(`- "${linkInfo.label || linkId}": ${linkInfo.url}`);
-    }
-  } else {
-    // Fallback: extract external_link CTAs from cta_definitions
-    for (const [ctaId, ctaDef] of Object.entries(ctaDefinitions)) {
-      if (ctaDef.action === 'external_link' && ctaDef.url) {
-        linkEntries.push(`- "${ctaDef.label || ctaId}": ${ctaDef.url}`);
-      }
-    }
-  }
-
   if (linkEntries.length > 0) {
     parts.push(`
 AVAILABLE LINKS (use action "external_link"):
 ${linkEntries.join('\n')}`);
   }
 
-  // Query shortcuts explanation
-  parts.push(`
-QUERY SHORTCUTS (use action "send_query"):
-- Generate contextual follow-up questions the user might want to ask
-- The "query" field should be a natural question, NOT a keyword`);
+  if (infoCtas.length > 0) {
+    parts.push(`
+AVAILABLE INFO PAGES (use action "show_info"):
+${infoCtas.join('\n')}`);
+  }
 
   // Completed forms
   if (completedForms.length > 0) {
@@ -1487,24 +1485,23 @@ USER HAS COMPLETED: [${completedForms.join(', ')}] — do NOT suggest these form
   // Format instructions
   parts.push(`
 FORMAT (append at the very end of your response, after all visible text):
-<!-- ACTIONS: [{"label":"Apply Now","action":"start_form","formId":"lb_apply"},{"label":"What's the time commitment?","action":"send_query","query":"What is the time commitment for Love Box?"}] -->
+<!-- ACTIONS: [{"label":"Apply Now","action":"start_form","formId":"lb_apply"},{"label":"Learn About Love Box","action":"show_info","prompt":"...","target_branch":"lovebox_info"}] -->
 
 RULES:
 - Only suggest actions that are contextually relevant to THIS response
 - Do NOT suggest forms the user has already completed (listed above)
 - Include 0-3 actions (0 is fine — don't force actions when none are relevant)
-- "send_query" actions should be natural follow-up questions, not generic
 - Always include formId for "start_form" actions (must match available forms above)
 - Always include url for "external_link" actions
-- Always include query for "send_query" actions
+- For "show_info" actions, include prompt text and target_branch if applicable
 
 PROGRESSION RULES:
 - After 3+ turns on the same topic, prioritize ACTION buttons over info queries
 - If the user has been exploring a program in depth, suggest "Get Started" or "Schedule a Call" type actions, not more "Learn About..." buttons
-- Do NOT generate send_query actions for questions already answered in the conversation
-- Vary your action labels — don't repeat "Learn About Volunteering" across multiple responses`);
+- Vary your action labels — don't repeat the same button across multiple responses`);
 
-  console.log(`✅ Built dynamic action context section (${formEntries.length} forms, ${linkEntries.length} links)`);
+  const totalEntries = formEntries.length + linkEntries.length + infoCtas.length;
+  console.log(`✅ Built dynamic action context section (${formEntries.length} forms, ${linkEntries.length} links, ${infoCtas.length} info)`);
   return parts.join('\n');
 }
 
@@ -1523,19 +1520,12 @@ function buildChipSection(config, turnCount = 0) {
   const maxChips = config?.suggested_chips?.max_chips || 3;
 
   return `
-SUGGESTED FOLLOW-UP CHIPS:
-Your response ends with a question. Generate ${maxChips} chips that are the most likely answers the user would give to YOUR closing question.
-
-FORMAT (append after NEXT tag if present, or at the very end):
-<!-- CHIPS: ["answer option 1", "answer option 2", "answer option 3"] -->
-
-RULES:
-- ${maxChips} chips, each under 50 chars
-- Each chip answers YOUR closing question from the user's perspective
-- Write them as the user would say them: "Tell me about Love Box", "Yes, I'd like to apply", "Not sure yet"
-
-Example: If you end with "Are you leaning toward Dare to Dream, or would you like to explore Love Box?"
-→ <!-- CHIPS: ["I'm interested in Dare to Dream", "Tell me about Love Box", "I'm not sure yet"] -->`;
+CHIPS — suggest up to ${maxChips} things the user would most likely say next.
+Format: <!-- CHIPS: ["option 1", "option 2"] -->
+- Each under 50 chars, written from the user's perspective
+- Never repeat or rephrase what the user just asked — chips move forward, not backward
+- If your response covers multiple topics, spread chips across them — don't favor just one
+- Fewer is better than filler. Only include chips that are genuinely useful.`;
 }
 
 /**
@@ -1803,68 +1793,99 @@ function parseNextTags(response) {
  *   link:linkId   → external_link from config.available_actions.links
  */
 function mapNextTagsToActions(nextIds, config, sessionContext) {
-  const availableActions = config.available_actions || {};
+  const ctaDefinitions = config.cta_definitions || {};
   const completedForms = sessionContext?.completed_forms || [];
   const actions = [];
 
   for (const id of nextIds) {
-    const trimmed = id.trim();
+    const ctaId = id.trim();
+    const cta = ctaDefinitions[ctaId];
 
-    if (trimmed.startsWith('learn:')) {
-      const formId = trimmed.slice(6);
-      const formInfo = availableActions.forms?.[formId];
-      if (formInfo) {
-        const programName = (formInfo.label || formId).replace(/^Apply to /i, '');
-        actions.push({
-          label: `Learn About ${programName}`,
-          action: 'send_query',
-          query: `Tell me more about the ${programName} program`
-        });
+    if (!cta) {
+      // Legacy fallback: try prefix-based lookup against available_actions
+      const legacyAction = mapLegacyPrefixTag(ctaId, config, completedForms);
+      if (legacyAction) {
+        actions.push(legacyAction);
+      } else {
+        console.log(`[v3.5] Unknown CTA ID in NEXT tag: "${ctaId}"`);
+      }
+      continue;
+    }
+
+    // Skip completed forms
+    if (cta.action === 'start_form' && cta.formId) {
+      if (completedForms.includes(cta.formId)) {
+        console.log(`[v3.5] Skipping completed form CTA: ${ctaId}`);
+        continue;
       }
     }
-    else if (trimmed.startsWith('apply:')) {
-      const formId = trimmed.slice(6);
-      const programKey = formId === 'lb_apply' ? 'lovebox' : formId === 'dd_apply' ? 'daretodream' : formId;
-      if (!completedForms.includes(programKey)) {
-        const formInfo = availableActions.forms?.[formId];
-        if (formInfo) {
-          if (formInfo.show_info === true) {
-            // Guided path: show_info with optional branch CTAs
-            actions.push({
-              label: formInfo.label || 'Learn More',
-              action: 'show_info',
-              prompt: formInfo.prompt || formInfo.description || '',
-              target_branch: formInfo.target_branch || null
-            });
-          } else {
-            // Direct form: start conversational form immediately
-            actions.push({
-              label: formInfo.label || 'Apply',
-              action: 'start_form',
-              formId: formId
-            });
-          }
-        }
+
+    // Build action payload directly from CTA definition
+    const action = {
+      label: cta.label || ctaId,
+      action: cta.action,
+    };
+
+    if (cta.action === 'start_form' && cta.formId) {
+      action.formId = cta.formId;
+    }
+    if (cta.action === 'external_link' && cta.url) {
+      action.url = cta.url;
+    }
+    if (cta.action === 'show_info') {
+      action.prompt = cta.prompt || '';
+      if (cta.target_branch) {
+        action.target_branch = cta.target_branch;
       }
     }
-    else if (trimmed.startsWith('link:')) {
-      const linkId = trimmed.slice(5);
-      const linkInfo = availableActions.links?.[linkId];
-      if (linkInfo) {
-        actions.push({
-          label: linkInfo.label || linkId,
-          action: 'external_link',
-          url: linkInfo.url
-        });
-      }
+    if (cta.action === 'send_query' && cta.query) {
+      action.query = cta.query;
     }
-    else {
-      console.log(`[v3.5] Unknown NEXT tag prefix: ${trimmed}`);
-    }
+
+    actions.push(action);
   }
 
   console.log(`[v3.5] Mapped ${actions.length}/${nextIds.length} NEXT tags to actions`);
   return actions.slice(0, 3);
+}
+
+/**
+ * Legacy fallback: parse prefix-based tags (learn:/apply:/link:) against available_actions.
+ * Supports tenants not yet migrated to ai_available CTAs. Remove after full migration.
+ */
+function mapLegacyPrefixTag(tag, config, completedForms) {
+  const availableActions = config.available_actions || {};
+
+  if (tag.startsWith('apply:')) {
+    const formId = tag.slice(6);
+    if (completedForms.includes(formId)) return null;
+    const formInfo = availableActions.forms?.[formId];
+    if (!formInfo) return null;
+    if (formInfo.show_info === true) {
+      return {
+        label: formInfo.label || 'Learn More',
+        action: 'show_info',
+        prompt: formInfo.prompt || formInfo.description || '',
+        target_branch: formInfo.target_branch || null
+      };
+    }
+    return { label: formInfo.label || 'Apply', action: 'start_form', formId };
+  }
+
+  if (tag.startsWith('link:')) {
+    const linkId = tag.slice(5);
+    const linkInfo = availableActions.links?.[linkId];
+    if (!linkInfo) return null;
+    return { label: linkInfo.label || linkId, action: 'external_link', url: linkInfo.url };
+  }
+
+  // learn: dropped — CHIPS handle follow-up suggestions
+  if (tag.startsWith('learn:')) {
+    console.log(`[v3.5] Ignoring deprecated learn: tag — CHIPS handle follow-ups`);
+    return null;
+  }
+
+  return null;
 }
 
 function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, sessionContext = {}) {
@@ -1877,8 +1898,7 @@ function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, 
   // ── SANITIZED PERSONA (keep tenant personality, strip link/CTA instructions) ──
   const rawPersona = config?.tone_prompt || tone ||
     `You are a friendly team member at ${chatTitle} who genuinely cares about helping people.`;
-  const persona = sanitizeTonePrompt(rawPersona) +
-    `\nButtons appear below your message, so never put links or CTAs in your text.`;
+  const persona = sanitizeTonePrompt(rawPersona);
 
   // ── CONVERSATION HISTORY (smart compression: all user messages + last 2 assistant responses) ──
   let historyBlock = '';
@@ -1914,85 +1934,94 @@ function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, 
     kbBlock = `\n━━━ NO KNOWLEDGE BASE RESULTS ━━━\nRespond with: "${fallback}"\n`;
   }
 
-  // ── BUILD VOCABULARY ENTRIES from config ──
-  const availableActions = config.available_actions || {};
-  const conversationalForms = config.conversational_forms || {};
+  // ── BUILD VOCABULARY from ai_available CTAs ──
+  const ctaDefinitions = config.cta_definitions || {};
 
-  // Build form entries
-  const formEntries = [];
-  if (availableActions.forms && Object.keys(availableActions.forms).length > 0) {
-    for (const [formId, info] of Object.entries(availableActions.forms)) {
-      if (!completedForms.includes(formId)) {
-        formEntries.push({ formId, label: info.label || formId, directCta: info.direct_cta === true });
-      }
+  // Filter to AI-available CTAs, group by action type
+  const formCtas = [];
+  const infoCtas = [];
+  const linkCtas = [];
+
+  for (const [ctaId, cta] of Object.entries(ctaDefinitions)) {
+    if (cta.ai_available !== true) continue;
+
+    // Skip completed forms
+    if (cta.action === 'start_form' && cta.formId && completedForms.includes(cta.formId)) {
+      continue;
     }
-  } else if (Object.keys(conversationalForms).length > 0) {
-    for (const [key, formConfig] of Object.entries(conversationalForms)) {
-      if (formConfig.enabled !== false) {
-        const formId = formConfig.form_id || key;
+
+    switch (cta.action) {
+      case 'start_form':
+        formCtas.push({ ctaId, label: cta.label });
+        break;
+      case 'show_info':
+        infoCtas.push({ ctaId, label: cta.label });
+        break;
+      case 'external_link':
+        linkCtas.push({ ctaId, label: cta.label });
+        break;
+      // send_query excluded — CHIPS handle follow-up suggestions
+    }
+  }
+
+  // Legacy fallback: if no ai_available CTAs, try available_actions
+  const hasAiCtas = formCtas.length > 0 || infoCtas.length > 0 || linkCtas.length > 0;
+  if (!hasAiCtas && config.available_actions) {
+    console.log('[v3.5] No ai_available CTAs found, falling back to available_actions vocabulary');
+    const availableActions = config.available_actions;
+    if (availableActions.forms) {
+      for (const [formId, info] of Object.entries(availableActions.forms)) {
         if (!completedForms.includes(formId)) {
-          formEntries.push({ formId, label: formConfig.title || key, directCta: formConfig.direct_cta === true });
+          if (info.direct_cta === true) formCtas.push({ ctaId: `apply:${formId}`, label: info.label || formId });
+          infoCtas.push({ ctaId: `learn:${formId}`, label: `Learn about ${(info.label || formId).replace(/^Apply to /i, '')}` });
         }
       }
     }
-  }
-
-  // Build link entries
-  const linkEntries = [];
-  if (availableActions.links && Object.keys(availableActions.links).length > 0) {
-    for (const [linkId, info] of Object.entries(availableActions.links)) {
-      linkEntries.push({ linkId, label: info.label || linkId, url: info.url });
-    }
-  }
-
-  // ── BUILD ACTION VOCABULARY (all predefined IDs) ──
-  let vocabBlock = '';
-  const directCtaForms = formEntries.filter(f => f.directCta);
-  if (formEntries.length > 0 || linkEntries.length > 0) {
-    vocabBlock = '\n━━━ NEXT STEPS YOU CAN OFFER (pick 2-3) ━━━\n';
-    if (formEntries.length > 0) {
-      vocabBlock += 'Explore:\n';
-      formEntries.forEach(f => {
-        const name = (f.label || f.formId).replace(/^Apply to /i, '');
-        vocabBlock += `  learn:${f.formId} — Tell them more about ${name}\n`;
-      });
-      if (directCtaForms.length > 0) {
-        vocabBlock += 'Commit (offer these after you\'ve explained a program):\n';
-        directCtaForms.forEach(f => {
-          const name = (f.label || f.formId).replace(/^Apply to /i, '');
-          vocabBlock += `  apply:${f.formId} — Get started with ${name}\n`;
-        });
+    if (availableActions.links) {
+      for (const [linkId, info] of Object.entries(availableActions.links)) {
+        linkCtas.push({ ctaId: `link:${linkId}`, label: info.label || linkId });
       }
     }
-    if (linkEntries.length > 0) {
+  }
+
+  // ── BUILD VOCABULARY BLOCK ──
+  let vocabBlock = '';
+  const hasCtas = formCtas.length > 0 || infoCtas.length > 0 || linkCtas.length > 0;
+
+  if (hasCtas) {
+    vocabBlock = '\n━━━ NEXT STEPS YOU CAN OFFER (pick 2-3) ━━━\n';
+    if (infoCtas.length > 0) {
+      vocabBlock += 'Explore:\n';
+      infoCtas.forEach(c => {
+        vocabBlock += `  ${c.ctaId} — ${c.label}\n`;
+      });
+    }
+    if (formCtas.length > 0) {
+      vocabBlock += 'Apply:\n';
+      formCtas.forEach(c => {
+        vocabBlock += `  ${c.ctaId} — ${c.label}\n`;
+      });
+    }
+    if (linkCtas.length > 0) {
       vocabBlock += 'Links:\n';
-      linkEntries.forEach(l => {
-        vocabBlock += `  link:${l.linkId} — ${l.label}\n`;
+      linkCtas.forEach(c => {
+        vocabBlock += `  ${c.ctaId} — ${c.label}\n`;
       });
     }
     vocabBlock += '\nRULES:';
-    if (directCtaForms.length > 0) {
-      vocabBlock += '\n• After you explain a program → include apply: for it. That\'s the natural next step.';
+    vocabBlock += '\n• Use exact CTA IDs from the list above. Do not invent IDs.';
+    if (formCtas.length > 0) {
+      vocabBlock += '\n• Offer apply CTAs after you\'ve explained a program — that\'s the natural next step.';
     }
-    vocabBlock += '\n• learn: is ONLY for programs NOT yet discussed.';
-    vocabBlock += '\n• After explaining a program, move forward — don\'t offer learn: again for that program.';
-    vocabBlock += '\n• Stay on the user\'s topic. If they\'re asking about Love Box, buttons should be about Love Box.';
-    vocabBlock += '\n• Always pick 2-3 buttons. One is not enough.';
+    if (infoCtas.length > 0) {
+      vocabBlock += '\n• Offer explore CTAs for programs the user hasn\'t asked about yet.';
+    }
+    vocabBlock += '\n• Only offer a CTA when the user is ready for that action. Timing matters — don\'t push actions before the user has shown intent.';
+    vocabBlock += '\n• Zero buttons is fine if none fit the moment. Don\'t force CTAs.';
   }
 
   // ── GUIDANCE MODULES ──
-  let guidanceBlock = '';
-  if (isFeatureEnabled('GUIDANCE_MODULES', config) && config.guidance_modules) {
-    const recentText = (conversationHistory || [])
-      .slice(-3)
-      .map(m => (m.content || m.text || '').toLowerCase())
-      .join(' ');
-    for (const [key, module] of Object.entries(config.guidance_modules)) {
-      if (module.enabled !== false && recentText.includes(key.toLowerCase())) {
-        guidanceBlock += `\n━━━ GUIDANCE: ${key.toUpperCase()} ━━━\n${module.content}\n`;
-      }
-    }
-  }
+  const guidanceBlock = buildGuidanceSection(config, conversationHistory);
 
   // ── FILTERED CUSTOM CONSTRAINTS ──
   // Remove "follow-up question" rules — W5 WHERE handles conversation flow
@@ -2010,48 +2039,39 @@ function buildV3Prompt(userInput, kbContext, tone, conversationHistory, config, 
   }
 
   // ── BUILD THE PROMPT ──
-  const chipsEnabled = isFeatureEnabled('DYNAMIC_CHIPS', config);
   const chipSection = buildChipSection(config, turnCount);
+
   const prompt = `${persona}
-${historyBlock}
 ${kbBlock}
+${historyBlock}
 ${vocabBlock}
 ${guidanceBlock}
 ${constraintsBlock}
+
+━━━ YOUR TASK ━━━
+USER: ${userInput}
+
+Before responding, consider (silently — do NOT write your thinking):
+  WHO — Is this person exploring, learning, or ready to act?
+  WHAT — What specifically did they ask? Stay on that thread.
+  WHEN — Turn ${turnCount + 1}. What have I already covered? Don't repeat it.
+  WHERE — What's the natural next step from here — more info, or action?
+  WHY — For each button I pick: would they actually click it right now?
+
+Then write a concise, human response using only KB facts. End by guiding them forward.
+
+If the user is ready for an action, pick next steps from the vocabulary (use exact IDs, pipe-separated):
+<!-- NEXT: id | id -->
+Omit the NEXT tag entirely if no CTA fits the moment.
 ${chipSection}
 
-━━━ USER'S MESSAGE ━━━
-${userInput}
-
-━━━ RESPOND ━━━
-
-CONSIDER before responding (do NOT write your thinking):
-  WHO — Is this person exploring, learning, or ready to act?
-  WHAT — What specific topic are they asking about? Stay on their path.
-  WHEN — Turn ${turnCount + 1}. What have I already explained? (Don't re-explain or offer learn: for it.)
-  WHERE — Momentum check: Did I explain a program? Move forward — offer the next step, not learn: again.
-  WHY — For each button: why would they click it given what they already know?
-
-WRITE your response:
-  - 2-4 sentences using ONLY facts from the knowledge base
-  - Sound human: contractions, warmth, no robotic phrasing
-  - Stay on the user's topic — if they're asking about one program, answer about THAT program
-  - End by guiding them forward — a question or invitation
-  - Never repeat info from earlier turns
-  - Never put links in your text
-
-PICK 2-3 next steps from the vocabulary above (pipe-separated):
-<!-- NEXT: id | id | id -->
-
-${chipsEnabled ? `<!-- CHIPS: ["...", "..."] -->` : ''}
-
-OUTPUT FORMAT (no thinking, just respond):
-[response]
+OUTPUT:
+[your response]
 <!-- NEXT: ... -->
-${chipsEnabled ? '<!-- CHIPS: [...] -->' : ''}`;
+${chipSection ? '<!-- CHIPS: [...] -->' : ''}`;
 
   console.log(`📝 V3.5 prompt length: ${prompt.length} chars`);
-  console.log(`   Turn: ${turnCount + 1}, Forms: ${formEntries.length}, Queries: ${queryEntries.length}, Links: ${linkEntries.length}`);
+  console.log(`   Turn: ${turnCount + 1}, Explore: ${infoCtas.length}, Apply: ${formCtas.length}, Links: ${linkCtas.length}`);
   return prompt;
 }
 
@@ -2601,15 +2621,27 @@ const streamingHandler = async (event, responseStream, context) => {
 
     // Get KB context
     const kbContext = await retrieveKB(sanitizedInput, config, conversationHistory);
-    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config, sessionContext);
 
-    // Prepare Bedrock request - use config model or default
-    const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-    const maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
-    const temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
+    // V4 Pipeline: Use focused conversational prompt (no CTA instructions)
+    const isV4 = isFeatureEnabled('V4_PIPELINE', config);
+    let prompt;
+    let modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+    let maxTokens, temperature;
+
+    if (isV4) {
+      const { buildV4ConversationPrompt, V4_STEP2_INFERENCE_PARAMS } = require('./prompt_v4');
+      prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
+      maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
+      temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
+      console.log(`[V4] Step 2: Conversational prompt (${prompt.length} chars)`);
+    } else {
+      prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config, sessionContext);
+      maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
+      temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
+    }
 
     console.log(`🚀 Invoking Bedrock with model: ${modelId}`);
-    
+
     const command = new InvokeModelWithResponseStreamCommand({
       modelId,
       accept: 'application/json',
@@ -2688,8 +2720,9 @@ const streamingHandler = async (event, responseStream, context) => {
     console.log(`✅ Complete - ${tokenCount} tokens in ${totalTime}ms`);
 
     // ═══════════════════════════════════════════════════════════════
-    // EVOLUTION v3.5: Parse hidden tags from response buffer
-    // Supports both v3.5 NEXT tags and v3.0 ACTIONS tags (fallback)
+    // POST-STREAMING: Parse response and select actions
+    // V4: Separate Step 3 call for action selection
+    // V3.5/Legacy: Parse hidden NEXT/CHIPS tags from response buffer
     // ═══════════════════════════════════════════════════════════════
     const { parseAiActions, parseChips } = require('./response_enhancer');
 
@@ -2700,31 +2733,95 @@ const streamingHandler = async (event, responseStream, context) => {
     // Strip thought tags from buffer
     let cleanBuffer = responseBuffer.replace(/<thought>[\s\S]*?<\/thought>/gi, '').trim();
 
-    // v3.5: Try NEXT tags first, fall back to ACTIONS tags
     let parsedActions = [];
-    let afterActions = cleanBuffer;
+    let parsedChips = [];
+    let cleanResponse = cleanBuffer;
+    let selectedIds = []; // V4: track for logging
 
-    const { nextIds, cleanedResponse: afterNext } = parseNextTags(cleanBuffer);
-    if (nextIds.length > 0) {
-      // v3.5 Tag & Map: map IDs to full action objects
-      parsedActions = mapNextTagsToActions(nextIds, config, sessionContext);
-      // Cap link CTAs to max 1 — prioritize learn/query actions over links
-      const nonLinks = parsedActions.filter(a => a.action !== 'external_link');
-      const links = parsedActions.filter(a => a.action === 'external_link');
-      parsedActions = [...nonLinks, ...links.slice(0, 1)];
-      afterActions = afterNext;
-      console.log(`[v3.5] Mapped NEXT tags → ${parsedActions.length} actions: ${parsedActions.map(a => a.label).join(', ')}`);
-    } else {
-      // v3.0 fallback: parse full JSON actions
-      const legacy = parseAiActions(cleanBuffer);
-      parsedActions = legacy.actions;
-      afterActions = legacy.cleanedResponse;
-      if (parsedActions.length > 0) {
-        console.log(`[v3.0 fallback] Parsed ${parsedActions.length} legacy ACTIONS`);
+    if (isV4) {
+      // ═══════════════════════════════════════════════════════════════
+      // V4 PIPELINE: Step 3 — Synchronous Action Selection
+      // ═══════════════════════════════════════════════════════════════
+      const {
+        buildV4ActionSelectorPrompt, V4_SELECT_ACTIONS_TOOL,
+        parseV4ToolUseResponse, assembleV4Actions, V4_STEP3_INFERENCE_PARAMS,
+      } = require('./prompt_v4');
+
+      const { systemPrompt, validIds } = buildV4ActionSelectorPrompt(
+        cleanBuffer, conversationHistory, config, sessionContext
+      );
+
+      if (validIds.length > 0) {
+        try {
+          const step3Start = Date.now();
+          const step3Command = new InvokeModelCommand({
+            modelId,
+            accept: 'application/json',
+            contentType: 'application/json',
+            body: JSON.stringify({
+              anthropic_version: 'bedrock-2023-05-31',
+              system: systemPrompt,
+              messages: [{ role: 'user', content: [{ type: 'text', text: 'Select actions.' }] }],
+              tools: [V4_SELECT_ACTIONS_TOOL],
+              tool_choice: { type: 'tool', name: 'select_actions' },
+              max_tokens: V4_STEP3_INFERENCE_PARAMS.max_tokens,
+              temperature: V4_STEP3_INFERENCE_PARAMS.temperature,
+            })
+          });
+
+          const step3Response = await bedrock.send(step3Command);
+          const step3Body = JSON.parse(new TextDecoder().decode(step3Response.body));
+          selectedIds = parseV4ToolUseResponse(step3Body, validIds);
+
+          const step3Time = Date.now() - step3Start;
+          console.log(`[V4 Step3] Selected ${selectedIds.length} actions in ${step3Time}ms: ${selectedIds.join(', ') || '(none)'}`);
+
+          // Step 4: Assemble full action objects from selected IDs
+          parsedActions = assembleV4Actions(selectedIds, config, sessionContext, mapNextTagsToActions);
+        } catch (step3Error) {
+          console.error('[V4 Step3] Error:', step3Error.message);
+          // Fail open — no CTAs is safe
+          parsedActions = [];
+        }
+      } else {
+        console.log('[V4 Step3] No CTAs in vocabulary — skipping action selection');
       }
+
+      // V4: No CHIPS
+      parsedChips = [];
+      cleanResponse = cleanBuffer;
+
+    } else {
+      // ═══════════════════════════════════════════════════════════════
+      // V3.5 / Legacy: Parse hidden tags from response buffer
+      // ═══════════════════════════════════════════════════════════════
+      let afterActions = cleanBuffer;
+
+      const { nextIds, cleanedResponse: afterNext } = parseNextTags(cleanBuffer);
+      if (nextIds.length > 0) {
+        // v3.5 Tag & Map: map IDs to full action objects
+        parsedActions = mapNextTagsToActions(nextIds, config, sessionContext);
+        // Cap link CTAs to max 1 — prioritize learn/query actions over links
+        const nonLinks = parsedActions.filter(a => a.action !== 'external_link');
+        const links = parsedActions.filter(a => a.action === 'external_link');
+        parsedActions = [...nonLinks, ...links.slice(0, 1)];
+        afterActions = afterNext;
+        console.log(`[v3.5] Mapped NEXT tags → ${parsedActions.length} actions: ${parsedActions.map(a => a.label).join(', ')}`);
+      } else {
+        // v3.0 fallback: parse full JSON actions
+        const legacy = parseAiActions(cleanBuffer);
+        parsedActions = legacy.actions;
+        afterActions = legacy.cleanedResponse;
+        if (parsedActions.length > 0) {
+          console.log(`[v3.0 fallback] Parsed ${parsedActions.length} legacy ACTIONS`);
+        }
+      }
+
+      const chipsResult = parseChips(afterActions);
+      parsedChips = chipsResult.chips;
+      cleanResponse = chipsResult.cleanedResponse;
     }
 
-    const { chips: parsedChips, cleanedResponse: cleanResponse } = parseChips(afterActions);
     // Use clean response (no hidden tags) for logging
     const logBuffer = cleanResponse;
 
@@ -2742,6 +2839,7 @@ const streamingHandler = async (event, responseStream, context) => {
       console.log(JSON.stringify({
         type: 'QA_COMPLETE',
         timestamp: new Date().toISOString(),
+        pipeline: isV4 ? 'v4' : (isFeatureEnabled('DYNAMIC_ACTIONS', config) ? 'v3.5' : 'legacy'),
         session_id: sessionId,
         tenant_hash: tenantHash,
         tenant_id: config?.tenant_id || null,
@@ -2749,7 +2847,7 @@ const streamingHandler = async (event, responseStream, context) => {
         question: questionBuffer,
         answer: logBuffer,
         thought: thoughtContent,
-        next_tags: nextIds.length > 0 ? nextIds : undefined,
+        step3_selected_ids: isV4 && selectedIds.length > 0 ? selectedIds : undefined,
         ai_actions: parsedActions.length > 0 ? parsedActions : undefined,
         suggested_chips: parsedChips.length > 0 ? parsedChips : undefined,
         metrics: {
@@ -3012,12 +3110,24 @@ const bufferedHandler = async (event, context) => {
 
     // Get KB context
     const kbContext = await retrieveKB(sanitizedInput, config, conversationHistory);
-    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config, sessionContext);
 
-    // Prepare Bedrock request - use config model or default
-    const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-    const maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
-    const temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
+    // V4 Pipeline: Use focused conversational prompt (no CTA instructions)
+    const isV4 = isFeatureEnabled('V4_PIPELINE', config);
+    let prompt;
+    let modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+    let maxTokens, temperature;
+
+    if (isV4) {
+      const { buildV4ConversationPrompt, V4_STEP2_INFERENCE_PARAMS } = require('./prompt_v4');
+      prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
+      maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
+      temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
+      console.log(`[V4] Step 2: Conversational prompt (${prompt.length} chars)`);
+    } else {
+      prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config, sessionContext);
+      maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
+      temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
+    }
 
     // Invoke Bedrock
     const response = await bedrock.send(new InvokeModelWithResponseStreamCommand({
@@ -3091,6 +3201,52 @@ const bufferedHandler = async (event, context) => {
       // This ensures reliable delivery since the frontend knows exactly when messages are sent/received.
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // POST-GENERATION: Select actions and enhance response
+    // ═══════════════════════════════════════════════════════════════
+    let v4Actions = [];
+
+    if (isV4) {
+      // V4 Step 3: Synchronous action selection
+      try {
+        const {
+          buildV4ActionSelectorPrompt, V4_SELECT_ACTIONS_TOOL,
+          parseV4ToolUseResponse, assembleV4Actions, V4_STEP3_INFERENCE_PARAMS,
+        } = require('./prompt_v4');
+
+        const { systemPrompt, validIds } = buildV4ActionSelectorPrompt(
+          responseBuffer, conversationHistory, config, sessionContext
+        );
+
+        if (validIds.length > 0) {
+          const step3Start = Date.now();
+          const step3Command = new InvokeModelCommand({
+            modelId,
+            accept: 'application/json',
+            contentType: 'application/json',
+            body: JSON.stringify({
+              anthropic_version: 'bedrock-2023-05-31',
+              system: systemPrompt,
+              messages: [{ role: 'user', content: [{ type: 'text', text: 'Select actions.' }] }],
+              tools: [V4_SELECT_ACTIONS_TOOL],
+              tool_choice: { type: 'tool', name: 'select_actions' },
+              max_tokens: V4_STEP3_INFERENCE_PARAMS.max_tokens,
+              temperature: V4_STEP3_INFERENCE_PARAMS.temperature,
+            })
+          });
+
+          const step3Response = await bedrock.send(step3Command);
+          const step3Body = JSON.parse(new TextDecoder().decode(step3Response.body));
+          const selectedIds = parseV4ToolUseResponse(step3Body, validIds);
+
+          console.log(`[V4 Step3] Selected ${selectedIds.length} actions in ${Date.now() - step3Start}ms: ${selectedIds.join(', ') || '(none)'}`);
+          v4Actions = assembleV4Actions(selectedIds, config, sessionContext, mapNextTagsToActions);
+        }
+      } catch (step3Error) {
+        console.error('[V4 Step3] Error:', step3Error.message);
+      }
+    }
+
     // Enhance response with CTAs after generation is complete
     try {
       const { enhanceResponse } = require('./response_enhancer');
@@ -3103,7 +3259,8 @@ const bufferedHandler = async (event, context) => {
         userInput,       // The user's message
         tenantHash,      // Tenant identifier
         body.session_context || {}, // Session context for form tracking
-        routingMetadata  // Routing metadata for explicit routing (action chips, CTAs, fallback)
+        routingMetadata, // Routing metadata for explicit routing (action chips, CTAs, fallback)
+        isV4 ? v4Actions : undefined // V4: pass pre-selected actions
       );
 
       if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
