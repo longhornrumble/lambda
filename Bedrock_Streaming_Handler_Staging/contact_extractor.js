@@ -133,9 +133,6 @@ const COMMENTS_KEYS = [
   'message',
   'notes',
   'note',
-  'about_you',
-  'about',
-  'tell_us_about_yourself',
   'description_of_needs',
   'how_can_we_help',
   'reason_for_inquiry',
@@ -257,43 +254,6 @@ function truncateText(text, maxLength) {
   return text.substring(0, maxLength) + '...';
 }
 
-/**
- * Flatten composite fields (name, address) for easier extraction
- * Handles nested structures like:
- *   { "name": { "field_123.first_name": "John", "field_123.last_name": "Doe" } }
- * And transforms to:
- *   { "name": {...}, "first_name": "John", "last_name": "Doe" }
- *
- * @param {Object} formData - Form data object (may have nested composite fields)
- * @returns {Object} Flattened form data with extracted subfield keys
- */
-function flattenCompositeFields(formData) {
-  if (!formData || typeof formData !== 'object') {
-    return formData || {};
-  }
-
-  const flattened = { ...formData };
-
-  for (const [key, value] of Object.entries(formData)) {
-    // Check if this is a composite field (object with nested values)
-    if (value && typeof value === 'object' && !Array.isArray(value)) {
-      // Extract subfield values and add them to flattened data
-      for (const [subKey, subValue] of Object.entries(value)) {
-        // Extract the field name from keys like "field_123.first_name" -> "first_name"
-        const parts = subKey.split('.');
-        const extractedKey = parts.length > 1 ? parts[parts.length - 1] : subKey;
-
-        // Only add if we have a non-empty value and the key doesn't already exist
-        if (subValue !== null && subValue !== undefined && subValue !== '' && !flattened[extractedKey]) {
-          flattened[extractedKey] = subValue;
-        }
-      }
-    }
-  }
-
-  return flattened;
-}
-
 // ============================================================================
 // MAIN EXTRACTION FUNCTIONS
 // ============================================================================
@@ -312,34 +272,30 @@ function extractCanonicalContact(formData) {
     };
   }
 
-  // Flatten nested composite fields (name, address) for extraction
-  // Composite fields have structure: { "name": { "field_123.first_name": "John", ... } }
-  const flattenedData = flattenCompositeFields(formData);
-
-  // Extract name parts from flattened data
-  const firstName = findFirstMatch(flattenedData, FIRST_NAME_KEYS);
-  const middleName = findFirstMatch(flattenedData, MIDDLE_NAME_KEYS);
-  const lastName = findFirstMatch(flattenedData, LAST_NAME_KEYS);
+  // Extract name parts
+  const firstName = findFirstMatch(formData, FIRST_NAME_KEYS);
+  const middleName = findFirstMatch(formData, MIDDLE_NAME_KEYS);
+  const lastName = findFirstMatch(formData, LAST_NAME_KEYS);
 
   // Compute full name from parts
   const nameParts = [firstName, middleName, lastName].filter(Boolean);
   const nameFull = nameParts.length > 0 ? nameParts.join(' ') : null;
 
-  // Extract address parts from flattened data
-  const street = findFirstMatch(flattenedData, STREET_KEYS);
-  const unit = findFirstMatch(flattenedData, UNIT_KEYS);
-  const city = findFirstMatch(flattenedData, CITY_KEYS);
-  const state = findFirstMatch(flattenedData, STATE_KEYS);
-  const zip = findFirstMatch(flattenedData, ZIP_KEYS);
+  // Extract address parts
+  const street = findFirstMatch(formData, STREET_KEYS);
+  const unit = findFirstMatch(formData, UNIT_KEYS);
+  const city = findFirstMatch(formData, CITY_KEYS);
+  const state = findFirstMatch(formData, STATE_KEYS);
+  const zip = findFirstMatch(formData, ZIP_KEYS);
 
   // Compute address text
   const addressText = formatAddressText(street, unit, city, state, zip);
 
   // Extract email - try exact keys first, then partial match
-  let email = findFirstMatch(flattenedData, EMAIL_KEYS);
+  let email = findFirstMatch(formData, EMAIL_KEYS);
   if (!email) {
     // Fallback: find any field containing 'email' with @ in value
-    for (const [key, value] of Object.entries(flattenedData)) {
+    for (const [key, value] of Object.entries(formData)) {
       if (key.toLowerCase().includes('email') && value && String(value).includes('@')) {
         email = String(value).trim();
         break;
@@ -348,13 +304,13 @@ function extractCanonicalContact(formData) {
   }
 
   // Extract phone - try exact keys first, then partial match
-  let phone = findFirstMatch(flattenedData, PHONE_KEYS);
+  let phone = findFirstMatch(formData, PHONE_KEYS);
   if (!phone) {
-    phone = findFirstMatchPartial(flattenedData, ['phone', 'mobile', 'cell']);
+    phone = findFirstMatchPartial(formData, ['phone', 'mobile', 'cell']);
   }
 
-  // Extract comments from flattened data
-  let comments = findFirstMatch(flattenedData, COMMENTS_KEYS);
+  // Extract comments
+  let comments = findFirstMatch(formData, COMMENTS_KEYS);
   if (comments) {
     comments = truncateText(comments, COMMENTS_MAX_LENGTH);
   }
@@ -364,7 +320,7 @@ function extractCanonicalContact(formData) {
     first_name: firstName,
     middle_name: middleName,
     last_name: lastName,
-    full_name: nameFull,  // Dashboard expects full_name, not name_full
+    name_full: nameFull,
     email: email,
     phone: phone,
     address: {
@@ -393,7 +349,7 @@ function createEmptyContact() {
     first_name: null,
     middle_name: null,
     last_name: null,
-    full_name: null,
+    name_full: null,
     email: null,
     phone: null,
     address: {
@@ -493,7 +449,6 @@ module.exports = {
   formatAddressText,
   filterSensitiveFields,
   findFirstMatch,
-  flattenCompositeFields,
   isSensitiveField,
   truncateText,
   getSchemaVersion,
