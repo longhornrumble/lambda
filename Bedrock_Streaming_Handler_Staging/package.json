@@ -18,7 +18,7 @@
   },
   "scripts": {
     "build": "node esbuild.config.mjs",
-    "package": "npm run build && zip -j deployment.zip dist/index.js response_enhancer.js form_handler.js",
+    "package": "npm run build && zip -j deployment.zip dist/index.js response_enhancer.js form_handler.js cta_selector.js",
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
