@@ -42,6 +42,8 @@ function validateDynamicCTAConfig(config) {
   const aiAvailable = [];
   const slotCoverage = { action: [], info: [], lateral: [] };
   const lateralEligible = [];
+  const roleCoverage = { give: [], receive: [], learn: [], connect: [] };
+  const validRoles = new Set(['give', 'receive', 'learn', 'connect']);
   const vocabSet = new Set(vocabKeys);
 
   for (const [id, cta] of Object.entries(ctaDefs)) {
@@ -79,6 +81,16 @@ function validateDynamicCTAConfig(config) {
       lateralEligible.push(id);
     }
 
+    // Check role_axis
+    const roleAxis = meta.role_axis;
+    if (!roleAxis) {
+      warnings.push(`CTA "${id}" has no role_axis — role filtering will not apply`);
+    } else if (!validRoles.has(roleAxis)) {
+      errors.push(`CTA "${id}" has invalid role_axis "${roleAxis}" (must be give, receive, learn, or connect)`);
+    } else {
+      roleCoverage[roleAxis].push(id);
+    }
+
     // Check form CTAs have matching form definitions
     if (cta.action === 'start_form' && cta.formId) {
       if (!forms[cta.formId]) {
@@ -105,6 +117,22 @@ function validateDynamicCTAConfig(config) {
     warnings.push(`Only ${lateralEligible.length} lateral-eligible CTAs (recommend 2+ for escape routes)`);
   }
 
+  // Check role coverage — action CTAs should have give or receive
+  const actionCTAs = slotCoverage.action || [];
+  const actionWithRole = actionCTAs.filter(id => {
+    const meta = ctaDefs[id]?.selection_metadata;
+    return meta?.role_axis === 'give' || meta?.role_axis === 'receive';
+  });
+  if (actionCTAs.length > 0 && actionWithRole.length === 0) {
+    warnings.push('No action CTAs have role_axis=give or role_axis=receive — role filtering will have no effect');
+  }
+  if (roleCoverage.give.length === 0) {
+    warnings.push('No CTAs with role_axis=give');
+  }
+  if (roleCoverage.receive.length === 0) {
+    warnings.push('No CTAs with role_axis=receive');
+  }
+
   return {
     valid: errors.length === 0,
     errors,
@@ -119,6 +147,12 @@ function validateDynamicCTAConfig(config) {
         lateral: slotCoverage.lateral.length
       },
       lateral_eligible: lateralEligible.length,
+      role_coverage: {
+        give: roleCoverage.give.length,
+        receive: roleCoverage.receive.length,
+        learn: roleCoverage.learn.length,
+        connect: roleCoverage.connect.length
+      },
       form_ctas: Object.values(ctaDefs).filter(c => c.action === 'start_form').length
     }
   };
@@ -147,6 +181,7 @@ if (require.main === module) {
   console.log(`  Topic vocabulary: ${result.summary.topic_count} topics`);
   console.log(`  Slot coverage: action=${result.summary.slot_coverage.action}, info=${result.summary.slot_coverage.info}, lateral=${result.summary.slot_coverage.lateral}`);
   console.log(`  Lateral-eligible: ${result.summary.lateral_eligible}`);
+  console.log(`  Role coverage: give=${result.summary.role_coverage.give}, receive=${result.summary.role_coverage.receive}, learn=${result.summary.role_coverage.learn}, connect=${result.summary.role_coverage.connect}`);
 
   if (result.errors.length > 0) {
     console.log(`\n❌ ERRORS (${result.errors.length}):`);
