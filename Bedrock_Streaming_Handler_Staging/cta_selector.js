@@ -100,19 +100,25 @@ function scoreCTAs(ctaDefinitions, matchedTopics, userIntent, recentlyShownIds =
     if (cta.action === 'start_form' && cta.formId && completedSet.has(cta.formId)) continue;
 
     // Score: topic overlap
+    // Uses both absolute overlap count and normalized ratio to prevent
+    // single-tag CTAs from outscoring multi-tag CTAs with more matches.
+    // Example: 2 of 3 tags matching (0.67 ratio, 2 absolute) should beat
+    //          1 of 1 tag matching (1.0 ratio, 1 absolute)
     const ctaTopics = meta.topic_tags || [];
     let topicOverlap = 0;
     for (const tag of ctaTopics) {
       if (topicSet.has(tag)) topicOverlap++;
     }
-    const topicScore = ctaTopics.length > 0
+    const normalizedScore = ctaTopics.length > 0
       ? topicOverlap / ctaTopics.length
       : 0;
+    // Blend: 60% absolute overlap (rewards breadth), 40% normalized (rewards specificity)
+    const topicScore = (topicOverlap * 0.6) + (normalizedScore * 0.4);
 
     // Boost: committed intent + action depth
     let intentBoost = 0;
     if (userIntent === 'committed' && meta.depth_level === 'action') {
-      intentBoost = 0.2;
+      intentBoost = 0.3;
     }
 
     const totalScore = topicScore + intentBoost;
