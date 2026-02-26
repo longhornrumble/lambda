@@ -92,7 +92,8 @@ async function loadTenantConfig(tenantHash) {
             cta_definitions: config.cta_definitions || {},
             conversational_forms: config.conversational_forms || {},
             cta_settings: config.cta_settings || {},  // Required for Tier 3 fallback routing
-            content_showcase: config.content_showcase || []  // Required for showcase items
+            content_showcase: config.content_showcase || [],  // Required for showcase items
+            feature_flags: config.feature_flags || {}  // Required for WORKFLOW_TRACKING gate
         };
 
         // Cache the config
@@ -120,11 +121,13 @@ async function loadTenantConfig(tenantHash) {
  *
  * @param {Object} routingMetadata - Routing metadata from frontend
  * @param {Object} config - Tenant configuration
+ * @param {Object} sessionContext - Session context from frontend (includes current_node for workflow tracking)
  * @returns {string|null} - Branch name to use for CTA selection, or null if no match
  */
-function getConversationBranch(routingMetadata, config) {
+function getConversationBranch(routingMetadata, config, sessionContext = {}) {
     const branches = config.conversation_branches || {};
     const ctaSettings = config.cta_settings || {};
+    const featureFlags = config.feature_flags || {};
 
     // TIER 1: Explicit action chip routing
     if (routingMetadata.action_chip_triggered) {
@@ -150,18 +153,29 @@ function getConversationBranch(routingMetadata, config) {
         }
     }
 
-    // TIER 3: Fallback navigation hub
+    // TIER 5: Context-aware fallback (Sprint 1 — WORKFLOW_TRACKING)
+    // If user has a current position in the graph, stay in that branch
+    if (featureFlags.WORKFLOW_TRACKING && sessionContext.current_node) {
+        const currentNode = sessionContext.current_node;
+        if (branches[currentNode]) {
+            console.log(`[Tier 5] Staying in current node: ${currentNode}`);
+            return currentNode;
+        }
+        console.log(`[Tier 5] current_node '${currentNode}' not found in branches, falling through to fallback`);
+    }
+
+    // TIER 5 (default): Fallback navigation hub
     const fallbackBranch = ctaSettings.fallback_branch;
     if (fallbackBranch && branches[fallbackBranch]) {
-        console.log(`[Tier 3] Routing to fallback branch: ${fallbackBranch}`);
+        console.log(`[Tier 5] Routing to fallback branch: ${fallbackBranch}`);
         return fallbackBranch;
     }
 
     // No routing match - graceful degradation (backward compatibility)
     if (fallbackBranch) {
-        console.log(`[Tier 3] Fallback branch '${fallbackBranch}' not found in conversation_branches`);
+        console.log(`[Tier 5] Fallback branch '${fallbackBranch}' not found in conversation_branches`);
     } else {
-        console.log('[Tier 3] No fallback_branch configured - no CTAs will be shown');
+        console.log('[Tier 5] No fallback_branch configured - no CTAs will be shown');
     }
 
     return null;
@@ -634,7 +648,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         // TIER 1-3: Explicit Routing (PRD: Action Chips Explicit Routing)
         // ============================================================================
         // Check for explicit routing metadata BEFORE keyword detection or form triggers
-        const explicitBranch = getConversationBranch(routingMetadata, config);
+        const explicitBranch = getConversationBranch(routingMetadata, config, sessionContext);
         if (explicitBranch) {
             console.log(`[Explicit Routing] Using branch: ${explicitBranch}`);
             const ctas = buildCtasFromBranch(explicitBranch, config, completedForms);
@@ -670,7 +684,8 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                         branch: explicitBranch,
                         routing_tier: 'explicit',
                         routing_method: routingMetadata.action_chip_triggered ? 'action_chip' :
-                                       routingMetadata.cta_triggered ? 'cta' : 'fallback'
+                                       routingMetadata.cta_triggered ? 'cta' :
+                                       (config.feature_flags?.WORKFLOW_TRACKING && sessionContext.current_node === explicitBranch) ? 'context_aware_fallback' : 'fallback'
                     }
                 };
 
@@ -872,6 +887,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                         ctaButtons: [],  // No automatic CTAs - frontend will show switch options
                         metadata: {
                             enhanced: true,
+                            branch: null,
                             program_switch_detected: true,
                             suspended_form: {
                                 form_id: suspendedFormId,
@@ -895,6 +911,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                 ctaButtons: [],  // No CTAs when form is suspended
                 metadata: {
                     enhanced: false,
+                    branch: null,
                     suspended_forms_detected: suspendedForms
                 }
             };
@@ -924,6 +941,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                     }],
                     metadata: {
                         enhanced: true,
+                        branch: null,
                         form_triggered: formTrigger.formId,
                         program: program
                     }
@@ -985,7 +1003,10 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                 ctaButtons: ctaButtons,
                 metadata: {
                     enhanced: true,
+                    branch: branchResult.branch,
                     branch_detected: branchResult.branch,
+                    routing_tier: 'deprecated_keyword',
+                    routing_method: 'keyword_detection',
                     filtered_forms: completedForms
                 }
             };
@@ -995,7 +1016,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         return {
             message: bedrockResponse,
             ctaButtons: [],
-            metadata: { enhanced: false }
+            metadata: { enhanced: false, branch: null }
         };
 
     } catch (error) {
@@ -1004,7 +1025,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         return {
             message: bedrockResponse,
             ctaButtons: [],
-            metadata: { enhanced: false, error: error.message }
+            metadata: { enhanced: false, branch: null, error: error.message }
         };
     }
 }
