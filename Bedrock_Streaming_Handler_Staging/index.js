@@ -1879,53 +1879,21 @@ const streamingHandler = async (event, responseStream, context) => {
       const routingMetadata = body.routing_metadata || {};
       const sessionContext = body.session_context || {};
 
-      // Feature flag: DYNAMIC_CTA_SELECTION uses code-based topic scoring
-      if (config?.feature_flags?.DYNAMIC_CTA_SELECTION) {
-        const { selectCTAs } = require('./cta_selector');
+      // Deterministic branch-based CTA routing via response_enhancer.
+      // Tier 1: action chip click → program branch
+      // Tier 2: CTA click → program branch
+      // Tier 3: free text (no routing metadata) → fallback branch (main menu)
+      const { enhanceResponse } = require('./response_enhancer');
+      const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
 
-        // Build session state for the selector
-        const sessionState = {
-          recentlyShownCTAIds: sessionContext.recently_shown_ctas || [],
-          completedForms: sessionContext.completed_forms || [],
-          turnsSinceClick: sessionContext.turns_since_click || 0
-        };
-
-        // If user clicked an action CTA that triggers a guided flow, skip dynamic selection
-        if (routingMetadata.cta_triggered && routingMetadata.target_branch) {
-          // Action mode: fall through to legacy enhanceResponse for guided flow
-          const { enhanceResponse } = require('./response_enhancer');
-          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-            write(`data: ${JSON.stringify({ type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons, metadata: enhancedData.metadata, session_id: sessionId })}\n\n`);
-            console.log(`🎯 Action mode: sent ${enhancedData.ctaButtons.length} guided CTAs`);
-          }
-        } else {
-          // Explore mode: dynamic CTA selection
-          const { ctaButtons, selectionLog } = selectCTAs(responseBuffer, userInput, config, sessionState);
-
-          // Observability: log the full score vector
-          console.log(JSON.stringify({ ...selectionLog, tenant: tenantHash, session: sessionId }));
-
-          if (ctaButtons.length > 0) {
-            write(`data: ${JSON.stringify({ type: 'cta_buttons', ctaButtons, metadata: { enhanced: true, selection_method: 'dynamic_scoring' }, session_id: sessionId })}\n\n`);
-            console.log(`🎯 Dynamic selection: sent ${ctaButtons.length} CTAs [${ctaButtons.map(c => c.id).join(', ')}]`);
-          }
-        }
-      } else {
-        // Legacy path: branch-based CTA routing
-        const { enhanceResponse } = require('./response_enhancer');
-        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-
-        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-          const ctaData = JSON.stringify({
-            type: 'cta_buttons',
-            ctaButtons: enhancedData.ctaButtons,
-            metadata: enhancedData.metadata,
-            session_id: sessionId
-          });
-          write(`data: ${ctaData}\n\n`);
-          console.log(`🎯 Sent ${enhancedData.ctaButtons.length} CTA buttons for branch: ${enhancedData.metadata?.branch_detected || 'form'}`);
-        }
+      if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+        write(`data: ${JSON.stringify({
+          type: 'cta_buttons',
+          ctaButtons: enhancedData.ctaButtons,
+          metadata: enhancedData.metadata,
+          session_id: sessionId
+        })}\n\n`);
+        console.log(`🎯 Branch routing: sent ${enhancedData.ctaButtons.length} CTAs | branch: ${enhancedData.metadata?.branch_detected || 'fallback'} | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
       }
     } catch (enhanceError) {
       console.error('❌ CTA enhancement error:', enhanceError);

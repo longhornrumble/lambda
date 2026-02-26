@@ -219,18 +219,20 @@ function buildTopicClusters(matchedTopics, config) {
  *
  * @param {Object} ctaDefinitions - All CTA definitions from config
  * @param {string[]} matchedTopics - Topics found in the AI response
+ * @param {string[]} userTopics - Topics found in the user's message
  * @param {"exploring"|"committed"} userIntent
  * @param {{ role: string, confidence: string }} userRole
  * @param {string[]} recentlyShownIds - CTA IDs shown in last N turns
  * @param {string[]} completedForms - Form IDs already completed
  * @returns {Array<{id: string, score: number, cta: Object, cluster: string|null}>}
  */
-function scoreCTAs(ctaDefinitions, matchedTopics, userIntent, userRole, recentlyShownIds = [], completedForms = []) {
+function scoreCTAs(ctaDefinitions, matchedTopics, userTopics, userIntent, userRole, recentlyShownIds = [], completedForms = []) {
   if (!ctaDefinitions) return [];
 
   const recentSet = new Set(recentlyShownIds);
   const completedSet = new Set(completedForms);
   const topicSet = new Set(matchedTopics);
+  const userTopicSet = new Set(userTopics);
   const scored = [];
 
   for (const [id, cta] of Object.entries(ctaDefinitions)) {
@@ -277,12 +279,32 @@ function scoreCTAs(ctaDefinitions, matchedTopics, userIntent, userRole, recently
       if (ctaRole === userRole.role) roleBoost = 0.2;
     }
 
-    const totalScore = topicScore + intentBoost + roleBoost;
+    // Boost: user-topic alignment — CTAs whose tags match what the USER
+    // asked about (not just what the AI responded about) get a strong boost.
+    // This ensures "I want to donate" prioritizes donate CTAs even when
+    // the AI response also mentions volunteer programs.
+    let userTopicBoost = 0;
+    for (const tag of ctaTopics) {
+      if (userTopicSet.has(tag)) userTopicBoost += 0.5;
+    }
+
+    // Redundancy penalty: demote "Learn about X" when the user already asked
+    // about X and the AI has already responded. A send_query/info CTA would
+    // ask a question the user already asked — pure redundancy.
+    let redundancyPenalty = 0;
+    if (meta.depth_level === 'info' && cta.action === 'send_query') {
+      const primaryTag = ctaTopics[0];
+      if (primaryTag && userTopicSet.has(primaryTag)) {
+        redundancyPenalty = -1.5;
+      }
+    }
+
+    const totalScore = topicScore + intentBoost + roleBoost + userTopicBoost + redundancyPenalty;
 
     // Determine which cluster this CTA primarily belongs to
     const primaryCluster = (ctaTopics.find(t => topicSet.has(t))) || null;
 
-    scored.push({ id, score: totalScore, cta, cluster: primaryCluster });
+    scored.push({ id, score: totalScore, cta, cluster: primaryCluster, redundancyPenalty });
   }
 
   scored.sort((a, b) => b.score - a.score);
@@ -415,26 +437,43 @@ function selectCTAs(responseText, userMessage, config, sessionState = {}) {
   const {
     recentlyShownCTAIds = [],
     completedForms = [],
-    turnsSinceClick = 0
+    turnsSinceClick = 0,
+    accumulatedTopics = [],
+    priorRole = null
   } = sessionState;
 
   // Recency reset: after 5+ turns without a CTA click, clear recency exclusion
   const effectiveRecency = turnsSinceClick >= 5 ? [] : recentlyShownCTAIds;
 
-  // Step 1: Extract topics from AI response
-  const matchedTopics = extractTopics(responseText, topicVocabulary);
+  // Step 1: Extract topics from AI response AND user message
+  const responseTopics = extractTopics(responseText, topicVocabulary);
+  const userTopics = extractTopics(userMessage, topicVocabulary);
+
+  // Merge: response topics + user topics + accumulated from prior turns (deduplicated)
+  const allTopics = [...new Set([...responseTopics, ...userTopics, ...accumulatedTopics])];
 
   // Step 2: Detect user intent and role
   const userIntent = detectUserIntent(userMessage);
-  const userRole = detectUserRole(userMessage);
+  let userRole = detectUserRole(userMessage);
+
+  // Inherit prior role if current turn is neutral (conversation continuity)
+  if (userRole.role === 'neutral' && priorRole && priorRole !== 'neutral') {
+    userRole = { role: priorRole, confidence: 'low' };
+  }
 
   // Step 3: Build topic clusters for slot allocation
-  const topicClusters = buildTopicClusters(matchedTopics, config);
+  // Only cluster on user-focused topics (user message + accumulated context),
+  // NOT every topic the AI mentioned in passing. This prevents incidental
+  // mentions from stealing info slots away from the user's actual focus.
+  const focusTopics = [...new Set([...userTopics, ...accumulatedTopics])];
+  const clusterBasis = focusTopics.length > 0 ? focusTopics : responseTopics;
+  const topicClusters = buildTopicClusters(clusterBasis, config);
 
-  // Step 4: Score all eligible CTAs (role-filtered)
+  // Step 4: Score all eligible CTAs (role-filtered, user-topic boosted)
   const scoredCTAs = scoreCTAs(
     ctaDefinitions,
-    matchedTopics,
+    allTopics,
+    userTopics,
     userIntent,
     userRole,
     effectiveRecency,
@@ -451,14 +490,18 @@ function selectCTAs(responseText, userMessage, config, sessionState = {}) {
   if (slots.info2) ctaButtons.push(slots.info2);
   if (slots.lateral) ctaButtons.push(slots.lateral);
 
-  // Build selection log for observability
+  // Build selection log for observability AND context round-trip
   const selectionLog = {
     event: 'cta_selection',
-    matched_topics: matchedTopics,
+    response_topics: responseTopics,
+    user_topics: userTopics,
+    accumulated_topics: accumulatedTopics,
+    all_topics: allTopics,
     topic_clusters: topicClusters,
     user_intent: userIntent,
     user_role: userRole,
     recency_reset: turnsSinceClick >= 5,
+    redundancy_demoted: scoredCTAs.filter(c => c.redundancyPenalty < 0).map(c => c.id),
     scores_top5: scoredCTAs.slice(0, 5).map(c => ({ id: c.id, score: c.score, role_axis: c.cta.selection_metadata?.role_axis })),
     selected: ctaButtons.map(c => c.id),
     slots: {
@@ -469,7 +512,14 @@ function selectCTAs(responseText, userMessage, config, sessionState = {}) {
     }
   };
 
-  return { ctaButtons, selectionLog };
+  // Context to send back to frontend for next-turn accumulation
+  const conversationContext = {
+    matched_topics: allTopics,
+    detected_role: userRole.role,
+    selected_ctas: ctaButtons.map(c => c.id)
+  };
+
+  return { ctaButtons, selectionLog, conversationContext };
 }
 
 module.exports = {

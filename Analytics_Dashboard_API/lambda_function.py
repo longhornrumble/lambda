@@ -842,17 +842,32 @@ def fetch_form_events_from_dynamo(tenant_hash: str, date_range: Dict[str, str], 
         List of form event dictionaries
     """
     start_date = date_range['start_date_iso']
+    end_date = date_range.get('end_date_iso')
+
+    # Build key condition with end_date for custom ranges
+    if date_range.get('is_custom') and end_date:
+        end_date_inclusive = (datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        key_condition = 'tenant_hash = :th AND #ts BETWEEN :start AND :end'
+        expr_values = {
+            ':th': {'S': tenant_hash},
+            ':start': {'S': start_date},
+            ':end': {'S': end_date_inclusive},
+        }
+    else:
+        key_condition = 'tenant_hash = :th AND #ts >= :start'
+        expr_values = {
+            ':th': {'S': tenant_hash},
+            ':start': {'S': start_date},
+        }
 
     # Build filter expression for form event types
     filter_expr = 'event_type IN (:t1, :t2, :t3, :t4)'
-    expr_values = {
-        ':th': {'S': tenant_hash},
-        ':start': {'S': start_date},
+    expr_values.update({
         ':t1': {'S': 'FORM_VIEWED'},
         ':t2': {'S': 'FORM_STARTED'},
         ':t3': {'S': 'FORM_COMPLETED'},
         ':t4': {'S': 'FORM_ABANDONED'}
-    }
+    })
 
     # Add optional form_id filter
     if form_id:
@@ -867,7 +882,7 @@ def fetch_form_events_from_dynamo(tenant_hash: str, date_range: Dict[str, str], 
             query_params = {
                 'TableName': SESSION_EVENTS_TABLE,
                 'IndexName': 'tenant-date-index',
-                'KeyConditionExpression': 'tenant_hash = :th AND #ts >= :start',
+                'KeyConditionExpression': key_condition,
                 'FilterExpression': filter_expr,
                 'ExpressionAttributeNames': {'#ts': 'timestamp'},
                 'ExpressionAttributeValues': expr_values
@@ -989,16 +1004,31 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
         Dict with bottlenecks list and total_abandonments count
     """
     start_date = date_range['start_date_iso']
+    end_date = date_range.get('end_date_iso')
+
+    # Build key condition with end_date for custom ranges
+    if date_range.get('is_custom') and end_date:
+        end_date_inclusive = (datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        key_condition = 'tenant_hash = :th AND #ts BETWEEN :start AND :end'
+        expr_values = {
+            ':th': {'S': tenant_hash},
+            ':start': {'S': start_date},
+            ':end': {'S': end_date_inclusive},
+        }
+    else:
+        key_condition = 'tenant_hash = :th AND #ts >= :start'
+        expr_values = {
+            ':th': {'S': tenant_hash},
+            ':start': {'S': start_date},
+        }
 
     # Query form-related events: FORM_STARTED, FORM_COMPLETED, FORM_FIELD_SUBMITTED
     filter_expr = 'event_type IN (:t1, :t2, :t3)'
-    expr_values = {
-        ':th': {'S': tenant_hash},
-        ':start': {'S': start_date},
+    expr_values.update({
         ':t1': {'S': 'FORM_STARTED'},
         ':t2': {'S': 'FORM_COMPLETED'},
         ':t3': {'S': 'FORM_FIELD_SUBMITTED'}
-    }
+    })
 
     # Add optional form_id filter
     if form_id:
@@ -1014,7 +1044,7 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
             query_params = {
                 'TableName': SESSION_EVENTS_TABLE,
                 'IndexName': 'tenant-date-index',
-                'KeyConditionExpression': 'tenant_hash = :th AND #ts >= :start',
+                'KeyConditionExpression': key_condition,
                 'FilterExpression': filter_expr,
                 'ExpressionAttributeNames': {'#ts': 'timestamp'},
                 'ExpressionAttributeValues': expr_values
@@ -1191,13 +1221,13 @@ def fetch_form_top_performers_from_dynamo(tenant_hash: str, date_range: Dict[str
     total_completions = 0
 
     for form_id, stats in form_stats.items():
+        started = stats['started']
         completions = stats['completions']
         abandons = stats['abandons']
-        total_outcomes = completions + abandons
         total_completions += completions
 
-        conversion_rate = (completions / total_outcomes * 100) if total_outcomes > 0 else 0
-        abandon_rate = (abandons / total_outcomes * 100) if total_outcomes > 0 else 0
+        conversion_rate = (completions / started * 100) if started > 0 else 0
+        abandon_rate = ((started - completions) / started * 100) if started > 0 else 0
         avg_time = sum(stats['durations']) / len(stats['durations']) if stats['durations'] else 0
 
         # Determine trend indicator based on conversion rate thresholds
@@ -1559,7 +1589,9 @@ def handle_form_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any
         return access_error
 
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     form_id = params.get('form_id')
 
     # Validate form_id if provided
@@ -1625,7 +1657,9 @@ def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str,
         return access_error
 
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     limit = min(int(params.get('limit', '5')), 20)
     form_id = params.get('form_id')
 
@@ -1748,23 +1782,39 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     if access_error:
         return access_error
 
-    date_range = parse_date_range(params.get('range', '30d'))
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(params.get('range', '30d'), start_date_param, end_date_param)
     page = max(1, int(params.get('page', '1')))
     limit = min(int(params.get('limit', '25')), 100)
     form_id_filter = params.get('form_id')
     search = params.get('search', '').strip().lower()
 
     # Query DynamoDB using tenant-timestamp-index
+    # Build key condition with end_date for custom ranges
+    end_date_iso = date_range.get('end_date_iso')
+    if date_range.get('is_custom') and end_date_iso:
+        end_date_inclusive = (datetime.strptime(end_date_iso, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
+        key_condition = 'tenant_id = :tid AND #ts BETWEEN :start_date AND :end_date'
+        expr_values = {
+            ':tid': {'S': tenant_id},
+            ':start_date': {'S': date_range['start_date_iso']},
+            ':end_date': {'S': end_date_inclusive}
+        }
+    else:
+        key_condition = 'tenant_id = :tid AND #ts >= :start_date'
+        expr_values = {
+            ':tid': {'S': tenant_id},
+            ':start_date': {'S': date_range['start_date_iso']}
+        }
+
     try:
         query_params = {
             'TableName': FORM_SUBMISSIONS_TABLE,
             'IndexName': 'tenant-timestamp-index',
-            'KeyConditionExpression': 'tenant_id = :tid AND #ts >= :start_date',
+            'KeyConditionExpression': key_condition,
             'ExpressionAttributeNames': {'#ts': 'timestamp'},
-            'ExpressionAttributeValues': {
-                ':tid': {'S': tenant_id},
-                ':start_date': {'S': date_range['start_date_iso']}
-            },
+            'ExpressionAttributeValues': expr_values,
             'ScanIndexForward': False,  # Descending order (newest first)
             'Limit': 200  # Get more items to allow for filtering
         }
@@ -1793,42 +1843,47 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
         form_title = item.get('form_title', {}).get('S', form_id)
         submitted_at = item.get('submitted_at', {}).get('S', '')
 
-        # Extract contact info - prefer canonical contact object (new schema)
-        # Fall back to form_data_labeled, then form_data for backwards compatibility
+        # Extract contact info using a merge strategy:
+        # 1. Start with canonical contact object (if it has a name)
+        # 2. If contact has no name, use form_data_labeled (most reliable)
+        # 3. Legacy fallback to form_data for old records
         contact = item.get('contact', {})
         comments_field = item.get('comments', {})
 
-        # Check if contact has actual non-null values (not just NULL placeholders)
-        contact_has_values = False
+        # Try canonical contact object first
+        contact_name = ''
+        contact_email = ''
+        contact_phone = ''
+        contact_comments = ''
         if contact and contact.get('M'):
-            contact_map = contact.get('M', {})
-            # Check if any key field has an actual value (not NULL)
-            for key in ['first_name', 'last_name', 'full_name', 'email']:
-                field_val = contact_map.get(key, {})
-                if field_val.get('S') or (not field_val.get('NULL')):
-                    contact_has_values = True
-                    break
-
-        if contact_has_values:
-            # New schema: use canonical contact object
             contact_map = contact.get('M', {})
             first_name = contact_map.get('first_name', {}).get('S', '') or ''
             last_name = contact_map.get('last_name', {}).get('S', '') or ''
             full_name = contact_map.get('full_name', {}).get('S', '') or ''
-            name = full_name or f"{first_name} {last_name}".strip() or 'Anonymous'
-            email = contact_map.get('email', {}).get('S', '') or ''
-            phone = contact_map.get('phone', {}).get('S', '') or ''
-            comments = comments_field.get('S', '') if comments_field else ''
-            fields = {'name': name, 'email': email, 'phone': phone, 'comments': comments}
+            contact_name = full_name or f"{first_name} {last_name}".strip()
+            contact_email = contact_map.get('email', {}).get('S', '') or ''
+            contact_phone = contact_map.get('phone', {}).get('S', '') or ''
+            contact_comments = comments_field.get('S', '') if comments_field else ''
+
+        # If contact has a name, use it directly
+        if contact_name:
+            fields = {'name': contact_name, 'email': contact_email, 'phone': contact_phone, 'comments': contact_comments}
         else:
-            # Fall back to form_data_labeled extraction
+            # Contact has no name — try form_data_labeled (handles composite Name fields)
             form_data_labeled = item.get('form_data_labeled', {})
             if form_data_labeled and form_data_labeled.get('M'):
                 fields = extract_all_fields_from_form_data_labeled(form_data_labeled)
+                # Supplement with contact fields if form_data_labeled missed them
+                if not fields.get('email') and contact_email:
+                    fields['email'] = contact_email
+                if not fields.get('phone') and contact_phone:
+                    fields['phone'] = contact_phone
+                if not fields.get('comments') and contact_comments:
+                    fields['comments'] = contact_comments
             else:
                 # Legacy fallback - only has name/email
                 name, email = extract_name_email_from_form_data(item.get('form_data', {}))
-                fields = {'name': name, 'email': email, 'phone': '', 'comments': ''}
+                fields = {'name': name, 'email': email, 'phone': contact_phone, 'comments': contact_comments}
 
         # Apply search filter
         if search:
@@ -2062,7 +2117,9 @@ def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[s
         return access_error
 
     range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
+    start_date_param = params.get('start_date')
+    end_date_param = params.get('end_date')
+    date_range = parse_date_range(range_str, start_date_param, end_date_param)
     limit = min(int(params.get('limit', '5')), 20)
     sort_by = params.get('sort_by', 'conversion_rate')
 
