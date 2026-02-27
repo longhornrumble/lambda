@@ -77,6 +77,14 @@ const { SQSClient, SendMessageCommand, SendMessageBatchCommand } = require('@aws
 const crypto = require('crypto');
 const { enhanceResponse } = require('./response_enhancer');
 const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
+const {
+  buildV4ConversationPrompt,
+  classifyIntent,
+  routeFromClassification,
+  validateIntentDefinitions,
+  V4_STEP2_INFERENCE_PARAMS,
+  sanitizeTonePromptV4,
+} = require('./prompt_v4');
 
 // Default model configuration - single source of truth
 // Upgraded to Haiku 4.5 for better instruction following (2025-11-26)
@@ -263,6 +271,18 @@ async function loadConfig(tenantHash) {
         evictOldestCacheEntries(CONFIG_CACHE); // Prevent memory exhaustion
         console.log(`📋 KB ID in config: ${config?.aws?.knowledge_base_id || 'NOT SET'}`);
         console.log(`📋 Full AWS config:`, JSON.stringify(config?.aws || {}, null, 2));
+
+        // V4 Pipeline: validate intent_definitions at load time (amendment line 204)
+        if (config.intent_definitions) {
+          const validation = validateIntentDefinitions(config);
+          if (validation.warnings.length > 0) {
+            console.warn(`[V4] intent_definitions validation warnings:`, validation.warnings);
+          }
+          if (validation.definitions.length > 0) {
+            console.log(`[V4] ${validation.definitions.length} valid intent definitions loaded`);
+          }
+        }
+
         return config;
       }
     }
@@ -1361,18 +1381,48 @@ ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
     RIGHT: [Directly answer the question you asked, e.g., "Our mentorship approach supports foster youth through..."]`);
 
     // ═══════════════════════════════════════════════════════════════
-    // TIER 4: BRANCH ROUTING SUGGESTIONS (legacy only)
+    // TIER 3: BRANCH ROUTING SUGGESTIONS (legacy non-DYNAMIC_CTA tenants)
     // ═══════════════════════════════════════════════════════════════
-    // Skip branch hints when dynamic CTA selection is active — the prompt
-    // stays purely conversational and code handles CTA selection post-response.
     if (!config?.feature_flags?.DYNAMIC_CTA_SELECTION) {
       const branchPromptSection = buildBranchPromptSection(config);
       if (branchPromptSection) {
         parts.push(branchPromptSection);
-        console.log(`✅ Injected Tier 4 branch routing prompt`);
+        console.log(`✅ Injected Tier 3 branch routing prompt`);
       }
     } else {
-      console.log(`ℹ️ DYNAMIC_CTA_SELECTION active - skipping Tier 4 branch prompt`);
+      console.log(`ℹ️ DYNAMIC_CTA_SELECTION active - skipping Tier 3 branch prompt`);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // TIER 4: INTENT LABELING (Sprint 2 — WORKFLOW_TRACKING)
+    // ═══════════════════════════════════════════════════════════════
+    // Works alongside DYNAMIC_CTA_SELECTION — intent labels are lightweight
+    // semantic tags that let the routing engine pick the right branch.
+    if (config?.feature_flags?.WORKFLOW_TRACKING) {
+      const intentMap = config?.cta_settings?.intent_map || {};
+      const intentKeys = Object.keys(intentMap);
+
+      if (intentKeys.length > 0) {
+        parts.push(`
+
+CONVERSATION INTENT LABELING:
+You may optionally append an intent tag ONLY when the user's CURRENT message is explicitly asking about one of these topics:
+
+Available intents: ${intentKeys.join(', ')}
+
+RULES (follow strictly):
+- Format: <!-- INTENT: intent_name -->  (at the very end of your response)
+- Judge ONLY by the user's latest message — ignore conversation history
+- The user must be REQUESTING INFORMATION or TAKING ACTION on the topic
+- Do NOT tag greetings, thank-yous, goodbyes, follow-up questions about the current topic, yes/no answers, or vague messages
+- Do NOT tag general questions (e.g. "what are your hours?", "how do I contact you?", "tell me about your organization")
+- When in doubt, do NOT tag — it is always better to skip than to guess wrong
+- Example YES: "I'd like to volunteer" → <!-- INTENT: volunteering -->
+- Example NO: "Thanks, that's helpful" → (no tag)
+- Example NO: "What are your office hours?" → (no tag)
+- Example NO: "Tell me more" → (no tag)`);
+        console.log(`✅ Injected Tier 4 intent labeling prompt (${intentKeys.length} intents: ${intentKeys.join(', ')})`);
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -1773,13 +1823,28 @@ const streamingHandler = async (event, responseStream, context) => {
 
     // Get KB context
     const kbContext = await retrieveKB(sanitizedInput, config);
-    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
 
-    // Prepare Bedrock request - use config model or default
-    const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-    const maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
-    const temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
-    
+    // V4 Pipeline gate: use V4 prompt when feature flag is active (amendment line 275)
+    // V3.5 path is completely unchanged without the flag
+    let prompt;
+    let modelId;
+    let maxTokens;
+    let temperature;
+
+    if (config?.feature_flags?.V4_PIPELINE) {
+      console.log('[V4] Using V4 conversational prompt (Step 2)');
+      const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
+      prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+      maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
+      temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
+    } else {
+      prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
+      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+      maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
+      temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
+    }
+
     console.log(`🚀 Invoking Bedrock with model: ${modelId}`);
     
     const command = new InvokeModelWithResponseStreamCommand({
@@ -1879,22 +1944,116 @@ const streamingHandler = async (event, responseStream, context) => {
       const routingMetadata = body.routing_metadata || {};
       const sessionContext = body.session_context || {};
 
-      // Deterministic branch-based CTA routing via response_enhancer.
-      // Tier 1: action chip click → program branch
-      // Tier 2: CTA click → program branch
-      // Tier 3: free text (no routing metadata) → fallback branch (main menu)
-      const { enhanceResponse } = require('./response_enhancer');
-      const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+      if (config?.feature_flags?.V4_PIPELINE) {
+        // ═══════════════════════════════════════════════════════════════
+        // V4 PIPELINE: Three-layer architecture (amendment lines 45-55)
+        // ═══════════════════════════════════════════════════════════════
+        const validation = validateIntentDefinitions(config);
 
-      if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-        write(`data: ${JSON.stringify({
-          type: 'cta_buttons',
-          ctaButtons: enhancedData.ctaButtons,
-          metadata: enhancedData.metadata,
-          session_id: sessionId
-        })}\n\n`);
-        console.log(`🎯 Branch routing: sent ${enhancedData.ctaButtons.length} CTAs | branch: ${enhancedData.metadata?.branch_detected || 'fallback'} | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
+        if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
+          // Tiers 1-2: Explicit clicks — use existing enhanceResponse()
+          // (Amendment line 271: "Step 4 assembly, branch overrides — unchanged")
+          console.log('[V4] Tiers 1-2: Explicit click routing — using enhanceResponse()');
+          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+
+          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+            write(`data: ${JSON.stringify({
+              type: 'cta_buttons',
+              ctaButtons: enhancedData.ctaButtons,
+              metadata: enhancedData.metadata,
+              session_id: sessionId
+            })}\n\n`);
+            console.log(`🎯 [V4 Tier 1-2] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'explicit'}`);
+          }
+          // Send showcase card if present
+          if (enhancedData.showcaseCard) {
+            write(`data: ${JSON.stringify({
+              type: 'showcase_card',
+              showcaseCard: enhancedData.showcaseCard,
+              metadata: enhancedData.metadata,
+              session_id: sessionId
+            })}\n\n`);
+          }
+
+        } else if (validation.definitions.length > 0) {
+          // Step 3a: Classification (non-streaming LLM call)
+          console.log(`[V4] Step 3a: Classifying intent (${validation.definitions.length} definitions)`);
+          const label = await classifyIntent(
+            userInput,
+            conversationHistory,
+            { ...config, intent_definitions: validation.definitions },
+            bedrock
+          );
+
+          // Step 3b: Routing (deterministic, no AI — AC3c)
+          const result = routeFromClassification(
+            label,
+            config,
+            sessionContext?.completed_forms || []
+          );
+
+          // Send CTA SSE event (same format — amendment line 273)
+          if (result.ctaButtons && result.ctaButtons.length > 0) {
+            write(`data: ${JSON.stringify({
+              type: 'cta_buttons',
+              ctaButtons: result.ctaButtons,
+              metadata: result.metadata,
+              session_id: sessionId
+            })}\n\n`);
+            console.log(`🎯 [V4 Step3] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'} | branch: ${result.metadata?.target_branch || 'none'} | method: ${result.metadata?.routing_method}`);
+          } else {
+            console.log(`[V4 Step3] No CTAs to send | intent: ${label || 'null'} | method: ${result.metadata?.routing_method}`);
+          }
+
+        } else {
+          // V4 active but no intent_definitions — use existing enhanceResponse()
+          console.log('[V4] No intent_definitions configured — using enhanceResponse()');
+          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+
+          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+            write(`data: ${JSON.stringify({
+              type: 'cta_buttons',
+              ctaButtons: enhancedData.ctaButtons,
+              metadata: enhancedData.metadata,
+              session_id: sessionId
+            })}\n\n`);
+            console.log(`🎯 [V4 fallback] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
+          }
+          if (enhancedData.showcaseCard) {
+            write(`data: ${JSON.stringify({
+              type: 'showcase_card',
+              showcaseCard: enhancedData.showcaseCard,
+              metadata: enhancedData.metadata,
+              session_id: sessionId
+            })}\n\n`);
+          }
+        }
+
+      } else {
+        // ═══════════════════════════════════════════════════════════════
+        // V3.5 path — completely unchanged (amendment line 275)
+        // ═══════════════════════════════════════════════════════════════
+        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+
+        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+          write(`data: ${JSON.stringify({
+            type: 'cta_buttons',
+            ctaButtons: enhancedData.ctaButtons,
+            metadata: enhancedData.metadata,
+            session_id: sessionId
+          })}\n\n`);
+          console.log(`🎯 Branch routing: sent ${enhancedData.ctaButtons.length} CTAs | branch: ${enhancedData.metadata?.branch_detected || 'fallback'} | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
+        }
+        if (enhancedData.showcaseCard) {
+          write(`data: ${JSON.stringify({
+            type: 'showcase_card',
+            showcaseCard: enhancedData.showcaseCard,
+            metadata: enhancedData.metadata,
+            session_id: sessionId
+          })}\n\n`);
+        }
       }
+
     } catch (enhanceError) {
       console.error('❌ CTA enhancement error:', enhanceError);
       // Don't fail the response if CTA enhancement fails
@@ -2080,12 +2239,26 @@ const bufferedHandler = async (event, context) => {
 
     // Get KB context
     const kbContext = await retrieveKB(sanitizedInput, config);
-    const prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
 
-    // Prepare Bedrock request - use config model or default
-    const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-    const maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
-    const temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
+    // V4 Pipeline gate (buffered handler) — same logic as streaming handler
+    let prompt;
+    let modelId;
+    let maxTokens;
+    let temperature;
+
+    if (config?.feature_flags?.V4_PIPELINE) {
+      console.log('[V4] Buffered handler: Using V4 conversational prompt (Step 2)');
+      const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
+      prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+      maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
+      temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
+    } else {
+      prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
+      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+      maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
+      temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
+    }
 
     // Invoke Bedrock
     const response = await bedrock.send(new InvokeModelWithResponseStreamCommand({
@@ -2161,30 +2334,60 @@ const bufferedHandler = async (event, context) => {
 
     // Enhance response with CTAs after generation is complete
     try {
-      const { enhanceResponse } = require('./response_enhancer');
-
-      // Extract routing metadata for 3-tier explicit routing (PRD: Action Chips)
       const routingMetadata = body.routing_metadata || {};
+      const sessionContext = body.session_context || {};
 
-      const enhancedData = await enhanceResponse(
-        responseBuffer,  // The complete Bedrock response
-        userInput,       // The user's message
-        tenantHash,      // Tenant identifier
-        body.session_context || {}, // Session context for form tracking
-        routingMetadata  // Routing metadata for explicit routing (action chips, CTAs, fallback)
-      );
+      if (config?.feature_flags?.V4_PIPELINE) {
+        // V4 Pipeline — same logic as streaming handler
+        const validation = validateIntentDefinitions(config);
 
-      if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-        // Add CTAs to the chunks array before completion
-        const ctaData = JSON.stringify({
-          type: 'cta_buttons',
-          ctaButtons: enhancedData.ctaButtons,
-          metadata: enhancedData.metadata,
-          session_id: sessionId
-        });
-        // Insert CTAs before the [DONE] marker
-        chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-        console.log(`🎯 Added ${enhancedData.ctaButtons.length} CTA buttons for branch: ${enhancedData.metadata?.branch_detected || 'form'}`);
+        if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
+          // Tiers 1-2: Explicit clicks
+          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+            const ctaData = JSON.stringify({
+              type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
+              metadata: enhancedData.metadata, session_id: sessionId
+            });
+            chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+          }
+        } else if (validation.definitions.length > 0) {
+          // Step 3a + 3b: Classification → Routing
+          const label = await classifyIntent(
+            userInput, conversationHistory,
+            { ...config, intent_definitions: validation.definitions }, bedrock
+          );
+          const result = routeFromClassification(label, config, sessionContext?.completed_forms || []);
+          if (result.ctaButtons && result.ctaButtons.length > 0) {
+            const ctaData = JSON.stringify({
+              type: 'cta_buttons', ctaButtons: result.ctaButtons,
+              metadata: result.metadata, session_id: sessionId
+            });
+            chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+            console.log(`🎯 [V4 Step3 buffered] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'}`);
+          }
+        } else {
+          // V4 but no intent_definitions — fallback to enhanceResponse()
+          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+            const ctaData = JSON.stringify({
+              type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
+              metadata: enhancedData.metadata, session_id: sessionId
+            });
+            chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+          }
+        }
+      } else {
+        // V3.5 path — unchanged
+        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+          const ctaData = JSON.stringify({
+            type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
+            metadata: enhancedData.metadata, session_id: sessionId
+          });
+          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+          console.log(`🎯 Added ${enhancedData.ctaButtons.length} CTA buttons for branch: ${enhancedData.metadata?.branch_detected || 'form'}`);
+        }
       }
     } catch (enhanceError) {
       console.error('❌ CTA enhancement error:', enhanceError);

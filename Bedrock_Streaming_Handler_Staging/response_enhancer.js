@@ -111,23 +111,21 @@ async function loadTenantConfig(tenantHash) {
 }
 
 /**
- * Get conversation branch using 3-tier routing hierarchy (PRD: Action Chips Explicit Routing)
+ * Get conversation branch using explicit routing (Tiers 1-2 only)
  *
- * This implements explicit routing metadata, eliminating keyword matching for action chips and CTAs.
+ * Handles click-based routing where the frontend sends explicit routing metadata.
+ * Free-text routing (Tiers 3-5) is handled in enhanceResponse() where the AI
+ * response is available for branch hint and intent tag parsing.
  *
  * Tier 1: Explicit action chip routing (chip.target_branch)
  * Tier 2: Explicit CTA routing (cta.target_branch)
- * Tier 3: Fallback navigation hub (cta_settings.fallback_branch)
  *
  * @param {Object} routingMetadata - Routing metadata from frontend
  * @param {Object} config - Tenant configuration
- * @param {Object} sessionContext - Session context from frontend (includes current_node for workflow tracking)
- * @returns {string|null} - Branch name to use for CTA selection, or null if no match
+ * @returns {string|null} - Branch name to use for CTA selection, or null if no explicit match
  */
-function getConversationBranch(routingMetadata, config, sessionContext = {}) {
+function getConversationBranch(routingMetadata, config) {
     const branches = config.conversation_branches || {};
-    const ctaSettings = config.cta_settings || {};
-    const featureFlags = config.feature_flags || {};
 
     // TIER 1: Explicit action chip routing
     if (routingMetadata.action_chip_triggered) {
@@ -153,31 +151,7 @@ function getConversationBranch(routingMetadata, config, sessionContext = {}) {
         }
     }
 
-    // TIER 5: Context-aware fallback (Sprint 1 — WORKFLOW_TRACKING)
-    // If user has a current position in the graph, stay in that branch
-    if (featureFlags.WORKFLOW_TRACKING && sessionContext.current_node) {
-        const currentNode = sessionContext.current_node;
-        if (branches[currentNode]) {
-            console.log(`[Tier 5] Staying in current node: ${currentNode}`);
-            return currentNode;
-        }
-        console.log(`[Tier 5] current_node '${currentNode}' not found in branches, falling through to fallback`);
-    }
-
-    // TIER 5 (default): Fallback navigation hub
-    const fallbackBranch = ctaSettings.fallback_branch;
-    if (fallbackBranch && branches[fallbackBranch]) {
-        console.log(`[Tier 5] Routing to fallback branch: ${fallbackBranch}`);
-        return fallbackBranch;
-    }
-
-    // No routing match - graceful degradation (backward compatibility)
-    if (fallbackBranch) {
-        console.log(`[Tier 5] Fallback branch '${fallbackBranch}' not found in conversation_branches`);
-    } else {
-        console.log('[Tier 5] No fallback_branch configured - no CTAs will be shown');
-    }
-
+    // Tiers 3-5 (branch hint, intent, context-aware, fallback) handled in enhanceResponse()
     return null;
 }
 
@@ -322,6 +296,34 @@ function parseBranchHint(response) {
     }
 
     return { branch: null, cleanedResponse: response };
+}
+
+/**
+ * Parse intent tag from AI response (Sprint 2 — WORKFLOW_TRACKING)
+ *
+ * Extracts <!-- INTENT: label --> and strips it from visible text.
+ * Intent labels are semantic (e.g., "volunteering", "donating") and get
+ * resolved to branches via cta_settings.intent_map in the tenant config.
+ *
+ * @param {string} response - Raw or partially cleaned Bedrock response text
+ * @returns {Object} - { intent: string|null, cleanedResponse: string }
+ */
+function parseIntentTag(response) {
+    if (!response || typeof response !== 'string') {
+        return { intent: null, cleanedResponse: response || '' };
+    }
+
+    const intentPattern = /<!--\s*INTENT:\s*([a-zA-Z0-9_-]+)\s*-->/i;
+    const match = response.match(intentPattern);
+
+    if (match) {
+        const intent = match[1].toLowerCase();
+        const cleanedResponse = response.replace(intentPattern, '').trim();
+        console.log(`[Tier 4] Parsed intent tag: "${intent}"`);
+        return { intent, cleanedResponse };
+    }
+
+    return { intent: null, cleanedResponse: response };
 }
 
 /**
@@ -645,10 +647,9 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         const suspendedForms = sessionContext.suspended_forms || [];
 
         // ============================================================================
-        // TIER 1-3: Explicit Routing (PRD: Action Chips Explicit Routing)
+        // TIER 1-2: Explicit Routing (Action Chips + CTA clicks)
         // ============================================================================
-        // Check for explicit routing metadata BEFORE keyword detection or form triggers
-        const explicitBranch = getConversationBranch(routingMetadata, config, sessionContext);
+        const explicitBranch = getConversationBranch(routingMetadata, config);
         if (explicitBranch) {
             console.log(`[Explicit Routing] Using branch: ${explicitBranch}`);
             const ctas = buildCtasFromBranch(explicitBranch, config, completedForms);
@@ -658,9 +659,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
             let showcaseCard = null;
 
             if (showcaseItem) {
-                // Build showcase card with resolved CTAs
                 const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
-
                 showcaseCard = {
                     id: showcaseItem.id,
                     type: showcaseItem.type,
@@ -671,7 +670,6 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                     highlights: showcaseItem.highlights,
                     ctaButtons: resolvedCtas
                 };
-
                 console.log(`[Explicit Routing] Including showcase card: ${showcaseItem.id}`);
             }
 
@@ -683,13 +681,10 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
                         enhanced: true,
                         branch: explicitBranch,
                         routing_tier: 'explicit',
-                        routing_method: routingMetadata.action_chip_triggered ? 'action_chip' :
-                                       routingMetadata.cta_triggered ? 'cta' :
-                                       (config.feature_flags?.WORKFLOW_TRACKING && sessionContext.current_node === explicitBranch) ? 'context_aware_fallback' : 'fallback'
+                        routing_method: routingMetadata.action_chip_triggered ? 'action_chip' : 'cta'
                     }
                 };
 
-                // Add showcase card if present
                 if (showcaseCard) {
                     response.showcaseCard = showcaseCard;
                     response.metadata.has_showcase = true;
@@ -702,7 +697,7 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
             }
         }
         // ============================================================================
-        // End of Explicit Routing - Continue to existing logic for backward compatibility
+        // End of Tiers 1-2 - Continue to AI-based routing (Tiers 3-5)
         // ============================================================================
 
         // ============================================================================
@@ -830,7 +825,161 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
             bedrockResponse = cleanedResponse;
         }
         // ============================================================================
-        // End of Tier 4 - Continue to existing logic for backward compatibility
+        // End of Tier 3 (AI Branch Hint)
+        // ============================================================================
+
+        // ============================================================================
+        // TIER 4: Intent-Based Routing (Sprint 2 — WORKFLOW_TRACKING)
+        // AI labels response with <!-- INTENT: label -->, resolved via intent_map
+        // ============================================================================
+        const featureFlags = config.feature_flags || {};
+        const intentMap = ctaSettings.intent_map || {};
+
+        if (featureFlags.WORKFLOW_TRACKING && Object.keys(intentMap).length > 0) {
+            const { intent: detectedIntent, cleanedResponse: intentCleanedResponse } = parseIntentTag(bedrockResponse);
+
+            if (detectedIntent) {
+                const intentEntry = intentMap[detectedIntent];
+                if (intentEntry && intentEntry.target_branch) {
+                    const targetBranch = intentEntry.target_branch;
+                    const branches = config.conversation_branches || {};
+
+                    if (branches[targetBranch]) {
+                        console.log(`[Tier 4] Intent "${detectedIntent}" → branch "${targetBranch}"`);
+                        const ctas = buildCtasFromBranch(targetBranch, config, completedForms);
+
+                        const showcaseItem = getShowcaseForBranch(targetBranch, config);
+                        let showcaseCard = null;
+                        if (showcaseItem) {
+                            const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
+                            showcaseCard = {
+                                id: showcaseItem.id, type: showcaseItem.type,
+                                name: showcaseItem.name, tagline: showcaseItem.tagline,
+                                description: showcaseItem.description, image_url: showcaseItem.image_url,
+                                highlights: showcaseItem.highlights, ctaButtons: resolvedCtas
+                            };
+                        }
+
+                        if (ctas.length > 0 || showcaseCard) {
+                            const response = {
+                                message: intentCleanedResponse,
+                                ctaButtons: ctas,
+                                metadata: {
+                                    enhanced: true,
+                                    branch: targetBranch,
+                                    routing_tier: 'tier4_intent_transition',
+                                    routing_method: 'intent_map',
+                                    detected_intent: detectedIntent
+                                }
+                            };
+                            if (showcaseCard) {
+                                response.showcaseCard = showcaseCard;
+                                response.metadata.has_showcase = true;
+                            }
+                            console.log(`[Tier 4] Returning ${ctas.length} CTAs from intent "${detectedIntent}" → branch "${targetBranch}"`);
+                            return response;
+                        }
+                    } else {
+                        console.log(`[Tier 4] Intent "${detectedIntent}" maps to invalid branch "${targetBranch}"`);
+                    }
+                } else {
+                    console.log(`[Tier 4] Intent "${detectedIntent}" not found in intent_map`);
+                }
+
+                // Strip intent tag even if routing failed
+                bedrockResponse = intentCleanedResponse;
+            }
+        }
+        // ============================================================================
+        // End of Tier 4 (Intent Routing)
+        // ============================================================================
+
+        // ============================================================================
+        // TIER 5: Fallback Routing (context-aware + default)
+        // ============================================================================
+        {
+            const branches = config.conversation_branches || {};
+
+            // Tier 5a: Context-aware fallback — stay in current node
+            if (featureFlags.WORKFLOW_TRACKING && sessionContext.current_node) {
+                const currentNode = sessionContext.current_node;
+                if (branches[currentNode]) {
+                    console.log(`[Tier 5] Staying in current node: ${currentNode}`);
+                    const ctas = buildCtasFromBranch(currentNode, config, completedForms);
+
+                    const showcaseItem = getShowcaseForBranch(currentNode, config);
+                    let showcaseCard = null;
+                    if (showcaseItem) {
+                        const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
+                        showcaseCard = {
+                            id: showcaseItem.id, type: showcaseItem.type,
+                            name: showcaseItem.name, tagline: showcaseItem.tagline,
+                            description: showcaseItem.description, image_url: showcaseItem.image_url,
+                            highlights: showcaseItem.highlights, ctaButtons: resolvedCtas
+                        };
+                    }
+
+                    if (ctas.length > 0 || showcaseCard) {
+                        const response = {
+                            message: bedrockResponse,
+                            ctaButtons: ctas,
+                            metadata: {
+                                enhanced: true,
+                                branch: currentNode,
+                                routing_tier: 'tier5_context_aware',
+                                routing_method: 'context_aware_fallback'
+                            }
+                        };
+                        if (showcaseCard) {
+                            response.showcaseCard = showcaseCard;
+                            response.metadata.has_showcase = true;
+                        }
+                        return response;
+                    }
+                } else {
+                    console.log(`[Tier 5] current_node '${currentNode}' not found in branches`);
+                }
+            }
+
+            // Tier 5b: Default fallback — fallback_branch
+            const fallbackBranch = ctaSettings.fallback_branch;
+            if (fallbackBranch && branches[fallbackBranch]) {
+                console.log(`[Tier 5] Routing to fallback branch: ${fallbackBranch}`);
+                const ctas = buildCtasFromBranch(fallbackBranch, config, completedForms);
+
+                const showcaseItem = getShowcaseForBranch(fallbackBranch, config);
+                let showcaseCard = null;
+                if (showcaseItem) {
+                    const resolvedCtas = resolveShowcaseCTAs(showcaseItem, config);
+                    showcaseCard = {
+                        id: showcaseItem.id, type: showcaseItem.type,
+                        name: showcaseItem.name, tagline: showcaseItem.tagline,
+                        description: showcaseItem.description, image_url: showcaseItem.image_url,
+                        highlights: showcaseItem.highlights, ctaButtons: resolvedCtas
+                    };
+                }
+
+                if (ctas.length > 0 || showcaseCard) {
+                    const response = {
+                        message: bedrockResponse,
+                        ctaButtons: ctas,
+                        metadata: {
+                            enhanced: true,
+                            branch: fallbackBranch,
+                            routing_tier: 'tier5_fallback',
+                            routing_method: 'fallback'
+                        }
+                    };
+                    if (showcaseCard) {
+                        response.showcaseCard = showcaseCard;
+                        response.metadata.has_showcase = true;
+                    }
+                    return response;
+                }
+            }
+        }
+        // ============================================================================
+        // End of Tier 5 — No routing matched, fall through to legacy paths
         // ============================================================================
 
         // PHASE 1B: If there are suspended forms, check if user is asking about a DIFFERENT program
@@ -1087,10 +1236,11 @@ module.exports = {
     enhanceResponse,
     loadTenantConfig,
     detectConversationBranch,  // DEPRECATED - kept for backward compatibility
-    getConversationBranch,      // Tier 1-3 explicit routing
+    getConversationBranch,      // Tiers 1-2 explicit routing
     buildCtasFromBranch,        // Explicit CTA building from branch
-    parseBranchHint,            // Tier 4 - AI-suggested branch parsing
-    getShowcaseForBranch,       // Phase 2.3 - Showcase items lookup
-    resolveShowcaseCTAs,        // Phase 2.3 - Showcase CTA resolution
+    parseBranchHint,            // Tier 3 - AI-suggested branch parsing
+    parseIntentTag,             // Tier 4 - Intent tag parsing (Sprint 2)
+    getShowcaseForBranch,       // Showcase items lookup
+    resolveShowcaseCTAs,        // Showcase CTA resolution
     getShowcaseById             // Action chip → showcase direct routing
 };
