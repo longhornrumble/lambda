@@ -429,23 +429,15 @@ async function classifyIntent(userMessage, conversationHistory, config, bedrockC
 /**
  * Validate intent_definitions in tenant config.
  *
- * Config validation rules (amendment lines 203-206):
+ * Validation rules:
  *   Rule 1: Every entry must have non-empty name and description. Reject without.
- *   Rule 2: If V4_PIPELINE is false, intent_definitions is ignored silently.
- *   Rule 3: If target_branch references missing branch, log warning but don't error.
+ *   Rule 2: If target_branch references missing branch, log warning but don't error.
  *
  * @param {Object} config - Full tenant config
  * @returns {{ valid: boolean, definitions: Array, warnings: string[] }}
  */
 function validateIntentDefinitions(config) {
   const warnings = [];
-
-  // Rule 2 (amendment line 205): If intent_definitions present but V4_PIPELINE false,
-  // return early — ignored silently. No error.
-  if (config.intent_definitions && !config.feature_flags?.V4_PIPELINE) {
-    console.log('[V4] intent_definitions present but V4_PIPELINE flag is false — ignoring');
-    return { valid: true, definitions: [], warnings: [] };
-  }
 
   // If not present, not an array, or empty — valid but no definitions
   if (!config.intent_definitions || !Array.isArray(config.intent_definitions) || config.intent_definitions.length === 0) {

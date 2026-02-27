@@ -3,71 +3,14 @@
  * Uses awslambda.streamifyResponse for real SSE streaming
  * No JWT required - uses simple tenant_hash/session_id
  *
- * Version: v2.9.0
- * Deployed: 2025-12-05
- * Changes:
- *   - NEW: Engagement question feature - responses end with contextual follow-up questions
- *   - Prompts users to explore related topics (e.g., "Would you like to know the requirements?")
- *   - Works with existing loop prevention (Stage 1 only, skips Stage 2/3)
- *   - ENHANCED: Links and contact info now ALWAYS included regardless of formatting preferences
+ * Architecture: V4 Pipeline (three-layer)
+ *   Step 1: KB retrieval (Bedrock Agent Runtime)
+ *   Step 2: Streaming response generation (prompt_v4.js)
+ *   Step 3a: Intent classification (prompt_v4.js — non-streaming Bedrock call)
+ *   Step 3b: Deterministic CTA routing (prompt_v4.js — no AI)
  *
- * Version: v2.7.0
- * Deployed: 2025-11-26
- * Changes:
- *   - NEW: Tier 4 AI-suggested branch routing for CTAs
- *   - Model suggests conversation branch based on response content
- *   - Branch hint injected via prompt, extracted via <!-- BRANCH: xxx --> tag
- *   - Enables CTAs for free-flow conversations without explicit routing
- *   - Falls back to fallback_branch if invalid branch suggested
- *
- * Version: v2.6.0
- * Deployed: 2025-11-26
- * Changes:
- *   - NEW: Intelligent follow-up question detection
- *   - Detects when user says "yes" to a question the bot asked
- *   - Extracts the topic from questions like "Would you like to learn more about X?"
- *   - Adds explicit directive telling model exactly what to answer
- *   - Should eliminate "I noticed you said yes..." responses
- *
- * Version: v2.5.1
- * Deployed: 2025-11-26
- * Changes:
- *   - FIXED: Formatting preference conflicts between response_style and detail_level
- *   - Added conflict resolution for structured_detailed + concise (was contradicting)
- *   - Added conflict resolution for structured_detailed + balanced (was tension)
- *   - All 9 combinations now have consistent, non-conflicting instructions
- *
- * Version: v2.5.0
- * Deployed: 2025-11-26
- * Changes:
- *   - UPGRADED MODEL: Claude 3.5 Haiku → Claude Haiku 4.5
- *   - Better instruction following for follow-up questions
- *   - 8x larger max output (64K vs 8K tokens)
- *   - Vision/image support added
- *
- * Version: v2.4.2
- * Deployed: 2025-11-26
- * Changes:
- *   - STRONGER follow-up question fix: moved instruction to CRITICAL section near end of prompt
- *   - Added explicit WRONG/RIGHT examples for the model to follow
- *   - Instructions now have higher priority via recency bias positioning
- *
- * Version: v2.4.1
- * Deployed: 2025-11-26
- * Changes:
- *   - Fixed follow-up question handling: bot now answers its own questions when user affirms
- *   - Added explicit instructions to prevent "I noticed you said yes" preambles
- *   - Improved context interpretation for affirmative responses
- *
- * Version: v2.4.0
- * Deployed: 2025-11-20
- * Changes:
- *   - MAJOR: Rewrote style enforcement with contract-based approach
- *   - Moved formatting rules to END of prompt (recency bias)
- *   - Added explicit substitution rules (we're → we are for professional)
- *   - Added pre-generation verification checklists
- *   - Stronger behavioral contracts with mandatory compliance language
- *   - Should achieve 95%+ style differentiation accuracy
+ * Tier 1-2: Explicit click routing (action chips, CTA buttons) via response_enhancer.js
+ * Fallback: enhanceResponse() when no intent_definitions configured
  */
 
 const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -92,22 +35,6 @@ const DEFAULT_MODEL_ID = 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
 const DEFAULT_MAX_TOKENS = 1000;
 const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
 const DEFAULT_TONE = 'You are a helpful assistant.';
-
-// Prompt version tracking for tenant customization
-const PROMPT_VERSION = '2.8.0';
-
-// Default Bedrock instructions when config doesn't specify custom ones
-const DEFAULT_BEDROCK_INSTRUCTIONS = {
-  role_instructions: "You are a virtual assistant answering the questions of website visitors. You are always courteous and respectful and respond as if you are an employee of the organization. You replace words like they or their with our, which conveys that you are a representative of the team. You are answering a user's question using information from a knowledge base. Your job is to provide a helpful, natural response based on the information provided below.",
-  formatting_preferences: {
-    emoji_usage: "moderate",
-    max_emojis_per_response: 3,
-    response_style: "professional_concise",
-    detail_level: "balanced"
-  },
-  custom_constraints: [],
-  fallback_message: "I don't have specific information about that topic in my knowledge base. Would you like me to connect you with someone who can help?"
-};
 
 // Lambda streaming - use the global awslambda object when available
 // The awslambda global is injected by the Lambda runtime for streaming functions
@@ -344,1102 +271,6 @@ async function retrieveKB(userInput, config) {
   }
 }
 
-// ============================================================================
-// PROMPT BUILDING HELPERS - Modular prompt construction for tenant customization
-// ============================================================================
-
-/**
- * Validate bedrock_instructions structure
- */
-function validateBedrockInstructions(instructions) {
-  if (!instructions || typeof instructions !== 'object') {
-    return false;
-  }
-
-  // Check for required fields
-  if (!instructions.role_instructions || typeof instructions.role_instructions !== 'string') {
-    console.log('⚠️ Invalid bedrock_instructions: missing or invalid role_instructions');
-    return false;
-  }
-
-  // Check formatting preferences structure if present
-  if (instructions.formatting_preferences) {
-    const prefs = instructions.formatting_preferences;
-    if (typeof prefs !== 'object') {
-      console.log('⚠️ Invalid bedrock_instructions: formatting_preferences must be object');
-      return false;
-    }
-  }
-
-  // Check custom_constraints is array if present
-  if (instructions.custom_constraints && !Array.isArray(instructions.custom_constraints)) {
-    console.log('⚠️ Invalid bedrock_instructions: custom_constraints must be array');
-    return false;
-  }
-
-  return true;
-}
-
-/**
- * Get role instructions - AI personality and identity
- *
- * Migration path:
- * 1. NEW configs: Set bedrock_instructions.role_instructions
- * 2. OLD configs: tone_prompt used as fallback (deprecated)
- * 3. Future: Remove tone_prompt support entirely
- *
- * To migrate: Copy tone_prompt value → bedrock_instructions.role_instructions
- */
-function getRoleInstructions(config, toneFallback) {
-  const instructions = config?.bedrock_instructions;
-
-  // Priority 1: Use bedrock_instructions.role_instructions if present
-  if (instructions && validateBedrockInstructions(instructions)) {
-    console.log('✅ Using bedrock_instructions.role_instructions (master)');
-    return instructions.role_instructions;
-  }
-
-  // Priority 2: Fallback to tone_prompt for backward compatibility
-  if (toneFallback) {
-    console.log('⚠️ Using tone_prompt as fallback (deprecated - migrate to bedrock_instructions.role_instructions)');
-    return toneFallback;
-  }
-
-  // Priority 3: Use default
-  console.log('ℹ️ Using DEFAULT role instructions');
-  return DEFAULT_BEDROCK_INSTRUCTIONS.role_instructions;
-}
-
-/**
- * Build formatting rules from config preferences (LEGACY - kept for backward compatibility)
- * Use buildEnhancedFormattingRules() for new contract-based approach
- */
-function buildFormattingRulesLegacy(config) {
-  const instructions = config?.bedrock_instructions;
-  let prefs = DEFAULT_BEDROCK_INSTRUCTIONS.formatting_preferences;
-
-  if (instructions && validateBedrockInstructions(instructions) && instructions.formatting_preferences) {
-    prefs = { ...prefs, ...instructions.formatting_preferences };
-  }
-
-  // Build style-specific examples and constraints
-  let styleGuidance = '';
-  let styleExamples = '';
-
-  if (prefs.response_style === 'professional_concise') {
-    styleGuidance = `CRITICAL STYLE ENFORCEMENT - PROFESSIONAL & FORMAL:
-- NEVER use contractions (no "we're", "you'll", "it's" - use "we are", "you will", "it is")
-- NEVER use casual words like "awesome", "great", "cool", "super", "amazing"
-- Use formal vocabulary: "comprehensive" not "great", "exceptional" not "awesome"
-- Maintain a business-professional tone throughout
-- Write as if this is a formal business document`;
-    styleExamples = `
-STYLE EXAMPLES:
-❌ WRONG: "We've got an awesome mentorship program that'll help foster youth! It's really great!"
-❌ WRONG: "Our program is super helpful and we're here to support you!"
-✅ CORRECT: "We offer a comprehensive mentorship program designed to support foster youth. Our organization provides structured guidance for academic achievement and life skills development."`;
-  } else if (prefs.response_style === 'warm_conversational') {
-    styleGuidance = `CRITICAL STYLE ENFORCEMENT - WARM & CONVERSATIONAL:
-- ALWAYS use contractions (we're, you'll, it's, we've, you'd, etc.)
-- Use friendly, welcoming language - sound like a helpful friend, not overly enthusiastic
-- AVOID overused enthusiasm phrases like "super excited", "we're excited to share", "awesome", "incredible"
-- DO use measured warm words like "happy to help", "glad to share", "pleased to", "great", "wonderful"
-- Write naturally - friendly but not gushing
-- Use exclamation points sparingly (maximum 1 per response, only if truly warranted)
-- Sound genuine and approachable, not like marketing copy`;
-    styleExamples = `
-STYLE EXAMPLES:
-❌ WRONG (too formal): "We offer a comprehensive mentorship program designed to support foster youth."
-❌ WRONG (overly enthusiastic): "We're super excited to share about our awesome mentorship program! It's incredible and we love helping foster youth!"
-✅ CORRECT: "We've got a mentorship program that helps foster youth ages 11-22. It's a great way to get support, build skills, and we're here for you every step of the way."`;
-  } else if (prefs.response_style === 'structured_detailed') {
-    styleGuidance = `CRITICAL STYLE ENFORCEMENT - STRUCTURED & ORGANIZED:
-- ALWAYS use markdown headings with ** for major sections
-- ALWAYS use bullet points (-) or numbered lists for any list of items
-- Break content into clear sections with headings
-- Use this structure: [Intro sentence] → [**Heading:**] → [bullets] → [**Heading:**] → [bullets]
-- Never write long paragraphs - always break into structured sections`;
-    styleExamples = `
-STYLE EXAMPLES:
-❌ WRONG: "Dare to Dream is our mentorship program for foster youth ages 11-22. We provide life skills training, academic support, and career preparation. Our goal is to help youth succeed."
-✅ CORRECT: "Dare to Dream is our mentorship program supporting foster youth.
-
-**Program Structure:**
-- Dare to Dream Jr. (ages 11-14)
-- Dare to Dream (ages 15-22)
-
-**Services Provided:**
-- Life skills training
-- Academic support
-- Career preparation
-
-**Goal:** Empowering youth to achieve independence and success."`;
-  } else {
-    styleGuidance = prefs.response_style; // Custom style
-  }
-
-  // Build detail-level specific constraints with examples
-  let detailGuidance = '';
-  let detailExamples = '';
-
-  if (prefs.detail_level === 'concise') {
-    detailGuidance = `CRITICAL CONSTRAINT - MAXIMUM LENGTH ENFORCEMENT:
-Your response MUST be EXACTLY 2-3 sentences. Count your sentences BEFORE responding.
-DO NOT exceed 3 sentences under ANY circumstances. NO bullet points, NO lists, NO headings.
-Write in pure paragraph form - one continuous block of text.`;
-    detailExamples = `
-LENGTH EXAMPLES:
-❌ WRONG (4+ sentences): "Dare to Dream is our mentorship program. We have two tracks. One is for ages 11-14. The other is for ages 15-22."
-❌ WRONG (has bullets): "Dare to Dream is our mentorship program for foster youth ages 11-22. We provide:\n- Life skills training\n- Academic support"
-✅ CORRECT (2 sentences): "Dare to Dream is our mentorship program for foster youth ages 11-22, with separate tracks for ages 11-14 and 15-22. We provide life skills training, academic support, and guidance for independent living."`;
-  } else if (prefs.detail_level === 'balanced') {
-    detailGuidance = `CONSTRAINT - MODERATE LENGTH:
-Your response MUST be 4-6 sentences. Not less, not more.
-You MAY use 1-2 short bullet points if absolutely necessary, but prefer paragraph form.
-Keep it focused - don't ramble.`;
-    detailExamples = `
-LENGTH EXAMPLES:
-❌ TOO SHORT (2 sentences): "Dare to Dream is our mentorship program. We help foster youth."
-❌ TOO LONG (8+ sentences with extensive bullets): [long detailed response with many bullet points]
-✅ CORRECT (5 sentences with optional short bullets): "Dare to Dream is our mentorship program supporting foster youth ages 11-22. We offer two tracks: Dare to Dream Jr. (ages 11-14) and Dare to Dream (ages 15-22). The program focuses on:\n- Life skills and academic support\n- Career preparation\nOur goal is to help youth develop confidence and prepare for independent adulthood."`;
-  } else if (prefs.detail_level === 'comprehensive') {
-    detailGuidance = `COMPREHENSIVE DETAIL REQUIRED:
-Your response MUST be thorough and detailed - minimum 8-10 sentences.
-Use headings, bullet points, and structured sections to organize information.
-Cover ALL aspects mentioned in the knowledge base. Include examples and context.
-Anticipate follow-up questions and proactively address them.`;
-    detailExamples = `
-LENGTH EXAMPLES:
-❌ TOO SHORT: "Dare to Dream is our mentorship program for foster youth ages 11-22."
-✅ CORRECT (comprehensive with structure): "**Dare to Dream - Comprehensive Overview**\n\n[Opening paragraph with 2-3 sentences]\n\n**Program Structure:**\n[Detailed explanation with bullet points]\n\n**Key Features:**\n- [Multiple detailed bullet points]\n\n**Impact and Outcomes:**\n[Additional paragraphs explaining benefits]\n\n[10+ sentences total with clear organization]"`;
-  } else {
-    detailGuidance = prefs.detail_level; // Custom detail level
-  }
-
-  // Build emoji guidance with examples
-  let emojiGuidance = '';
-  let emojiExamples = '';
-
-  if (prefs.emoji_usage === 'none') {
-    emojiGuidance = 'CRITICAL: Do NOT use any emojis. Zero emojis allowed.';
-    emojiExamples = `
-EMOJI EXAMPLES:
-❌ BAD: "🌟 Dare to Dream is our mentorship program"
-✅ GOOD: "Dare to Dream is our mentorship program"`;
-  } else if (prefs.emoji_usage === 'minimal') {
-    emojiGuidance = `CONSTRAINT: Use maximum 1 emoji per response, only for key emphasis.`;
-    emojiExamples = `
-EMOJI EXAMPLES:
-❌ TOO MANY: "🌟 Dare to Dream 📚 is our 🏆 mentorship program"
-✅ GOOD: "Dare to Dream is our mentorship program 🌟"`;
-  } else {
-    emojiGuidance = `CONSTRAINT: Use maximum ${prefs.max_emojis_per_response} emojis per response.`;
-    emojiExamples = `
-EMOJI USAGE:
-- Maximum ${prefs.max_emojis_per_response} emojis total
-- Use for emphasis, not decoration
-- Never combine emoji with dash: ❌ "- 📞 Call" ✅ "📞 Call" or "- Call"`;
-  }
-
-  return `
-═══════════════════════════════════════════════════════════════
-🚨 MANDATORY FORMATTING RULES - NON-NEGOTIABLE 🚨
-═══════════════════════════════════════════════════════════════
-
-STOP AND READ: Before you write your response, you MUST check it against
-ALL rules below. If your response violates ANY rule, rewrite it.
-
-${detailGuidance}
-
-${styleGuidance}
-
-${emojiGuidance}
-
-${detailExamples}
-
-${styleExamples}
-
-${emojiExamples}
-
-🚨 FINAL CHECKPOINT - Before sending your response:
-1. Count your sentences - does it match the required length?
-2. Check your tone - does it match the required style?
-3. Count emojis - does it match the emoji constraint?
-4. If ANY rule is violated, REWRITE your response before sending
-
-CRITICAL: These are NOT suggestions. These are REQUIREMENTS that define
-whether your response is correct or incorrect. A response that violates
-these rules is a FAILED response, even if the information is accurate.
-═══════════════════════════════════════════════════════════════`;
-}
-/**
- * Build enhanced formatting rules with contract-based approach
- * Leverages recency bias by being placed at END of prompt
- * Uses behavioral contracts with mandatory substitutions
- */
-function buildEnhancedFormattingRules(config) {
-  const instructions = config?.bedrock_instructions;
-  let prefs = DEFAULT_BEDROCK_INSTRUCTIONS.formatting_preferences;
-
-  if (instructions && validateBedrockInstructions(instructions) && instructions.formatting_preferences) {
-    prefs = { ...prefs, ...instructions.formatting_preferences };
-  }
-
-  let styleContract = '';
-  let verificationChecklist = '';
-
-  if (prefs.response_style === 'professional_concise') {
-    styleContract = `
-🔒 STYLE CONTRACT - PROFESSIONAL CONCISE:
-Before generating each sentence, you WILL:
-1. Use "we are" NOT "we're" | "you will" NOT "you'll" | "it is" NOT "it's"
-2. Replace casual words: "comprehensive" (not "great"), "extensive" (not "awesome"), "exceptional" (not "amazing")
-3. Write as if this is a formal business communication to a stakeholder
-
-MANDATORY SUBSTITUTIONS:
-- "we've" → "we have"
-- "we're" → "we are"
-- "you'll" → "you will"
-- "it's" → "it is"
-- "that's" → "that is"
-- "there's" → "there is"
-- "great" → "comprehensive" or "extensive"
-- "awesome" → "exceptional" or "outstanding"
-- "super" → "highly" or "extremely"
-
-CORRECT EXAMPLES:
-✅ "We offer a comprehensive mentorship program designed to support foster youth ages 11-22. Our organization provides structured academic guidance and life skills development through two distinct tracks."
-✅ "Austin Angels has established an exceptional support system for foster families. Our services include emergency assistance, educational resources, and community connections."
-
-WRONG EXAMPLES (NEVER DO THIS):
-❌ "We've got an awesome mentorship program that'll help foster youth. It's really great!"
-❌ "We're here to support you with our amazing programs!"`;
-
-    verificationChecklist = `
-PRE-GENERATION CHECKLIST - Professional Concise:
-□ Zero contractions in entire response
-□ Zero casual words (great, awesome, cool, super, amazing)
-□ Formal business vocabulary only
-□ Tone sounds like annual report or board presentation`;
-
-  } else if (prefs.response_style === 'warm_conversational') {
-    styleContract = `
-🔒 STYLE CONTRACT - WARM CONVERSATIONAL:
-Before generating each sentence, you WILL:
-1. Use contractions: "we're" (not "we are"), "you'll" (not "you will"), "it's" (not "it is")
-2. Sound like a helpful friend, not a salesperson
-3. AVOID gushing enthusiasm: NO "super excited", "we're thrilled", "awesome", "incredible"
-4. DO use measured warmth: "happy to help", "glad to share", "pleased to", "great"
-5. Maximum 1 exclamation point in entire response
-
-MANDATORY CONTRACTIONS:
-- "we are" → "we're"
-- "you will" → "you'll"
-- "it is" → "it's"
-- "we have" → "we've"
-- "that is" → "that's"
-
-CORRECT EXAMPLES:
-✅ "We've got a mentorship program that helps foster youth ages 11-22. It's a great way to get support and build skills, and we're here for you every step of the way."
-✅ "Austin Angels is here to help foster families. We've created resources for emergency support, education, and connecting with your community."
-
-WRONG EXAMPLES (NEVER DO THIS):
-❌ "We offer a comprehensive mentorship program designed to support foster youth." (too formal - sounds like business doc)
-❌ "We're super excited to share about our awesome mentorship program! It's incredible!" (overly enthusiastic)`;
-
-    verificationChecklist = `
-PRE-GENERATION CHECKLIST - Warm Conversational:
-□ Multiple contractions used throughout
-□ Sounds like helpful friend, not formal business
-□ No gushing enthusiasm (super excited, awesome, incredible)
-□ Maximum 1 exclamation point total
-□ Natural, approachable tone`;
-
-  } else if (prefs.response_style === 'structured_detailed') {
-    styleContract = `
-🔒 STYLE CONTRACT - STRUCTURED DETAILED:
-You WILL format your response as:
-1. Opening sentence (no heading)
-2. **Heading 1:**
-3. - Bullet point
-4. - Bullet point
-5. **Heading 2:**
-6. - Bullet point
-7. - Bullet point
-
-MANDATORY STRUCTURE:
-- Use ** for ALL section headings
-- Use - for ALL bullet points
-- Break ANY list of 2+ items into bullets
-- Never write paragraphs with 5+ sentences - split into sections
-
-CORRECT EXAMPLE:
-✅ "Dare to Dream is our mentorship program supporting foster youth.
-
-**Program Structure:**
-- Dare to Dream Jr. (ages 11-14)
-- Dare to Dream (ages 15-22)
-
-**Services Provided:**
-- Life skills training
-- Academic support
-- Career preparation
-
-**Goal:** Empowering youth to achieve independence and success."
-
-WRONG EXAMPLES (NEVER DO THIS):
-❌ "Dare to Dream is our mentorship program for foster youth ages 11-22. We provide life skills training, academic support, and career preparation." (no structure - paragraph form)`;
-
-    verificationChecklist = `
-PRE-GENERATION CHECKLIST - Structured Detailed:
-□ Opening sentence without heading
-□ All sections have **Heading:**
-□ All lists use - bullet points
-□ No paragraphs with 5+ sentences
-□ Clear visual structure`;
-  }
-
-  // Detail level contract - with conflict resolution for structured_detailed style
-  let lengthContract = '';
-  let lengthChecklist = '';
-  const isStructuredStyle = prefs.response_style === 'structured_detailed';
-
-  if (prefs.detail_level === 'concise') {
-    if (isStructuredStyle) {
-      // CONFLICT RESOLUTION: structured_detailed + concise
-      // Keep it short but allow minimal structure
-      lengthContract = `
-🔒 LENGTH CONTRACT - CONCISE STRUCTURED:
-Your response WILL be brief (3-4 sentences worth of content) but WITH structure.
-Use ONE heading and 2-4 bullet points maximum.
-
-EXAMPLE:
-✅ "Dare to Dream supports foster youth ages 11-22.
-
-**Key Features:**
-- Two age tracks: Jr. (11-14) and Senior (15-22)
-- Life skills training and academic support
-- Career preparation guidance"
-
-This format keeps content brief while maintaining structure.`;
-
-      lengthChecklist = `
-PRE-GENERATION LENGTH CHECK - Concise Structured:
-□ Brief total content (equivalent to 3-4 sentences)
-□ Maximum 1 heading
-□ Maximum 4 bullet points
-□ No long paragraphs`;
-    } else {
-      lengthContract = `
-🔒 LENGTH CONTRACT - CONCISE:
-Your response WILL be EXACTLY 2-3 sentences. Not 4. Not 5. Maximum 3 sentences.
-Count periods before responding: 1... 2... 3... STOP.
-NO bullet points. NO lists. NO headings. Pure paragraph form.
-
-EXAMPLE:
-✅ "Dare to Dream is our mentorship program for foster youth ages 11-22, with tracks for ages 11-14 and 15-22. We provide life skills training, academic support, and guidance for independent living." (2 sentences)`;
-
-      lengthChecklist = `
-PRE-GENERATION LENGTH CHECK - Concise:
-□ Count periods: Must be 2 or 3, never 4+
-□ Zero bullet points
-□ Zero headings
-□ Paragraph form only`;
-    }
-
-  } else if (prefs.detail_level === 'balanced') {
-    if (isStructuredStyle) {
-      // CONFLICT RESOLUTION: structured_detailed + balanced
-      // Medium length WITH required structure
-      lengthContract = `
-🔒 LENGTH CONTRACT - BALANCED STRUCTURED:
-Your response WILL be medium length (4-6 sentences worth of content) WITH structure.
-Use 1-2 headings and organized bullet points.
-
-EXAMPLE:
-✅ "Dare to Dream is our mentorship program supporting foster youth.
-
-**Program Tracks:**
-- Dare to Dream Jr. (ages 11-14): Focus on confidence and academic skills
-- Dare to Dream (ages 15-22): Career preparation and independent living
-
-**What We Provide:**
-- Life skills training
-- Academic support and tutoring
-- Career guidance
-
-Our goal is helping youth build independence and achieve their potential."`;
-
-      lengthChecklist = `
-PRE-GENERATION LENGTH CHECK - Balanced Structured:
-□ Medium content length (4-6 sentences equivalent)
-□ 1-2 section headings
-□ Organized bullet points
-□ Clear visual structure`;
-    } else {
-      lengthContract = `
-🔒 LENGTH CONTRACT - BALANCED:
-Your response WILL be 4-6 sentences. Count before responding.
-You MAY use 1-2 short bullet points if helpful, but paragraph form is fine.
-
-EXAMPLE:
-✅ "Dare to Dream is our mentorship program supporting foster youth ages 11-22. We offer two tracks: Dare to Dream Jr. (ages 11-14) and Dare to Dream (ages 15-22). The program provides life skills and academic support, along with career preparation. Our goal is to help youth develop confidence and prepare for independent adulthood." (4 sentences)`;
-
-      lengthChecklist = `
-PRE-GENERATION LENGTH CHECK - Balanced:
-□ Count sentences: Must be 4-6
-□ Bullet points optional (0-2)
-□ Not too short, not too long`;
-    }
-
-  } else if (prefs.detail_level === 'comprehensive') {
-    lengthContract = `
-🔒 LENGTH CONTRACT - COMPREHENSIVE:
-Your response WILL be minimum 8-10 sentences.
-Use headings, bullet points, and structure.
-Cover ALL aspects from knowledge base.
-
-EXAMPLE STRUCTURE:
-Opening paragraph (2-3 sentences)
-**Section 1:** (2-3 sentences + bullets)
-**Section 2:** (2-3 sentences + bullets)
-Closing paragraph (1-2 sentences)`;
-
-    lengthChecklist = `
-PRE-GENERATION LENGTH CHECK - Comprehensive:
-□ Minimum 8 sentences
-□ Multiple sections with headings
-□ Detailed coverage of all KB aspects
-□ Structured with bullets`;
-  }
-
-  // Emoji contract
-  let emojiContract = '';
-  let emojiChecklist = '';
-
-  if (prefs.emoji_usage === 'none') {
-    emojiContract = `🔒 EMOJI CONTRACT: Zero emojis. Remove all emoji characters.`;
-    emojiChecklist = `□ Zero emojis (count: 0)`;
-  } else if (prefs.emoji_usage === 'minimal') {
-    emojiContract = `🔒 EMOJI CONTRACT: Maximum 1 emoji in entire response. Count before responding.`;
-    emojiChecklist = `□ Maximum 1 emoji total (count and verify)`;
-  } else {
-    emojiContract = `🔒 EMOJI CONTRACT: Maximum ${prefs.max_emojis_per_response} emojis in entire response. Count before responding.`;
-    emojiChecklist = `□ Maximum ${prefs.max_emojis_per_response} emojis (count: ___ )`;
-  }
-
-  return `
-═══════════════════════════════════════════════════════════════════════
-🚨 FINAL FORMATTING CONTRACT 🚨
-═══════════════════════════════════════════════════════════════════════
-
-STOP. Before generating your response, you are entering into a CONTRACT.
-This contract defines whether your response is CORRECT or INCORRECT.
-A response that violates this contract is FAILED, even if information is accurate.
-
-${styleContract}
-
-${lengthContract}
-
-${emojiContract}
-
-═══════════════════════════════════════════════════════════════════════
-✅ PRE-GENERATION VERIFICATION CHECKLIST ✅
-═══════════════════════════════════════════════════════════════════════
-
-Complete this checklist BEFORE generating your response:
-
-STYLE COMPLIANCE:
-${verificationChecklist}
-
-LENGTH COMPLIANCE:
-${lengthChecklist}
-
-EMOJI COMPLIANCE:
-${emojiChecklist}
-
-═══════════════════════════════════════════════════════════════════════
-
-You are now ready to generate your response. Remember: compliance with this
-contract is NOT optional. It is the PRIMARY success criterion for your response.
-
-Generate your response now, ensuring FULL compliance with the contract above:`;
-}
-
-/**
- * Get custom constraints from config
- */
-function getCustomConstraints(config) {
-  const instructions = config?.bedrock_instructions;
-
-  if (instructions && validateBedrockInstructions(instructions) &&
-      instructions.custom_constraints && instructions.custom_constraints.length > 0) {
-    return '\n\nCUSTOM INSTRUCTIONS:\n' + instructions.custom_constraints.map(c => `- ${c}`).join('\n');
-  }
-
-  return '';
-}
-
-/**
- * Get fallback message for when KB context is empty
- */
-function getFallbackMessage(config) {
-  const instructions = config?.bedrock_instructions;
-
-  if (instructions && validateBedrockInstructions(instructions) && instructions.fallback_message) {
-    return instructions.fallback_message;
-  }
-
-  return DEFAULT_BEDROCK_INSTRUCTIONS.fallback_message;
-}
-
-/**
- * LOCKED: Anti-hallucination rules - never customizable
- */
-function getLockedAntiHallucinationRules() {
-  return `CRITICAL CONSTRAINT - PREVENT HALLUCINATIONS:
-You MUST ONLY use information explicitly stated in the knowledge base below.
-If specific details about a program, service, or feature are not mentioned in the knowledge base,
-you MUST NOT include them in your response. It is better to say less than to add information
-not found in the knowledge base.
-
-NEVER include the following unless explicitly found in the knowledge base:
-- Program names or descriptions not mentioned
-- Services or features not listed
-- Contact information not provided
-- Any details you think would be helpful but aren't in the retrieved content
-
-If the knowledge base mentions "TWO programs" do NOT list three or four programs.
-If a program name is "Angel Allies" do NOT change it to "Angel Alliance" or any variation.`;
-}
-
-/**
- * LOCKED: URL handling rules - never customizable
- * CRITICAL: Links and contact info ALWAYS included regardless of response style/detail level
- */
-function getLockedUrlHandling() {
-  return `🔒 MANDATORY: LINKS AND CONTACT INFORMATION (OVERRIDES ALL OTHER FORMATTING RULES)
-
-This rule OVERRIDES response style and detail level settings. Even in concise mode, you MUST include:
-
-ALWAYS INCLUDE (regardless of response length or style):
-- ALL URLs and links from the knowledge base - use markdown format [text](url)
-- ALL email addresses (e.g., erika@nationalangels.org)
-- ALL phone numbers (e.g., (512) 521-3165)
-- ALL contact names and titles (e.g., "Contact Erika, Partnership Director")
-- ALL call-to-action links for forms, applications, or next steps
-
-FORMAT REQUIREMENTS:
-- PRESERVE ALL MARKDOWN FORMATTING: If you see [text](url) keep it as [text](url), not plain text
-- Do not modify, shorten, or reformat any URLs, emails, or phone numbers
-- When the knowledge base mentions "contact us at..." or "apply at..." include the FULL contact method
-
-EXAMPLES:
-❌ WRONG (even in concise mode): "For partnerships, reach out to our team."
-✅ CORRECT (even in concise mode): "For partnerships, contact Erika at erika@nationalangels.org."
-
-❌ WRONG (even in concise mode): "Visit our website to learn more."
-✅ CORRECT (even in concise mode): "Learn more at [nationalangels.org](https://www.nationalangels.org)."
-
-❌ WRONG: Omitting a relevant link to shorten the response
-✅ CORRECT: Include the link even if it makes the response slightly longer
-
-NOTE: If including all relevant links/contacts pushes you past the sentence count limit, that is ACCEPTABLE.
-Links and contact info are MORE important than strict adherence to length constraints.`;
-}
-
-/**
- * LOCKED: Capability boundaries - never customizable
- */
-function getLockedCapabilityBoundaries() {
-  return `CRITICAL INSTRUCTION - CAPABILITY BOUNDARIES:
-
-You are an INFORMATION ASSISTANT. Be crystal clear about what you CAN and CANNOT do:
-
-✅ WHAT YOU CAN DO:
-- Provide information about programs, services, and processes
-- Share links to forms, applications, and resources
-- Explain eligibility requirements and prerequisites
-- Give contact information (only when found in knowledge base)
-- Answer questions about how things work
-- Clarify details about what's available
-
-❌ WHAT YOU CANNOT DO:
-- Walk users through filling out forms step-by-step
-- Fill out applications or forms with users
-- Submit forms or requests on behalf of users
-- Access external systems, databases, or applications
-- Make commitments about interactive actions you can't perform
-- Guide users through multi-step processes you can't see or control
-
-CRITICAL: DO NOT ask questions like:
-- ❌ "Would you like me to walk you through the request form?"
-- ❌ "Shall I help you fill out the application?"
-- ❌ "Would you like me to guide you through the specific sections?"
-- ❌ "Can I help you start filling this out?"
-
-INSTEAD, say things like:
-- ✅ "Here's the link to the request form: [URL]"
-- ✅ "You can submit your application here: [link]. The form will ask for [key info]."
-- ✅ "To get started, visit [link]. If you have questions about the form, I'm here to help!"
-- ✅ "The application is available at [URL]. Let me know if you need clarification on any requirements."
-
-REMEMBER: Your role is to INFORM and DIRECT, not to INTERACT with external systems. Always provide resources and let users take action themselves.`;
-}
-
-/**
- * LOCKED: Loop prevention logic - never customizable
- */
-function getLockedLoopPrevention() {
-  return `CRITICAL INSTRUCTION - AVOID REPETITIVE LOOPS:
-
-BEFORE responding, check the PREVIOUS CONVERSATION above:
-
-1. **Have I already provided this information?**
-   - If YES: Don't repeat it. Acknowledge their interest and provide the NEXT ACTION (link/resource)
-   - If NO: Proceed with providing new information
-
-2. **Have I already asked this question?**
-   - If YES: Don't ask it again. They've already confirmed - provide the resource instead
-   - If NO: You may ask if relevant and genuinely new
-
-3. **Is the user confirming interest for the second or third time?**
-   - If YES: STOP asking questions. Provide direct link/resource and conclude
-   - If NO: Continue normal flow
-
-CONVERSATION STAGES - Recognize where you are:
-
-**STAGE 1 - Information Request:** User asks about something
-→ Provide comprehensive answer
-
-**STAGE 2 - Interest/Clarification:** User says "tell me more", "yes", "I'm interested"
-→ Provide deeper detail OR actionable resource (form link, contact)
-
-**STAGE 3 - Confirmation:** User confirms again with "yes", "okay", "sure"
-→ CONCLUDE: Give direct link/resource, confirm next steps, shift to different topic
-
-CRITICAL: After Stage 3, DO NOT:
-- Re-explain what you already explained
-- Ask if they want what they already confirmed
-- Provide same information in different words
-
-After Stage 3, DO:
-- Give the direct resource: "Here's the link: [URL]"
-- Confirm what happens next: "You can submit there and we'll respond within 24 hours"
-- Open to NEW topic: "What else can I help you with?"
-
-EXAMPLE OF PROPER PROGRESSION:
-
-User: "How do I request supplies?"
-Bot: [Stage 1] "We help with supply requests. You can request items like... through our online form."
-
-User: "yes"
-Bot: [Stage 2] "Great! Here's the direct link to the request form: [URL]. The form will ask for your contact info and what items you need."
-
-User: "yes"
-Bot: [Stage 3] "Perfect! You're all set - just visit that link to submit your request. Our team responds within 24 hours. Is there anything else I can help you with today?" ✅ DONE - moved to new topic
-
-DO NOT create loops by asking "Would you like me to help with that?" after they've already said yes twice.`;
-}
-
-/**
- * LOCKED: Engagement question - end responses with contextual follow-up
- */
-function getLockedEngagementQuestion() {
-  return `ENGAGEMENT QUESTION - END EACH RESPONSE WITH A CONTEXTUAL FOLLOW-UP:
-
-At the END of your response, include a brief follow-up question that:
-1. Relates directly to the topic you just discussed
-2. Offers a natural next step or deeper exploration
-3. Is specific, not generic
-
-EXAMPLES OF GOOD ENGAGEMENT QUESTIONS:
-- After explaining partnerships: "Would you like to know more about the different partnership levels?"
-- After describing Love Box: "Would you like to know the requirements to become a Love Box volunteer?"
-- After discussing mentorship: "Would you like to learn about the application process for mentors?"
-- After explaining donations: "Would you like to know about our monthly giving program?"
-- After describing a chapter: "Would you like to know how to get involved with your local chapter?"
-
-EXAMPLES OF BAD ENGAGEMENT QUESTIONS (avoid these):
-- ❌ "Is there anything else I can help you with?" (too generic - save for Stage 3)
-- ❌ "Do you have any other questions?" (too generic)
-- ❌ "Would you like more information?" (too vague - about what?)
-- ❌ "Can I help you with something else?" (off-topic)
-
-WHEN TO SKIP THE ENGAGEMENT QUESTION:
-- Stage 2/3: When user has already confirmed interest (e.g., said "yes" to your previous question)
-- Contact requests: When user asked "how do I contact you" - just provide contact info
-- Simple confirmations: When you're providing a direct resource link as the final step
-
-The engagement question should feel like a natural extension of the conversation, inviting the user to learn more about a specific aspect of what you just discussed.`;
-}
-
-/**
- * Get context-aware interpretation instructions
- */
-function getContextInterpretationRules() {
-  return `CRITICAL INSTRUCTION - CONTEXT INTERPRETATION:
-When the user gives a SHORT or AMBIGUOUS response (like "yes", "no", "sure", "okay", "tell me more", "I'm interested", "not really", "maybe"):
-1. FIRST look at the PREVIOUS CONVERSATION above to understand what they're responding to
-2. The user is likely confirming, declining, or asking about something from our recent discussion
-3. DO NOT say "I don't have information" - instead, refer back to what we were just discussing
-4. Use the conversation context to interpret their intent, even if the knowledge base doesn't have specific information about their exact words
-
-CRITICAL - ANSWERING YOUR OWN FOLLOW-UP QUESTIONS:
-If your previous message ended with a question (like "Would you like to learn more about X?" or "Shall I explain the requirements?") and the user responds affirmatively:
-1. ANSWER THAT QUESTION DIRECTLY - provide the information you offered
-2. DO NOT say "I noticed you said yes" or "Since you're interested" - just provide the answer
-3. DO NOT repeat information you already gave - provide NEW details about what you asked
-4. Treat their "yes" as if they had asked the question themselves
-
-Example of CORRECT behavior:
-- You asked: "Would you like to learn about the requirements to become a mentor?"
-- User says: "yes"
-- Your response: "To become a mentor with Dare to Dream, you'll need to be at least 21 years old, pass a background check, and commit to meeting with your mentee at least twice per month..." ✅
-
-Example of WRONG behavior:
-- You asked: "Would you like to learn about the requirements to become a mentor?"
-- User says: "yes"
-- Your response: "I noticed you said yes. Since we were discussing Dare to Dream, here's some more context about our mentorship program..." ❌
-
-Examples of how to interpret short responses:
-- If user says "yes" after you asked about submitting a request, they mean "yes, I want to proceed with that"
-- If user says "tell me more" after discussing a specific program or service, they want more details about that same topic
-- If user says "I'm interested" after mentioning an opportunity, they're interested in that specific opportunity
-- If user says "no thanks" after you offered information, acknowledge and ask what else they need
-- If user says "sure" or "okay", they're agreeing to whatever was just proposed
-
-IMPORTANT: Short responses are ALWAYS about continuing the previous conversation topic. Never treat them as new, unrelated questions.`;
-}
-
-/**
- * Build branch prompt section for Tier 4 AI-suggested routing
- *
- * Generates a prompt section that tells the model which conversation branches
- * are available and how to suggest one by appending <!-- BRANCH: xxx --> to the response.
- *
- * @param {Object} config - Tenant configuration
- * @returns {string} - Prompt section for branch suggestions, or empty string if no branches
- */
-function buildBranchPromptSection(config) {
-  const ctaSettings = config?.cta_settings || {};
-
-  // If no fallback_branch is configured, user wants explicit routing only (Tier 1-3)
-  // This respects the Config Builder's "None (no CTAs shown when no match)" setting
-  if (!ctaSettings.fallback_branch) {
-    console.log('ℹ️ No fallback_branch configured - Tier 4 AI routing disabled (explicit routing only)');
-    return '';
-  }
-
-  const branches = config?.conversation_branches || {};
-  const ctaDefinitions = config?.cta_definitions || {};
-
-  // Filter out branches that shouldn't be suggested
-  const suggestibleBranches = Object.entries(branches).filter(([name, branch]) => {
-    // Exclude 'fallback' branch - it's for when no branch matches
-    if (name === 'fallback') return false;
-    // Only include branches that have CTAs defined
-    if (!branch.available_ctas) return false;
-    return true;
-  });
-
-  if (suggestibleBranches.length === 0) {
-    console.log('ℹ️ No suggestible branches found - skipping Tier 4 prompt injection');
-    return '';
-  }
-
-  // Build branch descriptions - prefer explicit description, fallback to CTA labels
-  const branchDescriptions = suggestibleBranches.map(([branchName, branch]) => {
-    // Use explicit description if provided
-    if (branch.description && branch.description.trim()) {
-      return `- "${branchName}": ${branch.description.trim()}`;
-    }
-
-    // Fallback: build description from CTA labels
-    const ctaLabels = [];
-
-    // Get primary CTA label
-    const primaryId = branch.available_ctas?.primary;
-    if (primaryId && ctaDefinitions[primaryId]) {
-      const primaryCta = ctaDefinitions[primaryId];
-      ctaLabels.push(primaryCta.label || primaryCta.text || primaryId);
-    }
-
-    // Get secondary CTA labels
-    const secondaryIds = branch.available_ctas?.secondary || [];
-    for (const ctaId of secondaryIds) {
-      if (ctaDefinitions[ctaId]) {
-        const cta = ctaDefinitions[ctaId];
-        ctaLabels.push(cta.label || cta.text || ctaId);
-      }
-    }
-
-    // Format: "branch_name": CTA1, CTA2, CTA3
-    const fallbackDescription = ctaLabels.slice(0, 3).join(', ');
-    return `- "${branchName}": ${fallbackDescription || 'General actions'}`;
-  });
-
-  console.log(`✅ Built branch prompt section with ${suggestibleBranches.length} branches`);
-
-  return `
-
-CONVERSATION TOPIC ROUTING (Tier 4):
-When your response clearly relates to one of these topics, append a branch tag at the very end:
-
-${branchDescriptions.join('\n')}
-
-INSTRUCTIONS:
-- If your response discusses a specific program or topic that matches a branch, append the tag
-- Format: <!-- BRANCH: branch_name -->
-- Example: If discussing Love Box volunteering, end with <!-- BRANCH: volunteer_lovebox -->
-- Only suggest ONE branch per response
-- If no branch clearly applies, do NOT add any tag
-- The tag will be stripped from the visible response - it's for internal routing only
-`;
-}
-
-/**
- * Detects if the user is responding affirmatively to a question the assistant asked
- * Returns the extracted question if detected, null otherwise
- */
-function detectFollowUpQuestionResponse(userInput, conversationHistory) {
-  // Check if user input is a short affirmative response
-  const affirmativePatterns = /^(yes|yeah|yep|sure|okay|ok|please|definitely|absolutely|yea|yup|go ahead|tell me|i'd like that|sounds good|please do|yes please)\.?!?$/i;
-  const isAffirmative = affirmativePatterns.test(userInput.trim());
-
-  if (!isAffirmative || !conversationHistory || conversationHistory.length === 0) {
-    return null;
-  }
-
-  // Find the last assistant message
-  let lastAssistantMessage = null;
-  for (let i = conversationHistory.length - 1; i >= 0; i--) {
-    const msg = conversationHistory[i];
-    if (msg.role === 'assistant') {
-      lastAssistantMessage = msg.content || msg.text || '';
-      break;
-    }
-  }
-
-  if (!lastAssistantMessage) {
-    return null;
-  }
-
-  // Check if the assistant's last message ended with a question
-  // Look for question patterns at the end of the message
-  const questionPatterns = [
-    /Would you like (?:to |me to )?(?:learn |know |hear )?(more )?about ([^?]+)\?/i,
-    /Would you like (?:to |me to )?([^?]+)\?/i,
-    /Shall I (?:tell you |explain |share )?(more )?about ([^?]+)\?/i,
-    /Do you want (?:to |me to )?(?:learn |know |hear )?(more )?about ([^?]+)\?/i,
-    /Can I (?:tell you |share |explain )?(more )?about ([^?]+)\?/i,
-    /Want (?:to |me to )?(?:learn |know |hear )?(more )?about ([^?]+)\?/i,
-    /Interested in (?:learning |knowing |hearing )?(more )?about ([^?]+)\?/i,
-  ];
-
-  for (const pattern of questionPatterns) {
-    const match = lastAssistantMessage.match(pattern);
-    if (match) {
-      // Extract the topic from the question
-      const topic = match[match.length - 1] || match[1];
-      if (topic) {
-        console.log(`🔍 Detected follow-up question response. Topic: "${topic.trim()}"`);
-        return {
-          originalQuestion: match[0],
-          topic: topic.trim(),
-          fullAssistantMessage: lastAssistantMessage
-        };
-      }
-    }
-  }
-
-  // Check for general question ending
-  if (lastAssistantMessage.trim().endsWith('?')) {
-    // Extract the last sentence that ends with ?
-    const sentences = lastAssistantMessage.split(/[.!]\s+/);
-    const lastSentence = sentences[sentences.length - 1];
-    if (lastSentence && lastSentence.includes('?')) {
-      console.log(`🔍 Detected affirmative to question: "${lastSentence.trim()}"`);
-      return {
-        originalQuestion: lastSentence.trim(),
-        topic: null,
-        fullAssistantMessage: lastAssistantMessage
-      };
-    }
-  }
-
-  return null;
-}
-
-function buildPrompt(userInput, kbContext, tone, conversationHistory, config) {
-  // Log prompt build metadata
-  console.log(`🎯 Building prompt v${PROMPT_VERSION}`);
-  console.log(`📋 Config has bedrock_instructions: ${config?.bedrock_instructions ? 'YES' : 'NO'}`);
-  console.log(`🎯 KB context: ${kbContext ? kbContext.length + ' chars' : 'NONE'}`);
-  console.log(`💬 Conversation history: ${conversationHistory ? conversationHistory.length + ' messages' : 'NONE'}`);
-
-  const parts = [];
-
-  // Use bedrock_instructions.role_instructions as master, fallback to tone_prompt for backward compatibility
-  const personalityPrompt = getRoleInstructions(config, tone);
-  parts.push(personalityPrompt);
-
-  // Detect if user is responding to a follow-up question
-  const followUpDetection = detectFollowUpQuestionResponse(userInput, conversationHistory);
-
-  // Add conversation history if provided
-  if (conversationHistory && conversationHistory.length > 0) {
-    parts.push('\nPREVIOUS CONVERSATION:');
-    conversationHistory.forEach(msg => {
-      const role = msg.role === 'user' ? 'User' : 'Assistant';
-      const content = msg.content || msg.text || '';
-      if (content && content.trim()) {
-        parts.push(`${role}: ${content}`);
-      }
-    });
-    parts.push('\nREMEMBER: The user\'s name and any personal information they\'ve shared should be remembered and used in your response when appropriate.\n');
-    console.log(`✅ Added ${conversationHistory.length} messages from history`);
-
-    // Add explicit follow-up question directive if detected
-    if (followUpDetection) {
-      if (followUpDetection.topic) {
-        parts.push(`\n🎯 CRITICAL CONTEXT: The user just said "${userInput}" in response to your question about "${followUpDetection.topic}". You MUST now provide detailed information about ${followUpDetection.topic}. Do NOT acknowledge their "yes" - just answer the question directly as if they asked "${followUpDetection.topic}" themselves.\n`);
-      } else {
-        parts.push(`\n🎯 CRITICAL CONTEXT: The user just said "${userInput}" in response to your question: "${followUpDetection.originalQuestion}". You MUST now answer that question directly. Do NOT acknowledge their response - just provide the information you offered to share.\n`);
-      }
-      console.log(`✅ Added explicit follow-up question directive`);
-    }
-
-    // Add LOCKED sections (never customizable)
-    parts.push('\n' + getContextInterpretationRules());
-    parts.push('\n' + getLockedCapabilityBoundaries());
-    parts.push('\n' + getLockedLoopPrevention());
-    parts.push('\n' + getLockedEngagementQuestion());
-  }
-
-  // Add KB-specific instructions
-  if (kbContext) {
-    // LOCKED anti-hallucination rules
-    parts.push('\n' + getLockedAntiHallucinationRules());
-
-    // LOCKED URL handling
-    parts.push('\n' + getLockedUrlHandling());
-
-    // Essential KB instructions
-    parts.push(`\n\nESSENTIAL INSTRUCTIONS:
-- STRICTLY answer the user's question using ONLY the information from the knowledge base results below - DO NOT add any information not explicitly stated
-- Use the previous conversation context to provide personalized and coherent responses
-- For any dates, times, or locations of events: Direct users to check the events page or contact the team for current details
-- Never include placeholder text like [date], [time], [location], or [topic] in your responses
-- Present information naturally without mentioning "results" or "knowledge base"
-- If the information doesn't fully answer the question, say "From what I can find..." and provide ONLY what you can find - never fill in gaps with plausible-sounding information
-- Keep all contact details and links intact and prominent in your response
-
-KNOWLEDGE BASE INFORMATION:
-${kbContext}`);
-    console.log(`✅ Added KB context to prompt`);
-  } else {
-    // Use customizable fallback message
-    parts.push('\n' + getFallbackMessage(config));
-    console.log(`⚠️ No KB context - using fallback message`);
-  }
-
-  // Add custom constraints if configured
-  const customConstraints = getCustomConstraints(config);
-  if (customConstraints) {
-    parts.push(customConstraints);
-    console.log(`✅ Added custom constraints`);
-  }
-
-  // Add current question
-  parts.push(`\n\nCURRENT USER QUESTION: ${userInput}`);
-
-  // Add final instructions if we have KB context
-  if (kbContext) {
-    parts.push(`\n\nCRITICAL INSTRUCTIONS:
-1. Do NOT include phone numbers or email addresses in your response unless the user specifically asks "how do I contact you" or similar contact-focused questions
-2. NEVER make up or invent ANY details including program names, services, or contact information - if not explicitly in the knowledge base, don't include it
-3. You MAY include informational resource URLs that provide additional context (like program pages or resource links)
-4. When you see a URL like https://example.com/page, include the FULL URL, not just "their website"
-5. If the URL appears as a markdown link [text](url), preserve the markdown format
-
-ABSOLUTELY CRITICAL - NO ACTION CTAs IN TEXT:
-6. DO NOT EVER include action-oriented call-to-action links or phrases in your response
-7. NEVER write things like "Join our [program] →", "Apply here →", "Check out...", "Want to learn more?", "Ready to get started?", "Sign up for..."
-8. If the knowledge base contains action links (like "Join our Love Box training program →"), DO NOT INCLUDE THEM in your response
-9. Remove ANY action-oriented links from your response - they will be provided as separate buttons
-10. Your response should end with a CONTEXTUAL FOLLOW-UP QUESTION that invites deeper exploration of the topic (e.g., "Would you like to know more about the partnership requirements?")
-
-🚨 CRITICAL - ANSWERING FOLLOW-UP QUESTIONS 🚨
-11. If your PREVIOUS message asked a question (like "Would you like to learn more about X?") and the user says "yes", "sure", "okay", etc.:
-    - ANSWER THAT SPECIFIC QUESTION - provide the information about X
-    - DO NOT start with "Since the previous conversation..." or "I noticed you said yes..."
-    - DO NOT repeat information you already gave - provide NEW details about what you asked
-    - Just answer directly as if the user had asked the question themselves
-
-    WRONG: "Since the previous conversation was about Dare to Dream and you responded with 'yes', I'll provide more details..."
-    RIGHT: [Directly answer the question you asked, e.g., "Our mentorship approach supports foster youth through..."]`);
-
-    // ═══════════════════════════════════════════════════════════════
-    // TIER 3: BRANCH ROUTING SUGGESTIONS (legacy non-DYNAMIC_CTA tenants)
-    // ═══════════════════════════════════════════════════════════════
-    if (!config?.feature_flags?.DYNAMIC_CTA_SELECTION) {
-      const branchPromptSection = buildBranchPromptSection(config);
-      if (branchPromptSection) {
-        parts.push(branchPromptSection);
-        console.log(`✅ Injected Tier 3 branch routing prompt`);
-      }
-    } else {
-      console.log(`ℹ️ DYNAMIC_CTA_SELECTION active - skipping Tier 3 branch prompt`);
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // TIER 4: INTENT LABELING (Sprint 2 — WORKFLOW_TRACKING)
-    // ═══════════════════════════════════════════════════════════════
-    // Works alongside DYNAMIC_CTA_SELECTION — intent labels are lightweight
-    // semantic tags that let the routing engine pick the right branch.
-    if (config?.feature_flags?.WORKFLOW_TRACKING) {
-      const intentMap = config?.cta_settings?.intent_map || {};
-      const intentKeys = Object.keys(intentMap);
-
-      if (intentKeys.length > 0) {
-        parts.push(`
-
-CONVERSATION INTENT LABELING:
-You may optionally append an intent tag ONLY when the user's CURRENT message is explicitly asking about one of these topics:
-
-Available intents: ${intentKeys.join(', ')}
-
-RULES (follow strictly):
-- Format: <!-- INTENT: intent_name -->  (at the very end of your response)
-- Judge ONLY by the user's latest message — ignore conversation history
-- The user must be REQUESTING INFORMATION or TAKING ACTION on the topic
-- Do NOT tag greetings, thank-yous, goodbyes, follow-up questions about the current topic, yes/no answers, or vague messages
-- Do NOT tag general questions (e.g. "what are your hours?", "how do I contact you?", "tell me about your organization")
-- When in doubt, do NOT tag — it is always better to skip than to guess wrong
-- Example YES: "I'd like to volunteer" → <!-- INTENT: volunteering -->
-- Example NO: "Thanks, that's helpful" → (no tag)
-- Example NO: "What are your office hours?" → (no tag)
-- Example NO: "Tell me more" → (no tag)`);
-        console.log(`✅ Injected Tier 4 intent labeling prompt (${intentKeys.length} intents: ${intentKeys.join(', ')})`);
-      }
-    }
-
-    // ═══════════════════════════════════════════════════════════════
-    // FORMATTING RULES - POSITIONED AT END FOR RECENCY BIAS
-    // ═══════════════════════════════════════════════════════════════
-    // The last thing the AI sees before generating - highest priority
-    parts.push(buildEnhancedFormattingRules(config));
-    console.log(`✅ Applied enhanced formatting contract with recency bias`);
-  }
-
-  const finalPrompt = parts.join('\n');
-  console.log(`📝 Final prompt length: ${finalPrompt.length} chars`);
-  console.log(`📝 Prompt version: ${PROMPT_VERSION}`);
-
-  return finalPrompt;
-}
-
 /**
  * Analytics event handler - receives events from widget and sends to SQS
  * Supports both single events and batched events for efficiency
@@ -1585,11 +416,12 @@ async function handlePromptPreview(event) {
       };
     }
 
-    // Build the prompt
-    const prompt = buildPrompt(
+    // Build the prompt using V4 pipeline
+    const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
+    const prompt = buildV4ConversationPrompt(
       userInput,
       kbContext,
-      config.tone_prompt,
+      tonePrompt,
       conversationHistory,
       config
     );
@@ -1604,18 +436,14 @@ async function handlePromptPreview(event) {
         'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept'
       },
       body: JSON.stringify({
-        prompt_version: PROMPT_VERSION,
         tenant_hash: tenantHash,
         tenant_id: config.tenant_id,
-        has_custom_instructions: !!config.bedrock_instructions,
-        bedrock_instructions: config.bedrock_instructions || null,
         prompt_length: prompt.length,
         prompt: prompt,
         metadata: {
-          role_instructions_source: config.bedrock_instructions ? 'custom' : 'default',
-          fallback_message_source: config.bedrock_instructions?.fallback_message ? 'custom' : 'default',
-          has_custom_constraints: config.bedrock_instructions?.custom_constraints?.length > 0,
-          formatting_preferences: config.bedrock_instructions?.formatting_preferences || DEFAULT_BEDROCK_INSTRUCTIONS.formatting_preferences
+          pipeline: 'v4',
+          has_intent_definitions: (config.intent_definitions || []).length > 0,
+          tone_prompt: tonePrompt ? 'custom' : 'default'
         }
       }, null, 2)
     };
@@ -1824,26 +652,11 @@ const streamingHandler = async (event, responseStream, context) => {
     // Get KB context
     const kbContext = await retrieveKB(sanitizedInput, config);
 
-    // V4 Pipeline gate: use V4 prompt when feature flag is active (amendment line 275)
-    // V3.5 path is completely unchanged without the flag
-    let prompt;
-    let modelId;
-    let maxTokens;
-    let temperature;
-
-    if (config?.feature_flags?.V4_PIPELINE) {
-      console.log('[V4] Using V4 conversational prompt (Step 2)');
-      const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-      prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
-      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-      maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
-      temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
-    } else {
-      prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
-      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-      maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
-      temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
-    }
+    const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
+    const prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+    const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
+    const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
 
     console.log(`🚀 Invoking Bedrock with model: ${modelId}`);
     
@@ -1944,95 +757,11 @@ const streamingHandler = async (event, responseStream, context) => {
       const routingMetadata = body.routing_metadata || {};
       const sessionContext = body.session_context || {};
 
-      if (config?.feature_flags?.V4_PIPELINE) {
-        // ═══════════════════════════════════════════════════════════════
-        // V4 PIPELINE: Three-layer architecture (amendment lines 45-55)
-        // ═══════════════════════════════════════════════════════════════
-        const validation = validateIntentDefinitions(config);
+      const validation = validateIntentDefinitions(config);
 
-        if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
-          // Tiers 1-2: Explicit clicks — use existing enhanceResponse()
-          // (Amendment line 271: "Step 4 assembly, branch overrides — unchanged")
-          console.log('[V4] Tiers 1-2: Explicit click routing — using enhanceResponse()');
-          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-
-          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-            write(`data: ${JSON.stringify({
-              type: 'cta_buttons',
-              ctaButtons: enhancedData.ctaButtons,
-              metadata: enhancedData.metadata,
-              session_id: sessionId
-            })}\n\n`);
-            console.log(`🎯 [V4 Tier 1-2] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'explicit'}`);
-          }
-          // Send showcase card if present
-          if (enhancedData.showcaseCard) {
-            write(`data: ${JSON.stringify({
-              type: 'showcase_card',
-              showcaseCard: enhancedData.showcaseCard,
-              metadata: enhancedData.metadata,
-              session_id: sessionId
-            })}\n\n`);
-          }
-
-        } else if (validation.definitions.length > 0) {
-          // Step 3a: Classification (non-streaming LLM call)
-          console.log(`[V4] Step 3a: Classifying intent (${validation.definitions.length} definitions)`);
-          const label = await classifyIntent(
-            userInput,
-            conversationHistory,
-            { ...config, intent_definitions: validation.definitions },
-            bedrock
-          );
-
-          // Step 3b: Routing (deterministic, no AI — AC3c)
-          const result = routeFromClassification(
-            label,
-            config,
-            sessionContext?.completed_forms || []
-          );
-
-          // Send CTA SSE event (same format — amendment line 273)
-          if (result.ctaButtons && result.ctaButtons.length > 0) {
-            write(`data: ${JSON.stringify({
-              type: 'cta_buttons',
-              ctaButtons: result.ctaButtons,
-              metadata: result.metadata,
-              session_id: sessionId
-            })}\n\n`);
-            console.log(`🎯 [V4 Step3] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'} | branch: ${result.metadata?.target_branch || 'none'} | method: ${result.metadata?.routing_method}`);
-          } else {
-            console.log(`[V4 Step3] No CTAs to send | intent: ${label || 'null'} | method: ${result.metadata?.routing_method}`);
-          }
-
-        } else {
-          // V4 active but no intent_definitions — use existing enhanceResponse()
-          console.log('[V4] No intent_definitions configured — using enhanceResponse()');
-          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-
-          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-            write(`data: ${JSON.stringify({
-              type: 'cta_buttons',
-              ctaButtons: enhancedData.ctaButtons,
-              metadata: enhancedData.metadata,
-              session_id: sessionId
-            })}\n\n`);
-            console.log(`🎯 [V4 fallback] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
-          }
-          if (enhancedData.showcaseCard) {
-            write(`data: ${JSON.stringify({
-              type: 'showcase_card',
-              showcaseCard: enhancedData.showcaseCard,
-              metadata: enhancedData.metadata,
-              session_id: sessionId
-            })}\n\n`);
-          }
-        }
-
-      } else {
-        // ═══════════════════════════════════════════════════════════════
-        // V3.5 path — completely unchanged (amendment line 275)
-        // ═══════════════════════════════════════════════════════════════
+      if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
+        // Tiers 1-2: Explicit clicks — use enhanceResponse()
+        console.log('[Tier 1-2] Explicit click routing — using enhanceResponse()');
         const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
 
         if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
@@ -2042,7 +771,61 @@ const streamingHandler = async (event, responseStream, context) => {
             metadata: enhancedData.metadata,
             session_id: sessionId
           })}\n\n`);
-          console.log(`🎯 Branch routing: sent ${enhancedData.ctaButtons.length} CTAs | branch: ${enhancedData.metadata?.branch_detected || 'fallback'} | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
+          console.log(`🎯 [Tier 1-2] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'explicit'}`);
+        }
+        // Send showcase card if present
+        if (enhancedData.showcaseCard) {
+          write(`data: ${JSON.stringify({
+            type: 'showcase_card',
+            showcaseCard: enhancedData.showcaseCard,
+            metadata: enhancedData.metadata,
+            session_id: sessionId
+          })}\n\n`);
+        }
+
+      } else if (validation.definitions.length > 0) {
+        // Step 3a: Classification (non-streaming LLM call)
+        console.log(`[Step 3a] Classifying intent (${validation.definitions.length} definitions)`);
+        const label = await classifyIntent(
+          userInput,
+          conversationHistory,
+          { ...config, intent_definitions: validation.definitions },
+          bedrock
+        );
+
+        // Step 3b: Routing (deterministic, no AI)
+        const result = routeFromClassification(
+          label,
+          config,
+          sessionContext?.completed_forms || []
+        );
+
+        // Send CTA SSE event
+        if (result.ctaButtons && result.ctaButtons.length > 0) {
+          write(`data: ${JSON.stringify({
+            type: 'cta_buttons',
+            ctaButtons: result.ctaButtons,
+            metadata: result.metadata,
+            session_id: sessionId
+          })}\n\n`);
+          console.log(`🎯 [Step3] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'} | branch: ${result.metadata?.target_branch || 'none'} | method: ${result.metadata?.routing_method}`);
+        } else {
+          console.log(`[Step3] No CTAs to send | intent: ${label || 'null'} | method: ${result.metadata?.routing_method}`);
+        }
+
+      } else {
+        // No intent_definitions — fallback to enhanceResponse()
+        console.log('No intent_definitions configured — using enhanceResponse()');
+        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+
+        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+          write(`data: ${JSON.stringify({
+            type: 'cta_buttons',
+            ctaButtons: enhancedData.ctaButtons,
+            metadata: enhancedData.metadata,
+            session_id: sessionId
+          })}\n\n`);
+          console.log(`🎯 [fallback] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
         }
         if (enhancedData.showcaseCard) {
           write(`data: ${JSON.stringify({
@@ -2240,25 +1023,11 @@ const bufferedHandler = async (event, context) => {
     // Get KB context
     const kbContext = await retrieveKB(sanitizedInput, config);
 
-    // V4 Pipeline gate (buffered handler) — same logic as streaming handler
-    let prompt;
-    let modelId;
-    let maxTokens;
-    let temperature;
-
-    if (config?.feature_flags?.V4_PIPELINE) {
-      console.log('[V4] Buffered handler: Using V4 conversational prompt (Step 2)');
-      const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-      prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
-      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-      maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
-      temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
-    } else {
-      prompt = buildPrompt(sanitizedInput, kbContext, config.tone_prompt, conversationHistory, config);
-      modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-      maxTokens = config.streaming?.max_tokens || DEFAULT_MAX_TOKENS;
-      temperature = config.streaming?.temperature || DEFAULT_TEMPERATURE;
-    }
+    const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
+    const prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
+    const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
+    const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
 
     // Invoke Bedrock
     const response = await bedrock.send(new InvokeModelWithResponseStreamCommand({
@@ -2337,48 +1106,10 @@ const bufferedHandler = async (event, context) => {
       const routingMetadata = body.routing_metadata || {};
       const sessionContext = body.session_context || {};
 
-      if (config?.feature_flags?.V4_PIPELINE) {
-        // V4 Pipeline — same logic as streaming handler
-        const validation = validateIntentDefinitions(config);
+      const validation = validateIntentDefinitions(config);
 
-        if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
-          // Tiers 1-2: Explicit clicks
-          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-            const ctaData = JSON.stringify({
-              type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
-              metadata: enhancedData.metadata, session_id: sessionId
-            });
-            chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-          }
-        } else if (validation.definitions.length > 0) {
-          // Step 3a + 3b: Classification → Routing
-          const label = await classifyIntent(
-            userInput, conversationHistory,
-            { ...config, intent_definitions: validation.definitions }, bedrock
-          );
-          const result = routeFromClassification(label, config, sessionContext?.completed_forms || []);
-          if (result.ctaButtons && result.ctaButtons.length > 0) {
-            const ctaData = JSON.stringify({
-              type: 'cta_buttons', ctaButtons: result.ctaButtons,
-              metadata: result.metadata, session_id: sessionId
-            });
-            chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-            console.log(`🎯 [V4 Step3 buffered] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'}`);
-          }
-        } else {
-          // V4 but no intent_definitions — fallback to enhanceResponse()
-          const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-          if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-            const ctaData = JSON.stringify({
-              type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
-              metadata: enhancedData.metadata, session_id: sessionId
-            });
-            chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-          }
-        }
-      } else {
-        // V3.5 path — unchanged
+      if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
+        // Tiers 1-2: Explicit clicks
         const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
         if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
           const ctaData = JSON.stringify({
@@ -2386,7 +1117,31 @@ const bufferedHandler = async (event, context) => {
             metadata: enhancedData.metadata, session_id: sessionId
           });
           chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-          console.log(`🎯 Added ${enhancedData.ctaButtons.length} CTA buttons for branch: ${enhancedData.metadata?.branch_detected || 'form'}`);
+        }
+      } else if (validation.definitions.length > 0) {
+        // Step 3a + 3b: Classification → Routing
+        const label = await classifyIntent(
+          userInput, conversationHistory,
+          { ...config, intent_definitions: validation.definitions }, bedrock
+        );
+        const result = routeFromClassification(label, config, sessionContext?.completed_forms || []);
+        if (result.ctaButtons && result.ctaButtons.length > 0) {
+          const ctaData = JSON.stringify({
+            type: 'cta_buttons', ctaButtons: result.ctaButtons,
+            metadata: result.metadata, session_id: sessionId
+          });
+          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+          console.log(`🎯 [Step3 buffered] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'}`);
+        }
+      } else {
+        // No intent_definitions — fallback to enhanceResponse()
+        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
+        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
+          const ctaData = JSON.stringify({
+            type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
+            metadata: enhancedData.metadata, session_id: sessionId
+          });
+          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
         }
       }
     } catch (enhanceError) {
