@@ -306,29 +306,20 @@ function sanitizeTonePromptV4(tonePrompt) {
 function buildTopicClassificationPrompt(userMessage, conversationHistory, config) {
   console.log('[V4.1 Step3a] Building topic classification prompt');
 
-  // Extract the last 2 user-role messages from conversation history
-  const priorUserMessages = (conversationHistory || [])
-    .filter(m => m.role === 'user')
-    .map(m => (m.content || m.text || '').trim())
-    .filter(Boolean)
-    .slice(-2);
-
-  const allUserMessages = [...priorUserMessages, userMessage];
-  const customerMessagesBlock = allUserMessages
-    .map(msg => `- ${msg}`)
-    .join('\n');
-
   // Build topic taxonomy block: {topic.name}: {topic.description}
   const topicDefinitions = config.topic_definitions || [];
   const taxonomyBlock = topicDefinitions
     .map(topic => `${topic.name}: ${topic.description}`)
     .join('\n');
 
-  const prompt = `You are a conversation classifier. Read the customer messages below and identify
-which topic best matches, using only the taxonomy provided.
+  // Current message only — prior messages bias the classifier more than they help.
+  // Anaphora resolution (e.g. "tell me more about that") is rare enough that
+  // eliminating history bias is the better tradeoff for Phase 1.
+  const prompt = `You are a conversation classifier. Classify the customer message below
+using only the taxonomy provided.
 
-CUSTOMER MESSAGES (most recent last):
-${customerMessagesBlock}
+CUSTOMER MESSAGE:
+${userMessage}
 
 TOPIC TAXONOMY:
 ${taxonomyBlock}
@@ -336,7 +327,7 @@ ${taxonomyBlock}
 Return ONLY the topic name that matches, or null if no topic matches.
 Do not explain. Do not select multiple topics. Do not invent new topics.`;
 
-  console.log(`[V4.1 Step3a] Classification prompt: ${prompt.length} chars, ${topicDefinitions.length} topics, ${allUserMessages.length} user messages`);
+  console.log(`[V4.1 Step3a] Classification prompt: ${prompt.length} chars, ${topicDefinitions.length} topics`);
   return prompt;
 }
 
