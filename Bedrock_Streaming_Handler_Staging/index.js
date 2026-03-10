@@ -3,14 +3,14 @@
  * Uses awslambda.streamifyResponse for real SSE streaming
  * No JWT required - uses simple tenant_hash/session_id
  *
- * Architecture: V4 Pipeline (three-layer)
+ * Architecture: V4.1 Pipeline (three-layer)
  *   Step 1: KB retrieval (Bedrock Agent Runtime)
  *   Step 2: Streaming response generation (prompt_v4.js)
- *   Step 3a: Intent classification (prompt_v4.js — non-streaming Bedrock call)
- *   Step 3b: Deterministic CTA routing (prompt_v4.js — no AI)
+ *   Step 3a: Topic classification (prompt_v4.js — non-streaming Bedrock call)
+ *   Step 3b: Dynamic CTA pool selection (prompt_v4.js — no AI)
  *
  * Tier 1-2: Explicit click routing (action chips, CTA buttons) via response_enhancer.js
- * Fallback: enhanceResponse() when no intent_definitions configured
+ * Fallback: enhanceResponse() when no topic_definitions configured
  */
 
 const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -22,9 +22,9 @@ const { enhanceResponse } = require('./response_enhancer');
 const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
 const {
   buildV4ConversationPrompt,
-  classifyIntent,
-  routeFromClassification,
-  validateIntentDefinitions,
+  classifyTopic,
+  selectCTAsFromPool,
+  validateTopicDefinitions,
   V4_STEP2_INFERENCE_PARAMS,
   sanitizeTonePromptV4,
 } = require('./prompt_v4');
@@ -199,14 +199,14 @@ async function loadConfig(tenantHash) {
         console.log(`📋 KB ID in config: ${config?.aws?.knowledge_base_id || 'NOT SET'}`);
         console.log(`📋 Full AWS config:`, JSON.stringify(config?.aws || {}, null, 2));
 
-        // V4 Pipeline: validate intent_definitions at load time (amendment line 204)
-        if (config.intent_definitions) {
-          const validation = validateIntentDefinitions(config);
+        // V4.1 Pipeline: validate topic_definitions at load time
+        if (config.topic_definitions) {
+          const validation = validateTopicDefinitions(config);
           if (validation.warnings.length > 0) {
-            console.warn(`[V4] intent_definitions validation warnings:`, validation.warnings);
+            console.warn(`[V4.1] topic_definitions validation warnings:`, validation.warnings);
           }
           if (validation.definitions.length > 0) {
-            console.log(`[V4] ${validation.definitions.length} valid intent definitions loaded`);
+            console.log(`[V4.1] ${validation.definitions.length} valid topic definitions loaded`);
           }
         }
 
@@ -441,8 +441,8 @@ async function handlePromptPreview(event) {
         prompt_length: prompt.length,
         prompt: prompt,
         metadata: {
-          pipeline: 'v4',
-          has_intent_definitions: (config.intent_definitions || []).length > 0,
+          pipeline: 'v4.1',
+          has_topic_definitions: (config.topic_definitions || []).length > 0,
           tone_prompt: tonePrompt ? 'custom' : 'default'
         }
       }, null, 2)
@@ -757,7 +757,7 @@ const streamingHandler = async (event, responseStream, context) => {
       const routingMetadata = body.routing_metadata || {};
       const sessionContext = body.session_context || {};
 
-      const validation = validateIntentDefinitions(config);
+      const validation = validateTopicDefinitions(config);
 
       if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks — use enhanceResponse()
@@ -784,21 +784,17 @@ const streamingHandler = async (event, responseStream, context) => {
         }
 
       } else if (validation.definitions.length > 0) {
-        // Step 3a: Classification (non-streaming LLM call)
-        console.log(`[Step 3a] Classifying intent (${validation.definitions.length} definitions)`);
-        const label = await classifyIntent(
+        // Step 3a: Topic classification (non-streaming LLM call)
+        console.log(`[Step 3a] Classifying topic (${validation.definitions.length} definitions)`);
+        const topicName = await classifyTopic(
           userInput,
           conversationHistory,
-          { ...config, intent_definitions: validation.definitions },
+          { ...config, topic_definitions: validation.definitions },
           bedrock
         );
 
-        // Step 3b: Routing (deterministic, no AI)
-        const result = routeFromClassification(
-          label,
-          config,
-          sessionContext?.completed_forms || []
-        );
+        // Step 3b: Dynamic CTA pool selection (deterministic, no AI)
+        const result = selectCTAsFromPool(topicName, config, sessionContext);
 
         // Send CTA SSE event
         if (result.ctaButtons && result.ctaButtons.length > 0) {
@@ -808,14 +804,14 @@ const streamingHandler = async (event, responseStream, context) => {
             metadata: result.metadata,
             session_id: sessionId
           })}\n\n`);
-          console.log(`🎯 [Step3] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'} | branch: ${result.metadata?.target_branch || 'none'} | method: ${result.metadata?.routing_method}`);
+          console.log(`🎯 [Step3] sent ${result.ctaButtons.length} CTAs | topic: ${result.metadata?.classified_topic || 'null'} | depth: ${result.metadata?.depth} | method: ${result.metadata?.routing_method}`);
         } else {
-          console.log(`[Step3] No CTAs to send | intent: ${label || 'null'} | method: ${result.metadata?.routing_method}`);
+          console.log(`[Step3] No CTAs to send | topic: ${topicName || 'null'} | method: ${result.metadata?.routing_method}`);
         }
 
       } else {
-        // No intent_definitions — fallback to enhanceResponse()
-        console.log('No intent_definitions configured — using enhanceResponse()');
+        // No topic_definitions — fallback to enhanceResponse()
+        console.log('No topic_definitions configured — using enhanceResponse()');
         const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
 
         if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
@@ -1106,7 +1102,7 @@ const bufferedHandler = async (event, context) => {
       const routingMetadata = body.routing_metadata || {};
       const sessionContext = body.session_context || {};
 
-      const validation = validateIntentDefinitions(config);
+      const validation = validateTopicDefinitions(config);
 
       if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks
@@ -1119,22 +1115,22 @@ const bufferedHandler = async (event, context) => {
           chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
         }
       } else if (validation.definitions.length > 0) {
-        // Step 3a + 3b: Classification → Routing
-        const label = await classifyIntent(
+        // Step 3a + 3b: Topic classification → Pool selection
+        const topicName = await classifyTopic(
           userInput, conversationHistory,
-          { ...config, intent_definitions: validation.definitions }, bedrock
+          { ...config, topic_definitions: validation.definitions }, bedrock
         );
-        const result = routeFromClassification(label, config, sessionContext?.completed_forms || []);
+        const result = selectCTAsFromPool(topicName, config, sessionContext);
         if (result.ctaButtons && result.ctaButtons.length > 0) {
           const ctaData = JSON.stringify({
             type: 'cta_buttons', ctaButtons: result.ctaButtons,
             metadata: result.metadata, session_id: sessionId
           });
           chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-          console.log(`🎯 [Step3 buffered] sent ${result.ctaButtons.length} CTAs | intent: ${result.metadata?.classified_intent || 'null'}`);
+          console.log(`🎯 [Step3 buffered] sent ${result.ctaButtons.length} CTAs | topic: ${result.metadata?.classified_topic || 'null'} | depth: ${result.metadata?.depth}`);
         }
       } else {
-        // No intent_definitions — fallback to enhanceResponse()
+        // No topic_definitions — fallback to enhanceResponse()
         const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
         if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
           const ctaData = JSON.stringify({

@@ -1,14 +1,20 @@
 /**
- * V4 Prompt Builders — Three-Layer Architecture
+ * V4.1 Prompt Builders — Three-Layer Architecture
  *
  * Step 2: buildV4ConversationPrompt() — streaming conversational response
- * Step 3a: buildClassificationPrompt() + classifyIntent() — intent classification
- * Step 3b: routeFromClassification() — deterministic routing (no AI)
+ * Step 3a: buildTopicClassificationPrompt() + classifyTopic() — topic classification
+ * Step 3b: selectCTAsFromPool() — dynamic CTA pool selection (no AI)
  *
  * The three layers are independent:
- *   - Step 2 (response generation) does not know the intent taxonomy exists
+ *   - Step 2 (response generation) does not know the topic taxonomy exists
  *   - Step 3a (classification) does not know which CTAs exist
- *   - Step 3b (routing) has no AI — evaluates rules only
+ *   - Step 3b (pool selection) has no AI — filters CTA inventory by metadata
+ *
+ * V4.1 changes (Dynamic CTA Pool Selection):
+ *   - topic_definitions replace intent_definitions (no target_branch, no cta_id)
+ *   - selectCTAsFromPool() replaces routeFromClassification() and all branch lookup
+ *   - CTA selection_metadata (topic_tags, depth_level, role_axis) drives selection
+ *   - Session context (accumulated_topics, recently_shown_ctas) drives depth gate
  *
  * Design principles:
  *   - Each function has ONE job. No vocabulary in Step 2. No persona in Step 3a.
@@ -270,106 +276,90 @@ function sanitizeTonePromptV4(tonePrompt) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 3a: Classification (LLM — non-streaming)
-// PRD Amendment lines 59-143
+// STEP 3a: Topic Classification (LLM — non-streaming)
+// V4.1: topic_definitions replace intent_definitions
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Build the Step 3a classification prompt.
+ * Build the Step 3a topic classification prompt.
  *
- * A separate, non-streaming prompt that evaluates the user's message against
- * a described taxonomy of intents. Returns a single label or null.
+ * Evaluates the user's message against a described taxonomy of topics.
+ * Returns a single topic name or null.
  *
- * INCLUDED (amendment lines 67-70):
+ * INCLUDED:
  *   - The user's current message (verbatim)
- *   - Recent conversation context: the last 2 complete user-turn messages
- *   - The full described taxonomy: each intent's name and description
+ *   - Recent conversation context: the last 2 user-turn messages
+ *   - The full described taxonomy: each topic's name and description
  *
- * EXCLUDED (amendment lines 72-79 — these exclusions are not optional):
+ * EXCLUDED (these exclusions are not optional):
  *   - The AI's generated response from Step 2
- *   - CTA definitions, action menus, button configurations, cta_definitions records
+ *   - CTA definitions, action menus, button configurations
  *   - The system prompt, persona block, or tone_prompt
  *   - KB retrieval passages
  *   - Branch structure or conversation_branches config
  *
  * @param {string} userMessage - The current user message (verbatim)
  * @param {Array} conversationHistory - [{role, content}] — all prior messages
- * @param {Object} config - Must contain config.intent_definitions (validated)
+ * @param {Object} config - Must contain config.topic_definitions (validated)
  * @returns {string} Complete prompt string for the classification Bedrock call
  */
-function buildClassificationPrompt(userMessage, conversationHistory, config) {
-  console.log('[V4 Step3a] Building classification prompt');
+function buildTopicClassificationPrompt(userMessage, conversationHistory, config) {
+  console.log('[V4.1 Step3a] Building topic classification prompt');
 
-  // Extract the last 2 user-role messages from conversation history (amendment line 69)
-  // Only user turns — not assistant turns, not KB passages
+  // Extract the last 2 user-role messages from conversation history
   const priorUserMessages = (conversationHistory || [])
     .filter(m => m.role === 'user')
     .map(m => (m.content || m.text || '').trim())
     .filter(Boolean)
     .slice(-2);
 
-  // Build customer messages block: prior user messages + current message (most recent last)
   const allUserMessages = [...priorUserMessages, userMessage];
   const customerMessagesBlock = allUserMessages
     .map(msg => `- ${msg}`)
     .join('\n');
 
-  // Build intent taxonomy block (amendment lines 102-106)
-  // Each entry rendered as: {intent.name}: {intent.description}
-  const intentDefinitions = config.intent_definitions || [];
-  const intentBlock = intentDefinitions
-    .map(intent => `${intent.name}: ${intent.description}`)
+  // Build topic taxonomy block: {topic.name}: {topic.description}
+  const topicDefinitions = config.topic_definitions || [];
+  const taxonomyBlock = topicDefinitions
+    .map(topic => `${topic.name}: ${topic.description}`)
     .join('\n');
 
-  // Assemble exact prompt structure from amendment lines 83-100
   const prompt = `You are a conversation classifier. Read the customer messages below and identify
-which intent best matches, using only the taxonomy provided.
+which topic best matches, using only the taxonomy provided.
 
 CUSTOMER MESSAGES (most recent last):
 ${customerMessagesBlock}
 
-INTENT TAXONOMY:
-${intentBlock}
+TOPIC TAXONOMY:
+${taxonomyBlock}
 
-Return ONLY the intent name that matches, or null if no intent matches.
-Do not explain. Do not select multiple intents. Do not invent new intents.
+Return ONLY the topic name that matches, or null if no topic matches.
+Do not explain. Do not select multiple topics. Do not invent new topics.`;
 
-Examples of valid output:
-null
-"mentoring_recipient"
-"volunteer_lovebox"`;
-
-  console.log(`[V4 Step3a] Classification prompt: ${prompt.length} chars, ${intentDefinitions.length} intents, ${allUserMessages.length} user messages`);
+  console.log(`[V4.1 Step3a] Classification prompt: ${prompt.length} chars, ${topicDefinitions.length} topics, ${allUserMessages.length} user messages`);
   return prompt;
 }
 
 /**
- * Classify user intent via a non-streaming Bedrock call.
+ * Classify user topic via a non-streaming Bedrock call.
  *
- * Makes a separate, non-streaming Bedrock InvokeModel call (amendment lines 61-63).
- * Returns a single label from the closed intent list, or null.
- *
- * AC3b: Output is either a string matching an intent_definitions[].name value,
- * or null. Any output that is not a recognized intent name is treated as null.
- * Malformed output is caught, logged, and returned as null.
- * On any error → log error, return null, never throw.
+ * Same mechanics as the former classifyIntent() — non-streaming InvokeModel,
+ * temp 0.1, max_tokens 50, parse to known name or null.
  *
  * @param {string} userMessage - The current user message
  * @param {Array} conversationHistory - [{role, content}]
- * @param {Object} config - Must contain config.intent_definitions (validated)
+ * @param {Object} config - Must contain config.topic_definitions (validated)
  * @param {Object} bedrockClient - Bedrock runtime client (for InvokeModelCommand)
- * @returns {Promise<string|null>} Matched intent name, or null
+ * @returns {Promise<string|null>} Matched topic name, or null
  */
-async function classifyIntent(userMessage, conversationHistory, config, bedrockClient) {
+async function classifyTopic(userMessage, conversationHistory, config, bedrockClient) {
   const startTime = Date.now();
 
   try {
-    const prompt = buildClassificationPrompt(userMessage, conversationHistory, config);
-    const intentDefinitions = config.intent_definitions || [];
-    const knownNames = intentDefinitions.map(d => d.name);
+    const prompt = buildTopicClassificationPrompt(userMessage, conversationHistory, config);
+    const topicDefinitions = config.topic_definitions || [];
+    const knownNames = topicDefinitions.map(d => d.name);
 
-    // Non-streaming Bedrock call — classification, not generation
-    // Temperature: 0.1 (amendment line 108) — deterministic by design
     const { InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
     const modelId = config.model_id || config.aws?.model_id || 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
 
@@ -388,7 +378,6 @@ async function classifyIntent(userMessage, conversationHistory, config, bedrockC
     const response = await bedrockClient.send(command);
     const responseBody = JSON.parse(new TextDecoder().decode(response.body));
 
-    // Extract text from response
     const rawOutput = (responseBody?.content?.[0]?.text || '').trim();
 
     // Parse: trim whitespace, strip surrounding quotes
@@ -403,81 +392,83 @@ async function classifyIntent(userMessage, conversationHistory, config, bedrockC
 
     const duration = Date.now() - startTime;
 
-    // Check if the value matches any known intent name (AC3b)
     if (parsed === 'null' || parsed === '') {
-      console.log(`[V4 Step3a] Classification result: null (raw: "${rawOutput}") in ${duration}ms`);
+      console.log(`[V4.1 Step3a] Classification result: null (raw: "${rawOutput}") in ${duration}ms`);
       return null;
     }
 
     if (knownNames.includes(parsed)) {
-      console.log(`[V4 Step3a] Classification result: "${parsed}" (raw: "${rawOutput}") in ${duration}ms`);
+      console.log(`[V4.1 Step3a] Classification result: "${parsed}" (raw: "${rawOutput}") in ${duration}ms`);
       return parsed;
     }
 
-    // Unknown name, explanation prose, non-string, object — treat as null (AC3b)
-    console.warn(`[V4 Step3a] Unknown classification output: "${rawOutput}" — treating as null (${duration}ms)`);
+    console.warn(`[V4.1 Step3a] Unknown classification output: "${rawOutput}" — treating as null (${duration}ms)`);
     return null;
 
   } catch (err) {
-    // On any error → log error, return null, never throw (AC3b)
     const duration = Date.now() - startTime;
-    console.error(`[V4 Step3a] Classification error (${duration}ms):`, err.message);
+    console.error(`[V4.1 Step3a] Classification error (${duration}ms):`, err.message);
     return null;
   }
 }
 
 /**
- * Validate intent_definitions in tenant config.
+ * Validate topic_definitions in tenant config.
  *
- * Validation rules:
- *   Rule 1: Every entry must have non-empty name and description. Reject without.
- *   Rule 2: If target_branch references missing branch, log warning but don't error.
+ * Rules:
+ *   - Every entry must have non-empty name and description
+ *   - tags must be an array of strings if present
+ *   - role must be a known value if present
+ *   - Log warnings for invalid entries, filter them out
  *
  * @param {Object} config - Full tenant config
  * @returns {{ valid: boolean, definitions: Array, warnings: string[] }}
  */
-function validateIntentDefinitions(config) {
+function validateTopicDefinitions(config) {
   const warnings = [];
+  const KNOWN_ROLES = ['give', 'receive', 'learn', 'connect'];
 
-  // If not present, not an array, or empty — valid but no definitions
-  if (!config.intent_definitions || !Array.isArray(config.intent_definitions) || config.intent_definitions.length === 0) {
+  if (!config.topic_definitions || !Array.isArray(config.topic_definitions) || config.topic_definitions.length === 0) {
     return { valid: true, definitions: [], warnings: [] };
   }
 
   const validEntries = [];
 
-  for (let i = 0; i < config.intent_definitions.length; i++) {
-    const entry = config.intent_definitions[i];
+  for (let i = 0; i < config.topic_definitions.length; i++) {
+    const entry = config.topic_definitions[i];
 
-    // Rule 1 (amendment line 204): Every entry must have non-empty name (string) and
-    // non-empty description (string). Reject entries without — log a warning per rejected entry.
     if (!entry.name || typeof entry.name !== 'string' || entry.name.trim() === '') {
-      const msg = `[V4] intent_definitions[${i}]: rejected — missing or empty name`;
+      const msg = `[V4.1] topic_definitions[${i}]: rejected — missing or empty name`;
       console.warn(msg);
       warnings.push(msg);
       continue;
     }
 
     if (!entry.description || typeof entry.description !== 'string' || entry.description.trim() === '') {
-      const msg = `[V4] intent_definitions[${i}] ("${entry.name}"): rejected — missing or empty description`;
+      const msg = `[V4.1] topic_definitions[${i}] ("${entry.name}"): rejected — missing or empty description`;
       console.warn(msg);
       warnings.push(msg);
       continue;
     }
 
-    // Rule 3 (amendment line 206): If target_branch references a branch not present
-    // in conversation_branches, log a warning. Do NOT error — entry stays valid,
-    // falls through to fallback on match at runtime.
-    if (entry.target_branch && !config.conversation_branches?.[entry.target_branch]) {
-      const msg = `[V4] intent_definitions[${i}] ("${entry.name}"): target_branch "${entry.target_branch}" not found in conversation_branches — will fall through to fallback on match`;
+    if (entry.tags !== undefined && !Array.isArray(entry.tags)) {
+      const msg = `[V4.1] topic_definitions[${i}] ("${entry.name}"): tags must be an array — ignoring tags`;
       console.warn(msg);
       warnings.push(msg);
+      entry.tags = undefined;
+    }
+
+    if (entry.role !== undefined && !KNOWN_ROLES.includes(entry.role)) {
+      const msg = `[V4.1] topic_definitions[${i}] ("${entry.name}"): unknown role "${entry.role}" — ignoring role`;
+      console.warn(msg);
+      warnings.push(msg);
+      entry.role = undefined;
     }
 
     validEntries.push(entry);
   }
 
-  console.log(`[V4] Validated intent_definitions: ${validEntries.length}/${config.intent_definitions.length} entries valid`);
+  console.log(`[V4.1] Validated topic_definitions: ${validEntries.length}/${config.topic_definitions.length} entries valid`);
 
   return {
     valid: validEntries.length > 0,
@@ -488,132 +479,223 @@ function validateIntentDefinitions(config) {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
-// STEP 3b: Routing (Deterministic — no AI)
-// PRD Amendment lines 147-206
+// STEP 3b: Dynamic CTA Pool Selection (Deterministic — no AI)
+// V4.1: Replaces branch-based routing with metadata-driven pool filtering
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Route from classification result to CTAs. Deterministic code, no AI (AC3c).
+ * Select CTAs from the pool based on topic classification and session context.
+ * Deterministic — same inputs always produce the same output. No AI.
  *
- * Implements the exact function from amendment lines 155-176.
- * Given the same label and config, returns the same CTA set on every invocation.
+ * Replaces routeFromClassification() and all branch/CTA lookup functions.
  *
- * Step 3b routing applies only when intent_definitions is present (amendment line 179).
- * Tenants without intent_definitions continue using existing enhanceResponse() path.
+ * Algorithm:
+ *   1. Resolve topic → tags + role
+ *   2. Filter pool by tag intersection + role
+ *   3. Determine depth preference (info vs action)
+ *   4. Apply depth gate
+ *   5. Sort by priority → tag overlap → insertion order
+ *   6. Dedup (recently_shown_ctas, completed_forms)
+ *   7. Zero-result handling (retry with fallback_tags)
+ *   8. Select top 3, assign positions
  *
- * @param {string|null} label - Classified intent name from Step 3a, or null
- * @param {Object} config - Full tenant config
- * @param {string[]} completedForms - Completed form IDs for filtering
+ * @param {string|null} topicName - Classified topic name from Step 3a, or null
+ * @param {Object} config - Full tenant config (cta_definitions, topic_definitions, cta_settings)
+ * @param {Object} sessionContext - { accumulated_topics, recently_shown_ctas, turns_since_click,
+ *                                    completed_forms, detected_role, ctas_clicked }
  * @returns {{ ctaButtons: Array, metadata: Object }}
  */
-function routeFromClassification(label, config, completedForms = []) {
-  if (!label) {
-    return resolveFallbackBranch(config, completedForms);
-  }
+function selectCTAsFromPool(topicName, config, sessionContext = {}) {
+  const startTime = Date.now();
+  const ctx = sessionContext || {};
 
-  const intent = config.intent_definitions?.find(d => d.name === label);
-  if (!intent) {
-    return resolveFallbackBranch(config, completedForms);
-  }
+  // ── 1. RESOLVE TOPIC ─────────────────────────────────────────────────────
+  let resolvedTags = [];
+  let resolvedRole = null;
+  let topicDef = null;
 
-  if (intent.target_branch && config.conversation_branches?.[intent.target_branch]) {
-    return resolveBranchCTAs(intent.target_branch, config, completedForms, label);
-  }
-
-  // Intent matched but no branch configured — return the single CTA if specified
-  if (intent.cta_id) {
-    return resolveSingleCTA(intent.cta_id, config, label);
-  }
-
-  // Intent matched but no routing configured — AI response stands alone
-  console.log(`[V4 Step3b] Intent "${label}" matched with no routing — response only`);
-  return {
-    ctaButtons: [],
-    metadata: {
-      routing_tier: 'v4_classification',
-      classified_intent: label,
-      target_branch: null,
-      routing_method: 'intent_only'
+  if (topicName) {
+    topicDef = (config.topic_definitions || []).find(d => d.name === topicName);
+    if (topicDef) {
+      resolvedTags = topicDef.tags || [];
+      resolvedRole = topicDef.role || null;
     }
-  };
-}
+  }
 
-/**
- * Resolve fallback branch CTAs.
- * Uses config.cta_settings.fallback_branch → buildCtasFromBranch().
- * If no fallback configured, returns empty array.
- */
-function resolveFallbackBranch(config, completedForms = []) {
-  const fallbackBranch = config.cta_settings?.fallback_branch;
-  if (fallbackBranch && config.conversation_branches?.[fallbackBranch]) {
-    console.log(`[V4 Step3b] Routing to fallback branch: ${fallbackBranch}`);
-    const { buildCtasFromBranch } = require('./response_enhancer');
-    const ctaButtons = buildCtasFromBranch(fallbackBranch, config, completedForms);
+  // If no topic or topic has no tags, use fallback_tags
+  if (resolvedTags.length === 0) {
+    resolvedTags = config.cta_settings?.fallback_tags || [];
+    console.log(`[V4.1 Step3b] Using fallback_tags: [${resolvedTags.join(', ')}]`);
+  }
+
+  console.log(`[V4.1 Step3b] Resolved: topic="${topicName || 'null'}", tags=[${resolvedTags.join(', ')}], role=${resolvedRole || 'none'}`);
+
+  // ── 2. FILTER POOL ───────────────────────────────────────────────────────
+  const ctaDefs = config.cta_definitions || {};
+  let pool = [];
+
+  for (const [ctaId, ctaDef] of Object.entries(ctaDefs)) {
+    // Only CTAs available for AI selection
+    if (!ctaDef.ai_available) continue;
+
+    const ctaTags = ctaDef.selection_metadata?.topic_tags || [];
+    const ctaRole = ctaDef.selection_metadata?.role_axis || null;
+
+    // Tag intersection: CTA must share at least one tag with resolved tags
+    const tagOverlap = ctaTags.filter(t => resolvedTags.includes(t));
+    if (tagOverlap.length === 0) continue;
+
+    // Role filter: if topic has a role, apply role constraint
+    if (resolvedRole) {
+      // Pass if: CTA role matches topic role, OR CTA role is "learn" (universal),
+      // OR CTA has no role_axis (role-agnostic)
+      if (ctaRole && ctaRole !== resolvedRole && ctaRole !== 'learn') continue;
+    }
+
+    // Clean CTA for output (strip style property, add id and overlap count)
+    const { style, ...cleanCta } = ctaDef;
+    pool.push({
+      ...cleanCta,
+      id: ctaId,
+      _tagOverlap: tagOverlap.length,
+      _priority: ctaDef.selection_metadata?.priority ?? 50,
+    });
+  }
+
+  console.log(`[V4.1 Step3b] Pool after tag+role filter: ${pool.length} CTAs`);
+
+  // ── 3. DETERMINE DEPTH ───────────────────────────────────────────────────
+  const depth = determineDepthPreference(resolvedTags, ctx, topicDef);
+
+  // ── 4. APPLY DEPTH GATE ──────────────────────────────────────────────────
+  if (depth === 'info') {
+    // Keep info-depth and lateral-eligible CTAs only
+    pool = pool.filter(cta => {
+      const depthLevel = cta.selection_metadata?.depth_level;
+      const lateralEligible = cta.selection_metadata?.lateral_eligible;
+      return depthLevel === 'info' || lateralEligible === true;
+    });
+  } else {
+    // Action depth: keep all, sort action-depth first
+    pool.sort((a, b) => {
+      const aIsAction = a.selection_metadata?.depth_level === 'action' ? 0 : 1;
+      const bIsAction = b.selection_metadata?.depth_level === 'action' ? 0 : 1;
+      return aIsAction - bIsAction;
+    });
+  }
+
+  console.log(`[V4.1 Step3b] Pool after depth gate (${depth}): ${pool.length} CTAs`);
+
+  // ── 5. SORT (within depth tier) ──────────────────────────────────────────
+  pool.sort((a, b) => {
+    // Primary: depth tier (action first when depth=action, already sorted above)
+    if (depth === 'action') {
+      const aIsAction = a.selection_metadata?.depth_level === 'action' ? 0 : 1;
+      const bIsAction = b.selection_metadata?.depth_level === 'action' ? 0 : 1;
+      if (aIsAction !== bIsAction) return aIsAction - bIsAction;
+    }
+    // Secondary: priority (lower = higher priority)
+    if (a._priority !== b._priority) return a._priority - b._priority;
+    // Tertiary: tag overlap count (more overlap = higher priority)
+    if (a._tagOverlap !== b._tagOverlap) return b._tagOverlap - a._tagOverlap;
+    // Quaternary: insertion order (stable sort preserves)
+    return 0;
+  });
+
+  // ── 6. DEDUP & FILTER ────────────────────────────────────────────────────
+  const recentlyShown = ctx.recently_shown_ctas || [];
+  const completedForms = ctx.completed_forms || [];
+
+  pool = pool.filter(cta => {
+    // Skip recently shown CTAs
+    if (recentlyShown.includes(cta.id)) return false;
+    // Skip form CTAs whose program is in completed_forms
+    if (cta.action_type === 'start_form' && completedForms.includes(cta.form_id)) return false;
+    return true;
+  });
+
+  // ── 7. ZERO-RESULT HANDLING ──────────────────────────────────────────────
+  if (pool.length === 0 && topicName) {
+    // Retry with fallback_tags
+    const fallbackTags = config.cta_settings?.fallback_tags || [];
+    if (fallbackTags.length > 0 && fallbackTags !== resolvedTags) {
+      console.log(`[V4.1 Step3b] Zero results — retrying with fallback_tags: [${fallbackTags.join(', ')}]`);
+      const fallbackResult = selectCTAsFromPool(null, config, sessionContext);
+      fallbackResult.metadata.original_topic = topicName;
+      fallbackResult.metadata.routing_method = 'fallback_retry';
+      return fallbackResult;
+    }
+  }
+
+  // ── 8. SELECT & RETURN ───────────────────────────────────────────────────
+  const selected = pool.slice(0, 3);
+
+  // Assign positions and clean internal fields
+  const ctaButtons = selected.map((cta, idx) => {
+    const { _tagOverlap, _priority, ...cleanCta } = cta;
     return {
-      ctaButtons,
-      metadata: {
-        routing_tier: 'v4_classification',
-        classified_intent: null,
-        target_branch: fallbackBranch,
-        routing_method: 'fallback'
-      }
+      ...cleanCta,
+      _position: idx === 0 ? 'primary' : 'secondary',
     };
-  }
+  });
 
-  console.log('[V4 Step3b] No fallback branch configured — returning empty');
-  return {
-    ctaButtons: [],
-    metadata: {
-      routing_tier: 'v4_classification',
-      classified_intent: null,
-      target_branch: null,
-      routing_method: 'no_fallback'
-    }
-  };
-}
+  const selectedIds = ctaButtons.map(c => c.id);
+  const duration = Date.now() - startTime;
 
-/**
- * Resolve CTAs for a classified branch.
- * Calls buildCtasFromBranch() from response_enhancer.js (battle-tested in production).
- */
-function resolveBranchCTAs(branchName, config, completedForms = [], label = null) {
-  console.log(`[V4 Step3b] Routing intent "${label}" → branch "${branchName}"`);
-  const { buildCtasFromBranch } = require('./response_enhancer');
-  const ctaButtons = buildCtasFromBranch(branchName, config, completedForms);
+  console.log(`[V4.1 Step3b] Selected ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}] (depth=${depth}) in ${duration}ms`);
+
   return {
     ctaButtons,
     metadata: {
-      routing_tier: 'v4_classification',
-      classified_intent: label,
-      target_branch: branchName,
-      routing_method: 'intent_to_branch'
+      routing_tier: 'v4_pool',
+      classified_topic: topicName || null,
+      depth,
+      routing_method: topicName ? 'pool_selection' : 'fallback_tags',
+      pool_size: Object.keys(ctaDefs).length,
+      filtered_count: pool.length,
+      conversation_context: {
+        matched_topics: resolvedTags,
+        selected_ctas: selectedIds,
+      }
     }
   };
 }
 
 /**
- * Resolve a single CTA by ID.
- * Looks up config.cta_definitions[ctaId], returns as single-element array.
+ * Determine depth preference based on session context and topic definition.
+ *
+ * The depth gate is the heart of the "learn before act" principle:
+ *   - If topic has depth_override: "action" → action
+ *   - If primary topic tag (tags[0]) overlaps with accumulated_topics → action
+ *   - Otherwise → info (first encounter — learn first)
+ *
+ * Only tags[0] (the program-level tag) is checked against accumulated_topics.
+ * Cross-topic utility tags like "volunteer" or "enroll" must NOT drive depth
+ * escalation alone — only the primary tag is checked.
+ *
+ * @param {string[]} resolvedTags - Tags from the topic definition
+ * @param {Object} sessionContext - { accumulated_topics, ... }
+ * @param {Object|null} topicDef - The matched topic definition, or null
+ * @returns {'info'|'action'}
  */
-function resolveSingleCTA(ctaId, config, label = null) {
-  const ctaDef = config.cta_definitions?.[ctaId];
-  if (!ctaDef) {
-    console.warn(`[V4 Step3b] CTA "${ctaId}" not found in cta_definitions — falling back`);
-    return resolveFallbackBranch(config);
+function determineDepthPreference(resolvedTags, sessionContext, topicDef) {
+  // Operator override: topic is always action-ready
+  if (topicDef?.depth_override === 'action') {
+    console.log(`[V4.1 depth] depth_override=action on topic "${topicDef.name}"`);
+    return 'action';
   }
 
-  console.log(`[V4 Step3b] Routing intent "${label}" → single CTA "${ctaId}"`);
-  const { style, ...cleanCta } = ctaDef;
-  return {
-    ctaButtons: [{ ...cleanCta, id: ctaId }],
-    metadata: {
-      routing_tier: 'v4_classification',
-      classified_intent: label,
-      target_branch: null,
-      cta_id: ctaId,
-      routing_method: 'intent_to_cta'
-    }
-  };
+  // Check if the primary tag (tags[0]) is already in accumulated_topics
+  const primaryTag = resolvedTags[0] || null;
+  const accumulated = sessionContext.accumulated_topics || [];
+
+  if (primaryTag && accumulated.includes(primaryTag)) {
+    console.log(`[V4.1 depth] Primary tag "${primaryTag}" found in accumulated_topics → action`);
+    return 'action';
+  }
+
+  console.log(`[V4.1 depth] Primary tag "${primaryTag || 'none'}" not in accumulated [${accumulated.join(', ')}] → info`);
+  return 'info';
 }
 
 
@@ -652,15 +734,16 @@ module.exports = {
   // Step 2: Conversational Response (streaming)
   buildV4ConversationPrompt,
 
-  // Step 3a: Classification (non-streaming LLM call)
-  buildClassificationPrompt,
-  classifyIntent,
+  // Step 3a: Topic Classification (non-streaming LLM call)
+  buildTopicClassificationPrompt,
+  classifyTopic,
 
-  // Step 3b: Routing (deterministic, no AI)
-  routeFromClassification,
+  // Step 3b: Dynamic CTA Pool Selection (deterministic, no AI)
+  selectCTAsFromPool,
+  determineDepthPreference,
 
   // Config validation
-  validateIntentDefinitions,
+  validateTopicDefinitions,
 
   // Parameters
   V4_STEP2_INFERENCE_PARAMS,
