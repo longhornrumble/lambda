@@ -244,6 +244,13 @@ export const handler = async (event) => {
         action_chips: [],
         bedrock_instructions: '',
         card_inventory: [],
+        monitor: {
+          enabled: true,
+          siteUrl: '',
+          keyPages: ['/'],
+          dubTag: '',
+          webhookUrl: 'https://integrate.myrecruiter.ai/webhook/kb-monitor',
+        },
       };
 
       // Save config
@@ -440,6 +447,7 @@ export const handler = async (event) => {
             headers,
             body: JSON.stringify({
               error: 'Invalid edited sections',
+              message: `Validation failed: ${validation.errors.join('; ')}`,
               details: validation.errors,
             }),
           };

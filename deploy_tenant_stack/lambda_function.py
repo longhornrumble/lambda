@@ -829,6 +829,15 @@ def transform_bubble_to_picasso_config(bubble_data: Dict[str, Any]) -> Dict[str,
     transformed_config["cta_definitions"] = {}
     transformed_config["conversation_branches"] = {}
 
+    # KB freshness monitor — skeleton populated by KB pipeline after scrape
+    transformed_config["monitor"] = {
+        "enabled": True,
+        "siteUrl": "",
+        "keyPages": ["/"],
+        "dubTag": "",
+        "webhookUrl": "https://integrate.myrecruiter.ai/webhook/kb-monitor"
+    }
+
     # CTA settings with fallback branch support (new routing feature)
     transformed_config["cta_settings"] = {
         "fallback_branch": None  # Will be set in Config Builder UI

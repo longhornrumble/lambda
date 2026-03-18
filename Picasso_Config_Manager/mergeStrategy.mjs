@@ -20,6 +20,11 @@ const EDITABLE_SECTIONS = [
   'widget_behavior',
   'aws',
   'bedrock_instructions',
+  'feature_flags',
+  'intent_definitions',
+  'topic_definitions',
+  'form_settings',
+  'monitor',
 ];
 
 /**
@@ -34,6 +39,7 @@ const READ_ONLY_SECTIONS = [
  */
 const METADATA_FIELDS = [
   'tenant_id',
+  'tenant_hash',
   'version',
   'chat_title',
   'company_name',
@@ -44,6 +50,7 @@ const METADATA_FIELDS = [
   'tone_prompt',
   'model_id',
   'callout_text',
+  'generated_at',
 ];
 
 /**
@@ -121,17 +128,17 @@ export function validateEditedSections(editedSections) {
   const errors = [];
   const allowedKeys = [...EDITABLE_SECTIONS, ...METADATA_FIELDS];
 
-  // Check for disallowed sections
+  // Check for unknown sections (warn but don't block — frontend may send full config)
   const editedKeys = Object.keys(editedSections);
-  const disallowedKeys = editedKeys.filter(
+  const unknownKeys = editedKeys.filter(
     key => !allowedKeys.includes(key) && !READ_ONLY_SECTIONS.includes(key)
   );
 
-  if (disallowedKeys.length > 0) {
-    errors.push(`Disallowed sections in edited config: ${disallowedKeys.join(', ')}`);
+  if (unknownKeys.length > 0) {
+    console.warn(`Unknown sections in edited config (will be ignored during merge): ${unknownKeys.join(', ')}`);
   }
 
-  // Check for attempts to edit read-only sections
+  // Only block attempts to edit read-only sections
   const readOnlyAttempts = editedKeys.filter(key => READ_ONLY_SECTIONS.includes(key));
   if (readOnlyAttempts.length > 0) {
     errors.push(`Cannot edit read-only sections: ${readOnlyAttempts.join(', ')}`);
