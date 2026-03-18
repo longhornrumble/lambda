@@ -103,7 +103,7 @@ ${lines.join('\n')}`;
   // ── LOCKED RULES ──────────────────────────────────────────────────────────
   // These are NEVER removed or overridden by tenant config.
   // Each rule addresses a documented, observed failure mode in V3.5 testing.
-  const lockedRules = buildV4LockedRules(kbContext !== null, turnCount);
+  const lockedRules = buildV4LockedRules(kbContext !== null, turnCount, config);
 
   // ── TENANT CUSTOM CONSTRAINTS ─────────────────────────────────────────────
   // Tenant-provided rules (from config.bedrock_instructions.custom_constraints).
@@ -134,7 +134,8 @@ ${lines.join('\n')}`;
   sections.push(`━━━ USER MESSAGE ━━━`);
   sections.push(`USER: ${userInput}`);
   sections.push('');
-  sections.push(buildV4FinalInstruction(kbContext !== null));
+  const detailLevel = config?.bedrock_instructions?.formatting_preferences?.detail_level || 'balanced';
+  sections.push(buildV4FinalInstruction(kbContext !== null, detailLevel));
 
   const prompt = sections.join('\n');
 
@@ -144,13 +145,13 @@ ${lines.join('\n')}`;
 
 /**
  * Build the locked rules block for Step 2.
- * These rules are invariant — they do not change per tenant.
  *
  * @param {boolean} hasKb - Whether KB context is present
  * @param {number} turnCount - Number of prior user turns in this session
+ * @param {Object} config - Full tenant config (for formatting_preferences)
  * @returns {string}
  */
-function buildV4LockedRules(hasKb, turnCount) {
+function buildV4LockedRules(hasKb, turnCount, config) {
   const rules = [];
 
   rules.push(`━━━ RESPONSE RULES ━━━`);
@@ -191,12 +192,8 @@ function buildV4LockedRules(hasKb, turnCount) {
 - Do not use the phrase "Is there anything else I can help you with?" unless the conversation has reached a natural end point and there is genuinely no more to say on this topic.
 - Match the user's energy. If they are warm and enthusiastic, be warm. If they are frustrated or confused, be calm and direct.`);
 
-  // ── Formatting ─────────────────────────────────────────────────────────
-  rules.push(`FORMATTING
-- Write in prose paragraphs. Do not use markdown headers (lines starting with #). This is a chat conversation, not a document.
-- Use bullet points only for genuine lists of 3 or more discrete, parallel items. Do not use bullets to pad a response.
-- Keep responses concise: 2 to 4 short paragraphs for most answers. Include relevant KB details without padding.
-- Preserve all URLs and email addresses from the KB exactly as written. Do not shorten them to "their website" or "reach out to the team."`);
+  // ── Formatting (driven by tenant config formatting_preferences) ────────
+  rules.push(buildV4FormattingRules(config));
 
   // ── Closing rule ───────────────────────────────────────────────────────
   rules.push(`CLOSING
@@ -209,14 +206,117 @@ function buildV4LockedRules(hasKb, turnCount) {
 }
 
 /**
- * Build the final instruction line at the end of the Step 2 prompt.
- * Positioned last for recency bias.
+ * Build formatting rules from tenant config formatting_preferences.
+ *
+ * Reads: config.bedrock_instructions.formatting_preferences
+ *   - response_style: 'professional_concise' | 'warm_conversational' | 'structured_detailed'
+ *   - detail_level: 'concise' | 'balanced' | 'comprehensive'
+ *   - emoji_usage: 'none' | 'moderate' | 'generous'
+ *   - max_emojis_per_response: number
+ *
+ * @param {Object} config
+ * @returns {string}
  */
-function buildV4FinalInstruction(hasKb) {
-  if (hasKb) {
-    return `Respond conversationally using only the KB facts above. End with a specific follow-up question that moves the conversation forward.`;
+function buildV4FormattingRules(config) {
+  const prefs = config?.bedrock_instructions?.formatting_preferences || {};
+  const style = prefs.response_style || 'warm_conversational';
+  const detail = prefs.detail_level || 'balanced';
+  const emoji = prefs.emoji_usage || 'moderate';
+  const maxEmoji = prefs.max_emojis_per_response ?? 3;
+  console.log(`[V4 Formatting] Using: style=${style}, detail=${detail}, emoji=${emoji}, maxEmoji=${maxEmoji}`);
+
+  const lines = ['FORMATTING'];
+
+  // ── Context: This is a chat widget ──────────────────────────────────
+  lines.push('- IMPORTANT: This is a small chat widget, not a document. Responses must be easy to scan on a phone screen.');
+  lines.push('- Do not use markdown headers (lines starting with #).');
+  lines.push('- Preserve all URLs and email addresses from the KB exactly as written.');
+  lines.push('- Never cram all KB facts into one response. Pick the most relevant facts for THIS question and leave the rest for follow-ups.');
+
+  // ── Response style (controls FORMAT — how it's written) ─────────────
+  switch (style) {
+    case 'professional_concise':
+      lines.push('- Use a professional, business-appropriate tone. No greetings like "Hey!" or "I\'d love to help!" — get straight to the answer.');
+      lines.push('- Never open with enthusiasm or small talk. State the facts directly.');
+      lines.push('- Use short bullet points when presenting 2+ items. Keep each bullet to one line.');
+      break;
+    case 'structured_detailed':
+      lines.push('- Organize information with bold labels and short bullet points. No long flowing paragraphs.');
+      lines.push('- Lead with a one-sentence summary, then break details into structured points.');
+      lines.push('- Keep each bullet point to one line. Use bold text for category labels.');
+      break;
+    case 'warm_conversational':
+    default:
+      lines.push('- Write in a warm, conversational tone — like a friendly colleague.');
+      lines.push('- Use short sentences and line breaks between ideas. Avoid dense walls of text.');
+      lines.push('- It\'s okay to open with a brief personal touch ("Great question!" or "I\'d love to tell you about that!").');
+      break;
   }
-  return `Use the fallback message above. Offer to help with topics you do have information about.`;
+
+  // ── Detail level (controls LENGTH — hard word limits) ───────────────
+  switch (detail) {
+    case 'concise':
+      lines.push('- HARD LIMIT: 2-3 sentences maximum, under 60 words total (excluding the closing question). This is non-negotiable.');
+      lines.push('- Give a one-line overview. Do NOT enumerate sub-programs, tracks, age ranges, or requirements. Let the follow-up question draw out more.');
+      break;
+    case 'comprehensive':
+      lines.push('- Provide a thorough response: 3-4 short paragraphs or an intro sentence plus organized bullet points.');
+      lines.push('- Cover key distinctions (e.g. different tracks, eligibility, program details). Use line breaks between sections for readability.');
+      lines.push('- LIMIT: Stay under 200 words (excluding the closing question). Thorough does not mean exhaustive.');
+      break;
+    case 'balanced':
+    default:
+      lines.push('- Keep responses to 2 short paragraphs or 1 paragraph plus a few bullet points.');
+      lines.push('- Cover the main facts with enough detail to be useful. Don\'t exhaustively list everything.');
+      lines.push('- LIMIT: Stay under 120 words (excluding the closing question).');
+      break;
+  }
+
+  // ── Emoji usage ─────────────────────────────────────────────────────
+  switch (emoji) {
+    case 'none':
+      lines.push('- Do not use any emojis in responses.');
+      break;
+    case 'generous':
+      lines.push(`- Use emojis freely to add warmth (up to ${maxEmoji} per response).`);
+      break;
+    case 'moderate':
+    default:
+      lines.push(`- Use emojis sparingly (up to ${maxEmoji} per response).`);
+      break;
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Build the final instruction line at the end of the Step 2 prompt.
+ * Positioned last for recency bias — the model pays most attention to this.
+ * Includes a hard word-limit reminder based on detail_level.
+ */
+function buildV4FinalInstruction(hasKb, detailLevel = 'balanced') {
+  let instruction;
+  if (hasKb) {
+    instruction = `Respond conversationally using only the KB facts above. End with a specific follow-up question that moves the conversation forward.`;
+  } else {
+    instruction = `Use the fallback message above. Offer to help with topics you do have information about.`;
+  }
+
+  // Add hard word-limit reminder as the absolute last thing the model reads
+  switch (detailLevel) {
+    case 'concise':
+      instruction += `\n\nREMINDER: Your answer (before the closing question) must be under 50 words. Two to three short sentences. Stop writing and ask your follow-up question.`;
+      break;
+    case 'comprehensive':
+      instruction += `\n\nREMINDER: Keep your answer under 200 words. Use line breaks for readability.`;
+      break;
+    case 'balanced':
+    default:
+      instruction += `\n\nREMINDER: Keep your answer under 120 words. Use line breaks for readability.`;
+      break;
+  }
+
+  return instruction;
 }
 
 /**
@@ -488,7 +588,7 @@ function validateTopicDefinitions(config) {
  *   5. Sort by priority → tag overlap → insertion order
  *   6. Dedup (recently_shown_ctas, completed_forms)
  *   7. Zero-result handling (retry with fallback_tags)
- *   8. Select top 3, assign positions
+ *   8. Select top 4, assign positions
  *
  * @param {string|null} topicName - Classified topic name from Step 3a, or null
  * @param {Object} config - Full tenant config (cta_definitions, topic_definitions, cta_settings)
@@ -513,10 +613,12 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
     }
   }
 
-  // If no topic or topic has no tags, use fallback_tags
+  // If no topic or topic has no tags, use fallback_tags.
+  // Fallback_tags should be broad enough to surface good learning CTAs
+  // (operator ensures key learning CTAs carry the "programs" tag).
   if (resolvedTags.length === 0) {
     resolvedTags = config.cta_settings?.fallback_tags || [];
-    console.log(`[V4.1 Step3b] Using fallback_tags: [${resolvedTags.join(', ')}]`);
+    console.log(`[V4.1 Step3b] No topic tags — using fallback_tags: [${resolvedTags.join(', ')}]`);
   }
 
   console.log(`[V4.1 Step3b] Resolved: topic="${topicName || 'null'}", tags=[${resolvedTags.join(', ')}], role=${resolvedRole || 'none'}`);
@@ -555,61 +657,73 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
 
   console.log(`[V4.1 Step3b] Pool after tag+role filter: ${pool.length} CTAs`);
 
-  // ── 3. DETERMINE DEPTH ───────────────────────────────────────────────────
+  // ── 3. DETERMINE DEPTH (sort preference, not a filter) ──────────────────
   const depth = determineDepthPreference(resolvedTags, ctx, topicDef);
 
-  // ── 4. APPLY DEPTH GATE ──────────────────────────────────────────────────
-  if (depth === 'info') {
-    // Keep info-depth and lateral-eligible CTAs only
-    pool = pool.filter(cta => {
-      const depthLevel = cta.selection_metadata?.depth_level;
-      const lateralEligible = cta.selection_metadata?.lateral_eligible;
-      return depthLevel === 'info' || lateralEligible === true;
-    });
-  } else {
-    // Action depth: keep all, sort action-depth first
-    pool.sort((a, b) => {
-      const aIsAction = a.selection_metadata?.depth_level === 'action' ? 0 : 1;
-      const bIsAction = b.selection_metadata?.depth_level === 'action' ? 0 : 1;
-      return aIsAction - bIsAction;
-    });
-  }
-
-  console.log(`[V4.1 Step3b] Pool after depth gate (${depth}): ${pool.length} CTAs`);
-
-  // ── 5. SORT (within depth tier) ──────────────────────────────────────────
-  pool.sort((a, b) => {
-    // Primary: depth tier (action first when depth=action, already sorted above)
-    if (depth === 'action') {
-      const aIsAction = a.selection_metadata?.depth_level === 'action' ? 0 : 1;
-      const bIsAction = b.selection_metadata?.depth_level === 'action' ? 0 : 1;
-      if (aIsAction !== bIsAction) return aIsAction - bIsAction;
-    }
-    // Secondary: priority (lower = higher priority)
-    if (a._priority !== b._priority) return a._priority - b._priority;
-    // Tertiary: tag overlap count (more overlap = higher priority)
-    if (a._tagOverlap !== b._tagOverlap) return b._tagOverlap - a._tagOverlap;
-    // Quaternary: insertion order (stable sort preserves)
-    return 0;
-  });
-
-  // ── 6. DEDUP & FILTER ────────────────────────────────────────────────────
-  const recentlyShown = ctx.recently_shown_ctas || [];
+  // ── 4. FILTER ──────────────────────────────────────────────────────────
   const completedForms = ctx.completed_forms || [];
 
   pool = pool.filter(cta => {
-    // Skip recently shown CTAs
-    if (recentlyShown.includes(cta.id)) return false;
-    // Skip form CTAs whose program is in completed_forms
+    // Don't show form CTAs for forms the user already completed
     if (cta.action_type === 'start_form' && completedForms.includes(cta.form_id)) return false;
+    // Filter core learning CTAs that are redundant to the question just answered.
+    // "Learn about Dare to Dream" is redundant when the AI just explained D2D.
+    // Sub-topic CTAs ("What's in a Love Box?", "Download D2D manual") pass through.
+    if (topicName && cta.action === 'send_query' && cta.selection_metadata?.core_learning) {
+      const primaryCtaTag = (cta.selection_metadata?.topic_tags || [])[0];
+      const primaryTopicTag = resolvedTags[0];
+      if (primaryCtaTag && primaryTopicTag && primaryCtaTag === primaryTopicTag) {
+        console.log(`[V4.1 Step3b] Filtering redundant core CTA "${cta.id}" — AI just answered "${primaryTopicTag}"`);
+        return false;
+      }
+    }
     return true;
   });
 
+  console.log(`[V4.1 Step3b] Pool after filter: ${pool.length} CTAs`);
+
+  // ── 5. SORT ──────────────────────────────────────────────────────────────
+  // Sort by priority → tag overlap → insertion order (deterministic)
+  pool.sort((a, b) => {
+    if (a._priority !== b._priority) return a._priority - b._priority;
+    if (a._tagOverlap !== b._tagOverlap) return b._tagOverlap - a._tagOverlap;
+    return 0;
+  });
+
+  // ── 6. DIVERSE SELECT ──────────────────────────────────────────────────
+  // Pick the best CTA from each depth tier to ensure the user always sees
+  // a mix of options: learn more (info), take action (action), explore (lateral).
+  // Depth preference controls which tier gets the primary slot.
+  const tiers = { info: [], action: [], lateral: [] };
+  for (const cta of pool) {
+    const tier = cta.selection_metadata?.depth_level || 'info';
+    if (tiers[tier]) tiers[tier].push(cta);
+    else tiers.info.push(cta); // unknown depth_level → treat as info
+  }
+
+  const selected = [];
+  // Order tiers by depth preference: preferred tier gets primary slot
+  const tierOrder = depth === 'action'
+    ? ['action', 'info', 'lateral']
+    : ['info', 'action', 'lateral'];
+
+  // Round 1: take top 1 from each non-empty tier
+  for (const tier of tierOrder) {
+    if (tiers[tier].length > 0 && selected.length < 4) {
+      selected.push(tiers[tier].shift());
+    }
+  }
+  // Round 2: fill remaining slots from the preferred tier, then others
+  for (const tier of tierOrder) {
+    while (tiers[tier].length > 0 && selected.length < 4) {
+      selected.push(tiers[tier].shift());
+    }
+  }
+
   // ── 7. ZERO-RESULT HANDLING ──────────────────────────────────────────────
-  if (pool.length === 0 && topicName) {
-    // Retry with fallback_tags
+  if (selected.length === 0 && topicName) {
     const fallbackTags = config.cta_settings?.fallback_tags || [];
-    if (fallbackTags.length > 0 && fallbackTags !== resolvedTags) {
+    if (fallbackTags.length > 0) {
       console.log(`[V4.1 Step3b] Zero results — retrying with fallback_tags: [${fallbackTags.join(', ')}]`);
       const fallbackResult = selectCTAsFromPool(null, config, sessionContext);
       fallbackResult.metadata.original_topic = topicName;
@@ -618,8 +732,13 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
     }
   }
 
-  // ── 8. SELECT & RETURN ───────────────────────────────────────────────────
-  const selected = pool.slice(0, 3);
+  // Action CTAs always take the primary (first) position.
+  // Learning CTAs appear alongside as secondary options for continued exploration.
+  selected.sort((a, b) => {
+    const aIsAction = (a.selection_metadata?.depth_level === 'action') ? 0 : 1;
+    const bIsAction = (b.selection_metadata?.depth_level === 'action') ? 0 : 1;
+    return aIsAction - bIsAction;
+  });
 
   // Assign positions and clean internal fields
   const ctaButtons = selected.map((cta, idx) => {
@@ -647,6 +766,7 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
       conversation_context: {
         matched_topics: resolvedTags,
         selected_ctas: selectedIds,
+        last_classified_topic: topicName || null,
       }
     }
   };
@@ -655,14 +775,15 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
 /**
  * Determine depth preference based on session context and topic definition.
  *
- * The depth gate is the heart of the "learn before act" principle:
+ * Depth is a SORT preference for diverse CTA selection, not a filter.
+ * It controls which tier gets the primary slot:
+ *   - info → learning CTA is primary, action is secondary
+ *   - action → action CTA is primary, learning is secondary
+ *
+ * Rules:
  *   - If topic has depth_override: "action" → action
  *   - If primary topic tag (tags[0]) overlaps with accumulated_topics → action
- *   - Otherwise → info (first encounter — learn first)
- *
- * Only tags[0] (the program-level tag) is checked against accumulated_topics.
- * Cross-topic utility tags like "volunteer" or "enroll" must NOT drive depth
- * escalation alone — only the primary tag is checked.
+ *   - Otherwise → info (first encounter — learning CTAs get primary position)
  *
  * @param {string[]} resolvedTags - Tags from the topic definition
  * @param {Object} sessionContext - { accumulated_topics, ... }

@@ -145,10 +145,10 @@ function evictOldestCacheEntries(cache, maxSize = MAX_CACHE_SIZE) {
   }
 }
 
-async function loadConfig(tenantHash) {
+async function loadConfig(tenantHash, { skipCache = false } = {}) {
   try {
     const cacheKey = `config:${tenantHash}`;
-    if (CONFIG_CACHE[cacheKey] && isCacheValid(CONFIG_CACHE[cacheKey])) {
+    if (!skipCache && CONFIG_CACHE[cacheKey] && isCacheValid(CONFIG_CACHE[cacheKey])) {
       console.log(`✅ Config cache hit for ${tenantHash.substring(0, 8)}...`);
       const cachedConfig = CONFIG_CACHE[cacheKey].data;
       console.log(`📋 Cached KB ID: ${cachedConfig?.aws?.knowledge_base_id || 'NOT SET'}`);
@@ -523,6 +523,7 @@ const streamingHandler = async (event, responseStream, context) => {
     const sessionId = body.session_id || 'default';
     const userInput = body.user_input || '';
     const isFormMode = body.form_mode === true;
+    const skipConfigCache = body.nocache === true || queryParams.nocache !== undefined;
 
     // Form mode requests don't require user_input - they have form_data instead
     if (!tenantHash || (!userInput && !isFormMode)) {
@@ -533,7 +534,7 @@ const streamingHandler = async (event, responseStream, context) => {
       responseStream.end();
       return;
     }
-    
+
     // Capture the question for logging
     questionBuffer = userInput;
     
@@ -553,7 +554,8 @@ const streamingHandler = async (event, responseStream, context) => {
     }, 2000);
 
     // Load config
-    let config = await loadConfig(tenantHash);
+    if (skipConfigCache) console.log('🔄 Config cache bypass requested (nocache=true)');
+    let config = await loadConfig(tenantHash, { skipCache: skipConfigCache });
     if (!config) {
       config = {
         model_id: DEFAULT_MODEL_ID,
@@ -786,12 +788,21 @@ const streamingHandler = async (event, responseStream, context) => {
       } else if (validation.definitions.length > 0) {
         // Step 3a: Topic classification (non-streaming LLM call)
         console.log(`[Step 3a] Classifying topic (${validation.definitions.length} definitions)`);
-        const topicName = await classifyTopic(
+        let topicName = await classifyTopic(
           userInput,
           conversationHistory,
           { ...config, topic_definitions: validation.definitions },
           bedrock
         );
+
+        // Continuation detection: short/ambiguous messages carry forward the previous topic
+        const isShortMessage = userInput.trim().length < 20;
+        const isNullOrGeneral = !topicName || topicName === 'general_inquiry';
+        const previousTopic = sessionContext.last_classified_topic;
+        if (isShortMessage && isNullOrGeneral && previousTopic) {
+          console.log(`[Step 3a] Continuation detected: "${userInput}" → carrying forward topic "${previousTopic}"`);
+          topicName = previousTopic;
+        }
 
         // Step 3b: Dynamic CTA pool selection (deterministic, no AI)
         const result = selectCTAsFromPool(topicName, config, sessionContext);
@@ -907,22 +918,23 @@ const bufferedHandler = async (event, context) => {
     const tenantHash = body.tenant_hash || '';
     const sessionId = body.session_id || 'default';
     const userInput = body.user_input || '';
-    
+    const skipConfigCache = body.nocache === true || queryParams.nocache !== undefined;
+
     // Capture the question
     questionBuffer = userInput;
-    
+
     // Extract conversation history from the request
-    const conversationHistory = body.conversation_history || 
-                               body.conversation_context?.recentMessages || 
+    const conversationHistory = body.conversation_history ||
+                               body.conversation_context?.recentMessages ||
                                [];
-    
+
     console.log(`💬 Conversation history: ${conversationHistory.length} messages`);
-    
+
     if (!tenantHash || !userInput) {
       const error = !tenantHash ? 'Missing tenant_hash' : 'Missing user_input';
       chunks.push(`data: {"type": "error", "error": "${error}"}\n\n`);
       chunks.push('data: [DONE]\n\n');
-      
+
       return {
         statusCode: 400,
         headers: {
@@ -934,11 +946,12 @@ const bufferedHandler = async (event, context) => {
         body: chunks.join('')
       };
     }
-    
+
     console.log(`📝 Processing: ${tenantHash.substring(0,8)}... / ${sessionId.substring(0,12)}...`);
-    
+
     // Load config
-    let config = await loadConfig(tenantHash);
+    if (skipConfigCache) console.log('🔄 Config cache bypass requested (nocache=true)');
+    let config = await loadConfig(tenantHash, { skipCache: skipConfigCache });
     if (!config) {
       config = {
         model_id: DEFAULT_MODEL_ID,
@@ -1116,10 +1129,20 @@ const bufferedHandler = async (event, context) => {
         }
       } else if (validation.definitions.length > 0) {
         // Step 3a + 3b: Topic classification → Pool selection
-        const topicName = await classifyTopic(
+        let topicName = await classifyTopic(
           userInput, conversationHistory,
           { ...config, topic_definitions: validation.definitions }, bedrock
         );
+
+        // Continuation detection: short/ambiguous messages carry forward the previous topic
+        const isShortMsg = userInput.trim().length < 20;
+        const isNullOrGen = !topicName || topicName === 'general_inquiry';
+        const prevTopic = sessionContext.last_classified_topic;
+        if (isShortMsg && isNullOrGen && prevTopic) {
+          console.log(`[Step 3a buffered] Continuation detected: "${userInput}" → carrying forward topic "${prevTopic}"`);
+          topicName = prevTopic;
+        }
+
         const result = selectCTAsFromPool(topicName, config, sessionContext);
         if (result.ctaButtons && result.ctaButtons.length > 0) {
           const ctaData = JSON.stringify({
