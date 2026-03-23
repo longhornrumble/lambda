@@ -21,6 +21,13 @@ Endpoints:
 - GET /sessions/{session_id} - Full session timeline (User Journey)
 - GET /sessions/list        - Paginated session list with filters (User Journey)
 - GET /features             - Dashboard feature flags for tenant
+- GET /notifications/summary        - Sent/delivered/bounced/opened/clicked counts + rates
+- GET /notifications/events         - Paginated notification event log (newest first)
+- GET /notifications/events/{id}    - Full lifecycle for a single message (GSI ByMessageId)
+
+Required IAM permissions (Lambda execution role) for notification endpoints:
+- dynamodb:Query on picasso-notification-events (table + ByMessageId GSI)
+- dynamodb:Query on picasso-notification-sends
 
 Authentication:
 - JWT token in Authorization header (Bearer token)
@@ -83,6 +90,11 @@ FORM_SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_
 # DynamoDB Session Tables (User Journey Analytics)
 SESSION_EVENTS_TABLE = os.environ.get('SESSION_EVENTS_TABLE', 'picasso-session-events')
 SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries')
+
+# DynamoDB Notification Tables (Phase 2a)
+# IAM: Lambda execution role needs dynamodb:Query on both tables and the ByMessageId GSI.
+NOTIFICATION_EVENTS_TABLE = os.environ.get('NOTIFICATION_EVENTS_TABLE', 'picasso-notification-events')
+NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-notification-sends')
 
 # S3 Tenant Configuration
 S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
@@ -287,8 +299,19 @@ def lambda_handler(event, context):
     # NOTE: More specific routes must come before generic ones
     # (e.g., /forms/summary before /summary)
     try:
+        # Notification endpoints (most specific - check first)
+        if '/notifications/events/' in path:
+            # GET /notifications/events/{message_id}
+            message_id = path.split('/notifications/events/')[-1].split('/')[0]
+            if message_id:
+                return handle_notification_event_detail(tenant_id, message_id)
+        elif path.endswith('/notifications/events'):
+            return handle_notification_events(tenant_id, params)
+        elif path.endswith('/notifications/summary'):
+            return handle_notification_summary(tenant_id, params)
+
         # Conversations endpoints (most specific - check first)
-        if path.endswith('/conversations/summary'):
+        elif path.endswith('/conversations/summary'):
             return handle_conversation_summary(tenant_id, params)
         elif path.endswith('/conversations/heatmap'):
             return handle_conversation_heatmap(tenant_id, params)
@@ -490,7 +513,7 @@ def get_tenant_config(tenant_id: str) -> Optional[Dict[str, Any]]:
             return _tenant_config_cache[tenant_id]
 
     try:
-        key = f"tenants/{tenant_id}/config.json"
+        key = f"tenants/{tenant_id}/{tenant_id}-config.json"
         response = s3.get_object(Bucket=S3_CONFIG_BUCKET, Key=key)
         config = json.loads(response['Body'].read().decode('utf-8'))
 
@@ -518,6 +541,8 @@ def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
     - dashboard_conversations: True (FREE tier)
     - dashboard_forms: True (legacy tenant support)
     - dashboard_attribution: False (PREMIUM only)
+    - dashboard_notifications: False (requires notification-enabled forms in config)
+    - dashboard_settings: False (Phase 3 placeholder)
     """
     config = get_tenant_config(tenant_id)
 
@@ -527,14 +552,26 @@ def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
             'dashboard_conversations': True,
             'dashboard_forms': True,
             'dashboard_attribution': False,
+            'dashboard_notifications': False,
+            'dashboard_settings': False,
         }
 
     features = config.get('features', {})
+
+    # Derive dashboard_notifications from whether any form has notifications enabled
+    has_notifications = False
+    forms = config.get('conversational_forms', {})
+    for form_id, form in forms.items():
+        if isinstance(form, dict) and form.get('notifications', {}).get('internal', {}).get('enabled', False):
+            has_notifications = True
+            break
 
     return {
         'dashboard_conversations': features.get('dashboard_conversations', True),
         'dashboard_forms': features.get('dashboard_forms', True),
         'dashboard_attribution': features.get('dashboard_attribution', False),
+        'dashboard_notifications': features.get('dashboard_notifications', has_notifications),
+        'dashboard_settings': features.get('dashboard_settings', False),
     }
 
 
@@ -3673,3 +3710,343 @@ def handle_lead_queue(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     except Exception as e:
         logger.exception(f"Error fetching lead queue: {e}")
         return cors_response(500, {'error': 'Internal server error'})
+
+
+# =============================================================================
+# Notification Endpoint Handlers (Phase 2a)
+# =============================================================================
+# Tables:
+#   picasso-notification-events  PK=pk("TENANT#<id>"), SK=<ISO_DATE>#<event_type>#<message_id>
+#                                GSI ByMessageId: PK=message_id, SK=event_type_timestamp
+#   picasso-notification-sends   PK=pk("TENANT#<id>"), SK=<ISO_DATE>#<channel>#<message_id>
+#
+# IAM: Lambda execution role needs dynamodb:Query on both tables and the ByMessageId GSI.
+# =============================================================================
+
+def _notification_date_range_start(range_str: str) -> str:
+    """
+    Convert a range string (1d, 7d, 30d, 90d) to an ISO-8601 date string for
+    DynamoDB SK prefix comparisons (YYYY-MM-DD).  Falls back to 7d for unknown values.
+    """
+    try:
+        days = int(range_str.rstrip('d'))
+    except (ValueError, AttributeError):
+        days = 7
+    start = datetime.now(timezone.utc) - timedelta(days=days)
+    return start.strftime('%Y-%m-%d')
+
+
+def handle_notification_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /notifications/summary
+
+    Returns aggregated counts and delivery-rate metrics for the requested period.
+
+    Query params:
+    - range: 1d | 7d | 30d | 90d (default 7d)
+
+    Response schema:
+    {
+        "sent": int, "delivered": int, "bounced": int, "complained": int,
+        "opened": int, "clicked": int, "failed": int,
+        "delivery_rate": float, "open_rate": float, "bounce_rate": float,
+        "period": str
+    }
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_notifications')
+    if access_error:
+        return access_error
+
+    range_str = params.get('range', '7d')
+    start_date = _notification_date_range_start(range_str)
+    pk = f'TENANT#{tenant_id}'
+
+    logger.info(
+        f"[notifications/summary] tenant={redact_tenant_id(tenant_id)} "
+        f"range={range_str} start={start_date}"
+    )
+
+    # --- Query picasso-notification-events for delivery/open/click/bounce/complaint ---
+    event_counts: Dict[str, int] = {}
+    try:
+        last_key = None
+        while True:
+            query_kwargs: Dict[str, Any] = {
+                'TableName': NOTIFICATION_EVENTS_TABLE,
+                'KeyConditionExpression': 'pk = :pk AND sk >= :sk_start',
+                'ExpressionAttributeValues': {
+                    ':pk': {'S': pk},
+                    ':sk_start': {'S': start_date},
+                },
+                'ProjectionExpression': 'event_type',
+            }
+            if last_key:
+                query_kwargs['ExclusiveStartKey'] = last_key
+            resp = dynamodb.query(**query_kwargs)
+            for item in resp.get('Items', []):
+                et = item.get('event_type', {}).get('S', '')
+                if et:
+                    event_counts[et] = event_counts.get(et, 0) + 1
+            last_key = resp.get('LastEvaluatedKey')
+            if not last_key:
+                break
+    except ClientError as e:
+        logger.error(f"DynamoDB error querying notification-events: {e}")
+        return cors_response(500, {'error': 'Failed to query notification events'})
+
+    # --- Query picasso-notification-sends for sent/failed counts ---
+    sent_count = 0
+    failed_count = 0
+    try:
+        last_key = None
+        while True:
+            query_kwargs = {
+                'TableName': NOTIFICATION_SENDS_TABLE,
+                'KeyConditionExpression': 'pk = :pk AND sk >= :sk_start',
+                'ExpressionAttributeValues': {
+                    ':pk': {'S': pk},
+                    ':sk_start': {'S': start_date},
+                },
+                'ProjectionExpression': '#st',
+                'ExpressionAttributeNames': {'#st': 'status'},
+            }
+            if last_key:
+                query_kwargs['ExclusiveStartKey'] = last_key
+            resp = dynamodb.query(**query_kwargs)
+            for item in resp.get('Items', []):
+                status = item.get('status', {}).get('S', '')
+                if status == 'failed':
+                    failed_count += 1
+                else:
+                    sent_count += 1
+            last_key = resp.get('LastEvaluatedKey')
+            if not last_key:
+                break
+    except ClientError as e:
+        logger.error(f"DynamoDB error querying notification-sends: {e}")
+        return cors_response(500, {'error': 'Failed to query notification sends'})
+
+    delivered = event_counts.get('delivery', 0)
+    bounced = event_counts.get('bounce', 0)
+    complained = event_counts.get('complaint', 0)
+    opened = event_counts.get('open', 0)
+    clicked = event_counts.get('click', 0)
+
+    delivery_rate = round((delivered / sent_count * 100), 1) if sent_count > 0 else 0.0
+    open_rate = round((opened / delivered * 100), 1) if delivered > 0 else 0.0
+    bounce_rate = round((bounced / sent_count * 100), 1) if sent_count > 0 else 0.0
+
+    return cors_response(200, {
+        'sent': sent_count,
+        'delivered': delivered,
+        'bounced': bounced,
+        'complained': complained,
+        'opened': opened,
+        'clicked': clicked,
+        'failed': failed_count,
+        'delivery_rate': delivery_rate,
+        'open_rate': open_rate,
+        'bounce_rate': bounce_rate,
+        'period': range_str,
+    })
+
+
+def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
+    """
+    GET /notifications/events
+
+    Returns a paginated, newest-first event log from picasso-notification-events,
+    combining send and delivery events.
+
+    Query params:
+    - range:   1d | 7d | 30d | 90d (default 7d)
+    - page:    page number, 1-based (default 1)
+    - limit:   results per page, max 100 (default 25)
+    - channel: filter by channel, e.g. "email" (optional)
+    - status:  filter by event_type, e.g. "delivery" (optional)
+    - search:  filter by recipient email substring (optional)
+
+    Response schema:
+    {
+        "events": [ { timestamp, event_type, channel, recipient, form_id,
+                      status, message_id } ],
+        "total": int, "page": int, "limit": int, "has_more": bool
+    }
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_notifications')
+    if access_error:
+        return access_error
+
+    range_str = params.get('range', '7d')
+    start_date = _notification_date_range_start(range_str)
+    pk = f'TENANT#{tenant_id}'
+
+    try:
+        page = max(1, int(params.get('page', '1')))
+    except ValueError:
+        page = 1
+    try:
+        limit = min(max(1, int(params.get('limit', '25'))), 100)
+    except ValueError:
+        limit = 25
+
+    channel_filter = params.get('channel', '').strip().lower()
+    status_filter = params.get('status', '').strip().lower()
+    search = params.get('search', '').strip().lower()
+
+    logger.info(
+        f"[notifications/events] tenant={redact_tenant_id(tenant_id)} "
+        f"range={range_str} page={page} limit={limit}"
+    )
+
+    # Build DynamoDB query — scan index forward = False gives newest first
+    query_kwargs: Dict[str, Any] = {
+        'TableName': NOTIFICATION_EVENTS_TABLE,
+        'KeyConditionExpression': 'pk = :pk AND sk >= :sk_start',
+        'ExpressionAttributeValues': {
+            ':pk': {'S': pk},
+            ':sk_start': {'S': start_date},
+        },
+        'ScanIndexForward': False,
+    }
+
+    # Optional server-side filter on channel
+    filter_parts = []
+    if channel_filter:
+        query_kwargs['ExpressionAttributeValues'][':ch'] = {'S': channel_filter}
+        filter_parts.append('channel = :ch')
+    if filter_parts:
+        query_kwargs['FilterExpression'] = ' AND '.join(filter_parts)
+
+    all_events = []
+    try:
+        last_key = None
+        while True:
+            if last_key:
+                query_kwargs['ExclusiveStartKey'] = last_key
+            resp = dynamodb.query(**query_kwargs)
+            for item in resp.get('Items', []):
+                event_type = item.get('event_type', {}).get('S', '')
+
+                # status_filter maps to event_type
+                if status_filter and event_type != status_filter:
+                    continue
+
+                # destination is a List; take first element as primary recipient
+                dest_list = item.get('destination', {}).get('L', [])
+                recipient = dest_list[0].get('S', '') if dest_list else ''
+
+                # search filter on recipient
+                if search and search not in recipient.lower():
+                    continue
+
+                context = item.get('context', {}).get('M', {})
+                form_id = context.get('form_id', {}).get('S', '')
+
+                # SK: <ISO_DATE>#<event_type>#<message_id>
+                sk = item.get('sk', {}).get('S', '')
+                sk_parts = sk.split('#')
+                message_id = sk_parts[2] if len(sk_parts) >= 3 else ''
+                timestamp = item.get('sk', {}).get('S', '').split('#')[0] if sk else ''
+
+                all_events.append({
+                    'timestamp': timestamp,
+                    'event_type': event_type,
+                    'channel': item.get('channel', {}).get('S', ''),
+                    'recipient': recipient,
+                    'form_id': form_id,
+                    'status': event_type,
+                    'message_id': message_id,
+                })
+            last_key = resp.get('LastEvaluatedKey')
+            if not last_key:
+                break
+    except ClientError as e:
+        logger.error(f"DynamoDB error querying notification-events list: {e}")
+        return cors_response(500, {'error': 'Failed to query notification events'})
+
+    total = len(all_events)
+    offset = (page - 1) * limit
+    page_events = all_events[offset:offset + limit]
+    has_more = (offset + limit) < total
+
+    return cors_response(200, {
+        'events': page_events,
+        'total': total,
+        'page': page,
+        'limit': limit,
+        'has_more': has_more,
+    })
+
+
+def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[str, Any]:
+    """
+    GET /notifications/events/{message_id}
+
+    Returns the full lifecycle event sequence for a single message using the
+    ByMessageId GSI on picasso-notification-events.
+
+    Response schema:
+    {
+        "message_id": str,
+        "events": [ { "event_type": str, "timestamp": str, "detail": dict } ]
+    }
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_notifications')
+    if access_error:
+        return access_error
+
+    # Basic input validation — message IDs are hex strings up to 64 chars
+    if not message_id or len(message_id) > 128 or not re.match(r'^[A-Za-z0-9_\-]+$', message_id):
+        return cors_response(400, {'error': 'Invalid message_id format'})
+
+    logger.info(
+        f"[notifications/events/detail] tenant={redact_tenant_id(tenant_id)} "
+        f"message_id={message_id[:16]}..."
+    )
+
+    try:
+        resp = dynamodb.query(
+            TableName=NOTIFICATION_EVENTS_TABLE,
+            IndexName='ByMessageId',
+            KeyConditionExpression='message_id = :mid',
+            ExpressionAttributeValues={
+                ':mid': {'S': message_id},
+            },
+            ScanIndexForward=True,  # chronological order
+        )
+    except ClientError as e:
+        logger.error(f"DynamoDB error querying ByMessageId GSI: {e}")
+        return cors_response(500, {'error': 'Failed to query notification event detail'})
+
+    events = []
+    for item in resp.get('Items', []):
+        event_type = item.get('event_type', {}).get('S', '')
+
+        # event_type_timestamp SK: <event_type>#<ISO timestamp>
+        sk = item.get('event_type_timestamp', {}).get('S', '')
+        sk_parts = sk.split('#', 1)
+        timestamp = sk_parts[1] if len(sk_parts) == 2 else ''
+
+        # detail is a free-form Map attribute
+        detail_raw = item.get('detail', {}).get('M', {})
+        detail: Dict[str, Any] = {}
+        for k, v in detail_raw.items():
+            # Unwrap single-type DynamoDB values (S, N, BOOL only for simplicity)
+            if 'S' in v:
+                detail[k] = v['S']
+            elif 'N' in v:
+                detail[k] = v['N']
+            elif 'BOOL' in v:
+                detail[k] = v['BOOL']
+
+        events.append({
+            'event_type': event_type,
+            'timestamp': timestamp,
+            'detail': detail,
+        })
+
+    return cors_response(200, {
+        'message_id': message_id,
+        'events': events,
+    })

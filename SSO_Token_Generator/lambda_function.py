@@ -12,16 +12,61 @@ import hashlib
 import base64
 import time
 import boto3
+import logging
 from functools import lru_cache
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 # Cache signing key for 5 minutes (Lambda container reuse)
 secrets_client = None
+s3_client = None
+
+# S3 bucket for tenant configurations
+S3_CONFIG_BUCKET = 'picasso-configs'
+
+# Cache for tenant configs (TTL: 5 minutes)
+_tenant_config_cache = {}
+_tenant_config_cache_time = {}
+TENANT_CONFIG_CACHE_TTL = 300  # seconds
+
 
 def get_secrets_client():
     global secrets_client
     if secrets_client is None:
         secrets_client = boto3.client('secretsmanager', region_name='us-east-1')
     return secrets_client
+
+
+def get_s3_client():
+    global s3_client
+    if s3_client is None:
+        s3_client = boto3.client('s3', region_name='us-east-1')
+    return s3_client
+
+
+def get_tenant_config(tenant_id: str) -> dict:
+    """
+    Fetch tenant configuration from S3 with per-container caching.
+    Returns empty dict if config not found or on error.
+    """
+    now = time.time()
+    if tenant_id in _tenant_config_cache:
+        if (now - _tenant_config_cache_time.get(tenant_id, 0)) < TENANT_CONFIG_CACHE_TTL:
+            return _tenant_config_cache[tenant_id]
+
+    try:
+        s3 = get_s3_client()
+        key = f"tenants/{tenant_id}/config.json"
+        response = s3.get_object(Bucket=S3_CONFIG_BUCKET, Key=key)
+        config = json.loads(response['Body'].read().decode('utf-8'))
+        _tenant_config_cache[tenant_id] = config
+        _tenant_config_cache_time[tenant_id] = now
+        logger.info(f"Loaded tenant config for {tenant_id[:8]}...")
+        return config
+    except Exception as e:
+        logger.warning(f"Could not load tenant config for {tenant_id[:8]}...: {e}")
+        return {}
 
 @lru_cache(maxsize=1)
 def get_signing_key():
@@ -67,7 +112,9 @@ def lambda_handler(event, context):
         "tenants": [...] (optional, for super_admin tenant switching),
         "dashboard_conversations": true (optional),
         "dashboard_forms": true (optional),
-        "dashboard_attribution": false (optional)
+        "dashboard_attribution": false (optional),
+        "dashboard_notifications": true (optional, auto-derived from tenant config if omitted),
+        "dashboard_settings": false (optional, Phase 3 placeholder)
     }
 
     Returns:
@@ -142,6 +189,28 @@ def lambda_handler(event, context):
             features['dashboard_forms'] = body['dashboard_forms']
         if 'dashboard_attribution' in body:
             features['dashboard_attribution'] = body['dashboard_attribution']
+
+        # dashboard_notifications: caller may pass explicit override; otherwise
+        # auto-derive from whether the tenant config has any notification-enabled
+        # conversational forms (internal.enabled == true).
+        if 'dashboard_notifications' in body:
+            features['dashboard_notifications'] = bool(body['dashboard_notifications'])
+        else:
+            config = get_tenant_config(body['tenant_id'])
+            has_notifications = False
+            forms = config.get('conversational_forms', {})
+            for form_id, form in forms.items():
+                if form.get('notifications', {}).get('internal', {}).get('enabled', False):
+                    has_notifications = True
+                    break
+            features['dashboard_notifications'] = has_notifications
+            logger.info(
+                f"Auto-derived dashboard_notifications={has_notifications} "
+                f"for tenant {body['tenant_id'][:8]}..."
+            )
+
+        # dashboard_settings: Phase 3 placeholder — always False for now
+        features['dashboard_settings'] = bool(body.get('dashboard_settings', False))
 
         if features:
             payload['features'] = features
