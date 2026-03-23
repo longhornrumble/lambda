@@ -5,6 +5,7 @@ Handles notifications, storage, and fulfillment
 """
 
 import json
+import time
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -34,6 +35,9 @@ logger.setLevel(logging.INFO)
 SUBMISSIONS_TABLE = 'picasso_form_submissions'
 SMS_USAGE_TABLE = 'picasso_sms_usage'
 AUDIT_TABLE = 'picasso_audit_logs'
+NOTIFICATION_SENDS_TABLE = 'picasso-notification-sends'
+
+notification_sends_table = dynamodb.Table(NOTIFICATION_SENDS_TABLE)
 
 
 def normalize_label(label: str) -> str:
@@ -689,12 +693,54 @@ class FormHandler:
                     ]
                 )
 
+                ses_message_id = response.get('MessageId', 'unknown')
                 sent.append(f"email:{recipient}")
-                logger.info(f"Email sent to {recipient}: {response['MessageId']}")
+                logger.info(f"Email sent to {recipient}: {ses_message_id}")
+
+                # Audit: write send record to picasso-notification-sends
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    iso_date = now_iso[:10]
+                    notification_sends_table.put_item(Item={
+                        'pk': f'TENANT#{self.tenant_id or "unknown"}',
+                        'sk': f'{iso_date}#email#{ses_message_id}',
+                        'channel': 'email',
+                        'recipient': recipient,
+                        'submission_id': str(form_data.get('submission_id', 'unknown')),
+                        'form_id': str(form_data.get('form_type', 'unknown')),
+                        'template': 'internal_notification',
+                        'status': 'sent',
+                        'error': '',
+                        'message_id': ses_message_id,
+                        'timestamp': now_iso,
+                        'ttl': int(time.time()) + (90 * 24 * 3600),
+                    })
+                except Exception as ddb_err:
+                    logger.error(f"Failed to write notification send record: {ddb_err}", exc_info=True)
 
             except ClientError as e:
                 logger.error(f"Email send error to {recipient}: {str(e)}")
-                # TODO: Write to picasso-notification-sends with status='failed'
+
+                # Audit: write failure record to picasso-notification-sends
+                try:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    iso_date = now_iso[:10]
+                    notification_sends_table.put_item(Item={
+                        'pk': f'TENANT#{self.tenant_id or "unknown"}',
+                        'sk': f'{iso_date}#email#failed-{form_data.get("submission_id", "unknown")}-{recipient}',
+                        'channel': 'email',
+                        'recipient': recipient,
+                        'submission_id': str(form_data.get('submission_id', 'unknown')),
+                        'form_id': str(form_data.get('form_type', 'unknown')),
+                        'template': 'internal_notification',
+                        'status': 'failed',
+                        'error': str(e),
+                        'message_id': '',
+                        'timestamp': now_iso,
+                        'ttl': int(time.time()) + (90 * 24 * 3600),
+                    })
+                except Exception as ddb_err:
+                    logger.error(f"Failed to write notification failure record: {ddb_err}", exc_info=True)
 
         return sent
 

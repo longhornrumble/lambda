@@ -32,6 +32,7 @@ const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' })
 // Form submission table
 const FORM_SUBMISSIONS_TABLE = process.env.FORM_SUBMISSIONS_TABLE || 'picasso-form-submissions';
 const SMS_USAGE_TABLE = process.env.SMS_USAGE_TABLE || 'picasso-sms-usage';
+const NOTIFICATION_SENDS_TABLE = process.env.NOTIFICATION_SENDS_TABLE || 'picasso-notification-sends';
 const SMS_MONTHLY_LIMIT = parseInt(process.env.SMS_MONTHLY_LIMIT || '100', 10);
 
 /**
@@ -534,11 +535,66 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
       // Use notification config for subject/body if available
       const emailSubject = internalNotif.subject || null;
       const emailBodyTemplate = internalNotif.body_template || null;
-      await sendFormEmail(emailRecipients, formId, displayData, config, priority, submissionId, emailSubject, emailBodyTemplate);
+      const sesResponse = await sendFormEmail(emailRecipients, formId, displayData, config, priority, submissionId, emailSubject, emailBodyTemplate);
       results.push({ channel: 'email', status: 'sent', recipients: Array.isArray(emailRecipients) ? emailRecipients.length : 1 });
+
+      // Audit: write one record per recipient to picasso-notification-sends
+      const sesMessageId = sesResponse?.MessageId || 'unknown';
+      const nowIso = new Date().toISOString();
+      const recipientList = Array.isArray(emailRecipients) ? emailRecipients : [emailRecipients];
+      for (const recipient of recipientList) {
+        try {
+          await dynamodb.send(new PutCommand({
+            TableName: NOTIFICATION_SENDS_TABLE,
+            Item: {
+              pk: `TENANT#${config.tenant_id || 'unknown'}`,
+              sk: `${nowIso.slice(0, 10)}#email#${sesMessageId}`,
+              channel: 'email',
+              recipient: recipient,
+              submission_id: submissionId || 'unknown',
+              form_id: formId || 'unknown',
+              template: 'internal_notification',
+              status: 'sent',
+              error: '',
+              message_id: sesMessageId,
+              timestamp: nowIso,
+              ttl: Math.floor(Date.now() / 1000) + 90 * 24 * 3600,
+            }
+          }));
+        } catch (ddbErr) {
+          console.error('Failed to write notification send record to DynamoDB:', ddbErr);
+        }
+      }
     } catch (error) {
       console.error('Email fulfillment failed:', error);
       results.push({ channel: 'email', status: 'failed', error: error.message });
+
+      // Audit: record failure for each intended recipient
+      const nowIso = new Date().toISOString();
+      const recipientList = Array.isArray(emailRecipients) ? emailRecipients : [emailRecipients];
+      for (const recipient of recipientList) {
+        try {
+          await dynamodb.send(new PutCommand({
+            TableName: NOTIFICATION_SENDS_TABLE,
+            Item: {
+              pk: `TENANT#${config.tenant_id || 'unknown'}`,
+              sk: `${nowIso.slice(0, 10)}#email#failed-${submissionId || 'unknown'}-${recipient}`,
+              channel: 'email',
+              recipient: recipient,
+              submission_id: submissionId || 'unknown',
+              form_id: formId || 'unknown',
+              template: 'internal_notification',
+              status: 'failed',
+              error: error.message || 'unknown error',
+              message_id: '',
+              timestamp: nowIso,
+              ttl: Math.floor(Date.now() / 1000) + 90 * 24 * 3600,
+            }
+          }));
+        } catch (ddbErr) {
+          console.error('Failed to write notification failure record to DynamoDB:', ddbErr);
+        }
+      }
     }
   }
 
@@ -734,8 +790,9 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
     ]
   };
 
-  await sesClient.send(new SendEmailCommand(params));
+  const sesResponse = await sesClient.send(new SendEmailCommand(params));
   console.log(`✅ Form email sent to ${toEmail}`);
+  return sesResponse;
 }
 
 /**

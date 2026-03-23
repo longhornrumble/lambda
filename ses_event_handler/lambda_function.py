@@ -8,8 +8,11 @@ from SNS and forwards them to Bubble via webhook.
 import json
 import logging
 import os
+import time
 import urllib.request
 import urllib.error
+
+import boto3
 
 # Configure logging
 logger = logging.getLogger()
@@ -22,6 +25,10 @@ BUBBLE_WEBHOOK_URL = os.environ.get(
 )
 WEBHOOK_TIMEOUT = int(os.environ.get('WEBHOOK_TIMEOUT', '10'))
 BUBBLE_FORWARDING_ENABLED = os.environ.get('BUBBLE_FORWARDING_ENABLED', 'true').lower() == 'true'
+
+# DynamoDB
+_dynamodb = boto3.resource('dynamodb')
+notification_events_table = _dynamodb.Table('picasso-notification-events')
 
 
 def lambda_handler(event, context):
@@ -63,13 +70,22 @@ def lambda_handler(event, context):
             }
 
             # Extract tags as a dictionary
+            # SES tags in SNS events come as {"key": ["val1", "val2"], ...}
+            raw_tags = mail.get('tags', {})
             tags = {}
-            for tag in mail.get('tags', []):
-                tag_name = tag.get('name')
-                tag_values = tag.get('value', [])
-                if tag_name and tag_values:
-                    # Tags can have multiple values, but usually there's just one
-                    tags[tag_name] = tag_values[0] if len(tag_values) == 1 else tag_values
+            if isinstance(raw_tags, dict):
+                for tag_name, tag_values in raw_tags.items():
+                    if isinstance(tag_values, list) and len(tag_values) == 1:
+                        tags[tag_name] = tag_values[0]
+                    else:
+                        tags[tag_name] = tag_values
+            elif isinstance(raw_tags, list):
+                # Legacy format: [{"name": "key", "value": ["val"]}]
+                for tag in raw_tags:
+                    tag_name = tag.get('name')
+                    tag_values = tag.get('value', [])
+                    if tag_name and tag_values:
+                        tags[tag_name] = tag_values[0] if len(tag_values) == 1 else tag_values
             payload['tags'] = tags
 
             # Transition guard: check for tenant_id tag added by Phase 1 migration.
@@ -83,8 +99,49 @@ def lambda_handler(event, context):
                     "pre-migration email, skipping DynamoDB write"
                 )
 
-            # TODO: Write to picasso-notification-events table here
-            # (only when tenant_id is present — post-migration emails)
+            # Write to picasso-notification-events (post-migration emails only)
+            if tenant_id:
+                try:
+                    event_type_lower = payload['event_type']
+                    message_id = payload.get('message_id') or 'unknown'
+                    iso_date = (payload.get('timestamp') or '').split('T')[0] or \
+                        __import__('datetime').datetime.utcnow().strftime('%Y-%m-%d')
+
+                    # Build event-specific detail map from existing payload keys
+                    skip_keys = {
+                        'event_type', 'message_id', 'timestamp', 'source',
+                        'destination', 'source_arn', 'source_ip',
+                        'sending_account_id', 'tags'
+                    }
+                    detail = {k: v for k, v in payload.items() if k not in skip_keys and v is not None}
+
+                    notification_events_table.put_item(Item={
+                        'pk': f'TENANT#{tenant_id}',
+                        'sk': f'{iso_date}#{event_type_lower}#{message_id}',
+                        'message_id': message_id,
+                        'event_type': event_type_lower,
+                        'channel': 'email',
+                        'destination': payload.get('destination', []),
+                        'source': payload.get('source', ''),
+                        'context': {
+                            'form_id': tags.get('form_id', ''),
+                            'submission_id': tags.get('submission_id', ''),
+                            'session_id': tags.get('session_id', ''),
+                        },
+                        'detail': detail,
+                        'tags': tags,
+                        'ttl': int(time.time()) + (90 * 24 * 3600),
+                        'event_type_timestamp': f'{event_type_lower}#{payload.get("timestamp", "")}',
+                    })
+                    logger.info(
+                        f"DynamoDB write: picasso-notification-events "
+                        f"TENANT#{tenant_id} / {event_type_lower} / {message_id}"
+                    )
+                except Exception as ddb_err:
+                    logger.error(
+                        f"Failed to write notification event to DynamoDB: {ddb_err}",
+                        exc_info=True
+                    )
 
             # Add event-specific details
             if event_type.lower() == 'bounce':
