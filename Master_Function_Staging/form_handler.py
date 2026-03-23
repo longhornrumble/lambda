@@ -679,7 +679,14 @@ class FormHandler:
                         'Body': {
                             'Html': {'Data': body}
                         }
-                    }
+                    },
+                    ConfigurationSetName='picasso-emails',
+                    Tags=[
+                        {'Name': 'tenant_id', 'Value': str(self.tenant_id or 'unknown')[:256]},
+                        {'Name': 'form_type', 'Value': str(form_data.get('form_type', 'unknown'))[:256]},
+                        {'Name': 'submission_id', 'Value': str(form_data.get('submission_id', 'unknown'))[:256]},
+                        {'Name': 'email_type', 'Value': 'internal_notification'}
+                    ]
                 )
 
                 sent.append(f"email:{recipient}")
@@ -687,6 +694,7 @@ class FormHandler:
 
             except ClientError as e:
                 logger.error(f"Email send error to {recipient}: {str(e)}")
+                # TODO: Write to picasso-notification-sends with status='failed'
 
         return sent
 
@@ -926,7 +934,7 @@ class FormHandler:
             user_email = responses.get('email')
             if user_email:
                 template = fulfillment.get('template', 'thank_you')
-                self._send_fulfillment_email(user_email, template, responses)
+                self._send_fulfillment_email(user_email, template, responses, form_type, submission_id)
                 return {'type': 'email', 'status': 'sent', 'recipient': user_email}
 
         elif fulfillment_type == 's3':
@@ -1069,7 +1077,8 @@ class FormHandler:
 
         return html
 
-    def _send_fulfillment_email(self, recipient: str, template: str, responses: Dict[str, Any]):
+    def _send_fulfillment_email(self, recipient: str, template: str, responses: Dict[str, Any],
+                               form_type: str = 'unknown', submission_id: str = 'unknown'):
         """Send fulfillment email to form submitter"""
         try:
             # Get template content from config or use default
@@ -1095,7 +1104,14 @@ class FormHandler:
                     'Body': {
                         'Html': {'Data': body}
                     }
-                }
+                },
+                ConfigurationSetName='picasso-emails',
+                Tags=[
+                    {'Name': 'tenant_id', 'Value': str(self.tenant_id or 'unknown')[:256]},
+                    {'Name': 'form_type', 'Value': str(form_type)[:256]},
+                    {'Name': 'submission_id', 'Value': str(submission_id)[:256]},
+                    {'Name': 'email_type', 'Value': 'applicant_confirmation'}
+                ]
             )
 
             logger.info(f"Fulfillment email sent to {recipient}")

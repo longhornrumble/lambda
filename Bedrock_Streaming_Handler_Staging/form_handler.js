@@ -59,10 +59,10 @@ function getSESFromEmail() {
   const email = process.env.SES_FROM_EMAIL;
   if (!email) {
     if (!sesEmailWarningLogged) {
-      console.warn('⚠️ SES_FROM_EMAIL not set - using fallback noreply@picasso.ai (ensure this is verified in SES)');
+      console.warn('⚠️ SES_FROM_EMAIL not set - using fallback notify@myrecruiter.ai');
       sesEmailWarningLogged = true;
     }
-    return 'noreply@picasso.ai';
+    return 'notify@myrecruiter.ai';
   }
   return email;
 }
@@ -216,7 +216,7 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
 
     // Send confirmation email if configured (non-blocking)
     if (formData.email && config.send_confirmation_email !== false) {
-      sendConfirmationEmail(formData.email, formId, config).catch(err => {
+      sendConfirmationEmail(formData.email, formId, config, submissionId).catch(err => {
         console.error('❌ Confirmation email failed:', err.message);
       });
     }
@@ -446,6 +446,9 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
     }
   }
 
+  // Build human-readable form data for email notifications
+  const displayData = buildFormDataDisplay(formData, formConfig);
+
   // Check form-specific fulfillment configuration (formConfig already defined above)
   const fulfillment = formConfig.fulfillment || config.default_fulfillment || {};
 
@@ -520,10 +523,19 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   }
 
   // Email fulfillment (notification to organization)
-  if (fulfillment.email_to) {
+  // Support both legacy fulfillment.email_to and new notifications.internal config
+  const notifications = formConfig.notifications || {};
+  const internalNotif = notifications.internal || {};
+  const emailRecipients = fulfillment.email_to ||
+    (internalNotif.enabled && internalNotif.channels?.email !== false ? internalNotif.recipients : null);
+
+  if (emailRecipients && emailRecipients.length > 0) {
     try {
-      await sendFormEmail(fulfillment.email_to, formId, formData, config, priority);
-      results.push({ channel: 'email', status: 'sent' });
+      // Use notification config for subject/body if available
+      const emailSubject = internalNotif.subject || null;
+      const emailBodyTemplate = internalNotif.body_template || null;
+      await sendFormEmail(emailRecipients, formId, displayData, config, priority, submissionId, emailSubject, emailBodyTemplate);
+      results.push({ channel: 'email', status: 'sent', recipients: Array.isArray(emailRecipients) ? emailRecipients.length : 1 });
     } catch (error) {
       console.error('Email fulfillment failed:', error);
       results.push({ channel: 'email', status: 'failed', error: error.message });
@@ -644,31 +656,63 @@ async function incrementSMSUsage(tenantId) {
 /**
  * Send form data via email
  */
-async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal') {
-  const subject = `New Form Submission: ${formId}`;
+async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal', submissionId = 'unknown', customSubject = null, bodyTemplate = null) {
+  // Build human-readable form data for template substitution
+  const formDataText = Object.entries(formData)
+    .map(([key, value]) => `${key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}: ${value}`)
+    .join('\n');
 
-  let htmlBody = `
-    <h2>New ${formId} Submission</h2>
-    <p>A new form has been submitted through the chat widget.</p>
-    <h3>Form Data:</h3>
-    <table border="1" cellpadding="5" cellspacing="0">
-  `;
-
-  for (const [key, value] of Object.entries(formData)) {
-    htmlBody += `
-      <tr>
-        <td><strong>${key}:</strong></td>
-        <td>${value}</td>
-      </tr>
-    `;
+  // Use custom subject with template variables if provided
+  let subject;
+  if (customSubject) {
+    subject = customSubject
+      .replace('{first_name}', formData.first_name || formData.firstName || '')
+      .replace('{last_name}', formData.last_name || formData.lastName || '')
+      .replace('{email}', formData.email || formData.email_address || '')
+      .replace('{form_type}', formId)
+      .replace('{organization_name}', config.chat_title || config.tenant_id || '');
+  } else {
+    subject = `New Form Submission: ${formId}`;
   }
 
-  htmlBody += `
-    </table>
-    <p><strong>Priority:</strong> ${priority.toUpperCase()}</p>
-    <p>Submitted at: ${new Date().toISOString()}</p>
-    <p>Tenant: ${config.tenant_id || 'unknown'}</p>
-  `;
+  let htmlBody;
+  if (bodyTemplate) {
+    // Use custom body template with variable substitution
+    const bodyText = bodyTemplate
+      .replace('{first_name}', formData.first_name || formData.firstName || '')
+      .replace('{last_name}', formData.last_name || formData.lastName || '')
+      .replace('{email}', formData.email || formData.email_address || '')
+      .replace('{phone}', formData.phone || formData.phone_number || '')
+      .replace('{organization_name}', config.chat_title || config.tenant_id || '')
+      .replace('{form_data}', formDataText)
+      .replace('{form_type}', formId);
+    // Convert newlines to HTML
+    htmlBody = `<div style="font-family: Arial, sans-serif; line-height: 1.6;">${bodyText.replace(/\n/g, '<br>')}</div>`;
+  } else {
+    // Default HTML email body
+    htmlBody = `
+      <h2>New ${formId} Submission</h2>
+      <p>A new form has been submitted through the chat widget.</p>
+      <h3>Form Data:</h3>
+      <table border="1" cellpadding="5" cellspacing="0">
+    `;
+
+    for (const [key, value] of Object.entries(formData)) {
+      htmlBody += `
+        <tr>
+          <td><strong>${key}:</strong></td>
+          <td>${value}</td>
+        </tr>
+      `;
+    }
+
+    htmlBody += `
+      </table>
+      <p><strong>Priority:</strong> ${priority.toUpperCase()}</p>
+      <p>Submitted at: ${new Date().toISOString()}</p>
+      <p>Tenant: ${config.tenant_id || 'unknown'}</p>
+    `;
+  }
 
   const params = {
     Source: getSESFromEmail(),
@@ -680,7 +724,14 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
       Body: {
         Html: { Data: htmlBody }
       }
-    }
+    },
+    ConfigurationSetName: 'picasso-emails',
+    Tags: [
+      { Name: 'tenant_id', Value: String(config.tenant_id || 'unknown').slice(0, 256) },
+      { Name: 'form_type', Value: String(formId || 'unknown').slice(0, 256) },
+      { Name: 'submission_id', Value: String(submissionId || 'unknown').slice(0, 256) },
+      { Name: 'email_type', Value: 'internal_notification' }
+    ]
   };
 
   await sesClient.send(new SendEmailCommand(params));
@@ -690,7 +741,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
 /**
  * Send confirmation email to user
  */
-async function sendConfirmationEmail(userEmail, formId, config) {
+async function sendConfirmationEmail(userEmail, formId, config, submissionId = 'unknown') {
   const tenantName = config.chat_title || 'Organization';
   const subject = `Thank you for your ${formId} submission`;
 
@@ -714,7 +765,14 @@ async function sendConfirmationEmail(userEmail, formId, config) {
       Body: {
         Html: { Data: htmlBody }
       }
-    }
+    },
+    ConfigurationSetName: 'picasso-emails',
+    Tags: [
+      { Name: 'tenant_id', Value: String(config.tenant_id || 'unknown').slice(0, 256) },
+      { Name: 'form_type', Value: String(formId || 'unknown').slice(0, 256) },
+      { Name: 'submission_id', Value: String(submissionId || 'unknown').slice(0, 256) },
+      { Name: 'email_type', Value: 'applicant_confirmation' }
+    ]
   };
 
   try {

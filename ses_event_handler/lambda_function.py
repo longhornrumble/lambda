@@ -21,6 +21,7 @@ BUBBLE_WEBHOOK_URL = os.environ.get(
     'https://hrfx.bubbleapps.io/api/1.1/wf/ses_event'
 )
 WEBHOOK_TIMEOUT = int(os.environ.get('WEBHOOK_TIMEOUT', '10'))
+BUBBLE_FORWARDING_ENABLED = os.environ.get('BUBBLE_FORWARDING_ENABLED', 'true').lower() == 'true'
 
 
 def lambda_handler(event, context):
@@ -70,6 +71,20 @@ def lambda_handler(event, context):
                     # Tags can have multiple values, but usually there's just one
                     tags[tag_name] = tag_values[0] if len(tag_values) == 1 else tag_values
             payload['tags'] = tags
+
+            # Transition guard: check for tenant_id tag added by Phase 1 migration.
+            # Pre-migration emails (sent before ConfigurationSet/Tags were added) will
+            # not carry tenant_id. For those, we skip future DynamoDB writes but still
+            # forward to Bubble for backwards compatibility.
+            tenant_id = tags.get('tenant_id')
+            if not tenant_id:
+                logger.warning(
+                    f"No tenant_id tag found on message {mail.get('messageId')} — "
+                    "pre-migration email, skipping DynamoDB write"
+                )
+
+            # TODO: Write to picasso-notification-events table here
+            # (only when tenant_id is present — post-migration emails)
 
             # Add event-specific details
             if event_type.lower() == 'bounce':
@@ -144,10 +159,12 @@ def lambda_handler(event, context):
                     'ip_address': click.get('ipAddress'),
                 })
 
-            # Forward to Bubble
-            success = forward_to_bubble(payload)
+            # Forward to Bubble (controlled by BUBBLE_FORWARDING_ENABLED env var)
+            bubble_success = True
+            if BUBBLE_FORWARDING_ENABLED:
+                bubble_success = forward_to_bubble(payload)
 
-            if success:
+            if bubble_success:
                 processed += 1
                 logger.info(f"Processed {event_type} event for message {mail.get('messageId')}")
             else:
@@ -161,6 +178,17 @@ def lambda_handler(event, context):
             errors += 1
 
     logger.info(f"Completed: {processed} processed, {errors} errors")
+
+    # Return non-200 when all records failed so SNS will retry delivery.
+    # Partial failures still return 200 — individual error details are in logs.
+    if errors > 0 and processed == 0:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({
+                'processed': processed,
+                'errors': errors
+            })
+        }
 
     return {
         'statusCode': 200,
