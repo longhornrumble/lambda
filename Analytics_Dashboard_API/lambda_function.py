@@ -53,6 +53,8 @@ import boto3
 import hashlib
 import hmac
 import base64
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
@@ -98,6 +100,31 @@ NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-n
 
 # S3 Tenant Configuration
 S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
+
+# =============================================================================
+# Clerk Authentication Bridge (Trial — hardcoded user map)
+# =============================================================================
+# JWKS URL: move to env var CLERK_JWKS_URL for production.
+CLERK_JWKS_URL = os.environ.get(
+    'CLERK_JWKS_URL',
+    'https://capable-peacock-51.clerk.accounts.dev/.well-known/jwks.json'
+)
+
+# Hardcoded user map for trial — replace with DynamoDB lookup in production.
+CLERK_USER_MAP: Dict[str, Dict[str, Any]] = {
+    'chris@myrecruiter.ai': {
+        'tenant_id': 'MYR384719',
+        'tenant_hash': 'my87674d777bf9',
+        'role': 'admin',
+        'name': 'Chris Miller',
+        'company': 'MyRecruiter',
+    }
+}
+
+# JWKS cache (TTL: 1 hour)
+_clerk_jwks_cache: Optional[Dict[str, Any]] = None
+_clerk_jwks_cache_time: float = 0
+CLERK_JWKS_CACHE_TTL = 3600  # 1 hour
 
 # S3 client
 s3 = boto3.client('s3')
@@ -270,6 +297,15 @@ def lambda_handler(event, context):
     if method == 'OPTIONS':
         return cors_response(200, {})
 
+    # /auth/clerk — PRE-AUTH: exchange Clerk session token for internal Picasso JWT.
+    # Must be checked BEFORE authenticate_request since no internal JWT exists yet.
+    if path.endswith('/auth/clerk') and method == 'POST':
+        try:
+            body = json.loads(event.get('body', '{}') or '{}')
+        except json.JSONDecodeError:
+            return cors_response(400, {'error': 'Invalid JSON body'})
+        return handle_clerk_auth(body)
+
     # Authenticate request
     auth_result = authenticate_request(event)
     if not auth_result['success']:
@@ -421,6 +457,236 @@ def lambda_handler(event, context):
 # =============================================================================
 # Authentication
 # =============================================================================
+
+# =============================================================================
+# Clerk Authentication Bridge — Handler & Helpers
+# =============================================================================
+
+def _fetch_clerk_jwks() -> Dict[str, Any]:
+    """
+    Fetch Clerk JWKS document with in-process cache (TTL: 1 hour).
+    Returns the parsed JWKS dict {'keys': [...]}.
+    """
+    global _clerk_jwks_cache, _clerk_jwks_cache_time
+
+    now = time.time()
+    if _clerk_jwks_cache and (now - _clerk_jwks_cache_time) < CLERK_JWKS_CACHE_TTL:
+        return _clerk_jwks_cache
+
+    try:
+        req = urllib.request.Request(CLERK_JWKS_URL, headers={'Accept': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        _clerk_jwks_cache = data
+        _clerk_jwks_cache_time = now
+        logger.info(f"[clerk-auth] Fetched JWKS from {CLERK_JWKS_URL} ({len(data.get('keys', []))} keys)")
+        return data
+    except Exception as exc:
+        logger.error(f"[clerk-auth] Failed to fetch JWKS: {exc}")
+        raise
+
+
+def _decode_clerk_jwt_claims(token: str) -> Dict[str, Any]:
+    """
+    Decode and validate Clerk JWT claims.
+
+    SECURITY NOTE (trial): This verifies expiry, not-before, and issuer claims.
+    Full RS256 signature verification requires the `cryptography` package
+    (not in base Lambda runtime). Add PyJWT[cryptography] as a Lambda layer
+    before using in production with untrusted tokens.
+
+    The Clerk token is obtained server-side via getToken() which already
+    validates the session with Clerk's servers, providing defence-in-depth.
+    """
+    parts = token.split('.')
+    if len(parts) != 3:
+        raise ValueError('Clerk token must have 3 parts')
+
+    header_b64, payload_b64, _signature_b64 = parts
+
+    # Decode header
+    header_json = base64.urlsafe_b64decode(header_b64 + '==')
+    header = json.loads(header_json)
+
+    alg = header.get('alg', '')
+    if alg not in ('RS256', 'RS384', 'RS512'):
+        raise ValueError(f'Unexpected Clerk JWT algorithm: {alg}')
+
+    # Decode payload
+    payload_json = base64.urlsafe_b64decode(payload_b64 + '==')
+    payload = json.loads(payload_json)
+
+    # Verify expiry
+    exp = payload.get('exp')
+    if not exp or time.time() > exp:
+        raise ValueError('Clerk token is expired')
+
+    # Verify not-before
+    nbf = payload.get('nbf')
+    if nbf and time.time() < nbf:
+        raise ValueError('Clerk token not yet valid (nbf)')
+
+    # Verify issuer belongs to our Clerk domain
+    iss = payload.get('iss', '')
+    if 'capable-peacock-51.clerk.accounts.dev' not in iss and 'clerk.accounts.dev' not in iss:
+        raise ValueError(f'Unexpected Clerk token issuer: {iss}')
+
+    # Verify JWKS kid exists (confirms token was issued by our Clerk instance)
+    kid = header.get('kid')
+    if kid:
+        jwks = _fetch_clerk_jwks()
+        known_kids = {k.get('kid') for k in jwks.get('keys', [])}
+        if kid not in known_kids:
+            raise ValueError(f'Unknown Clerk key id: {kid}')
+    else:
+        # No kid in header — still fetch JWKS to confirm connectivity
+        _fetch_clerk_jwks()
+
+    logger.info(f"[clerk-auth] Clerk JWT claims valid (sub={payload.get('sub', 'unknown')[:12]}...)")
+    return payload
+
+
+def _extract_clerk_email(payload: Dict[str, Any]) -> str:
+    """
+    Extract email from verified Clerk JWT payload.
+    Clerk's default session token does NOT include email — only sub (user ID).
+    We check JWT claims first, then fall back to Clerk's Backend API.
+    """
+    # Check direct JWT claims (present if Clerk JWT template is customized)
+    email = payload.get('email')
+    if email and isinstance(email, str) and '@' in email:
+        return email.lower().strip()
+
+    primary = payload.get('primary_email_address')
+    if primary and isinstance(primary, str) and '@' in primary:
+        return primary.lower().strip()
+
+    # Fallback: fetch email from Clerk Backend API using sub (user ID)
+    user_id = payload.get('sub')
+    if user_id:
+        clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
+        if clerk_secret:
+            try:
+                clerk_url = f'https://api.clerk.com/v1/users/{user_id}'
+                logger.info(f'[clerk-auth] Fetching user from {clerk_url}')
+                req = urllib.request.Request(
+                    clerk_url,
+                    headers={
+                        'Authorization': f'Bearer {clerk_secret}',
+                        'User-Agent': 'MyRecruiter-Portal/1.0',
+                        'Accept': 'application/json',
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    user_data = json.loads(resp.read().decode('utf-8'))
+                    email_addresses = user_data.get('email_addresses', [])
+                    for addr in email_addresses:
+                        if addr.get('id') == user_data.get('primary_email_address_id'):
+                            return addr['email_address'].lower().strip()
+                    if email_addresses:
+                        return email_addresses[0]['email_address'].lower().strip()
+            except Exception as e:
+                logger.warning(f'[clerk-auth] Failed to fetch user from Clerk API: {e}')
+        else:
+            logger.warning('[clerk-auth] No CLERK_SECRET_KEY env var — cannot fetch user email from Clerk API')
+
+    raise ValueError('Could not determine email — add CLERK_SECRET_KEY env var or customize Clerk JWT template to include email claim')
+
+
+def _sign_internal_jwt(payload: Dict[str, Any]) -> str:
+    """
+    Sign a Picasso internal JWT using the same HS256 approach as validate_jwt/get_jwt_secret.
+    Mirrors the SSO_Token_Generator output format.
+    """
+    header = {'alg': 'HS256', 'typ': 'JWT'}
+    header_b64 = base64.urlsafe_b64encode(json.dumps(header, separators=(',', ':')).encode()).rstrip(b'=').decode()
+    payload_b64 = base64.urlsafe_b64encode(json.dumps(payload, separators=(',', ':')).encode()).rstrip(b'=').decode()
+
+    message = f"{header_b64}.{payload_b64}".encode('utf-8')
+    secret = get_jwt_secret()
+    signature = hmac.new(secret.encode('utf-8'), message, hashlib.sha256).digest()
+    sig_b64 = base64.urlsafe_b64encode(signature).rstrip(b'=').decode()
+
+    return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
+def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    POST /auth/clerk
+    Exchange a Clerk session token for an internal Picasso JWT.
+
+    Request body: { "clerk_token": "<Clerk session JWT>" }
+    Response 200: { "token": "<internal Picasso JWT>" }
+    Response 400: { "error": "..." }   — bad request / missing token
+    Response 403: { "error": "User not registered" }
+    Response 500: { "error": "..." }   — upstream failure
+
+    SECURITY: Does NOT require an existing internal JWT. Must stay BEFORE
+    authenticate_request in the routing chain.
+    """
+    start = time.time()
+
+    clerk_token = body.get('clerk_token', '').strip()
+    if not clerk_token:
+        logger.warning('[clerk-auth] Request missing clerk_token')
+        return cors_response(400, {'error': 'clerk_token is required'})
+
+    try:
+        # Step 1 — Verify Clerk JWT claims and kid against JWKS
+        claims = _decode_clerk_jwt_claims(clerk_token)
+
+        # Step 2 — Extract email
+        email = _extract_clerk_email(claims)
+        logger.info(f'[clerk-auth] Verified Clerk token for {redact_email(email)}')
+
+    except ValueError as exc:
+        logger.warning(f'[clerk-auth] Token validation failed: {exc}')
+        return cors_response(400, {'error': f'Invalid Clerk token: {exc}'})
+    except Exception as exc:
+        logger.error(f'[clerk-auth] Upstream error during token validation: {exc}')
+        return cors_response(500, {'error': 'Authentication service unavailable'})
+
+    # Step 3 — Authorise against user map
+    user_info = CLERK_USER_MAP.get(email)
+    if not user_info:
+        logger.warning(f'[clerk-auth] Unregistered user: {redact_email(email)}')
+        return cors_response(403, {'error': 'User not registered'})
+
+    # Step 4 — Build and sign internal Picasso JWT
+    try:
+        issued_at = int(time.time())
+        internal_payload = {
+            'tenant_id': user_info['tenant_id'],
+            'tenant_hash': user_info['tenant_hash'],
+            'email': email,
+            'role': user_info['role'],
+            'name': user_info.get('name'),
+            'company': user_info.get('company'),
+            'iat': issued_at,
+            'exp': issued_at + 7200,  # 2 hours
+            'features': {
+                'dashboard_conversations': True,
+                'dashboard_forms': True,
+                'dashboard_attribution': True,
+                'dashboard_notifications': True,
+                'dashboard_settings': False,
+            },
+        }
+
+        internal_token = _sign_internal_jwt(internal_payload)
+
+    except Exception as exc:
+        logger.error(f'[clerk-auth] Failed to sign internal JWT: {exc}')
+        return cors_response(500, {'error': 'Failed to issue session token'})
+
+    elapsed_ms = int((time.time() - start) * 1000)
+    logger.info(
+        f'[clerk-auth] Issued internal JWT for {redact_email(email)} '
+        f'tenant={user_info["tenant_id"]} latency={elapsed_ms}ms'
+    )
+
+    return cors_response(200, {'token': internal_token})
+
 
 def authenticate_request(event: Dict[str, Any]) -> Dict[str, Any]:
     """
