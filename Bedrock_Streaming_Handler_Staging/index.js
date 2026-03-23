@@ -651,8 +651,21 @@ const streamingHandler = async (event, responseStream, context) => {
     // Sanitize user input to prevent prompt injection
     const sanitizedInput = sanitizeUserInput(userInput);
 
+    // For short continuation messages ("yes", "sure", "tell me more"), the raw input
+    // is too vague for KB retrieval. Use the last substantive user message instead
+    // so the KB returns relevant context for the ongoing topic.
+    const CONTINUATION_PATTERNS = /^(yes|yeah|yep|sure|ok|okay|please|go ahead|tell me more|more info|continue|absolutely|definitely|of course|why not|sounds good|great|cool|yea|ye|ya|mhm|uh huh)\.?!?$/i;
+    let kbQuery = sanitizedInput;
+    if (sanitizedInput.trim().length < 30 && CONTINUATION_PATTERNS.test(sanitizedInput.trim())) {
+      const lastUserMsg = [...conversationHistory].reverse().find(m => m.role === 'user' && (m.content || m.text || '').trim().length > 10);
+      if (lastUserMsg) {
+        kbQuery = sanitizeUserInput((lastUserMsg.content || lastUserMsg.text).trim());
+        console.log(`🔁 Continuation detected: "${sanitizedInput}" → KB query from previous: "${kbQuery.substring(0, 60)}..."`);
+      }
+    }
+
     // Get KB context
-    const kbContext = await retrieveKB(sanitizedInput, config);
+    const kbContext = await retrieveKB(kbQuery, config);
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
     const prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);

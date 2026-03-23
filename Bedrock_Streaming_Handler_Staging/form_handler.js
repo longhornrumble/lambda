@@ -216,8 +216,20 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     const fulfillmentResult = await routeFulfillment(formId, formData, config, submissionId, priority, sessionId, conversationId);
 
     // Send confirmation email if configured (non-blocking)
-    if (formData.email && config.send_confirmation_email !== false) {
-      sendConfirmationEmail(formData.email, formId, config, submissionId).catch(err => {
+    // Uses per-form applicant_confirmation config from tenant config (editable in portal Templates tab)
+    // Form data uses field IDs (e.g. field_1774282600263), not named keys — extract email
+    // via the same contact extractor used for DynamoDB and Bubble.
+    const transformedForContact = transformFormDataToLabels(formData, formConfig);
+    const { contact: applicantContact } = extractCanonicalContact(transformedForContact);
+    const applicantEmail = applicantContact?.email;
+
+    const confirmationConfig = formConfig.notifications?.applicant_confirmation;
+    const shouldSendConfirmation = confirmationConfig
+      ? confirmationConfig.enabled && applicantEmail
+      : applicantEmail && config.send_confirmation_email !== false;
+
+    if (shouldSendConfirmation) {
+      sendConfirmationEmail(applicantEmail, formId, formData, config, submissionId).catch(err => {
         console.error('❌ Confirmation email failed:', err.message);
       });
     }
@@ -796,21 +808,57 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
 }
 
 /**
- * Send confirmation email to user
+ * Send confirmation email to the applicant who submitted the form.
+ *
+ * Reads per-form `notifications.applicant_confirmation` from tenant config
+ * (editable via portal Templates tab). Falls back to a generic template when
+ * no per-form config exists.
+ *
+ * Template variables: {first_name}, {last_name}, {email}, {phone},
+ *   {organization_name}, {form_data}
  */
-async function sendConfirmationEmail(userEmail, formId, config, submissionId = 'unknown') {
+async function sendConfirmationEmail(userEmail, formId, formData, config, submissionId = 'unknown') {
   const tenantName = config.chat_title || 'Organization';
-  const subject = `Thank you for your ${formId} submission`;
+  const formConfig = config.conversational_forms?.[formId] || {};
+  const confirmationConfig = formConfig.notifications?.applicant_confirmation;
 
-  const htmlBody = `
-    <h2>Thank you for your submission!</h2>
-    <p>Dear Applicant,</p>
-    <p>We have received your ${formId} submission to ${tenantName}.</p>
-    <p>Our team will review your information and get back to you soon.</p>
-    <p>If you have any questions, please don't hesitate to contact us.</p>
-    <br>
-    <p>Best regards,<br>${tenantName} Team</p>
-  `;
+  // Build template variables from submitted form data.
+  // Form data uses field IDs (e.g. field_1774282600263) — use the same extraction
+  // pipeline as DynamoDB save to get human-readable labels and contact info.
+  const displayData = buildFormDataDisplay(formData, formConfig);
+  const formDataText = Object.entries(displayData)
+    .map(([label, value]) => `${label}: ${value}`)
+    .join('\n');
+
+  const transformedData = transformFormDataToLabels(formData, formConfig);
+  const { contact } = extractCanonicalContact(transformedData);
+
+  // Capitalize name fields — frontend should do this too, but ensure it server-side
+  const capitalize = (s) => (s && typeof s === 'string') ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+
+  const templateVars = {
+    first_name: capitalize(contact?.first_name),
+    last_name: capitalize(contact?.last_name),
+    email: userEmail,
+    phone: contact?.phone || '',
+    organization_name: tenantName,
+    form_data: formDataText,
+  };
+
+  let subject, bodyText;
+
+  if (confirmationConfig?.subject && confirmationConfig?.body_template) {
+    // Use per-form template from tenant config
+    subject = renderTemplate(confirmationConfig.subject, templateVars);
+    bodyText = renderTemplate(confirmationConfig.body_template, templateVars);
+  } else {
+    // Fallback to generic template
+    subject = `Thank you for your ${formConfig.title || formId} submission`;
+    bodyText = `Dear Applicant,\n\nWe have received your ${formConfig.title || formId} submission to ${tenantName}.\n\nOur team will review your information and get back to you soon.\n\nIf you have any questions, please don't hesitate to contact us.\n\nBest regards,\n${tenantName} Team`;
+  }
+
+  // Convert plain text body to simple HTML
+  const htmlBody = `<div>${bodyText.replace(/\n/g, '<br>')}</div>`;
 
   const params = {
     Source: getSESFromEmail(),
@@ -834,11 +882,33 @@ async function sendConfirmationEmail(userEmail, formId, config, submissionId = '
 
   try {
     await sesClient.send(new SendEmailCommand(params));
-    console.log(`✅ Confirmation email sent to ${userEmail}`);
+    console.log(`✅ Confirmation email sent to ${userEmail} using ${confirmationConfig ? 'per-form template' : 'fallback template'}`);
   } catch (error) {
     console.error('Failed to send confirmation email:', error);
     // Don't fail the submission if confirmation email fails
   }
+}
+
+/**
+ * Replace {variable} placeholders in a template string.
+ * Empty or anonymous values are treated as blank — any surrounding whitespace
+ * is collapsed so "Hi {first_name}," becomes "Hi," (not "Hi ,").
+ */
+function renderTemplate(template, variables) {
+  const ANONYMOUS = ['anonymous', 'unknown', 'n/a', 'none', ''];
+  let result = template;
+  for (const [key, value] of Object.entries(variables)) {
+    const strVal = String(value ?? '').trim();
+    const resolved = ANONYMOUS.includes(strVal.toLowerCase()) ? '' : strVal;
+    // Replace placeholder, then collapse any extra space left behind
+    result = result.replace(new RegExp(`\\s*\\{${key}\\}`, 'g'), resolved ? ` ${resolved}` : '');
+  }
+  // Clean up artifacts from removed placeholders
+  result = result.replace(/ {2,}/g, ' ');    // collapse double spaces
+  result = result.replace(/,\s*!/g, '!');    // ",!" → "!"
+  result = result.replace(/,\s*\./g, '.');   // ",." → "."
+  result = result.replace(/,\s*,/g, ',');    // ",," → ","
+  return result;
 }
 
 /**
@@ -940,9 +1010,20 @@ function transformFormDataToLabels(formData, formConfig) {
 
   // Transform the form data keys
   for (const [key, value] of Object.entries(formData)) {
-    // Skip composite parent fields (e.g., "field_1761666576305" with object value)
-    // These are redundant - the individual subfields are already being processed
+    // Flatten composite parent fields (e.g., "field_1769160911801" with nested subfields)
+    // Subfield keys like "field_1769160911801.first_name" live inside the object —
+    // promote them to top-level so the mapping logic below can resolve them.
     if (/^field_\d+$/.test(key) && typeof value === 'object' && value !== null) {
+      for (const [subKey, subVal] of Object.entries(value)) {
+        if (fieldMap[subKey]) {
+          transformed[fieldMap[subKey]] = subVal;
+        } else {
+          const parts = subKey.split('.');
+          if (parts.length > 1) {
+            transformed[parts[parts.length - 1]] = subVal;
+          }
+        }
+      }
       continue;
     }
 

@@ -255,13 +255,14 @@ export async function listBackups(tenantId) {
       return [];
     }
 
-    // Filter to only backup files (exclude the main config file)
+    // Filter to only backup files (exclude the main config and draft files)
     // Backup files have format: tenantId-YYYY-MM-DDTHH-MM-SS-MMMZ.json
     // Main config has format: tenantId-config.json
+    // Draft has format: tenantId-draft.json
     return response.Contents
       .filter(item => {
         const key = item.Key;
-        return key.endsWith('.json') && !key.endsWith('-config.json');
+        return key.endsWith('.json') && !key.endsWith('-config.json') && !key.endsWith('-draft.json');
       })
       .map(item => ({
         key: item.Key,
@@ -272,6 +273,95 @@ export async function listBackups(tenantId) {
   } catch (error) {
     console.error(`Error listing backups for ${tenantId}:`, error);
     throw new Error(`Failed to list backups: ${error.message}`);
+  }
+}
+
+/**
+ * Save a draft configuration for a tenant
+ * Draft is stored as a sibling to the live config; no backup is created.
+ * @param {string} tenantId - The tenant ID
+ * @param {Object} config - The configuration object
+ * @returns {Promise<Object>} Save result
+ */
+export async function saveDraft(tenantId, config) {
+  try {
+    const draftSavedAt = new Date().toISOString();
+    const draftConfig = { ...config, draft_saved_at: draftSavedAt };
+
+    const key = `tenants/${tenantId}/${tenantId}-draft.json`;
+    const command = new PutObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+      Body: JSON.stringify(draftConfig, null, 2),
+      ContentType: 'application/json',
+    });
+
+    await s3Client.send(command);
+    console.log(`Draft saved for tenant ${tenantId} at ${draftSavedAt}`);
+
+    return {
+      success: true,
+      tenantId,
+      key,
+      timestamp: draftSavedAt,
+    };
+  } catch (error) {
+    console.error(`Error saving draft for ${tenantId}:`, error);
+    throw new Error(`Failed to save draft: ${error.message}`);
+  }
+}
+
+/**
+ * Load a draft configuration for a tenant
+ * @param {string} tenantId - The tenant ID
+ * @returns {Promise<{ config: Object|null, hasDraft: boolean }>}
+ */
+export async function loadDraft(tenantId) {
+  try {
+    const key = `tenants/${tenantId}/${tenantId}-draft.json`;
+    const command = new GetObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+    });
+
+    const response = await s3Client.send(command);
+    const configString = await streamToString(response.Body);
+    const config = JSON.parse(configString);
+
+    return { config, hasDraft: true };
+  } catch (error) {
+    if (error.name === 'NoSuchKey') {
+      return { config: null, hasDraft: false };
+    }
+    console.error(`Error loading draft for ${tenantId}:`, error);
+    throw new Error(`Failed to load draft: ${error.message}`);
+  }
+}
+
+/**
+ * Delete a draft configuration for a tenant
+ * @param {string} tenantId - The tenant ID
+ * @returns {Promise<Object>} Delete result
+ */
+export async function deleteDraft(tenantId) {
+  try {
+    const key = `tenants/${tenantId}/${tenantId}-draft.json`;
+    const command = new DeleteObjectCommand({
+      Bucket: BUCKET,
+      Key: key,
+    });
+
+    await s3Client.send(command);
+    console.log(`Draft deleted for tenant ${tenantId}`);
+
+    return {
+      success: true,
+      tenantId,
+      deletedKey: key,
+    };
+  } catch (error) {
+    console.error(`Error deleting draft for ${tenantId}:`, error);
+    throw new Error(`Failed to delete draft: ${error.message}`);
   }
 }
 

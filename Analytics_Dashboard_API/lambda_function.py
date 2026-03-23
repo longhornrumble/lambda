@@ -102,6 +102,9 @@ S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
 # S3 client
 s3 = boto3.client('s3')
 
+# SES client (us-east-1 — SES sandbox/production identity is in us-east-1)
+ses = boto3.client('ses', region_name='us-east-1')
+
 # Cache for tenant configs (TTL: 5 minutes)
 _tenant_config_cache: Dict[str, Dict[str, Any]] = {}
 _tenant_config_cache_time: Dict[str, float] = {}
@@ -123,6 +126,11 @@ ALLOWED_EVENT_TYPES = {
 
 # Security: Tenant ID validation pattern (alphanumeric, underscore, hyphen only)
 TENANT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+class ConcurrentModificationError(Exception):
+    """Raised when an S3 write fails due to ETag mismatch (optimistic locking)."""
+    pass
 
 
 def sanitize_tenant_id(tenant_id: str, for_sql: bool = False) -> str:
@@ -377,6 +385,30 @@ def lambda_handler(event, context):
         # Admin endpoints (super_admin only)
         elif path.endswith('/admin/tenants') and method == 'GET':
             return handle_admin_tenants(auth_result.get('role'))
+
+        # Settings — Notification Recipients & Templates (Phase 2b/2c)
+        # NOTE: More specific paths must come first within this block.
+        elif path.endswith('/settings/notifications/recipients/test-send') and method == 'POST':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_notification_recipients_test_send(tenant_id, body, user_role)
+        elif '/settings/notifications/templates/' in path and path.endswith('/preview') and method == 'POST':
+            form_id = path.split('/settings/notifications/templates/')[1].split('/preview')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_notification_template_preview(tenant_id, form_id, body, user_role)
+        elif '/settings/notifications/templates/' in path and path.endswith('/test-send') and method == 'POST':
+            form_id = path.split('/settings/notifications/templates/')[1].split('/test-send')[0]
+            return handle_notification_template_test_send(tenant_id, form_id, user_email, user_role)
+        elif '/settings/notifications/templates/' in path and method == 'PATCH':
+            form_id = path.split('/settings/notifications/templates/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_notification_templates_update(tenant_id, form_id, body, user_role)
+        elif path.endswith('/settings/notifications/templates') and method == 'GET':
+            return handle_notification_templates_get(tenant_id)
+        elif path.endswith('/settings/notifications') and method == 'GET':
+            return handle_settings_notifications_get(tenant_id)
+        elif path.endswith('/settings/notifications') and method == 'PATCH':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_settings_notifications_patch(tenant_id, body, user_role)
 
         else:
             return cors_response(404, {'error': f'Unknown endpoint: {path}'})
@@ -4050,3 +4082,550 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
         'message_id': message_id,
         'events': events,
     })
+
+
+# =============================================================================
+# Settings — Notification Recipients & Templates (Phase 2b/2c)
+# =============================================================================
+
+# Sender identity for all outbound SES emails from this API.
+SES_SENDER = 'notify@myrecruiter.ai'
+
+# Sample values injected when rendering preview or test-send templates.
+SAMPLE_DATA: Dict[str, str] = {
+    'first_name': 'Test',
+    'last_name': 'User',
+    'email': 'test@example.com',
+    'phone': '(555) 123-4567',
+    'organization_name': '',          # overridden per-tenant at runtime
+    'form_data': 'Full Name: Test User\nEmail: test@example.com\nPhone: (555) 123-4567',
+    'form_type': 'test_form',
+}
+
+# Variables surfaced to the frontend template editor.
+AVAILABLE_VARIABLES: List[str] = [
+    '{first_name}', '{last_name}', '{email}', '{phone}',
+    '{organization_name}', '{form_data}',
+]
+
+# Role guard for all write operations on settings endpoints.
+_WRITE_ROLES = {'admin', 'super_admin'}
+
+
+def _require_write_role(user_role: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return a 403 response if the caller lacks admin/super_admin role, else None."""
+    if user_role not in _WRITE_ROLES:
+        logger.warning(f"[settings] write attempt by role={user_role!r} denied")
+        return cors_response(403, {'error': 'Forbidden: admin or super_admin role required'})
+    return None
+
+
+def render_template(template: str, variables: Dict[str, str]) -> str:
+    """Replace {variable} placeholders in a template string with supplied values."""
+    result = template
+    for key, value in variables.items():
+        result = result.replace('{' + key + '}', str(value))
+    return result
+
+
+def _build_sample_vars(config: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Produce sample variable dict, filling organization_name from tenant config."""
+    sample = dict(SAMPLE_DATA)
+    if config:
+        sample['organization_name'] = config.get('chat_title', '')
+    return sample
+
+
+def _deep_merge(base: dict, updates: dict) -> dict:
+    """
+    Recursively merge *updates* into *base*.
+    For dict values, recurse.  For all other types, updates wins.
+    Returns the mutated *base* dict.
+    """
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def update_tenant_notifications(
+    tenant_id: str,
+    form_id: str,
+    updates: Dict[str, Any],
+    update_key: str = 'notifications',
+) -> Dict[str, Any]:
+    """
+    Targeted merge of a single form's notification or template config in S3.
+
+    Uses S3 ETag optimistic locking to prevent concurrent write conflicts.
+    After a successful write the in-process cache is invalidated so the next
+    read fetches fresh data.
+
+    Args:
+        tenant_id:  Validated tenant identifier.
+        form_id:    Key inside conversational_forms that must exist.
+        updates:    Dict of sub-fields to deep-merge into form[update_key].
+        update_key: 'notifications' or the specific sub-key being updated.
+                    Pass 'notifications' for recipient / channel changes,
+                    and the template key names for template-only changes.
+
+    Returns:
+        The updated value of form[update_key] after merge.
+
+    Raises:
+        ValueError: form_id not found in config.
+        ConcurrentModificationError: ETag mismatch — concurrent writer.
+        ClientError: Unexpected S3 error.
+    """
+    bucket = S3_CONFIG_BUCKET
+    key = f"tenants/{tenant_id}/{tenant_id}-config.json"
+
+    # --- Read with ETag ---
+    response = s3.get_object(Bucket=bucket, Key=key)
+    etag = response['ETag']
+    config = json.loads(response['Body'].read().decode('utf-8'))
+
+    # --- Validate form exists ---
+    forms = config.get('conversational_forms', {})
+    if form_id not in forms:
+        raise ValueError(f"Form '{form_id}' not found in conversational_forms")
+
+    form = forms[form_id]
+
+    if update_key == 'notifications':
+        existing = form.get('notifications', {})
+        _deep_merge(existing, updates)
+        form['notifications'] = existing
+        result = existing
+    else:
+        # For template-key updates: merge each provided notification type's
+        # template fields (subject, body_template) only.
+        existing_notif = form.get('notifications', {})
+        TEMPLATE_FIELDS = {'subject', 'body_template'}
+        for notif_type, notif_updates in updates.items():
+            if isinstance(notif_updates, dict):
+                existing_notif.setdefault(notif_type, {})
+                for field, val in notif_updates.items():
+                    if field in TEMPLATE_FIELDS:
+                        existing_notif[notif_type][field] = val
+        form['notifications'] = existing_notif
+        result = existing_notif
+
+    # --- Write back with optimistic lock ---
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(config, indent=2),
+            ContentType='application/json',
+            IfMatch=etag,
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] in ('PreconditionFailed', '412'):
+            raise ConcurrentModificationError(
+                "Config was modified by another user. Please refresh."
+            )
+        raise
+
+    # --- Invalidate in-process cache ---
+    _tenant_config_cache.pop(tenant_id, None)
+    _tenant_config_cache_time.pop(tenant_id, None)
+
+    logger.info(
+        f"[settings/notifications] config updated "
+        f"tenant={redact_tenant_id(tenant_id)} form={form_id}"
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GET /settings/notifications
+# ---------------------------------------------------------------------------
+
+def handle_settings_notifications_get(tenant_id: str) -> Dict[str, Any]:
+    """
+    GET /settings/notifications
+
+    Returns the notification config for every conversational form that has
+    a notifications block, keyed by form_id.
+    """
+    config = get_tenant_config(tenant_id)
+    if not config:
+        return cors_response(404, {'error': 'Tenant configuration not found'})
+
+    forms_out: Dict[str, Any] = {}
+    for form_id, form in config.get('conversational_forms', {}).items():
+        if not isinstance(form, dict):
+            continue
+        if 'notifications' in form:
+            forms_out[form_id] = {
+                'form_title': form.get('form_title', form_id),
+                'notifications': form['notifications'],
+            }
+
+    logger.info(
+        f"[settings/notifications] GET "
+        f"tenant={redact_tenant_id(tenant_id)} forms={len(forms_out)}"
+    )
+    return cors_response(200, {'forms': forms_out})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /settings/notifications
+# ---------------------------------------------------------------------------
+
+def handle_settings_notifications_patch(
+    tenant_id: str,
+    body: Dict[str, Any],
+    user_role: Optional[str],
+) -> Dict[str, Any]:
+    """
+    PATCH /settings/notifications
+
+    Deep-merges the supplied notifications sub-fields for a specific form.
+    Body: { "form_id": str, "notifications": { ... } }
+    """
+    role_error = _require_write_role(user_role)
+    if role_error:
+        return role_error
+
+    form_id = body.get('form_id', '').strip()
+    notifications = body.get('notifications')
+
+    if not form_id:
+        return cors_response(400, {'error': 'form_id is required'})
+    if not isinstance(notifications, dict) or not notifications:
+        return cors_response(400, {'error': 'notifications must be a non-empty object'})
+
+    # Validate form_id characters to prevent path traversal / injection
+    if not re.match(r'^[A-Za-z0-9_-]+$', form_id):
+        return cors_response(400, {'error': 'Invalid form_id format'})
+
+    logger.info(
+        f"[settings/notifications] PATCH "
+        f"tenant={redact_tenant_id(tenant_id)} form={form_id}"
+    )
+
+    try:
+        updated = update_tenant_notifications(
+            tenant_id, form_id, notifications, update_key='notifications'
+        )
+    except ValueError as e:
+        return cors_response(404, {'error': str(e)})
+    except ConcurrentModificationError as e:
+        return cors_response(409, {'error': str(e)})
+    except ClientError as e:
+        logger.error(f"[settings/notifications] S3 error: {e}")
+        return cors_response(500, {'error': 'Failed to update notification config'})
+
+    return cors_response(200, {
+        'form_id': form_id,
+        'notifications': updated,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /settings/notifications/recipients/test-send
+# ---------------------------------------------------------------------------
+
+def handle_notification_recipients_test_send(
+    tenant_id: str,
+    body: Dict[str, Any],
+    user_role: Optional[str],
+) -> Dict[str, Any]:
+    """
+    POST /settings/notifications/recipients/test-send
+
+    Sends a test email to the supplied address using the form's internal
+    notification template filled with sample data.
+    Body: { "email": str, "form_id": str }
+    """
+    role_error = _require_write_role(user_role)
+    if role_error:
+        return role_error
+
+    email = body.get('email', '').strip()
+    form_id = body.get('form_id', '').strip()
+
+    if not email or '@' not in email:
+        return cors_response(400, {'error': 'A valid email address is required'})
+    if not form_id or not re.match(r'^[A-Za-z0-9_-]+$', form_id):
+        return cors_response(400, {'error': 'A valid form_id is required'})
+    if len(email) > 254:
+        return cors_response(400, {'error': 'Email address too long'})
+
+    config = get_tenant_config(tenant_id)
+    if not config:
+        return cors_response(404, {'error': 'Tenant configuration not found'})
+
+    forms = config.get('conversational_forms', {})
+    if form_id not in forms:
+        return cors_response(404, {'error': f"Form '{form_id}' not found"})
+
+    notif = forms[form_id].get('notifications', {}).get('internal', {})
+    subject_tpl = notif.get('subject', f'[Test] Notification from {form_id}')
+    body_tpl = notif.get('body_template', 'This is a test notification.\n\n{form_data}')
+
+    sample = _build_sample_vars(config)
+    subject = render_template(subject_tpl, sample)
+    body_text = render_template(body_tpl, sample)
+
+    logger.info(
+        f"[settings/notifications/recipients/test-send] "
+        f"tenant={redact_tenant_id(tenant_id)} form={form_id} "
+        f"to={redact_email(email)}"
+    )
+
+    try:
+        resp = ses.send_email(
+            Source=SES_SENDER,
+            Destination={'ToAddresses': [email]},
+            Message={
+                'Subject': {'Data': f'[TEST] {subject}', 'Charset': 'UTF-8'},
+                'Body': {
+                    'Text': {'Data': body_text, 'Charset': 'UTF-8'},
+                },
+            },
+        )
+    except ClientError as e:
+        logger.error(f"[settings/notifications/recipients/test-send] SES error: {e}")
+        return cors_response(502, {'error': 'Failed to send test email via SES'})
+
+    message_id = resp.get('MessageId', '')
+    logger.info(
+        f"[settings/notifications/recipients/test-send] sent "
+        f"message_id={message_id} to={redact_email(email)}"
+    )
+    return cors_response(200, {'success': True, 'message_id': message_id})
+
+
+# ---------------------------------------------------------------------------
+# GET /settings/notifications/templates
+# ---------------------------------------------------------------------------
+
+def handle_notification_templates_get(tenant_id: str) -> Dict[str, Any]:
+    """
+    GET /settings/notifications/templates
+
+    Returns the template content (subject + body_template) for every
+    notification type within every conversational form.
+    """
+    config = get_tenant_config(tenant_id)
+    if not config:
+        return cors_response(404, {'error': 'Tenant configuration not found'})
+
+    forms_out: Dict[str, Any] = {}
+    for form_id, form in config.get('conversational_forms', {}).items():
+        if not isinstance(form, dict):
+            continue
+        notif = form.get('notifications', {})
+        if not notif:
+            continue
+
+        entry: Dict[str, Any] = {
+            'form_title': form.get('form_title', form_id),
+            'available_variables': AVAILABLE_VARIABLES,
+        }
+        for notif_type, notif_cfg in notif.items():
+            if isinstance(notif_cfg, dict):
+                entry[notif_type] = {
+                    'subject': notif_cfg.get('subject', ''),
+                    'body_template': notif_cfg.get('body_template', ''),
+                }
+        forms_out[form_id] = entry
+
+    logger.info(
+        f"[settings/notifications/templates] GET "
+        f"tenant={redact_tenant_id(tenant_id)} forms={len(forms_out)}"
+    )
+    return cors_response(200, {'forms': forms_out})
+
+
+# ---------------------------------------------------------------------------
+# PATCH /settings/notifications/templates/{form_id}
+# ---------------------------------------------------------------------------
+
+def handle_notification_templates_update(
+    tenant_id: str,
+    form_id: str,
+    body: Dict[str, Any],
+    user_role: Optional[str],
+) -> Dict[str, Any]:
+    """
+    PATCH /settings/notifications/templates/{form_id}
+
+    Merges only subject/body_template fields from the request into the
+    relevant notification type blocks.  All other fields are left untouched.
+
+    Body: {
+        "internal": { "subject": "...", "body_template": "..." },
+        "applicant_confirmation": { ... }
+    }
+    """
+    role_error = _require_write_role(user_role)
+    if role_error:
+        return role_error
+
+    if not form_id or not re.match(r'^[A-Za-z0-9_-]+$', form_id):
+        return cors_response(400, {'error': 'Invalid form_id in path'})
+    if not isinstance(body, dict) or not body:
+        return cors_response(400, {'error': 'Request body must be a non-empty object'})
+
+    logger.info(
+        f"[settings/notifications/templates] PATCH "
+        f"tenant={redact_tenant_id(tenant_id)} form={form_id}"
+    )
+
+    try:
+        updated = update_tenant_notifications(
+            tenant_id, form_id, body, update_key='templates'
+        )
+    except ValueError as e:
+        return cors_response(404, {'error': str(e)})
+    except ConcurrentModificationError as e:
+        return cors_response(409, {'error': str(e)})
+    except ClientError as e:
+        logger.error(f"[settings/notifications/templates] S3 error: {e}")
+        return cors_response(500, {'error': 'Failed to update template config'})
+
+    return cors_response(200, {
+        'form_id': form_id,
+        'notifications': updated,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /settings/notifications/templates/{form_id}/preview
+# ---------------------------------------------------------------------------
+
+def handle_notification_template_preview(
+    tenant_id: str,
+    form_id: str,
+    body: Dict[str, Any],
+    user_role: Optional[str],
+) -> Dict[str, Any]:
+    """
+    POST /settings/notifications/templates/{form_id}/preview
+
+    Renders the named template type with sample data and returns both the
+    rendered subject and an HTML body for frontend display.
+
+    Body: { "template_type": "internal" | "applicant_confirmation" }
+    """
+    if not form_id or not re.match(r'^[A-Za-z0-9_-]+$', form_id):
+        return cors_response(400, {'error': 'Invalid form_id in path'})
+
+    template_type = body.get('template_type', 'internal')
+    if not re.match(r'^[A-Za-z0-9_-]+$', template_type):
+        return cors_response(400, {'error': 'Invalid template_type'})
+
+    config = get_tenant_config(tenant_id)
+    if not config:
+        return cors_response(404, {'error': 'Tenant configuration not found'})
+
+    forms = config.get('conversational_forms', {})
+    if form_id not in forms:
+        return cors_response(404, {'error': f"Form '{form_id}' not found"})
+
+    notif = forms[form_id].get('notifications', {}).get(template_type)
+    if not notif:
+        return cors_response(404, {
+            'error': f"Template type '{template_type}' not found for form '{form_id}'"
+        })
+
+    subject_tpl = notif.get('subject', '')
+    body_tpl = notif.get('body_template', '')
+
+    sample = _build_sample_vars(config)
+    rendered_subject = render_template(subject_tpl, sample)
+    rendered_body = render_template(body_tpl, sample)
+
+    # Convert plain-text body to minimal HTML for frontend preview
+    html_lines = rendered_body.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    html_body = '<div>' + '<br>'.join(
+        line if line.strip() else '' for line in html_lines
+    ) + '</div>'
+
+    logger.info(
+        f"[settings/notifications/templates/preview] "
+        f"tenant={redact_tenant_id(tenant_id)} form={form_id} type={template_type}"
+    )
+    return cors_response(200, {
+        'form_id': form_id,
+        'template_type': template_type,
+        'subject': rendered_subject,
+        'body_html': html_body,
+    })
+
+
+# ---------------------------------------------------------------------------
+# POST /settings/notifications/templates/{form_id}/test-send
+# ---------------------------------------------------------------------------
+
+def handle_notification_template_test_send(
+    tenant_id: str,
+    form_id: str,
+    user_email: str,
+    user_role: Optional[str],
+) -> Dict[str, Any]:
+    """
+    POST /settings/notifications/templates/{form_id}/test-send
+
+    Sends a test email to the currently authenticated user's address using
+    the form's internal template filled with sample data.
+    """
+    role_error = _require_write_role(user_role)
+    if role_error:
+        return role_error
+
+    if not form_id or not re.match(r'^[A-Za-z0-9_-]+$', form_id):
+        return cors_response(400, {'error': 'Invalid form_id in path'})
+
+    if not user_email or user_email == 'unknown' or '@' not in user_email:
+        return cors_response(400, {'error': 'Authenticated user email is missing or invalid'})
+
+    config = get_tenant_config(tenant_id)
+    if not config:
+        return cors_response(404, {'error': 'Tenant configuration not found'})
+
+    forms = config.get('conversational_forms', {})
+    if form_id not in forms:
+        return cors_response(404, {'error': f"Form '{form_id}' not found"})
+
+    notif = forms[form_id].get('notifications', {}).get('internal', {})
+    subject_tpl = notif.get('subject', f'[Test] Notification from {form_id}')
+    body_tpl = notif.get('body_template', 'This is a test notification.\n\n{form_data}')
+
+    sample = _build_sample_vars(config)
+    subject = render_template(subject_tpl, sample)
+    body_text = render_template(body_tpl, sample)
+
+    logger.info(
+        f"[settings/notifications/templates/test-send] "
+        f"tenant={redact_tenant_id(tenant_id)} form={form_id} "
+        f"to={redact_email(user_email)}"
+    )
+
+    try:
+        resp = ses.send_email(
+            Source=SES_SENDER,
+            Destination={'ToAddresses': [user_email]},
+            Message={
+                'Subject': {'Data': f'[TEST] {subject}', 'Charset': 'UTF-8'},
+                'Body': {
+                    'Text': {'Data': body_text, 'Charset': 'UTF-8'},
+                },
+            },
+        )
+    except ClientError as e:
+        logger.error(f"[settings/notifications/templates/test-send] SES error: {e}")
+        return cors_response(502, {'error': 'Failed to send test email via SES'})
+
+    message_id = resp.get('MessageId', '')
+    logger.info(
+        f"[settings/notifications/templates/test-send] sent "
+        f"message_id={message_id} to={redact_email(user_email)}"
+    )
+    return cors_response(200, {'success': True, 'message_id': message_id})

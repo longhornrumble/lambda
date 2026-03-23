@@ -609,6 +609,28 @@ async function enhanceResponse(bedrockResponse, userMessage, tenantHash, session
         responseSnippet: bedrockResponse?.substring(0, 100)
     });
 
+    // Run the core logic, then apply the CTA cap before returning
+    const result = await _enhanceResponseCore(bedrockResponse, userMessage, tenantHash, sessionContext, routingMetadata);
+
+    // Apply max_ctas_per_response cap from tenant config
+    if (result && result.ctaButtons && result.ctaButtons.length > 0) {
+        try {
+            const config = await loadTenantConfig(tenantHash);
+            const maxCtas = config?.cta_settings?.max_ctas_per_response;
+            if (maxCtas && result.ctaButtons.length > maxCtas) {
+                console.log(`[CTA Cap] Trimming CTAs from ${result.ctaButtons.length} to ${maxCtas} (cta_settings.max_ctas_per_response)`);
+                result.ctaButtons = result.ctaButtons.slice(0, maxCtas);
+            }
+        } catch (e) {
+            // Config already loaded in core — cap is best-effort
+            console.warn('[CTA Cap] Could not apply max_ctas_per_response:', e.message);
+        }
+    }
+
+    return result;
+}
+
+async function _enhanceResponseCore(bedrockResponse, userMessage, tenantHash, sessionContext = {}, routingMetadata = {}) {
     try {
         // Load tenant configuration
         const config = await loadTenantConfig(tenantHash);

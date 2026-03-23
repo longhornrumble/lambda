@@ -979,8 +979,14 @@ class FormHandler:
             # Send fulfillment email to user
             user_email = responses.get('email')
             if user_email:
-                template = fulfillment.get('template', 'thank_you')
-                self._send_fulfillment_email(user_email, template, responses, form_type, submission_id)
+                # Check per-form applicant_confirmation config first (portal Templates tab)
+                confirmation_config = form_config.get('notifications', {}).get('applicant_confirmation', {})
+                if confirmation_config.get('enabled') and confirmation_config.get('subject') and confirmation_config.get('body_template'):
+                    self._send_applicant_confirmation(user_email, confirmation_config, responses, form_type, form_config, submission_id)
+                else:
+                    # Fall back to legacy email_templates config
+                    template = fulfillment.get('template', 'thank_you')
+                    self._send_fulfillment_email(user_email, template, responses, form_type, submission_id)
                 return {'type': 'email', 'status': 'sent', 'recipient': user_email}
 
         elif fulfillment_type == 's3':
@@ -1122,6 +1128,67 @@ class FormHandler:
         """
 
         return html
+
+    def _send_applicant_confirmation(self, recipient: str, confirmation_config: Dict[str, Any],
+                                     responses: Dict[str, Any], form_type: str,
+                                     form_config: Dict[str, Any], submission_id: str = 'unknown'):
+        """Send applicant confirmation using per-form template config (portal Templates tab)."""
+        try:
+            tenant_name = self.tenant_config.get('chat_title', 'Organization')
+
+            # Build template variables
+            template_vars = {
+                'first_name': responses.get('first_name', ''),
+                'last_name': responses.get('last_name', ''),
+                'email': recipient,
+                'phone': responses.get('phone', ''),
+                'organization_name': tenant_name,
+                'form_data': self._build_display_text(responses, form_config),
+            }
+
+            # Render templates
+            subject = confirmation_config['subject']
+            body_text = confirmation_config['body_template']
+            for key, value in template_vars.items():
+                subject = subject.replace(f'{{{key}}}', str(value))
+                body_text = body_text.replace(f'{{{key}}}', str(value))
+
+            html_body = f"<div>{body_text.replace(chr(10), '<br>')}</div>"
+
+            from_email = self.tenant_config.get('notification_settings', {}).get(
+                'from_email', self.tenant_config.get('from_email', 'notify@myrecruiter.ai'))
+
+            ses.send_email(
+                Source=from_email,
+                Destination={'ToAddresses': [recipient]},
+                Message={
+                    'Subject': {'Data': subject},
+                    'Body': {'Html': {'Data': html_body}}
+                },
+                ConfigurationSetName='picasso-emails',
+                Tags=[
+                    {'Name': 'tenant_id', 'Value': str(self.tenant_id or 'unknown')[:256]},
+                    {'Name': 'form_type', 'Value': str(form_type)[:256]},
+                    {'Name': 'submission_id', 'Value': str(submission_id)[:256]},
+                    {'Name': 'email_type', 'Value': 'applicant_confirmation'}
+                ]
+            )
+            logger.info(f"Applicant confirmation sent to {recipient} using per-form template")
+
+        except ClientError as e:
+            logger.error(f"Applicant confirmation email error: {str(e)}")
+
+    def _build_display_text(self, responses: Dict[str, Any], form_config: Dict[str, Any]) -> str:
+        """Build human-readable form data text for email templates."""
+        fields = form_config.get('fields', [])
+        field_map = {f['id']: f.get('label', f['id']) for f in fields}
+        lines = []
+        for key, value in responses.items():
+            label = field_map.get(key, key.replace('_', ' ').title())
+            if isinstance(value, dict):
+                value = ', '.join(f"{k}: {v}" for k, v in value.items() if v)
+            lines.append(f"{label}: {value}")
+        return '\n'.join(lines)
 
     def _send_fulfillment_email(self, recipient: str, template: str, responses: Dict[str, Any],
                                form_type: str = 'unknown', submission_id: str = 'unknown'):

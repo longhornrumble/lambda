@@ -14,6 +14,9 @@ import {
   deleteConfig,
   listBackups,
   storeTenantMapping,
+  saveDraft,
+  loadDraft,
+  deleteDraft,
 } from './s3Operations.mjs';
 import crypto from 'crypto';
 
@@ -240,7 +243,9 @@ export const handler = async (event) => {
         cta_definitions: [],
         conversation_branches: [],
         content_showcase: [],
-        cta_settings: {},
+        topic_definitions: [],
+        feature_flags: {},
+        cta_settings: { fallback_tags: [] },
         action_chips: [],
         bedrock_instructions: '',
         card_inventory: [],
@@ -535,6 +540,125 @@ export const handler = async (event) => {
           success: true,
           ...result,
         }),
+      };
+    }
+
+    // PUT /config/{tenantId}/draft - Save draft config
+    if (httpMethod === 'PUT' && path.match(/^\/config\/([^/]+)\/draft$/)) {
+      const tenantId = path.match(/^\/config\/([^/]+)\/draft$/)[1];
+
+      // Authorization check: verify user has access to this tenant
+      if (auth.success && auth.role !== 'super_admin') {
+        const userTenants = auth.tenants || [];
+        if (!userTenants.includes(tenantId)) {
+          console.warn(`User ${auth.email} attempted to save draft for tenant ${tenantId} without permission`);
+
+          if (ENFORCE_AUTH) {
+            return {
+              statusCode: 403,
+              headers,
+              body: JSON.stringify({
+                error: 'Forbidden',
+                message: 'You do not have access to this tenant',
+              }),
+            };
+          } else {
+            console.warn('PERMISSIVE MODE: Allowing unauthorized draft save');
+          }
+        }
+      }
+
+      const requestBody = JSON.parse(body);
+      const { config } = requestBody;
+
+      if (!config || typeof config !== 'object') {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            error: 'Bad Request',
+            message: 'config object is required in request body',
+          }),
+        };
+      }
+
+      console.log(`Saving draft for tenant ${tenantId}`);
+      await saveDraft(tenantId, config);
+
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ success: true, message: 'Draft saved' }),
+      };
+    }
+
+    // GET /config/{tenantId}/draft - Load draft config
+    if (httpMethod === 'GET' && path.match(/^\/config\/([^/]+)\/draft$/)) {
+      const tenantId = path.match(/^\/config\/([^/]+)\/draft$/)[1];
+
+      // Authorization check: verify user has access to this tenant
+      if (auth.success && auth.role !== 'super_admin') {
+        const userTenants = auth.tenants || [];
+        if (!userTenants.includes(tenantId)) {
+          console.warn(`User ${auth.email} attempted to load draft for tenant ${tenantId} without permission`);
+
+          if (ENFORCE_AUTH) {
+            return {
+              statusCode: 403,
+              headers,
+              body: JSON.stringify({
+                error: 'Forbidden',
+                message: 'You do not have access to this tenant',
+              }),
+            };
+          } else {
+            console.warn('PERMISSIVE MODE: Allowing unauthorized draft load');
+          }
+        }
+      }
+
+      console.log(`Loading draft for tenant ${tenantId}`);
+      const { config, hasDraft } = await loadDraft(tenantId);
+
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ hasDraft, config }),
+      };
+    }
+
+    // DELETE /config/{tenantId}/draft - Delete draft config
+    if (httpMethod === 'DELETE' && path.match(/^\/config\/([^/]+)\/draft$/)) {
+      const tenantId = path.match(/^\/config\/([^/]+)\/draft$/)[1];
+
+      // Authorization check: verify user has access to this tenant
+      if (auth.success && auth.role !== 'super_admin') {
+        const userTenants = auth.tenants || [];
+        if (!userTenants.includes(tenantId)) {
+          console.warn(`User ${auth.email} attempted to delete draft for tenant ${tenantId} without permission`);
+
+          if (ENFORCE_AUTH) {
+            return {
+              statusCode: 403,
+              headers,
+              body: JSON.stringify({
+                error: 'Forbidden',
+                message: 'You do not have access to this tenant',
+              }),
+            };
+          } else {
+            console.warn('PERMISSIVE MODE: Allowing unauthorized draft deletion');
+          }
+        }
+      }
+
+      console.log(`Deleting draft for tenant ${tenantId}`);
+      await deleteDraft(tenantId);
+
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ success: true, message: 'Draft deleted' }),
       };
     }
 

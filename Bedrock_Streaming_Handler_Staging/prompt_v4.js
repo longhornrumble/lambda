@@ -230,6 +230,7 @@ function buildV4FormattingRules(config) {
   // ── Context: This is a chat widget ──────────────────────────────────
   lines.push('- IMPORTANT: This is a small chat widget, not a document. Responses must be easy to scan on a phone screen.');
   lines.push('- Do not use markdown headers (lines starting with #).');
+  lines.push('- When the KB content contains relevant links (markdown URLs), include them inline in your response so the user can click through. Present them naturally — e.g. "You can [Donate Now](https://...) or [Invest Monthly](https://...)" — do not strip links from your answer.');
   lines.push('- Preserve all URLs and email addresses from the KB exactly as written.');
   lines.push('- Never cram all KB facts into one response. Pick the most relevant facts for THIS question and leave the rest for follow-ups.');
 
