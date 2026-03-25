@@ -60,7 +60,6 @@ function buildV4ConversationPrompt(userInput, kbContext, tonePrompt, conversatio
   if (kbContext) {
     kbBlock = `━━━ KNOWLEDGE BASE ━━━
 Use ONLY this information to answer. Never add details not found below.
-Do not reproduce markdown action links from this content — action buttons are provided separately.
 
 ${kbContext}`;
   } else {
@@ -158,49 +157,24 @@ function buildV4LockedRules(hasKb, turnCount, config) {
 
   // ── Source constraint (only meaningful when KB is present) ──────────────
   if (hasKb) {
-    rules.push(`SOURCE CONSTRAINT
-- Answer using only the facts in the Knowledge Base above. Do not add information that is not explicitly stated there.
-- Do not change program names, eligibility rules, or numeric details. If the KB says "two programs," do not list three.
-- If the KB does not contain the specific detail the user asked about, say "I don't have details on that" rather than inferring or filling in.
-- Do not reproduce markdown action links (e.g., [Apply Now →](url)) from the KB in your response text. Action buttons are handled separately by the system.`);
+    rules.push(`SOURCE
+- Answer using only the Knowledge Base above. Do not add facts that are not there.
+- When the KB contains links relevant to what you are discussing — resource pages, FAQs, application forms, flipbooks, videos — include them in your response. These links help the user explore further. Do not strip links from your answer.`);
   }
 
-  // ── Context continuity ─────────────────────────────────────────────────
-  rules.push(`CONTEXT CONTINUITY
-- If the user's message is a short affirmative ("yes," "sure," "okay," "go ahead," "tell me more," "please"), treat it as a continuation of the prior topic. Answer the question you just asked or continue where you left off.
-- Do not start your response with "I noticed you said yes," "Since you expressed interest," or any phrase that restates the affirmative. Just continue.
-- Do not re-introduce information you already covered. Move forward.`);
-
-  // ── Loop prevention ────────────────────────────────────────────────────
-  // Abridged version of V3.5 getLockedLoopPrevention() — same behavior, fewer tokens.
-  // Only inject the stage-3 escalation instruction after turn 2, where it is relevant.
-  let loopRule = `LOOP PREVENTION
-- Before responding, check what you covered in the prior turn. Do not repeat it.
-- If you asked a follow-up question last turn and the user responded, answer that question directly — do not ask a different question in its place.`;
-
-  if (turnCount >= 2) {
-    loopRule += `
-- This user has confirmed interest multiple times. Provide the direct resource, link, or next step. Do not ask again whether they want it.`;
-  }
-
-  rules.push(loopRule);
-
-  // ── Phrasing guardrails ────────────────────────────────────────────────
-  rules.push(`PHRASING
-- Do not say: "Based on the knowledge base," "According to the information provided," "I found that," "As mentioned earlier," or "Based on our previous conversation."
-- Do not offer to "walk the user through a form," "help them fill it out," or "guide them step by step through the application." You can provide information and links — you cannot interact with external systems.
-- Do not use the phrase "Is there anything else I can help you with?" unless the conversation has reached a natural end point and there is genuinely no more to say on this topic.
-- Match the user's energy. If they are warm and enthusiastic, be warm. If they are frustrated or confused, be calm and direct.`);
+  // ── Context ─────────────────────────────────────────────────────────────
+  rules.push(`CONTEXT
+- Pay attention to what the user is asking about. Stay on that topic. Do not introduce other programs or services unless the user brings them up.
+- If the user gives a short answer ("yes", "volunteering", "sure"), they are continuing the current topic. Do not pivot to something new.
+- Do not repeat information you already covered. Move forward with new details.`);
 
   // ── Formatting (driven by tenant config formatting_preferences) ────────
   rules.push(buildV4FormattingRules(config));
 
-  // ── Closing rule ───────────────────────────────────────────────────────
+  // ── Closing ─────────────────────────────────────────────────────────────
   rules.push(`CLOSING
-- End every response with a specific, contextual follow-up question that invites the next natural step. The question must relate directly to the topic you just discussed.
-- Good examples: "Would you like to know the eligibility requirements?" / "The application takes about 10 minutes — want me to explain what it asks for?"
-- Do not use generic closers: "Is there anything else I can help you with?" / "Do you have any other questions?" / "Would you like more information?" — these are not specific.
-- Exception: if the user has reached a clear end point (e.g., you just provided the direct application link and they said "thanks"), a brief warm close is appropriate.`);
+- When exploring: end with a follow-up question about the current topic.
+- When the user says they are ready to act: provide the resource and a warm close. Do not ask more questions.`);
 
   return rules.join('\n\n');
 }
@@ -413,15 +387,27 @@ function buildTopicClassificationPrompt(userMessage, conversationHistory, config
     .map(topic => `${topic.name}: ${topic.description}`)
     .join('\n');
 
-  // Current message only — prior messages bias the classifier more than they help.
-  // Anaphora resolution (e.g. "tell me more about that") is rare enough that
-  // eliminating history bias is the better tradeoff for Phase 1.
+  // Include recent user messages for context — short follow-ups like "I'm thinking
+  // about volunteering" are ambiguous without knowing the prior topic was Love Box.
+  // Limit to last 2 user messages to avoid biasing the classifier with stale context.
+  const recentUserMessages = (conversationHistory || [])
+    .filter(m => m.role === 'user')
+    .slice(-2)
+    .map(m => (m.content || m.text || '').trim())
+    .filter(Boolean);
+
+  let contextBlock = '';
+  if (recentUserMessages.length > 0) {
+    contextBlock = `\nRECENT CONTEXT (prior user messages, oldest first):\n${recentUserMessages.map(m => `- ${m}`).join('\n')}\n`;
+  }
+
   const prompt = `You are a conversation classifier. Classify the customer message below
-using only the taxonomy provided.
+using only the taxonomy provided. Use the recent context to disambiguate
+short or ambiguous messages.
 
 CUSTOMER MESSAGE:
 ${userMessage}
-
+${contextBlock}
 TOPIC TAXONOMY:
 ${taxonomyBlock}
 
@@ -840,6 +826,128 @@ const V4_STEP3_INFERENCE_PARAMS = {
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+// V4.0 ACTION SELECTOR (LLM-based CTA selection — replaces V4.1 taxonomy)
+// Gated by feature_flags.V4_ACTION_SELECTOR per tenant
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Select CTAs using a focused LLM call that reads the completed response
+ * and conversation history, then picks relevant actions from the vocabulary.
+ *
+ * This replaces V4.1's classifyTopic() + selectCTAsFromPool() with a single
+ * AI judgment call. The prompt has ONE job: pick actions. No persona, no KB,
+ * no formatting rules.
+ *
+ * @param {string} responseText - The completed AI response from Step 2
+ * @param {Array} conversationHistory - [{role, content}] — prior messages
+ * @param {Object} config - Full tenant config (cta_definitions used for vocabulary)
+ * @param {Object} bedrockClient - Bedrock runtime client
+ * @returns {Promise<string[]>} Array of CTA IDs (0-4), validated against config
+ */
+async function selectActionsV4(responseText, conversationHistory, config, bedrockClient) {
+  const startTime = Date.now();
+
+  try {
+    // Build vocabulary: only ai_available CTAs, with intent labels
+    const intentLabel = (action) => {
+      switch (action) {
+        case 'send_query': return 'LEARN';
+        case 'start_form': return 'APPLY';
+        case 'external_link': return 'VISIT';
+        case 'show_info': return 'INFO';
+        default: return action;
+      }
+    };
+    const vocabulary = Object.entries(config.cta_definitions || {})
+      .filter(([_, cta]) => cta.ai_available)
+      .map(([id, cta]) => `  ${id} — ${cta.label} [${intentLabel(cta.action)}]`)
+      .join('\n');
+
+    // Last 3 exchanges (6 messages) for context
+    const recent = (conversationHistory || []).slice(-6);
+    const conversationBlock = recent
+      .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${(m.content || m.text || '').trim()}`)
+      .filter(Boolean)
+      .join('\n');
+
+    const prompt = `You are an action selector for a chatbot. Given the conversation and the assistant's latest response, decide which actions (if any) the user is ready for RIGHT NOW.
+
+CONVERSATION:
+${conversationBlock}
+Assistant: ${responseText}
+
+AVAILABLE ACTIONS:
+${vocabulary}
+
+RULES:
+- Select 1-4 actions. Each action is labeled LEARN, APPLY, VISIT, or INFO.
+- LEARNING FIRST: Most selections should be LEARN actions — they help the user discover details, FAQs, and specifics about the programs being discussed. Always include LEARN actions when available.
+- APPLY/VISIT ONLY WHEN COMMITTED: Only select APPLY or VISIT actions when the user has unprompted said "I want to apply", "sign me up", "I'm ready", "let's donate", or similar. Answering the bot's question or expressing general interest is NOT commitment — keep showing LEARN actions.
+- If multiple programs are mentioned in the response, include a LEARN action for each.
+- Only return an empty array on the very first message when the user hasn't indicated any direction.
+
+Return ONLY a raw JSON array of action IDs. No explanation, no markdown, no code fences.`;
+
+    console.log(`[V4 ActionSelector] Prompt: ${prompt.length} chars, ${vocabulary.split('\n').length} CTAs`);
+
+    const { InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+    const modelId = config.model_id || config.aws?.model_id || 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
+
+    const command = new InvokeModelCommand({
+      modelId,
+      accept: 'application/json',
+      contentType: 'application/json',
+      body: JSON.stringify({
+        anthropic_version: 'bedrock-2023-05-31',
+        messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+        max_tokens: 100,
+        temperature: 0.1,
+      })
+    });
+
+    const response = await bedrockClient.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+    const rawOutput = (responseBody?.content?.[0]?.text || '[]').trim();
+
+    const duration = Date.now() - startTime;
+
+    // Strip markdown code fences if present (model sometimes wraps in ```json ... ```)
+    let cleaned = rawOutput;
+    if (cleaned.startsWith('```')) {
+      cleaned = cleaned.replace(/^```(?:json)?\s*/, '').replace(/\s*```$/, '').trim();
+    }
+
+    // Parse JSON array
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch {
+      console.warn(`[V4 ActionSelector] Failed to parse output: "${rawOutput}" (${duration}ms)`);
+      return [];
+    }
+
+    if (!Array.isArray(parsed)) {
+      console.warn(`[V4 ActionSelector] Output is not an array: "${rawOutput}" (${duration}ms)`);
+      return [];
+    }
+
+    // Validate against known CTA IDs
+    const knownIds = new Set(Object.keys(config.cta_definitions || {}));
+    const validated = parsed.filter(id => knownIds.has(id)).slice(0, 4);
+
+    console.log(`[V4 ActionSelector] Selected ${validated.length} CTAs: [${validated.join(', ')}] (raw: "${rawOutput}") in ${duration}ms`);
+
+    return validated;
+
+  } catch (err) {
+    const duration = Date.now() - startTime;
+    console.error(`[V4 ActionSelector] Error (${duration}ms):`, err.message);
+    return [];
+  }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 // EXPORTS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -854,6 +962,9 @@ module.exports = {
   // Step 3b: Dynamic CTA Pool Selection (deterministic, no AI)
   selectCTAsFromPool,
   determineDepthPreference,
+
+  // V4.0 Action Selector (LLM-based, per-tenant feature flag)
+  selectActionsV4,
 
   // Config validation
   validateTopicDefinitions,

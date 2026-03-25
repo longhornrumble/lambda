@@ -24,6 +24,7 @@ const {
   buildV4ConversationPrompt,
   classifyTopic,
   selectCTAsFromPool,
+  selectActionsV4,
   validateTopicDefinitions,
   V4_STEP2_INFERENCE_PARAMS,
   sanitizeTonePromptV4,
@@ -664,6 +665,29 @@ const streamingHandler = async (event, responseStream, context) => {
       }
     }
 
+    // Enrich KB query for follow-up turns to pull deeper content.
+    // If the user is asking about the same topic again ("tell me more", "what else"),
+    // append what the bot already covered so retrieval targets uncovered content.
+    if (conversationHistory && conversationHistory.length >= 2) {
+      const lastAssistantMsg = [...conversationHistory].reverse().find(m => m.role === 'assistant');
+      if (lastAssistantMsg) {
+        const covered = (lastAssistantMsg.content || lastAssistantMsg.text || '').trim();
+        // If the user is asking for more detail on the same topic, enrich the query
+        const morePatterns = /more|else|detail|learn|what about|tell me|specifics|information|further|deeper|everything/i;
+        if (morePatterns.test(sanitizedInput)) {
+          // Append topic keywords from the last response to diversify retrieval
+          const topicKeywords = covered
+            .split(/[.!?\n]/)
+            .filter(s => s.trim().length > 20)
+            .slice(0, 2)
+            .map(s => s.trim().substring(0, 80))
+            .join(' ');
+          kbQuery = `${sanitizedInput} — details beyond: ${topicKeywords}`;
+          console.log(`🔍 Enriched KB query for follow-up: "${kbQuery.substring(0, 120)}..."`);
+        }
+      }
+    }
+
     // Get KB context
     const kbContext = await retrieveKB(kbQuery, config);
 
@@ -796,6 +820,32 @@ const streamingHandler = async (event, responseStream, context) => {
             metadata: enhancedData.metadata,
             session_id: sessionId
           })}\n\n`);
+        }
+
+      } else if (config.feature_flags?.V4_ACTION_SELECTOR) {
+        // V4.0 Action Selector: AI picks CTAs from the full vocabulary
+        console.log('[V4 ActionSelector] Using LLM-based CTA selection');
+        const selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
+
+        if (selectedIds.length > 0) {
+          const ctaButtons = selectedIds.map((id, idx) => {
+            const { style, ...cleanCta } = config.cta_definitions[id] || {};
+            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
+          });
+
+          write(`data: ${JSON.stringify({
+            type: 'cta_buttons',
+            ctaButtons,
+            metadata: {
+              routing_tier: 'v4_action_selector',
+              selected_ids: selectedIds,
+              conversation_context: { selected_ctas: selectedIds }
+            },
+            session_id: sessionId
+          })}\n\n`);
+          console.log(`🎯 [V4 ActionSelector] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
+        } else {
+          console.log('[V4 ActionSelector] No CTAs selected');
         }
 
       } else if (validation.definitions.length > 0) {
@@ -1140,6 +1190,30 @@ const bufferedHandler = async (event, context) => {
           });
           chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
         }
+      } else if (config.feature_flags?.V4_ACTION_SELECTOR) {
+        // V4.0 Action Selector (buffered path)
+        console.log('[V4 ActionSelector buffered] Using LLM-based CTA selection');
+        const selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
+
+        if (selectedIds.length > 0) {
+          const ctaButtons = selectedIds.map((id, idx) => {
+            const { style, ...cleanCta } = config.cta_definitions[id] || {};
+            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
+          });
+
+          const ctaData = JSON.stringify({
+            type: 'cta_buttons', ctaButtons,
+            metadata: {
+              routing_tier: 'v4_action_selector',
+              selected_ids: selectedIds,
+              conversation_context: { selected_ctas: selectedIds }
+            },
+            session_id: sessionId
+          });
+          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+          console.log(`🎯 [V4 ActionSelector buffered] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
+        }
+
       } else if (validation.definitions.length > 0) {
         // Step 3a + 3b: Topic classification → Pool selection
         let topicName = await classifyTopic(
