@@ -69,18 +69,12 @@ logger.setLevel(logging.INFO)
 JWT_SECRET_KEY_NAME = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/staging/jwt/signing-key')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 
-# DynamoDB hot path configuration
-AGGREGATES_TABLE = os.environ.get('AGGREGATES_TABLE', 'picasso-dashboard-aggregates')
-USE_DYNAMO_CACHE = os.environ.get('USE_DYNAMO_CACHE', 'true').lower() == 'true'
-CACHE_MAX_AGE_HOURS = int(os.environ.get('CACHE_MAX_AGE_HOURS', '2'))  # Consider stale after 2 hours
 
 # AWS clients
 secrets_manager = boto3.client('secretsmanager')
 dynamodb = boto3.client('dynamodb')
 dynamodb_resource = boto3.resource('dynamodb')
 
-# DynamoDB tables
-aggregates_table = dynamodb_resource.Table(AGGREGATES_TABLE)
 
 # DynamoDB table for form submissions (contains PII)
 FORM_SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_submissions')
@@ -138,14 +132,6 @@ _jwt_secret_cache = None
 _jwt_secret_cache_time = 0
 JWT_SECRET_CACHE_TTL = 300  # 5 minutes
 
-# Security: Allowed event types whitelist
-ALLOWED_EVENT_TYPES = {
-    'WIDGET_OPENED', 'WIDGET_CLOSED', 'MESSAGE_SENT', 'FORM_STARTED',
-    'FORM_COMPLETED', 'FORM_ABANDONED', 'FORM_VIEWED', 'FORM_FIELD_SUBMITTED',
-    'ACTION_CHIP_CLICKED', 'CTA_CLICKED', 'LINK_CLICKED', 'HELP_MENU_CLICKED',
-    'SHOWCASE_CTA_CLICKED', 'MESSAGE_RECEIVED', 'CONVERSATION_STARTED',
-    'SESSION_STARTED', 'SESSION_ENDED', 'ERROR'
-}
 
 # Security: Tenant ID validation pattern (alphanumeric, underscore, hyphen only)
 TENANT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
@@ -183,21 +169,6 @@ def sanitize_tenant_id(tenant_id: str, for_sql: bool = False) -> str:
 
     return tenant_id
 
-
-def sanitize_event_type(event_type: str) -> str:
-    """
-    Validate event_type against whitelist.
-    Prevents SQL injection by only allowing known event types.
-
-    Raises ValueError if event_type is not in whitelist.
-    """
-    if not event_type:
-        return None
-
-    if event_type not in ALLOWED_EVENT_TYPES:
-        raise ValueError(f"Invalid event type: {event_type}")
-
-    return event_type
 
 
 # =============================================================================
@@ -364,15 +335,6 @@ def lambda_handler(event, context):
             session_id = path.split('/sessions/')[-1].split('/')[0]
             if session_id and session_id != 'list':
                 return handle_session_detail(tenant_id, session_id, params)
-        # Analytics endpoints (generic)
-        elif path.endswith('/summary'):
-            return handle_summary(tenant_id, params)
-        elif path.endswith('/sessions'):
-            return handle_sessions(tenant_id, params)
-        elif path.endswith('/events'):
-            return handle_events(tenant_id, params)
-        elif path.endswith('/funnel'):
-            return handle_funnel(tenant_id, params)
         # Feature flags endpoint
         elif path.endswith('/features'):
             return handle_features(tenant_id)
@@ -972,67 +934,7 @@ def validate_feature_access(tenant_id: str, required_feature: str) -> Optional[D
     return None
 
 
-# =============================================================================
-# DynamoDB Hot Path Cache Functions
-# =============================================================================
 
-def get_cached_metric(tenant_id: str, metric_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Get pre-computed metric from DynamoDB cache.
-    Returns None if cache miss, stale, or disabled.
-
-    Performance: ~5-20ms vs 5-30s for Athena
-    """
-    if not USE_DYNAMO_CACHE:
-        return None
-
-    try:
-        response = aggregates_table.get_item(
-            Key={
-                'pk': f'TENANT#{tenant_id}',
-                'sk': f'METRIC#{metric_key}'
-            }
-        )
-
-        item = response.get('Item')
-        if not item:
-            logger.debug(f"Cache miss for {metric_key}")
-            return None
-
-        # Check freshness
-        updated_at = item.get('updated_at', '')
-        if updated_at:
-            try:
-                update_time = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
-                age_hours = (datetime.now(timezone.utc) - update_time).total_seconds() / 3600
-
-                if age_hours > CACHE_MAX_AGE_HOURS:
-                    logger.info(f"Cache stale for {metric_key} (age: {age_hours:.1f}h)")
-                    return None
-            except (ValueError, TypeError):
-                pass
-
-        # Convert Decimal to float for JSON serialization
-        data = convert_decimal_to_float(item.get('data', {}))
-        logger.info(f"Cache hit for {metric_key}")
-        return data
-
-    except Exception as e:
-        logger.warning(f"Cache error for {metric_key}: {e}")
-        return None
-
-
-def convert_decimal_to_float(obj):
-    """
-    Recursively convert Decimal to float for JSON serialization.
-    """
-    if isinstance(obj, Decimal):
-        return float(obj)
-    elif isinstance(obj, dict):
-        return {k: convert_decimal_to_float(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [convert_decimal_to_float(item) for item in obj]
-    return obj
 
 
 # =============================================================================
@@ -1599,131 +1501,6 @@ def fetch_form_top_performers_from_dynamo(tenant_hash: str, date_range: Dict[str
 
 
 # =============================================================================
-# Endpoint Handlers
-# =============================================================================
-
-def handle_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
-    """
-    GET /analytics/summary
-    Returns overview metrics for the dashboard.
-
-    Query params:
-    - range: Time range (7d, 30d, 90d) - default 30d
-    """
-    range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
-
-    # Try DynamoDB cache first (sub-100ms)
-    cached = get_cached_metric(tenant_id, f'analytics_summary#{range_str}')
-    if cached:
-        return cors_response(200, {
-            'tenant_id': tenant_id,
-            'range': range_str,
-            'metrics': cached,
-            'source': 'cache'
-        })
-
-    # Cache miss — return empty metrics (Athena removed, DynamoDB is sole source)
-    logger.info(f"Cache miss for analytics_summary#{range_str} — no aggregated data available")
-
-    return cors_response(200, {
-        'tenant_id': tenant_id,
-        'range': params.get('range', '30d'),
-        'metrics': {
-            'total_sessions': 0,
-            'total_events': 0,
-            'widget_opens': 0,
-            'forms_started': 0,
-            'forms_completed': 0,
-            'chip_clicks': 0,
-            'cta_clicks': 0,
-            'conversion_rate': 0
-        }
-    })
-
-
-def handle_sessions(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
-    """
-    GET /analytics/sessions
-    Returns session counts over time.
-
-    Query params:
-    - range: Time range (7d, 30d, 90d) - default 30d
-    - granularity: day, week, month - default day
-    """
-    date_range = parse_date_range(params.get('range', '30d'))
-    granularity = params.get('granularity', 'day')
-
-    # Athena removed — DynamoDB is sole source. Return empty if no cache.
-    logger.info(f"Cache miss for analytics_sessions — no aggregated data available")
-
-    return cors_response(200, {
-        'tenant_id': tenant_id,
-        'range': params.get('range', '30d'),
-        'granularity': granularity,
-        'data': []
-    })
-
-
-def handle_events(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
-    """
-    GET /analytics/events
-    Returns event breakdown by type.
-
-    Query params:
-    - range: Time range (7d, 30d, 90d) - default 30d
-    - type: Filter by specific event type (optional, must be in whitelist)
-    """
-    date_range = parse_date_range(params.get('range', '30d'))
-
-    # Athena removed — DynamoDB is sole source. Return empty.
-    logger.info(f"Cache miss for analytics_events — no aggregated data available")
-
-    return cors_response(200, {
-        'tenant_id': tenant_id,
-        'range': params.get('range', '30d'),
-        'events': []
-    })
-
-
-def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
-    """
-    GET /analytics/funnel
-    Returns conversion funnel analysis.
-
-    Funnel stages:
-    1. Widget Opened
-    2. Action Chip Clicked (optional)
-    3. Form Started
-    4. Form Completed
-
-    Query params:
-    - range: Time range (7d, 30d, 90d) - default 30d
-    """
-    range_str = params.get('range', '30d')
-    date_range = parse_date_range(range_str)
-
-    # Try DynamoDB cache first (sub-100ms)
-    cached = get_cached_metric(tenant_id, f'analytics_funnel#{range_str}')
-    if cached:
-        return cors_response(200, {
-            'tenant_id': tenant_id,
-            'range': range_str,
-            'funnel': cached.get('funnel', []),
-            'overall_conversion': cached.get('overall_conversion', 0),
-            'source': 'cache'
-        })
-
-    # Athena removed — DynamoDB is sole source. Return empty if no cache.
-    logger.info(f"Cache miss for analytics_funnel#{range_str} — no aggregated data available")
-
-    return cors_response(200, {
-        'tenant_id': tenant_id,
-        'range': params.get('range', '30d'),
-        'funnel': [],
-        'overall_conversion': 0
-    })
-
 
 # =============================================================================
 # Forms Endpoint Handlers
