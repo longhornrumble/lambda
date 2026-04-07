@@ -25,6 +25,8 @@ const EDITABLE_SECTIONS = [
   'topic_definitions',
   'form_settings',
   'monitor',
+  'notification_settings',
+  'bubble_integration',
 ];
 
 /**

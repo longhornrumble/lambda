@@ -10,8 +10,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 s3 = boto3.client("s3")
-athena = boto3.client("athena")
-
 # Production Configuration
 PRODUCTION_BUCKET = "myrecruiter-picasso"
 TENANTS_PREFIX = "tenants"
@@ -19,10 +17,6 @@ MAPPINGS_PREFIX = "mappings"
 EMBED_PREFIX = "embed"
 CLOUDFRONT_DOMAIN = "chat.myrecruiter.ai"
 
-# Analytics Configuration
-ATHENA_DATABASE = "picasso_analytics"
-ATHENA_TABLE = "events"
-ATHENA_OUTPUT_LOCATION = "s3://picasso-analytics/athena-results/"
 
 # Security: Tenant ID validation pattern (alphanumeric, underscore, hyphen only)
 # This prevents SQL injection in Athena queries
@@ -285,11 +279,7 @@ def lambda_handler(event, context):
         logger.info("💾 Storing tenant hash mapping...")
         store_tenant_mapping(tenant_id, tenant_hash)
 
-        # 8. UPDATE ATHENA PARTITION PROJECTION (for analytics)
-        logger.info("📊 Updating Athena partition projection...")
-        update_athena_tenant_partition(tenant_id)
-
-        # 9. GENERATE CLEAN EMBED CODE
+        # 8. GENERATE CLEAN EMBED CODE
         clean_embed_code = generate_clean_embed_code(tenant_hash)
         logger.info(f"✨ Generated clean embed code")
 
@@ -928,92 +918,6 @@ def store_tenant_mapping(tenant_id: str, tenant_hash: str):
         logger.error(f"❌ Failed to store tenant mapping: {str(e)}")
         raise
 
-
-def update_athena_tenant_partition(tenant_id: str):
-    """
-    Add tenant_id to Athena table's partition projection enum.
-    This ensures analytics queries can find data for new tenants immediately.
-
-    The table uses partition projection with tenant_id as an enum type.
-    New tenants must be added to the enum list for their data to be queryable.
-    """
-    try:
-        # Get current table properties
-        response = athena.start_query_execution(
-            QueryString=f"SHOW TBLPROPERTIES {ATHENA_DATABASE}.{ATHENA_TABLE}",
-            ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_LOCATION}
-        )
-        query_id = response['QueryExecutionId']
-
-        # Wait for query to complete (max 10 seconds)
-        for _ in range(20):
-            time.sleep(0.5)
-            status = athena.get_query_execution(QueryExecutionId=query_id)
-            state = status['QueryExecution']['Status']['State']
-            if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-                break
-
-        if state != 'SUCCEEDED':
-            logger.warning(f"⚠️ Could not get Athena table properties: {state}")
-            return
-
-        # Get results
-        results = athena.get_query_results(QueryExecutionId=query_id)
-
-        # Find current tenant_id enum values
-        # SHOW TBLPROPERTIES returns rows with "name\tvalue" in a single column
-        current_tenants = set()
-        for row in results.get('ResultSet', {}).get('Rows', []):
-            data = row.get('Data', [])
-            if len(data) >= 1:
-                cell_value = data[0].get('VarCharValue', '')
-                # Handle format: "projection.tenant_id.values\tVAL1,VAL2,VAL3"
-                if 'projection.tenant_id.values' in cell_value:
-                    parts = cell_value.split('\t')
-                    if len(parts) >= 2:
-                        current_tenants = set(parts[1].split(','))
-                    break
-
-        # Check if tenant already exists
-        if tenant_id in current_tenants:
-            logger.info(f"✅ Tenant already in Athena partition projection")
-            return
-
-        # Add new tenant to the list
-        current_tenants.add(tenant_id)
-        new_tenant_list = ','.join(sorted(current_tenants))
-
-        # Update table properties
-        alter_query = f"""
-            ALTER TABLE {ATHENA_DATABASE}.{ATHENA_TABLE}
-            SET TBLPROPERTIES (
-                'projection.tenant_id.values' = '{new_tenant_list}'
-            )
-        """
-
-        response = athena.start_query_execution(
-            QueryString=alter_query,
-            ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_LOCATION}
-        )
-        alter_query_id = response['QueryExecutionId']
-
-        # Wait for alter to complete
-        for _ in range(20):
-            time.sleep(0.5)
-            status = athena.get_query_execution(QueryExecutionId=alter_query_id)
-            state = status['QueryExecution']['Status']['State']
-            if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-                break
-
-        if state == 'SUCCEEDED':
-            logger.info(f"✅ Added tenant to Athena partition projection")
-        else:
-            error_msg = status['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
-            logger.warning(f"⚠️ Failed to update Athena partition projection: {error_msg}")
-
-    except Exception as e:
-        # Don't fail deployment if Athena update fails - analytics is non-critical
-        logger.warning(f"⚠️ Could not update Athena partition projection: {str(e)}")
 
 
 def generate_clean_embed_code(tenant_hash: str) -> str:

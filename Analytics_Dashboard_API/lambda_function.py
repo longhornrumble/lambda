@@ -66,9 +66,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Environment variables
-ATHENA_DATABASE = os.environ.get('ATHENA_DATABASE', 'picasso_analytics')
-ATHENA_TABLE = os.environ.get('ATHENA_TABLE', 'events')
-ATHENA_OUTPUT_LOCATION = os.environ.get('ATHENA_OUTPUT_LOCATION', 's3://picasso-analytics/athena-results/')
 JWT_SECRET_KEY_NAME = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/staging/jwt/signing-key')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 
@@ -78,7 +75,6 @@ USE_DYNAMO_CACHE = os.environ.get('USE_DYNAMO_CACHE', 'true').lower() == 'true'
 CACHE_MAX_AGE_HOURS = int(os.environ.get('CACHE_MAX_AGE_HOURS', '2'))  # Consider stale after 2 hours
 
 # AWS clients
-athena = boto3.client('athena')
 secrets_manager = boto3.client('secretsmanager')
 dynamodb = boto3.client('dynamodb')
 dynamodb_resource = boto3.resource('dynamodb')
@@ -259,20 +255,6 @@ def redact_tenant_id(tenant_id: str) -> str:
 
     return f"{tenant_id[:8]}..."
 
-
-def safe_sql_string(value: str) -> str:
-    """
-    Additional SQL injection protection layer.
-    Escapes single quotes for SQL string interpolation.
-
-    NOTE: This is defense-in-depth. Primary protection is sanitize_tenant_id()
-    which validates against alphanumeric pattern. This function handles edge cases.
-    """
-    if not value:
-        return ''
-
-    # Escape single quotes (SQL standard: '' for literal single quote)
-    return value.replace("'", "''")
 
 
 def lambda_handler(event, context):
@@ -1641,52 +1623,8 @@ def handle_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
             'source': 'cache'
         })
 
-    # Fallback to Athena (5-30s)
-    logger.info(f"Cache miss - querying Athena for analytics_summary#{range_str}")
-
-    # Use ISO date comparison for proper cross-month-boundary filtering
-    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
-    safe_tenant = safe_sql_string(tenant_id)
-    query = f"""
-    SELECT
-        COUNT(DISTINCT session_id) as total_sessions,
-        COUNT(*) as total_events,
-        COUNT(CASE WHEN event_type = 'WIDGET_OPENED' THEN 1 END) as widget_opens,
-        COUNT(CASE WHEN event_type = 'FORM_STARTED' THEN 1 END) as forms_started,
-        COUNT(CASE WHEN event_type = 'FORM_COMPLETED' THEN 1 END) as forms_completed,
-        COUNT(CASE WHEN event_type = 'ACTION_CHIP_CLICKED' THEN 1 END) as chip_clicks,
-        COUNT(CASE WHEN event_type = 'CTA_CLICKED' THEN 1 END) as cta_clicks
-    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{safe_tenant}'
-      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-          >= DATE '{date_range['start_date_iso']}'
-    """
-
-    results = execute_athena_query(query)
-
-    if results and len(results) > 0:
-        row = results[0]
-        # Calculate conversion rate
-        widget_opens = int(row.get('widget_opens', 0) or 0)
-        forms_completed = int(row.get('forms_completed', 0) or 0)
-        conversion_rate = (forms_completed / widget_opens * 100) if widget_opens > 0 else 0
-
-        return cors_response(200, {
-            'tenant_id': tenant_id,
-            'range': params.get('range', '30d'),
-            'metrics': {
-                'total_sessions': int(row.get('total_sessions', 0) or 0),
-                'total_events': int(row.get('total_events', 0) or 0),
-                'widget_opens': widget_opens,
-                'forms_started': int(row.get('forms_started', 0) or 0),
-                'forms_completed': forms_completed,
-                'chip_clicks': int(row.get('chip_clicks', 0) or 0),
-                'cta_clicks': int(row.get('cta_clicks', 0) or 0),
-                'conversion_rate': round(conversion_rate, 2)
-            }
-        })
+    # Cache miss — return empty metrics (Athena removed, DynamoDB is sole source)
+    logger.info(f"Cache miss for analytics_summary#{range_str} — no aggregated data available")
 
     return cors_response(200, {
         'tenant_id': tenant_id,
@@ -1716,49 +1654,14 @@ def handle_sessions(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     date_range = parse_date_range(params.get('range', '30d'))
     granularity = params.get('granularity', 'day')
 
-    # Build GROUP BY based on granularity
-    if granularity == 'month':
-        group_by = "year, month"
-        select_date = "CAST(year AS VARCHAR) || '-' || LPAD(CAST(month AS VARCHAR), 2, '0') as period"
-    elif granularity == 'week':
-        group_by = "year, week(date_parse(client_timestamp, '%Y-%m-%dT%H:%i:%s.%fZ'))"
-        select_date = "CAST(year AS VARCHAR) || '-W' || LPAD(CAST(week(date_parse(client_timestamp, '%Y-%m-%dT%H:%i:%s.%fZ')) AS VARCHAR), 2, '0') as period"
-    else:  # day
-        group_by = "year, month, day"
-        select_date = "CAST(year AS VARCHAR) || '-' || LPAD(CAST(month AS VARCHAR), 2, '0') || '-' || LPAD(CAST(day AS VARCHAR), 2, '0') as period"
-
-    # Use ISO date comparison for proper cross-month-boundary filtering
-    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
-    safe_tenant = safe_sql_string(tenant_id)
-    query = f"""
-    SELECT
-        {select_date},
-        COUNT(DISTINCT session_id) as sessions,
-        COUNT(*) as events
-    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{safe_tenant}'
-      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-          >= DATE '{date_range['start_date_iso']}'
-    GROUP BY {group_by}
-    ORDER BY period
-    """
-
-    results = execute_athena_query(query)
+    # Athena removed — DynamoDB is sole source. Return empty if no cache.
+    logger.info(f"Cache miss for analytics_sessions — no aggregated data available")
 
     return cors_response(200, {
         'tenant_id': tenant_id,
         'range': params.get('range', '30d'),
         'granularity': granularity,
-        'data': [
-            {
-                'period': row.get('period'),
-                'sessions': int(row.get('sessions', 0) or 0),
-                'events': int(row.get('events', 0) or 0)
-            }
-            for row in (results or [])
-        ]
+        'data': []
     })
 
 
@@ -1773,48 +1676,13 @@ def handle_events(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     """
     date_range = parse_date_range(params.get('range', '30d'))
 
-    # Validate event_type against whitelist to prevent SQL injection
-    event_type_filter = params.get('type')
-    if event_type_filter:
-        try:
-            event_type_filter = sanitize_event_type(event_type_filter)
-        except ValueError as e:
-            return cors_response(400, {'error': str(e), 'allowed_types': list(ALLOWED_EVENT_TYPES)})
-
-    type_clause = f"AND event_type = '{event_type_filter}'" if event_type_filter else ""
-
-    # Use ISO date comparison for proper cross-month-boundary filtering
-    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
-    safe_tenant = safe_sql_string(tenant_id)
-    query = f"""
-    SELECT
-        event_type,
-        COUNT(*) as count,
-        COUNT(DISTINCT session_id) as unique_sessions
-    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{safe_tenant}'
-      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-          >= DATE '{date_range['start_date_iso']}'
-      {type_clause}
-    GROUP BY event_type
-    ORDER BY count DESC
-    """
-
-    results = execute_athena_query(query)
+    # Athena removed — DynamoDB is sole source. Return empty.
+    logger.info(f"Cache miss for analytics_events — no aggregated data available")
 
     return cors_response(200, {
         'tenant_id': tenant_id,
         'range': params.get('range', '30d'),
-        'events': [
-            {
-                'type': row.get('event_type'),
-                'count': int(row.get('count', 0) or 0),
-                'unique_sessions': int(row.get('unique_sessions', 0) or 0)
-            }
-            for row in (results or [])
-        ]
+        'events': []
     })
 
 
@@ -1846,64 +1714,8 @@ def handle_funnel(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
             'source': 'cache'
         })
 
-    # Fallback to Athena (5-30s)
-    logger.info(f"Cache miss - querying Athena for analytics_funnel#{range_str}")
-
-    # Use ISO date comparison for proper cross-month-boundary filtering
-    # Defense-in-depth: apply safe_sql_string even though tenant_id is already validated
-    safe_tenant = safe_sql_string(tenant_id)
-    query = f"""
-    SELECT
-        COUNT(DISTINCT CASE WHEN event_type = 'WIDGET_OPENED' THEN session_id END) as stage1_widget_opened,
-        COUNT(DISTINCT CASE WHEN event_type = 'ACTION_CHIP_CLICKED' THEN session_id END) as stage2_chip_clicked,
-        COUNT(DISTINCT CASE WHEN event_type = 'FORM_STARTED' THEN session_id END) as stage3_form_started,
-        COUNT(DISTINCT CASE WHEN event_type = 'FORM_COMPLETED' THEN session_id END) as stage4_form_completed
-    FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
-    WHERE tenant_id = '{safe_tenant}'
-      AND CAST(CONCAT(CAST(year AS VARCHAR), '-',
-               LPAD(CAST(month AS VARCHAR), 2, '0'), '-',
-               LPAD(CAST(day AS VARCHAR), 2, '0')) AS DATE)
-          >= DATE '{date_range['start_date_iso']}'
-    """
-
-    results = execute_athena_query(query)
-
-    if results and len(results) > 0:
-        row = results[0]
-        stage1 = int(row.get('stage1_widget_opened', 0) or 0)
-        stage2 = int(row.get('stage2_chip_clicked', 0) or 0)
-        stage3 = int(row.get('stage3_form_started', 0) or 0)
-        stage4 = int(row.get('stage4_form_completed', 0) or 0)
-
-        funnel = [
-            {
-                'stage': 'Widget Opened',
-                'count': stage1,
-                'rate': 100.0
-            },
-            {
-                'stage': 'Chip Clicked',
-                'count': stage2,
-                'rate': round((stage2 / stage1 * 100) if stage1 > 0 else 0, 2)
-            },
-            {
-                'stage': 'Form Started',
-                'count': stage3,
-                'rate': round((stage3 / stage1 * 100) if stage1 > 0 else 0, 2)
-            },
-            {
-                'stage': 'Form Completed',
-                'count': stage4,
-                'rate': round((stage4 / stage1 * 100) if stage1 > 0 else 0, 2)
-            }
-        ]
-
-        return cors_response(200, {
-            'tenant_id': tenant_id,
-            'range': params.get('range', '30d'),
-            'funnel': funnel,
-            'overall_conversion': round((stage4 / stage1 * 100) if stage1 > 0 else 0, 2)
-        })
+    # Athena removed — DynamoDB is sole source. Return empty if no cache.
+    logger.info(f"Cache miss for analytics_funnel#{range_str} — no aggregated data available")
 
     return cors_response(200, {
         'tenant_id': tenant_id,
@@ -2505,69 +2317,6 @@ def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[s
             'source': 'error_fallback'
         })
 
-
-# =============================================================================
-# Athena Query Helpers
-# =============================================================================
-
-def execute_athena_query(query: str, timeout: int = 30) -> Optional[List[Dict[str, Any]]]:
-    """
-    Execute Athena query and return results as list of dicts.
-    """
-    logger.info(f"Executing Athena query: {query[:200]}...")
-
-    try:
-        # Start query execution
-        response = athena.start_query_execution(
-            QueryString=query,
-            ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_LOCATION}
-        )
-        query_id = response['QueryExecutionId']
-
-        # Wait for query to complete
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            status = athena.get_query_execution(QueryExecutionId=query_id)
-            state = status['QueryExecution']['Status']['State']
-
-            if state == 'SUCCEEDED':
-                break
-            elif state in ['FAILED', 'CANCELLED']:
-                error = status['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
-                logger.error(f"Athena query failed: {error}")
-                return None
-
-            time.sleep(0.5)
-        else:
-            logger.error("Athena query timed out")
-            return None
-
-        # Get results
-        results = athena.get_query_results(QueryExecutionId=query_id)
-
-        # Parse results into list of dicts
-        rows = results.get('ResultSet', {}).get('Rows', [])
-        if len(rows) < 2:
-            return []
-
-        # First row is headers
-        headers = [col.get('VarCharValue', '') for col in rows[0].get('Data', [])]
-
-        # Parse data rows
-        data = []
-        for row in rows[1:]:
-            row_data = {}
-            for i, col in enumerate(row.get('Data', [])):
-                if i < len(headers):
-                    row_data[headers[i]] = col.get('VarCharValue')
-            data.append(row_data)
-
-        logger.info(f"Query returned {len(data)} rows")
-        return data
-
-    except Exception as e:
-        logger.exception(f"Athena query error: {e}")
-        return None
 
 
 def parse_date_range(range_str: str, start_date_param: str = None, end_date_param: str = None) -> Dict[str, Any]:
