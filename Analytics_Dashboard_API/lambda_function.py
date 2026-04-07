@@ -115,7 +115,7 @@ CLERK_USER_MAP: Dict[str, Dict[str, Any]] = {
     'chris@myrecruiter.ai': {
         'tenant_id': 'MYR384719',
         'tenant_hash': 'my87674d777bf9',
-        'role': 'admin',
+        'role': 'super_admin',
         'name': 'Chris Miller',
         'company': 'MyRecruiter',
     }
@@ -930,15 +930,20 @@ def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
                 if not tenant_hash:
                     continue
 
-                # Read tenant config to get display name
+                # Read tenant config to get display name and active status
                 name = tenant_id  # fallback
+                active = False
                 try:
                     config_key = f'{TENANTS_PREFIX}/{tenant_id}/{tenant_id}-config.json'
                     config_resp = s3_client.get_object(Bucket=S3_CONFIG_BUCKET, Key=config_key)
                     config = json.loads(config_resp['Body'].read().decode('utf-8'))
                     name = config.get('chat_title') or config.get('organization_name') or tenant_id
+                    active = config.get('active', False)
                 except Exception:
-                    pass  # Use tenant_id as fallback name
+                    pass  # Use tenant_id as fallback name, inactive by default
+
+                if not active:
+                    continue
 
                 tenants.append({
                     'tenant_id': tenant_id,

@@ -40,8 +40,10 @@ const READ_ONLY_SECTIONS = [
 const METADATA_FIELDS = [
   'tenant_id',
   'tenant_hash',
+  'active',
   'version',
   'chat_title',
+  'organization_name',
   'company_name',
   'last_updated',
   'chat_subtitle',
