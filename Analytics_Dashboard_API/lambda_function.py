@@ -800,19 +800,11 @@ def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
 
     features = config.get('features', {})
 
-    # Derive dashboard_notifications from whether any form has notifications enabled
-    has_notifications = False
-    forms = config.get('conversational_forms', {})
-    for form_id, form in forms.items():
-        if isinstance(form, dict) and form.get('notifications', {}).get('internal', {}).get('enabled', False):
-            has_notifications = True
-            break
-
     return {
         'dashboard_conversations': features.get('dashboard_conversations', True),
         'dashboard_forms': features.get('dashboard_forms', True),
         'dashboard_attribution': features.get('dashboard_attribution', False),
-        'dashboard_notifications': features.get('dashboard_notifications', has_notifications),
+        'dashboard_notifications': features.get('dashboard_notifications', False),
         'dashboard_settings': features.get('dashboard_settings', False),
     }
 
@@ -3629,43 +3621,14 @@ def handle_notification_summary(tenant_id: str, params: Dict[str, str]) -> Dict[
         logger.error(f"DynamoDB error querying notification-events: {e}")
         return cors_response(500, {'error': 'Failed to query notification events'})
 
-    # --- Query picasso-notification-sends for sent/failed counts ---
-    sent_count = 0
-    failed_count = 0
-    try:
-        last_key = None
-        while True:
-            query_kwargs = {
-                'TableName': NOTIFICATION_SENDS_TABLE,
-                'KeyConditionExpression': 'pk = :pk AND sk >= :sk_start',
-                'ExpressionAttributeValues': {
-                    ':pk': {'S': pk},
-                    ':sk_start': {'S': start_date},
-                },
-                'ProjectionExpression': '#st',
-                'ExpressionAttributeNames': {'#st': 'status'},
-            }
-            if last_key:
-                query_kwargs['ExclusiveStartKey'] = last_key
-            resp = dynamodb.query(**query_kwargs)
-            for item in resp.get('Items', []):
-                status = item.get('status', {}).get('S', '')
-                if status == 'failed':
-                    failed_count += 1
-                else:
-                    sent_count += 1
-            last_key = resp.get('LastEvaluatedKey')
-            if not last_key:
-                break
-    except ClientError as e:
-        logger.error(f"DynamoDB error querying notification-sends: {e}")
-        return cors_response(500, {'error': 'Failed to query notification sends'})
-
+    # All counts from the single source of truth: picasso-notification-events
+    sent_count = event_counts.get('send', 0)
     delivered = event_counts.get('delivery', 0)
     bounced = event_counts.get('bounce', 0)
     complained = event_counts.get('complaint', 0)
     opened = event_counts.get('open', 0)
     clicked = event_counts.get('click', 0)
+    failed_count = event_counts.get('failed', 0)
 
     delivery_rate = round((delivered / sent_count * 100), 1) if sent_count > 0 else 0.0
     open_rate = round((opened / delivered * 100), 1) if delivered > 0 else 0.0

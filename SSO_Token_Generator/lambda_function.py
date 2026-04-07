@@ -190,23 +190,14 @@ def lambda_handler(event, context):
         if 'dashboard_attribution' in body:
             features['dashboard_attribution'] = body['dashboard_attribution']
 
-        # dashboard_notifications: caller may pass explicit override; otherwise
-        # auto-derive from whether the tenant config has any notification-enabled
-        # conversational forms (internal.enabled == true).
+        # dashboard_notifications: read from tenant config features flag (set in config builder).
+        # Caller may pass explicit override.
         if 'dashboard_notifications' in body:
             features['dashboard_notifications'] = bool(body['dashboard_notifications'])
         else:
             config = get_tenant_config(body['tenant_id'])
-            has_notifications = False
-            forms = config.get('conversational_forms', {})
-            for form_id, form in forms.items():
-                if form.get('notifications', {}).get('internal', {}).get('enabled', False):
-                    has_notifications = True
-                    break
-            features['dashboard_notifications'] = has_notifications
-            logger.info(
-                f"Auto-derived dashboard_notifications={has_notifications} "
-                f"for tenant {body['tenant_id'][:8]}..."
+            features['dashboard_notifications'] = bool(
+                config.get('features', {}).get('dashboard_notifications', False)
             )
 
         # dashboard_settings: Phase 3 placeholder — always False for now
