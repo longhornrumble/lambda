@@ -1422,8 +1422,7 @@ function getEmailSubjectSuffix(formData) {
 async function sendToBubble(bubbleConfig, formId, formData, tenantConfig, formConfig, submissionId, sessionId = null, conversationId = null) {
   const https = require('https');
 
-  const defaultWebhookUrl = 'https://hrfx.bubbleapps.io/api/1.1/wf/form_submission';
-  const webhookUrl = bubbleConfig.webhook_url || process.env.BUBBLE_WEBHOOK_URL || defaultWebhookUrl;
+  const webhookUrl = bubbleConfig.webhook_url || process.env.BUBBLE_WEBHOOK_URL;
   const apiKey = bubbleConfig.api_key || process.env.BUBBLE_API_KEY;
 
   if (!webhookUrl) {

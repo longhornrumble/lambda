@@ -838,8 +838,7 @@ class FormHandler:
 
         # Get webhook URL and API key (tenant config overrides env vars, with default fallback)
         bubble_config = self.tenant_config.get('bubble_integration', {})
-        default_webhook_url = 'https://hrfx.bubbleapps.io/api/1.1/wf/form_submission'
-        webhook_url = bubble_config.get('webhook_url') or os.environ.get('BUBBLE_WEBHOOK_URL') or default_webhook_url
+        webhook_url = bubble_config.get('webhook_url') or os.environ.get('BUBBLE_WEBHOOK_URL')
         api_key = bubble_config.get('api_key') or os.environ.get('BUBBLE_API_KEY')
 
         if not webhook_url:

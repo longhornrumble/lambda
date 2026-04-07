@@ -886,71 +886,77 @@ def handle_features(tenant_id: str) -> Dict[str, Any]:
     })
 
 
-# Bubble webhook configuration for tenant list
-BUBBLE_TENANTS_WEBHOOK_URL = 'https://hrfx.bubbleapps.io/api/1.1/wf/get_active_tenants'
-BUBBLE_API_KEY = '42912eddcbd001abdcee706cb12fd711'
+# S3 configuration for tenant list
+S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'myrecruiter-picasso')
+MAPPINGS_PREFIX = 'mappings'
+TENANTS_PREFIX = 'tenants'
+
+s3_client = boto3.client('s3')
 
 
 def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
     """
     Handle GET /admin/tenants endpoint.
     Returns list of active tenants for super_admin users.
-    Fetches from Bubble webhook (source of truth).
+    Reads from S3 mapping files (source of truth).
     """
-    # Validate super_admin role
     if user_role != 'super_admin':
         return cors_response(403, {'error': 'Forbidden: super_admin role required'})
 
     try:
-        # Call Bubble webhook
-        import urllib.request
-        import urllib.error
-
-        req = urllib.request.Request(
-            BUBBLE_TENANTS_WEBHOOK_URL,
-            method='POST',
-            headers={
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {BUBBLE_API_KEY}'
-            },
-            data=b'{}'
+        # List all mapping files
+        response = s3_client.list_objects_v2(
+            Bucket=S3_CONFIG_BUCKET,
+            Prefix=f'{MAPPINGS_PREFIX}/'
         )
 
-        with urllib.request.urlopen(req, timeout=10) as response:
-            bubble_response = json.loads(response.read().decode('utf-8'))
-
-        # Extract tenants string from Bubble response
-        tenants_str = bubble_response.get('response', {}).get('tenants', '')
-
-        if not tenants_str:
+        contents = response.get('Contents', [])
+        if not contents:
             return cors_response(200, {'tenants': []})
 
-        # Fix Bubble's JSON format: "[{...}],[{...}]" -> "[{...},{...}]"
-        # Replace "],[" with "," to merge into single array
-        fixed_json = tenants_str.replace('],[', ',')
+        tenants = []
+        for obj in contents:
+            key = obj['Key']
+            if not key.endswith('.json'):
+                continue
 
-        # Ensure it starts with [ and ends with ]
-        if not fixed_json.startswith('['):
-            fixed_json = '[' + fixed_json
-        if not fixed_json.endswith(']'):
-            fixed_json = fixed_json + ']'
+            try:
+                mapping_resp = s3_client.get_object(Bucket=S3_CONFIG_BUCKET, Key=key)
+                mapping = json.loads(mapping_resp['Body'].read().decode('utf-8'))
 
-        # Parse the fixed JSON
-        tenants = json.loads(fixed_json)
+                tenant_id = mapping.get('tenant_id', '')
+                tenant_hash = mapping.get('tenant_hash', '')
 
-        # Filter out tenants with empty tenant_hash (they won't work for API calls)
-        valid_tenants = [t for t in tenants if t.get('tenant_hash')]
+                if not tenant_hash:
+                    continue
 
-        logger.info(f"Returning {len(valid_tenants)} active tenants for super_admin")
+                # Read tenant config to get display name
+                name = tenant_id  # fallback
+                try:
+                    config_key = f'{TENANTS_PREFIX}/{tenant_id}/{tenant_id}-config.json'
+                    config_resp = s3_client.get_object(Bucket=S3_CONFIG_BUCKET, Key=config_key)
+                    config = json.loads(config_resp['Body'].read().decode('utf-8'))
+                    name = config.get('chat_title') or config.get('organization_name') or tenant_id
+                except Exception:
+                    pass  # Use tenant_id as fallback name
 
-        return cors_response(200, {'tenants': valid_tenants})
+                tenants.append({
+                    'tenant_id': tenant_id,
+                    'tenant_hash': tenant_hash,
+                    'name': name,
+                })
 
-    except urllib.error.URLError as e:
-        logger.error(f"Failed to fetch tenants from Bubble: {e}")
-        return cors_response(502, {'error': 'Failed to fetch tenant list from Bubble'})
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse Bubble response: {e}")
-        return cors_response(500, {'error': 'Invalid response from tenant service'})
+            except Exception as e:
+                logger.warning(f"Failed to read mapping {key}: {e}")
+                continue
+
+        # Sort by name
+        tenants.sort(key=lambda t: t['name'].lower())
+
+        logger.info(f"Returning {len(tenants)} tenants from S3 for super_admin")
+
+        return cors_response(200, {'tenants': tenants})
+
     except Exception as e:
         logger.exception(f"Error fetching admin tenants: {e}")
         return cors_response(500, {'error': 'Internal server error'})
