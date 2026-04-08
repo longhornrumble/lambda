@@ -49,6 +49,30 @@ function sanitizeForSMS(text, maxLength = 50) {
   return text.replace(/[^\w\s@.\-]/g, '').trim().slice(0, maxLength);
 }
 
+/**
+ * HTML-escape a string to prevent XSS in email templates.
+ * Used for tenant-controlled values (chat_title, org name) injected into HTML.
+ */
+function escapeHtml(str) {
+  if (!str || typeof str !== 'string') return '';
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/**
+ * Validate a URL is https:// only — prevents javascript: and data: URI injection.
+ */
+function isValidHttpsUrl(url) {
+  try { return url && new URL(url).protocol === 'https:'; } catch { return false; }
+}
+
+/**
+ * Sanitize a CSS value — strip semicolons and anything after them to prevent CSS injection.
+ */
+function sanitizeCssValue(val) {
+  if (!val || typeof val !== 'string') return '';
+  return val.split(';')[0].trim();
+}
+
 // Track if we've warned about SES fallback (only warn once per Lambda instance)
 let sesEmailWarningLogged = false;
 
@@ -223,13 +247,22 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     const { contact: applicantContact } = extractCanonicalContact(transformedForContact);
     const applicantEmail = applicantContact?.email;
 
+    // Applicant confirmation: per-form config takes precedence over tenant-level legacy flag.
+    // - New config (notifications.applicant_confirmation): requires enabled === true (strict boolean)
+    // - Legacy (config.send_confirmation_email): defaults to true if absent
+    // Note: strict === true check is a minor tightening from the original truthy check.
+    // In practice, the portal toggle always writes boolean true/false, so no behavioral change
+    // for any real config. But if a config had enabled: 1 or enabled: "yes", it would now
+    // be treated as disabled. This is intentional — enforce clean boolean values.
     const confirmationConfig = formConfig.notifications?.applicant_confirmation;
-    const shouldSendConfirmation = confirmationConfig
-      ? confirmationConfig.enabled && applicantEmail
-      : applicantEmail && config.send_confirmation_email !== false;
+    const shouldSendConfirmation = applicantEmail && (
+      confirmationConfig
+        ? confirmationConfig.enabled === true
+        : config.send_confirmation_email !== false
+    );
 
     if (shouldSendConfirmation) {
-      sendConfirmationEmail(applicantEmail, formId, formData, config, submissionId).catch(err => {
+      sendConfirmationEmail(applicantEmail, formId, formData, config, submissionId, sessionId).catch(err => {
         console.error('❌ Confirmation email failed:', err.message);
       });
     }
@@ -462,6 +495,11 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   // Build human-readable form data for email notifications
   const displayData = buildFormDataDisplay(formData, formConfig);
 
+  // Extract canonical contact from raw form data for template variable substitution.
+  // This runs the same pipeline as sendConfirmationEmail — field ID → label → contact fields.
+  const transformedForEmail = transformFormDataToLabels(formData, formConfig);
+  const { contact: emailContact } = extractCanonicalContact(transformedForEmail);
+
   // Check form-specific fulfillment configuration (formConfig already defined above)
   const fulfillment = formConfig.fulfillment || config.default_fulfillment || {};
 
@@ -547,7 +585,7 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
       // Use notification config for subject/body if available
       const emailSubject = internalNotif.subject || null;
       const emailBodyTemplate = internalNotif.body_template || null;
-      const sesResponse = await sendFormEmail(emailRecipients, formId, displayData, config, priority, submissionId, emailSubject, emailBodyTemplate);
+      const sesResponse = await sendFormEmail(emailRecipients, formId, displayData, config, priority, submissionId, emailSubject, emailBodyTemplate, sessionId, emailContact);
       results.push({ channel: 'email', status: 'sent', recipients: Array.isArray(emailRecipients) ? emailRecipients.length : 1 });
 
       // Audit: write one record per recipient to picasso-notification-sends
@@ -610,22 +648,60 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
     }
   }
 
-  // SMS fulfillment (notification to organization) with rate limiting
-  if (fulfillment.sms_to) {
-    try {
-      // Check SMS rate limit
-      const usage = await getMonthlySMSUsage(config.tenant_id);
-      if (usage >= SMS_MONTHLY_LIMIT) {
-        console.warn(`⚠️ SMS monthly limit reached for tenant ${config.tenant_id}: ${usage}/${SMS_MONTHLY_LIMIT}`);
-        results.push({ channel: 'sms', status: 'skipped', reason: 'monthly_limit_reached', usage: usage, limit: SMS_MONTHLY_LIMIT });
-      } else {
-        await sendFormSMS(fulfillment.sms_to, formId, formData, priority);
-        await incrementSMSUsage(config.tenant_id);
-        results.push({ channel: 'sms', status: 'sent', usage: usage + 1, limit: SMS_MONTHLY_LIMIT });
+  // SMS fulfillment via SMS_Sender Lambda (Twilio)
+  // Supports new notifications.internal.sms_recipients and legacy fulfillment.sms_to
+  const smsRecipients = internalNotif.enabled && internalNotif.channels?.sms
+    ? (internalNotif.sms_recipients || [])
+    : [];
+  const legacySmsTo = fulfillment.sms_to ? [fulfillment.sms_to] : [];
+  const allSmsRecipients = [...new Set([...smsRecipients, ...legacySmsTo])];
+
+  if (allSmsRecipients.length > 0) {
+    const usage = await getMonthlySMSUsage(config.tenant_id);
+    if (usage >= SMS_MONTHLY_LIMIT) {
+      console.warn(`⚠️ SMS monthly limit reached for tenant ${config.tenant_id}: ${usage}/${SMS_MONTHLY_LIMIT}`);
+      results.push({ channel: 'sms', status: 'skipped', reason: 'monthly_limit_reached', usage, limit: SMS_MONTHLY_LIMIT });
+    } else {
+      // Build SMS body from template or default
+      const safeName = `${sanitizeForSMS(formData.first_name, 30)} ${sanitizeForSMS(formData.last_name, 30)}`.trim();
+      const safeEmail = sanitizeForSMS(formData.email, 50);
+      const defaultSmsBody = `New ${sanitizeForSMS(formId, 30)} submission. Name: ${safeName}, Email: ${safeEmail}`;
+      const smsBody = internalNotif.sms_template
+        ? renderTemplate(internalNotif.sms_template, {
+            first_name: formData.first_name || '',
+            last_name: formData.last_name || '',
+            email: formData.email || '',
+            organization_name: config.chat_title || config.tenant_id || '',
+          })
+        : defaultSmsBody;
+
+      let smsCount = 0;
+      for (const phone of allSmsRecipients) {
+        try {
+          await lambdaClient.send(new InvokeCommand({
+            FunctionName: process.env.SMS_SENDER_FUNCTION || 'SMS_Sender',
+            InvocationType: 'Event',
+            Payload: JSON.stringify({
+              to: phone,
+              body: smsBody,
+              tenantId: config.tenant_id,
+              formId,
+              submissionId,
+              sessionId,
+              type: 'internal'
+            })
+          }));
+          smsCount++;
+          results.push({ channel: 'sms', status: 'invoked', recipient: phone });
+        } catch (error) {
+          console.error('SMS invocation failed:', error);
+          results.push({ channel: 'sms', status: 'failed', error: error.message });
+        }
       }
-    } catch (error) {
-      console.error('SMS fulfillment failed:', error);
-      results.push({ channel: 'sms', status: 'failed', error: error.message });
+      // Increment usage by actual count of SMS invoked
+      for (let i = 0; i < smsCount; i++) {
+        await incrementSMSUsage(config.tenant_id);
+      }
     }
   }
 
@@ -724,37 +800,35 @@ async function incrementSMSUsage(tenantId) {
 /**
  * Send form data via email
  */
-async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal', submissionId = 'unknown', customSubject = null, bodyTemplate = null) {
+async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal', submissionId = 'unknown', customSubject = null, bodyTemplate = null, sessionId = null, contact = null) {
   // Build human-readable form data for template substitution
   const formDataText = Object.entries(formData)
     .map(([key, value]) => `${key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}: ${value}`)
     .join('\n');
 
-  // Use custom subject with template variables if provided
+  // Build template variables from extracted contact (same pipeline as sendConfirmationEmail)
+  const capitalize = (s) => (s && typeof s === 'string') ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+  const templateVars = {
+    first_name: capitalize(contact?.first_name),
+    last_name: capitalize(contact?.last_name),
+    email: contact?.email || '',
+    phone: contact?.phone || '',
+    organization_name: config.chat_title || config.tenant_id || '',
+    form_data: formDataText,
+    form_type: formId,
+  };
+
+  // Use renderTemplate() for consistent variable substitution with cleanup
   let subject;
   if (customSubject) {
-    subject = customSubject
-      .replace('{first_name}', formData.first_name || formData.firstName || '')
-      .replace('{last_name}', formData.last_name || formData.lastName || '')
-      .replace('{email}', formData.email || formData.email_address || '')
-      .replace('{form_type}', formId)
-      .replace('{organization_name}', config.chat_title || config.tenant_id || '');
+    subject = renderTemplate(customSubject, templateVars);
   } else {
     subject = `New Form Submission: ${formId}`;
   }
 
   let htmlBody;
   if (bodyTemplate) {
-    // Use custom body template with variable substitution
-    const bodyText = bodyTemplate
-      .replace('{first_name}', formData.first_name || formData.firstName || '')
-      .replace('{last_name}', formData.last_name || formData.lastName || '')
-      .replace('{email}', formData.email || formData.email_address || '')
-      .replace('{phone}', formData.phone || formData.phone_number || '')
-      .replace('{organization_name}', config.chat_title || config.tenant_id || '')
-      .replace('{form_data}', formDataText)
-      .replace('{form_type}', formId);
-    // Convert newlines to HTML
+    const bodyText = renderTemplate(bodyTemplate, templateVars);
     htmlBody = `<div style="font-family: Arial, sans-serif; line-height: 1.6;">${bodyText.replace(/\n/g, '<br>')}</div>`;
   } else {
     // Default HTML email body
@@ -790,6 +864,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
     Message: {
       Subject: { Data: subject },
       Body: {
+        Text: { Data: formDataText },
         Html: { Data: htmlBody }
       }
     },
@@ -798,6 +873,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
       { Name: 'tenant_id', Value: String(config.tenant_id || 'unknown').slice(0, 256) },
       { Name: 'form_type', Value: String(formId || 'unknown').slice(0, 256) },
       { Name: 'submission_id', Value: String(submissionId || 'unknown').slice(0, 256) },
+      { Name: 'session_id', Value: String(sessionId || '').slice(0, 256) },
       { Name: 'email_type', Value: 'internal_notification' }
     ]
   };
@@ -817,7 +893,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
  * Template variables: {first_name}, {last_name}, {email}, {phone},
  *   {organization_name}, {form_data}
  */
-async function sendConfirmationEmail(userEmail, formId, formData, config, submissionId = 'unknown') {
+async function sendConfirmationEmail(userEmail, formId, formData, config, submissionId = 'unknown', sessionId = null) {
   const tenantName = config.chat_title || 'Organization';
   const formConfig = config.conversational_forms?.[formId] || {};
   const confirmationConfig = formConfig.notifications?.applicant_confirmation;
@@ -857,8 +933,42 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
     bodyText = `Dear Applicant,\n\nWe have received your ${formConfig.title || formId} submission to ${tenantName}.\n\nOur team will review your information and get back to you soon.\n\nIf you have any questions, please don't hesitate to contact us.\n\nBest regards,\n${tenantName} Team`;
   }
 
-  // Convert plain text body to simple HTML
-  const htmlBody = `<div>${bodyText.replace(/\n/g, '<br>')}</div>`;
+  // Build HTML email — branded if use_tenant_branding is enabled and branding config exists
+  let htmlBody;
+  const safeOrgName = escapeHtml(tenantName);
+
+  if (confirmationConfig?.use_tenant_branding !== false && config.branding) {
+    const b = config.branding;
+    const primaryColor = sanitizeCssValue(b.primary_color) || '#50C878';
+    const fontFamily = sanitizeCssValue(b.font_family) || 'Arial, sans-serif';
+    const logoUrl = isValidHttpsUrl(b.logo_url) ? b.logo_url : '';
+
+    htmlBody = `<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0; padding:0; background-color:#f4f4f4; font-family:${fontFamily}, Arial, sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f4; padding:20px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden;">
+        <tr><td style="background-color:${primaryColor}; padding:24px; text-align:center;">
+          ${logoUrl ? `<img src="${logoUrl}" alt="${safeOrgName}" style="max-height:48px; max-width:200px;">` : ''}
+          <div style="color:#ffffff; font-size:18px; font-weight:600; margin-top:${logoUrl ? '12' : '0'}px;">${safeOrgName}</div>
+        </td></tr>
+        <tr><td style="padding:32px 24px; color:#333333; font-size:15px; line-height:1.6;">
+          ${bodyText.replace(/\n/g, '<br>')}
+        </td></tr>
+        <tr><td style="padding:16px 24px; border-top:1px solid #eeeeee; color:#999999; font-size:12px; text-align:center;">
+          &copy; ${new Date().getFullYear()} ${safeOrgName}
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+  } else {
+    // No branding — bare HTML (existing behavior)
+    htmlBody = `<div>${bodyText.replace(/\n/g, '<br>')}</div>`;
+  }
 
   const params = {
     Source: getSESFromEmail(),
@@ -868,6 +978,7 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
     Message: {
       Subject: { Data: subject },
       Body: {
+        Text: { Data: bodyText },
         Html: { Data: htmlBody }
       }
     },
@@ -876,6 +987,7 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
       { Name: 'tenant_id', Value: String(config.tenant_id || 'unknown').slice(0, 256) },
       { Name: 'form_type', Value: String(formId || 'unknown').slice(0, 256) },
       { Name: 'submission_id', Value: String(submissionId || 'unknown').slice(0, 256) },
+      { Name: 'session_id', Value: String(sessionId || '').slice(0, 256) },
       { Name: 'email_type', Value: 'applicant_confirmation' }
     ]
   };
@@ -908,7 +1020,10 @@ function renderTemplate(template, variables) {
   result = result.replace(/,\s*!/g, '!');    // ",!" → "!"
   result = result.replace(/,\s*\./g, '.');   // ",." → "."
   result = result.replace(/,\s*,/g, ',');    // ",," → ","
-  return result;
+  result = result.replace(/\(\s*\)/g, '');   // "()" → remove empty parens
+  result = result.replace(/^\s*,\s*/g, '');  // leading ", " → remove
+  result = result.replace(/\s+$/gm, '');     // trailing whitespace per line
+  return result.trim();
 }
 
 /**

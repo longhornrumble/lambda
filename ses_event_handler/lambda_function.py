@@ -99,51 +99,7 @@ def lambda_handler(event, context):
                     "pre-migration email, skipping DynamoDB write"
                 )
 
-            # Write to picasso-notification-events (post-migration emails only)
-            if tenant_id:
-                try:
-                    event_type_lower = payload['event_type']
-                    message_id = payload.get('message_id') or 'unknown'
-                    iso_date = (payload.get('timestamp') or '').split('T')[0] or \
-                        __import__('datetime').datetime.utcnow().strftime('%Y-%m-%d')
-
-                    # Build event-specific detail map from existing payload keys
-                    skip_keys = {
-                        'event_type', 'message_id', 'timestamp', 'source',
-                        'destination', 'source_arn', 'source_ip',
-                        'sending_account_id', 'tags'
-                    }
-                    detail = {k: v for k, v in payload.items() if k not in skip_keys and v is not None}
-
-                    notification_events_table.put_item(Item={
-                        'pk': f'TENANT#{tenant_id}',
-                        'sk': f'{iso_date}#{event_type_lower}#{message_id}',
-                        'message_id': message_id,
-                        'event_type': event_type_lower,
-                        'channel': 'email',
-                        'destination': payload.get('destination', []),
-                        'source': payload.get('source', ''),
-                        'context': {
-                            'form_id': tags.get('form_id', ''),
-                            'submission_id': tags.get('submission_id', ''),
-                            'session_id': tags.get('session_id', ''),
-                        },
-                        'detail': detail,
-                        'tags': tags,
-                        'ttl': int(time.time()) + (90 * 24 * 3600),
-                        'event_type_timestamp': f'{event_type_lower}#{payload.get("timestamp", "")}',
-                    })
-                    logger.info(
-                        f"DynamoDB write: picasso-notification-events "
-                        f"TENANT#{tenant_id} / {event_type_lower} / {message_id}"
-                    )
-                except Exception as ddb_err:
-                    logger.error(
-                        f"Failed to write notification event to DynamoDB: {ddb_err}",
-                        exc_info=True
-                    )
-
-            # Add event-specific details
+            # Add event-specific details (MUST run before DynamoDB write so detail field is populated)
             if event_type.lower() == 'bounce':
                 bounce = sns_message.get('bounce', {})
                 payload.update({
@@ -215,6 +171,52 @@ def lambda_handler(event, context):
                     'user_agent': click.get('userAgent'),
                     'ip_address': click.get('ipAddress'),
                 })
+
+            # Write to picasso-notification-events (post-migration emails only)
+            # Runs AFTER event-specific payload updates so detail field captures
+            # bounce_type, bounce_subtype, complaint_type, etc.
+            if tenant_id:
+                try:
+                    event_type_lower = payload['event_type']
+                    message_id = payload.get('message_id') or 'unknown'
+                    iso_date = (payload.get('timestamp') or '').split('T')[0] or \
+                        __import__('datetime').datetime.utcnow().strftime('%Y-%m-%d')
+
+                    # Build event-specific detail map from payload (now includes bounce/complaint fields)
+                    skip_keys = {
+                        'event_type', 'message_id', 'timestamp', 'source',
+                        'destination', 'source_arn', 'source_ip',
+                        'sending_account_id', 'tags'
+                    }
+                    detail = {k: v for k, v in payload.items() if k not in skip_keys and v is not None}
+
+                    notification_events_table.put_item(Item={
+                        'pk': f'TENANT#{tenant_id}',
+                        'sk': f'{iso_date}#{event_type_lower}#{message_id}',
+                        'message_id': message_id,
+                        'event_type': event_type_lower,
+                        'channel': 'email',
+                        'destination': payload.get('destination', []),
+                        'source': payload.get('source', ''),
+                        'context': {
+                            'form_id': tags.get('form_id', ''),
+                            'submission_id': tags.get('submission_id', ''),
+                            'session_id': tags.get('session_id', ''),
+                        },
+                        'detail': detail,
+                        'tags': tags,
+                        'ttl': int(time.time()) + (90 * 24 * 3600),
+                        'event_type_timestamp': f'{event_type_lower}#{payload.get("timestamp", "")}',
+                    })
+                    logger.info(
+                        f"DynamoDB write: picasso-notification-events "
+                        f"TENANT#{tenant_id} / {event_type_lower} / {message_id}"
+                    )
+                except Exception as ddb_err:
+                    logger.error(
+                        f"Failed to write notification event to DynamoDB: {ddb_err}",
+                        exc_info=True
+                    )
 
             # Forward to Bubble (controlled by BUBBLE_FORWARDING_ENABLED env var)
             bubble_success = True

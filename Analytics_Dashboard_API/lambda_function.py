@@ -377,7 +377,8 @@ def lambda_handler(event, context):
             return handle_notification_template_preview(tenant_id, form_id, body, user_role)
         elif '/settings/notifications/templates/' in path and path.endswith('/test-send') and method == 'POST':
             form_id = path.split('/settings/notifications/templates/')[1].split('/test-send')[0]
-            return handle_notification_template_test_send(tenant_id, form_id, user_email, user_role)
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_notification_template_test_send(tenant_id, form_id, user_email, user_role, body)
         elif '/settings/notifications/templates/' in path and method == 'PATCH':
             form_id = path.split('/settings/notifications/templates/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
@@ -3747,6 +3748,21 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
                 message_id = sk_parts[2] if len(sk_parts) >= 3 else ''
                 timestamp = item.get('sk', {}).get('S', '').split('#')[0] if sk else ''
 
+                # Extract event-specific detail (bounce_type, complaint_type, etc.)
+                detail_raw = item.get('detail', {}).get('M', {})
+                detail = {}
+                for k, v in detail_raw.items():
+                    if 'S' in v:
+                        detail[k] = v['S']
+                    elif 'N' in v:
+                        detail[k] = v['N']
+                    elif 'BOOL' in v:
+                        detail[k] = v['BOOL']
+                    elif 'L' in v:
+                        detail[k] = [
+                            li.get('S', '') for li in v['L'] if 'S' in li
+                        ]
+
                 all_events.append({
                     'timestamp': timestamp,
                     'event_type': event_type,
@@ -3755,6 +3771,7 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
                     'form_id': form_id,
                     'status': event_type,
                     'message_id': message_id,
+                    'detail': detail,
                 })
             last_key = resp.get('LastEvaluatedKey')
             if not last_key:
@@ -3900,6 +3917,75 @@ def _build_sample_vars(config: Optional[Dict[str, Any]]) -> Dict[str, str]:
     if config:
         sample['organization_name'] = config.get('chat_title', '')
     return sample
+
+
+# SOURCE OF TRUTH: form_handler.js sendConfirmationEmail() in Bedrock_Streaming_Handler_Staging
+# If the production template changes, this function must be updated to match.
+# Last synced: R1.2 (2026-04)
+def _build_branded_html(body_text: str, config: Dict[str, Any]) -> str:
+    """
+    Wrap rendered body text in branded HTML email template.
+    Matches the production template in form_handler.js sendConfirmationEmail().
+
+    Returns bare HTML div if no branding config exists.
+    """
+    import html as html_module
+
+    branding = config.get('branding', {})
+    if not branding:
+        return f'<div>{body_text.replace(chr(10), "<br>")}</div>'
+
+    primary_color = branding.get('primary_color', '#50C878')
+    font_family = branding.get('font_family', 'Arial, sans-serif')
+    logo_url = branding.get('logo_url', '')
+    org_name = html_module.escape(config.get('chat_title', 'Organization'))
+
+    # Validate logo URL is https
+    if logo_url and not logo_url.startswith('https://'):
+        logo_url = ''
+
+    # Sanitize CSS values
+    primary_color = primary_color.split(';')[0].strip()
+    font_family = font_family.split(';')[0].strip()
+
+    logo_html = (
+        f'<img src="{logo_url}" alt="{org_name}" style="max-height:48px; max-width:200px;">'
+        if logo_url else ''
+    )
+    logo_margin = '12' if logo_url else '0'
+
+    from datetime import datetime
+    year = datetime.utcnow().year
+
+    body_html = body_text.replace('\n', '<br>')
+
+    return f'''<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+<body style="margin:0; padding:0; background-color:#f4f4f4; font-family:{font_family}, Arial, sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#f4f4f4; padding:20px 0;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff; border-radius:8px; overflow:hidden;">
+        <tr><td style="background-color:{primary_color}; padding:24px; text-align:center;">
+          {logo_html}
+          <div style="color:#ffffff; font-size:18px; font-weight:600; margin-top:{logo_margin}px;">{org_name}</div>
+        </td></tr>
+        <tr><td style="padding:32px 24px; color:#333333; font-size:15px; line-height:1.6;">
+          {body_html}
+        </td></tr>
+        <tr><td style="padding:16px 24px; border-top:1px solid #eeeeee; color:#999999; font-size:12px; text-align:center;">
+          &copy; {year} {org_name}
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>'''
+
+
+def _build_simple_html(body_text: str) -> str:
+    """Simple styled HTML for internal notification test-sends (no branding)."""
+    return f'<div style="font-family: Arial, sans-serif; line-height: 1.6;">{body_text.replace(chr(10), "<br>")}</div>'
 
 
 def _deep_merge(base: dict, updates: dict) -> dict:
@@ -4069,6 +4155,17 @@ def handle_settings_notifications_patch(
     if not re.match(r'^[A-Za-z0-9_-]+$', form_id):
         return cors_response(400, {'error': 'Invalid form_id format'})
 
+    # Validate sms_recipients phone numbers are E.164 format
+    sms_recipients = (notifications.get('internal') or {}).get('sms_recipients')
+    if sms_recipients is not None:
+        if not isinstance(sms_recipients, list):
+            return cors_response(400, {'error': 'sms_recipients must be an array'})
+        for phone in sms_recipients:
+            if not isinstance(phone, str) or not re.match(r'^\+1\d{10}$', phone):
+                return cors_response(400, {
+                    'error': f'Invalid phone number format: {phone}. Must be E.164 US format (e.g. +15125551234)'
+                })
+
     logger.info(
         f"[settings/notifications] PATCH "
         f"tenant={redact_tenant_id(tenant_id)} form={form_id}"
@@ -4152,6 +4249,7 @@ def handle_notification_recipients_test_send(
                 'Subject': {'Data': f'[TEST] {subject}', 'Charset': 'UTF-8'},
                 'Body': {
                     'Text': {'Data': body_text, 'Charset': 'UTF-8'},
+                    'Html': {'Data': _build_simple_html(body_text), 'Charset': 'UTF-8'},
                 },
             },
         )
@@ -4308,11 +4406,12 @@ def handle_notification_template_preview(
     rendered_subject = render_template(subject_tpl, sample)
     rendered_body = render_template(body_tpl, sample)
 
-    # Convert plain-text body to minimal HTML for frontend preview
-    html_lines = rendered_body.replace('\r\n', '\n').replace('\r', '\n').split('\n')
-    html_body = '<div>' + '<br>'.join(
-        line if line.strip() else '' for line in html_lines
-    ) + '</div>'
+    # Build HTML preview matching production rendering for this template type
+    if template_type == 'applicant_confirmation':
+        use_branding = notif.get('use_tenant_branding', True)
+        html_body = _build_branded_html(rendered_body, config) if use_branding else _build_simple_html(rendered_body)
+    else:
+        html_body = _build_simple_html(rendered_body)
 
     logger.info(
         f"[settings/notifications/templates/preview] "
@@ -4335,12 +4434,16 @@ def handle_notification_template_test_send(
     form_id: str,
     user_email: str,
     user_role: Optional[str],
+    body: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     POST /settings/notifications/templates/{form_id}/test-send
 
     Sends a test email to the currently authenticated user's address using
-    the form's internal template filled with sample data.
+    the form's template filled with sample data.
+
+    Body (optional): { "template_type": "internal" | "applicant_confirmation" }
+    Defaults to "internal" if not specified.
     """
     role_error = _require_write_role(user_role)
     if role_error:
@@ -4352,6 +4455,11 @@ def handle_notification_template_test_send(
     if not user_email or user_email == 'unknown' or '@' not in user_email:
         return cors_response(400, {'error': 'Authenticated user email is missing or invalid'})
 
+    body = body or {}
+    template_type = body.get('template_type', 'internal')
+    if template_type not in ('internal', 'applicant_confirmation'):
+        return cors_response(400, {'error': 'template_type must be "internal" or "applicant_confirmation"'})
+
     config = get_tenant_config(tenant_id)
     if not config:
         return cors_response(404, {'error': 'Tenant configuration not found'})
@@ -4360,18 +4468,30 @@ def handle_notification_template_test_send(
     if form_id not in forms:
         return cors_response(404, {'error': f"Form '{form_id}' not found"})
 
-    notif = forms[form_id].get('notifications', {}).get('internal', {})
-    subject_tpl = notif.get('subject', f'[Test] Notification from {form_id}')
-    body_tpl = notif.get('body_template', 'This is a test notification.\n\n{form_data}')
+    form_notif = forms[form_id].get('notifications', {})
+    if template_type == 'applicant_confirmation':
+        tpl_config = form_notif.get('applicant_confirmation', {})
+    else:
+        tpl_config = form_notif.get('internal', {})
+
+    subject_tpl = tpl_config.get('subject', f'[Test] Notification from {form_id}')
+    body_tpl = tpl_config.get('body_template', 'This is a test notification.\n\n{form_data}')
 
     sample = _build_sample_vars(config)
     subject = render_template(subject_tpl, sample)
     body_text = render_template(body_tpl, sample)
 
+    # Build HTML matching production rendering for this template type
+    if template_type == 'applicant_confirmation':
+        use_branding = tpl_config.get('use_tenant_branding', True)
+        html_body = _build_branded_html(body_text, config) if use_branding else _build_simple_html(body_text)
+    else:
+        html_body = _build_simple_html(body_text)
+
     logger.info(
         f"[settings/notifications/templates/test-send] "
         f"tenant={redact_tenant_id(tenant_id)} form={form_id} "
-        f"to={redact_email(user_email)}"
+        f"type={template_type} to={redact_email(user_email)}"
     )
 
     try:
@@ -4382,6 +4502,7 @@ def handle_notification_template_test_send(
                 'Subject': {'Data': f'[TEST] {subject}', 'Charset': 'UTF-8'},
                 'Body': {
                     'Text': {'Data': body_text, 'Charset': 'UTF-8'},
+                    'Html': {'Data': html_body, 'Charset': 'UTF-8'},
                 },
             },
         )

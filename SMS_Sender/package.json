@@ -1,0 +1,15 @@
+{
+  "name": "sms-sender",
+  "version": "1.0.0",
+  "description": "Telnyx SMS sender Lambda — shared service for notifications and scheduling",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "package": "rm -f deployment.zip && npm ci --production && zip -r deployment.zip . -x '*.test.*' -x '__tests__/*'"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0"
+  }
+}

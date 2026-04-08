@@ -1,0 +1,14 @@
+{
+  "name": "sms-webhook-handler",
+  "version": "1.0.0",
+  "description": "Telnyx delivery status webhook handler — writes SMS events to picasso-notification-events",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "package": "rm -f deployment.zip && npm ci --production && zip -r deployment.zip . -x '*.test.*' -x '__tests__/*'"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0"
+  }
+}
