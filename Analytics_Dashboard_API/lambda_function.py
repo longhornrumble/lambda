@@ -92,24 +92,13 @@ NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-n
 S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
 
 # =============================================================================
-# Clerk Authentication Bridge (Trial — hardcoded user map)
+# Clerk Authentication Bridge (Clerk Organizations)
 # =============================================================================
 # JWKS URL: move to env var CLERK_JWKS_URL for production.
 CLERK_JWKS_URL = os.environ.get(
     'CLERK_JWKS_URL',
     'https://capable-peacock-51.clerk.accounts.dev/.well-known/jwks.json'
 )
-
-# Hardcoded user map for trial — replace with DynamoDB lookup in production.
-CLERK_USER_MAP: Dict[str, Dict[str, Any]] = {
-    'chris@myrecruiter.ai': {
-        'tenant_id': 'MYR384719',
-        'tenant_hash': 'my87674d777bf9',
-        'role': 'super_admin',
-        'name': 'Chris Miller',
-        'company': 'MyRecruiter',
-    }
-}
 
 # JWKS cache (TTL: 1 hour)
 _clerk_jwks_cache: Optional[Dict[str, Any]] = None
@@ -803,16 +792,7 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
             }
     except ValueError as exc:
         logger.warning(f'[clerk-auth] Org lookup failed: {exc}')
-
-    # Fallback to CLERK_USER_MAP during transition (remove after org migration complete)
-    if not user_info:
-        fallback = CLERK_USER_MAP.get(email)
-        if fallback:
-            logger.info(f'[clerk-auth] Using CLERK_USER_MAP fallback for {redact_email(email)}')
-            user_info = fallback
-        else:
-            logger.warning(f'[clerk-auth] No org membership and no fallback for {redact_email(email)}')
-            return cors_response(403, {'error': 'User not registered — no organization membership found'})
+        return cors_response(403, {'error': f'Authentication failed: {exc}'})
 
     # Step 5 — Load feature flags from S3 tenant config
     features = get_tenant_features(user_info['tenant_id'])
