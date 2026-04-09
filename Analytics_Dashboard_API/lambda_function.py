@@ -132,6 +132,16 @@ _jwt_secret_cache = None
 _jwt_secret_cache_time = 0
 JWT_SECRET_CACHE_TTL = 300  # 5 minutes
 
+# Cache for Clerk user profiles (TTL: 5 minutes)
+_clerk_user_cache: Dict[str, Dict[str, Any]] = {}
+_clerk_user_cache_time: Dict[str, float] = {}
+CLERK_USER_CACHE_TTL = 300  # 5 minutes
+
+# Cache for Clerk org memberships (TTL: 5 minutes)
+_org_membership_cache: Dict[str, list] = {}
+_org_membership_cache_time: Dict[str, float] = {}
+ORG_MEMBERSHIP_CACHE_TTL = 300  # 5 minutes
+
 
 # Security: Tenant ID validation pattern (alphanumeric, underscore, hyphen only)
 TENANT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
@@ -491,6 +501,66 @@ def _decode_clerk_jwt_claims(token: str) -> Dict[str, Any]:
     return payload
 
 
+def _fetch_clerk_user(user_id: str) -> Dict[str, Any]:
+    """
+    Fetch a Clerk user profile by user ID, with 5-minute cache.
+    Returns the full user object from Clerk Backend API.
+    Raises ValueError if CLERK_SECRET_KEY is missing or API call fails.
+    """
+    global _clerk_user_cache, _clerk_user_cache_time
+
+    # Check cache
+    now = time.time()
+    if user_id in _clerk_user_cache:
+        if now - _clerk_user_cache_time.get(user_id, 0) < CLERK_USER_CACHE_TTL:
+            return _clerk_user_cache[user_id]
+
+    clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
+    if not clerk_secret:
+        raise ValueError('No CLERK_SECRET_KEY env var — cannot fetch user from Clerk API')
+
+    clerk_url = f'https://api.clerk.com/v1/users/{user_id}'
+    logger.info(f'[clerk-auth] Fetching user from {clerk_url}')
+    req = urllib.request.Request(
+        clerk_url,
+        headers={
+            'Authorization': f'Bearer {clerk_secret}',
+            'User-Agent': 'MyRecruiter-Portal/1.0',
+            'Accept': 'application/json',
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            user_data = json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        raise ValueError(f'Failed to fetch user from Clerk API: {e}')
+
+    # Cache the result
+    _clerk_user_cache[user_id] = user_data
+    _clerk_user_cache_time[user_id] = now
+
+    return user_data
+
+
+def _extract_email_from_clerk_user(user_data: Dict[str, Any]) -> str:
+    """Extract the primary email address from a Clerk user object."""
+    email_addresses = user_data.get('email_addresses', [])
+    for addr in email_addresses:
+        if addr.get('id') == user_data.get('primary_email_address_id'):
+            return addr['email_address'].lower().strip()
+    if email_addresses:
+        return email_addresses[0]['email_address'].lower().strip()
+    raise ValueError('Clerk user has no email addresses')
+
+
+def _extract_name_from_clerk_user(user_data: Dict[str, Any]) -> Optional[str]:
+    """Extract display name from a Clerk user object."""
+    first = user_data.get('first_name') or ''
+    last = user_data.get('last_name') or ''
+    name = f'{first} {last}'.strip()
+    return name if name else None
+
+
 def _extract_clerk_email(payload: Dict[str, Any]) -> str:
     """
     Extract email from verified Clerk JWT payload.
@@ -506,36 +576,127 @@ def _extract_clerk_email(payload: Dict[str, Any]) -> str:
     if primary and isinstance(primary, str) and '@' in primary:
         return primary.lower().strip()
 
-    # Fallback: fetch email from Clerk Backend API using sub (user ID)
+    # Fallback: fetch from Clerk Backend API using sub (user ID)
     user_id = payload.get('sub')
-    if user_id:
-        clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
-        if clerk_secret:
-            try:
-                clerk_url = f'https://api.clerk.com/v1/users/{user_id}'
-                logger.info(f'[clerk-auth] Fetching user from {clerk_url}')
-                req = urllib.request.Request(
-                    clerk_url,
-                    headers={
-                        'Authorization': f'Bearer {clerk_secret}',
-                        'User-Agent': 'MyRecruiter-Portal/1.0',
-                        'Accept': 'application/json',
-                    }
-                )
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    user_data = json.loads(resp.read().decode('utf-8'))
-                    email_addresses = user_data.get('email_addresses', [])
-                    for addr in email_addresses:
-                        if addr.get('id') == user_data.get('primary_email_address_id'):
-                            return addr['email_address'].lower().strip()
-                    if email_addresses:
-                        return email_addresses[0]['email_address'].lower().strip()
-            except Exception as e:
-                logger.warning(f'[clerk-auth] Failed to fetch user from Clerk API: {e}')
-        else:
-            logger.warning('[clerk-auth] No CLERK_SECRET_KEY env var — cannot fetch user email from Clerk API')
+    if not user_id:
+        raise ValueError('Could not determine email — no sub claim in JWT')
 
-    raise ValueError('Could not determine email — add CLERK_SECRET_KEY env var or customize Clerk JWT template to include email claim')
+    user_data = _fetch_clerk_user(user_id)
+    return _extract_email_from_clerk_user(user_data)
+
+
+def _fetch_user_org_memberships(user_id: str) -> list:
+    """
+    Fetch a Clerk user's organization memberships, with 5-minute cache.
+    Returns the list of membership objects from Clerk Backend API.
+    """
+    global _org_membership_cache, _org_membership_cache_time
+
+    # Check cache
+    now = time.time()
+    if user_id in _org_membership_cache:
+        if now - _org_membership_cache_time.get(user_id, 0) < ORG_MEMBERSHIP_CACHE_TTL:
+            return _org_membership_cache[user_id]
+
+    clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
+    if not clerk_secret:
+        raise ValueError('No CLERK_SECRET_KEY env var — cannot fetch org memberships')
+
+    clerk_url = f'https://api.clerk.com/v1/users/{user_id}/organization_memberships'
+    logger.info(f'[clerk-auth] Fetching org memberships from {clerk_url}')
+    req = urllib.request.Request(
+        clerk_url,
+        headers={
+            'Authorization': f'Bearer {clerk_secret}',
+            'User-Agent': 'MyRecruiter-Portal/1.0',
+            'Accept': 'application/json',
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            response_data = json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        raise ValueError(f'Failed to fetch org memberships from Clerk API: {e}')
+
+    memberships = response_data.get('data', [])
+
+    # Cache the result
+    _org_membership_cache[user_id] = memberships
+    _org_membership_cache_time[user_id] = now
+
+    return memberships
+
+
+def _resolve_org_tenant(user_id: str, requested_org_id: Optional[str]) -> Dict[str, Any]:
+    """
+    Resolve a Clerk user's active organization to Picasso tenant info.
+
+    Args:
+        user_id: Clerk user ID (sub claim)
+        requested_org_id: org ID from frontend (or None for auto-select)
+
+    Returns dict with: tenant_id, tenant_hash, role, company
+
+    Raises ValueError if user has no orgs, requested org not found,
+    or org missing tenant metadata.
+    """
+    memberships = _fetch_user_org_memberships(user_id)
+
+    if not memberships:
+        raise ValueError('User has no organization memberships')
+
+    is_multi_org = len(memberships) > 1
+
+    # Find the target membership
+    if requested_org_id:
+        membership = None
+        for m in memberships:
+            org = m.get('organization', {})
+            if org.get('id') == requested_org_id:
+                membership = m
+                break
+        if not membership:
+            raise ValueError(f'User is not a member of organization {requested_org_id}')
+    elif len(memberships) == 1:
+        membership = memberships[0]
+    else:
+        raise ValueError('org_id required — user belongs to multiple organizations')
+
+    # Extract org metadata
+    org = membership.get('organization', {})
+    public_metadata = org.get('public_metadata', {})
+    tenant_id = public_metadata.get('tenant_id')
+    tenant_hash = public_metadata.get('tenant_hash')
+
+    if not tenant_id or not tenant_hash:
+        org_name = org.get('name', org.get('id', 'unknown'))
+        raise ValueError(
+            f'Organization "{org_name}" is not configured for Picasso access '
+            f'(missing tenant_id or tenant_hash in publicMetadata)'
+        )
+
+    # Map Clerk org role to Picasso role
+    clerk_role = membership.get('role', '')
+    if is_multi_org:
+        role = 'super_admin'
+    elif clerk_role == 'org:admin':
+        role = 'admin'
+    else:
+        role = 'member'
+
+    company = org.get('name', '')
+
+    logger.info(
+        f'[clerk-auth] Resolved org {org.get("id")} → '
+        f'tenant={tenant_id} role={role} company={company}'
+    )
+
+    return {
+        'tenant_id': tenant_id,
+        'tenant_hash': tenant_hash,
+        'role': role,
+        'company': company,
+    }
 
 
 def _sign_internal_jwt(payload: Dict[str, Any]) -> str:
@@ -560,7 +721,7 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
     POST /auth/clerk
     Exchange a Clerk session token for an internal Picasso JWT.
 
-    Request body: { "clerk_token": "<Clerk session JWT>" }
+    Request body: { "clerk_token": "<Clerk session JWT>", "org_id": "<optional Clerk org ID>" }
     Response 200: { "token": "<internal Picasso JWT>" }
     Response 400: { "error": "..." }   — bad request / missing token
     Response 403: { "error": "User not registered" }
@@ -576,12 +737,41 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning('[clerk-auth] Request missing clerk_token')
         return cors_response(400, {'error': 'clerk_token is required'})
 
+    org_id = body.get('org_id', '').strip() or None
+
     try:
         # Step 1 — Verify Clerk JWT claims and kid against JWKS
         claims = _decode_clerk_jwt_claims(clerk_token)
+        user_id = claims.get('sub')
 
-        # Step 2 — Extract email
-        email = _extract_clerk_email(claims)
+        # Step 2 — Fetch user profile (email + name) from Clerk API
+        email = None
+        name = None
+        user_data = None
+
+        # Try JWT claims first for email
+        jwt_email = claims.get('email')
+        if jwt_email and isinstance(jwt_email, str) and '@' in jwt_email:
+            email = jwt_email.lower().strip()
+
+        if not email:
+            jwt_primary = claims.get('primary_email_address')
+            if jwt_primary and isinstance(jwt_primary, str) and '@' in jwt_primary:
+                email = jwt_primary.lower().strip()
+
+        # Fetch full user profile for email (if not in JWT) and name
+        if user_id:
+            try:
+                user_data = _fetch_clerk_user(user_id)
+                if not email:
+                    email = _extract_email_from_clerk_user(user_data)
+                name = _extract_name_from_clerk_user(user_data)
+            except ValueError as exc:
+                logger.warning(f'[clerk-auth] Failed to fetch Clerk user: {exc}')
+
+        if not email:
+            raise ValueError('Could not determine email from JWT claims or Clerk API')
+
         logger.info(f'[clerk-auth] Verified Clerk token for {redact_email(email)}')
 
     except ValueError as exc:
@@ -591,13 +781,35 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f'[clerk-auth] Upstream error during token validation: {exc}')
         return cors_response(500, {'error': 'Authentication service unavailable'})
 
-    # Step 3 — Authorise against user map
-    user_info = CLERK_USER_MAP.get(email)
-    if not user_info:
-        logger.warning(f'[clerk-auth] Unregistered user: {redact_email(email)}')
-        return cors_response(403, {'error': 'User not registered'})
+    # Step 3 — Resolve tenant via Clerk Organization membership
+    user_info = None
+    try:
+        if user_id:
+            org_info = _resolve_org_tenant(user_id, org_id)
+            user_info = {
+                'tenant_id': org_info['tenant_id'],
+                'tenant_hash': org_info['tenant_hash'],
+                'role': org_info['role'],
+                'name': name,
+                'company': org_info['company'],
+            }
+    except ValueError as exc:
+        logger.warning(f'[clerk-auth] Org lookup failed: {exc}')
 
-    # Step 4 — Build and sign internal Picasso JWT
+    # Fallback to CLERK_USER_MAP during transition (remove after org migration complete)
+    if not user_info:
+        fallback = CLERK_USER_MAP.get(email)
+        if fallback:
+            logger.info(f'[clerk-auth] Using CLERK_USER_MAP fallback for {redact_email(email)}')
+            user_info = fallback
+        else:
+            logger.warning(f'[clerk-auth] No org membership and no fallback for {redact_email(email)}')
+            return cors_response(403, {'error': 'User not registered — no organization membership found'})
+
+    # Step 4 — Load feature flags from S3 tenant config
+    features = get_tenant_features(user_info['tenant_id'])
+
+    # Step 5 — Build and sign internal Picasso JWT
     try:
         issued_at = int(time.time())
         internal_payload = {
@@ -605,17 +817,11 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
             'tenant_hash': user_info['tenant_hash'],
             'email': email,
             'role': user_info['role'],
-            'name': user_info.get('name'),
+            'name': user_info.get('name') or name,
             'company': user_info.get('company'),
             'iat': issued_at,
             'exp': issued_at + 7200,  # 2 hours
-            'features': {
-                'dashboard_conversations': True,
-                'dashboard_forms': True,
-                'dashboard_attribution': True,
-                'dashboard_notifications': True,
-                'dashboard_settings': False,
-            },
+            'features': features,
         }
 
         internal_token = _sign_internal_jwt(internal_payload)
@@ -627,7 +833,7 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
     elapsed_ms = int((time.time() - start) * 1000)
     logger.info(
         f'[clerk-auth] Issued internal JWT for {redact_email(email)} '
-        f'tenant={user_info["tenant_id"]} latency={elapsed_ms}ms'
+        f'tenant={user_info["tenant_id"]} role={user_info["role"]} latency={elapsed_ms}ms'
     )
 
     return cors_response(200, {'token': internal_token})
