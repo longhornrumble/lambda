@@ -390,6 +390,35 @@ def lambda_handler(event, context):
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_settings_notifications_patch(tenant_id, body, user_role)
 
+        # =================================================================
+        # Team Management endpoints (Phase 3)
+        # tenant_id passed separately because it may be overridden for super_admin
+        # =================================================================
+        elif path.endswith('/team/members') and method == 'GET':
+            return handle_team_members_list(auth_result, tenant_id)
+        elif path.endswith('/team/invite') and method == 'POST':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_team_invite(auth_result, tenant_id, body)
+        elif path.endswith('/team/invitations') and method == 'GET':
+            return handle_team_invitations_list(auth_result, tenant_id)
+        elif '/team/invitations/' in path and path.endswith('/revoke') and method == 'POST':
+            invitation_id = path.split('/team/invitations/')[1].split('/revoke')[0]
+            return handle_team_invitation_revoke(auth_result, tenant_id, invitation_id)
+        elif '/team/members/' in path and method == 'PATCH':
+            membership_id = path.split('/team/members/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_team_member_update(auth_result, tenant_id, membership_id, body)
+        elif '/team/members/' in path and method == 'DELETE':
+            membership_id = path.split('/team/members/')[1].split('/')[0]
+            return handle_team_member_remove(auth_result, tenant_id, membership_id)
+
+        # Profile endpoints (Phase 3)
+        elif path.endswith('/profile') and method == 'GET':
+            return handle_profile_get(auth_result)
+        elif path.endswith('/profile') and method == 'PATCH':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_profile_update(auth_result, body)
+
         else:
             return cors_response(404, {'error': f'Unknown endpoint: {path}'})
 
@@ -649,7 +678,10 @@ def _resolve_org_tenant(user_id: str, requested_org_id: Optional[str]) -> Dict[s
     elif len(memberships) == 1:
         membership = memberships[0]
     else:
-        raise ValueError('org_id required — user belongs to multiple organizations')
+        raise ValueError(
+            'Access denied — your account belongs to multiple organizations. '
+            'Contact your administrator to resolve this.'
+        )
 
     # Extract org metadata
     org = membership.get('organization', {})
@@ -685,7 +717,130 @@ def _resolve_org_tenant(user_id: str, requested_org_id: Optional[str]) -> Dict[s
         'tenant_hash': tenant_hash,
         'role': role,
         'company': company,
+        'org_id': org.get('id'),
     }
+
+
+# =============================================================================
+# Clerk Backend API helpers (Phase 3 — Team Management)
+# =============================================================================
+
+def _clerk_api_request(method: str, path: str, body: Optional[dict] = None) -> dict:
+    """
+    Make an authenticated request to the Clerk Backend API.
+    path: e.g. '/v1/organizations/{org_id}/memberships'
+    Returns parsed JSON response.
+    Raises ValueError on errors.
+    """
+    clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
+    if not clerk_secret:
+        raise ValueError('No CLERK_SECRET_KEY env var')
+
+    url = f'https://api.clerk.com{path}'
+    # Always send a body for POST/PATCH/DELETE so Content-Type header is included
+    if body:
+        data = json.dumps(body).encode('utf-8')
+    elif method in ('POST', 'PATCH', 'DELETE'):
+        data = b'{}'
+    else:
+        data = None
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            'Authorization': f'Bearer {clerk_secret}',
+            'Content-Type': 'application/json',
+            'User-Agent': 'MyRecruiter-Portal/1.0',
+            'Accept': 'application/json',
+        }
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp_body = resp.read().decode('utf-8')
+            return json.loads(resp_body) if resp_body else {}
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8') if e.fp else ''
+        try:
+            error_data = json.loads(error_body)
+        except (json.JSONDecodeError, ValueError):
+            error_data = {'message': error_body}
+        raise ValueError(f'Clerk API {method} {path} returned {e.code}: {json.dumps(error_data)}')
+    except Exception as e:
+        raise ValueError(f'Clerk API {method} {path} failed: {e}')
+
+
+def _clerk_role_to_portal(clerk_role: str) -> str:
+    """Map Clerk org role to portal role."""
+    return 'admin' if clerk_role == 'org:admin' else 'member'
+
+
+def _portal_role_to_clerk(portal_role: str) -> str:
+    """Map portal role to Clerk org role."""
+    return 'org:admin' if portal_role == 'admin' else 'org:member'
+
+
+# Cache for tenant_id → org_id mapping (TTL: 5 minutes)
+_tenant_org_cache: Dict[str, str] = {}
+_tenant_org_cache_time: Dict[str, float] = {}
+TENANT_ORG_CACHE_TTL = 300
+
+
+def _find_org_id_by_tenant_id(tenant_id: str) -> Optional[str]:
+    """
+    Look up the Clerk org_id for a given tenant_id by searching org publicMetadata.
+    Uses CLERK_SECRET_KEY for full backend access (no membership required).
+    Returns org_id or None if not found. Results cached for 5 minutes.
+    """
+    now = time.time()
+    if tenant_id in _tenant_org_cache:
+        if now - _tenant_org_cache_time.get(tenant_id, 0) < TENANT_ORG_CACHE_TTL:
+            return _tenant_org_cache[tenant_id]
+
+    try:
+        # List all orgs — Clerk doesn't support metadata search, so we filter client-side
+        data = _clerk_api_request('GET', '/v1/organizations?limit=100')
+        for org in data.get('data', []):
+            org_tenant = org.get('public_metadata', {}).get('tenant_id')
+            org_id = org.get('id')
+            if org_tenant and org_id:
+                # Cache every org we see
+                _tenant_org_cache[org_tenant] = org_id
+                _tenant_org_cache_time[org_tenant] = now
+
+        return _tenant_org_cache.get(tenant_id)
+    except ValueError as exc:
+        logger.error(f'[team] Failed to list orgs for tenant lookup: {exc}')
+        return None
+
+
+def _resolve_team_org_id(auth_result: Dict[str, Any], tenant_id: str) -> tuple:
+    """
+    Resolve the Clerk org_id for team operations.
+
+    For regular users: uses org_id from JWT (they're in one org).
+    For super_admin or when JWT org_id doesn't match the active tenant:
+      looks up org_id from tenant_id using CLERK_SECRET_KEY (full backend access).
+
+    Returns (org_id, error_response). If error_response is not None, return it.
+    """
+    jwt_org_id = auth_result.get('org_id')
+    jwt_tenant_id = auth_result.get('tenant_id', '')
+
+    # If the active tenant matches the JWT tenant, use the JWT org_id directly
+    if jwt_org_id and tenant_id == jwt_tenant_id:
+        return jwt_org_id, None
+
+    # Otherwise (super_admin with override, or mismatched tenant), look up dynamically
+    org_id = _find_org_id_by_tenant_id(tenant_id)
+    if not org_id:
+        return None, cors_response(404, {
+            'error': f'No Clerk Organization found for tenant {tenant_id}'
+        })
+
+    return org_id, None
 
 
 def _sign_internal_jwt(payload: Dict[str, Any]) -> str:
@@ -803,6 +958,8 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
         internal_payload = {
             'tenant_id': user_info['tenant_id'],
             'tenant_hash': user_info['tenant_hash'],
+            'org_id': user_info.get('org_id'),
+            'clerk_user_id': user_id,
             'email': email,
             'role': user_info['role'],
             'name': user_info.get('name') or name,
@@ -860,7 +1017,14 @@ def authenticate_request(event: Dict[str, Any]) -> Dict[str, Any]:
         raw_role = payload.get('role', '')
         role = raw_role.lower().replace(' ', '_') if raw_role else None
 
-        return {'success': True, 'tenant_id': tenant_id, 'email': email, 'role': role}
+        return {
+            'success': True,
+            'tenant_id': tenant_id,
+            'email': email,
+            'role': role,
+            'org_id': payload.get('org_id'),
+            'clerk_user_id': payload.get('clerk_user_id'),
+        }
 
     except Exception as e:
         logger.warning(f"JWT validation failed: {e}")
@@ -4710,3 +4874,396 @@ def handle_notification_template_test_send(
         f"message_id={message_id} to={redact_email(user_email)}"
     )
     return cors_response(200, {'success': True, 'message_id': message_id})
+
+
+# =============================================================================
+# Team Management Handlers (Phase 3)
+# =============================================================================
+
+def handle_team_members_list(auth_result: Dict[str, Any], tenant_id: str) -> Dict[str, Any]:
+    """GET /team/members — List organization members."""
+    org_id, err = _resolve_team_org_id(auth_result, tenant_id)
+    if err:
+        return err
+
+    user_role = auth_result.get('role')
+
+    try:
+        data = _clerk_api_request('GET', f'/v1/organizations/{org_id}/memberships?limit=100')
+    except ValueError as exc:
+        logger.error(f'[team] Failed to list members: {exc}')
+        return cors_response(502, {'error': 'Failed to fetch team members'})
+
+    members = []
+    admin_count = 0
+    for m in data.get('data', []):
+        clerk_role = m.get('role', '')
+        portal_role = _clerk_role_to_portal(clerk_role)
+        if portal_role == 'admin':
+            admin_count += 1
+
+        user_data = m.get('public_user_data', {})
+        first = user_data.get('first_name') or ''
+        last = user_data.get('last_name') or ''
+        name = f'{first} {last}'.strip() or user_data.get('identifier', '')
+
+        members.append({
+            'membership_id': m.get('id', ''),
+            'user_id': user_data.get('user_id', ''),
+            'name': name,
+            'email': user_data.get('identifier', ''),
+            'role': portal_role,
+            'status': 'active',
+            'image_url': user_data.get('image_url'),
+            'joined_at': m.get('created_at', ''),
+        })
+
+    return cors_response(200, {
+        'members': members,
+        'admin_count': admin_count,
+        'total': len(members),
+        'can_edit': user_role in _WRITE_ROLES,
+    })
+
+
+def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /team/invite — Invite a new member to the organization."""
+    org_id, err = _resolve_team_org_id(auth_result, tenant_id)
+    if err:
+        return err
+
+    role_error = _require_write_role(auth_result.get('role'))
+    if role_error:
+        return role_error
+    clerk_user_id = auth_result.get('clerk_user_id')
+
+    email = (body.get('email') or '').strip().lower()
+    role = (body.get('role') or '').strip().lower()
+
+    if not email or '@' not in email:
+        return cors_response(400, {'error': 'Valid email address is required'})
+    if role not in ('admin', 'member'):
+        return cors_response(400, {'error': 'Role must be "admin" or "member"'})
+
+    # Check if this email already belongs to another org (enforce single-org per user)
+    try:
+        existing_users = _clerk_api_request('GET', f'/v1/users?email_address={email}')
+        if isinstance(existing_users, list) and existing_users:
+            existing_user_id = existing_users[0].get('id')
+            if existing_user_id:
+                existing_memberships = _fetch_user_org_memberships(existing_user_id)
+                for m in existing_memberships:
+                    existing_org_id = m.get('organization', {}).get('id')
+                    if existing_org_id and existing_org_id != org_id:
+                        return cors_response(409, {
+                            'error': 'This user already belongs to another organization. '
+                                     'Users can only belong to one organization.'
+                        })
+    except ValueError:
+        pass  # User doesn't exist yet in Clerk — that's fine, invitation will create them
+
+    clerk_role = _portal_role_to_clerk(role)
+
+    try:
+        invite_body = {
+            'email_address': email,
+            'role': clerk_role,
+        }
+        if clerk_user_id:
+            invite_body['inviter_user_id'] = clerk_user_id
+
+        result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations', invite_body)
+    except ValueError as exc:
+        error_str = str(exc)
+        # Handle duplicate invitation (Clerk returns 422)
+        if '422' in error_str or 'duplicate' in error_str.lower():
+            return cors_response(409, {'error': 'An invitation for this email is already pending'})
+        # Handle user already a member
+        if 'already' in error_str.lower() and 'member' in error_str.lower():
+            return cors_response(409, {'error': 'This user is already a member of the organization'})
+        logger.error(f'[team] Failed to invite: {exc}')
+        return cors_response(502, {'error': 'Failed to send invitation'})
+
+    # Invalidate org membership cache
+    _org_membership_cache.clear()
+    _org_membership_cache_time.clear()
+
+    logger.info(f'[team] Invited {redact_email(email)} as {role} to org {org_id}')
+
+    return cors_response(200, {
+        'invitation_id': result.get('id', ''),
+        'email': email,
+        'role': role,
+        'status': 'pending',
+    })
+
+
+def handle_team_invitations_list(auth_result: Dict[str, Any], tenant_id: str) -> Dict[str, Any]:
+    """GET /team/invitations — List pending invitations."""
+    org_id, err = _resolve_team_org_id(auth_result, tenant_id)
+    if err:
+        return err
+
+    role_error = _require_write_role(auth_result.get('role'))
+    if role_error:
+        return role_error
+
+    try:
+        data = _clerk_api_request('GET', f'/v1/organizations/{org_id}/invitations?status=pending')
+    except ValueError as exc:
+        logger.error(f'[team] Failed to list invitations: {exc}')
+        return cors_response(502, {'error': 'Failed to fetch invitations'})
+
+    invitations = []
+    for inv in data.get('data', []):
+        invitations.append({
+            'invitation_id': inv.get('id', ''),
+            'email': inv.get('email_address', ''),
+            'role': _clerk_role_to_portal(inv.get('role', '')),
+            'status': inv.get('status', ''),
+            'created_at': inv.get('created_at', ''),
+        })
+
+    return cors_response(200, {'invitations': invitations})
+
+
+def handle_team_invitation_revoke(auth_result: Dict[str, Any], tenant_id: str, invitation_id: str) -> Dict[str, Any]:
+    """POST /team/invitations/{id}/revoke — Revoke a pending invitation."""
+    org_id, err = _resolve_team_org_id(auth_result, tenant_id)
+    if err:
+        return err
+
+    role_error = _require_write_role(auth_result.get('role'))
+    if role_error:
+        return role_error
+
+    if not invitation_id or not invitation_id.startswith('orginv_'):
+        return cors_response(400, {'error': 'Invalid invitation ID'})
+
+    try:
+        _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations/{invitation_id}/revoke')
+    except ValueError as exc:
+        logger.error(f'[team] Failed to revoke invitation: {exc}')
+        return cors_response(502, {'error': 'Failed to revoke invitation'})
+
+    logger.info(f'[team] Revoked invitation {invitation_id} in org {org_id}')
+
+    return cors_response(200, {'invitation_id': invitation_id, 'revoked': True})
+
+
+def handle_team_member_update(
+    auth_result: Dict[str, Any],
+    tenant_id: str,
+    membership_id: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """PATCH /team/members/{id} — Change a member's role."""
+    org_id, err = _resolve_team_org_id(auth_result, tenant_id)
+    if err:
+        return err
+
+    role_error = _require_write_role(auth_result.get('role'))
+    if role_error:
+        return role_error
+    clerk_user_id = auth_result.get('clerk_user_id')
+
+    new_role = (body.get('role') or '').strip().lower()
+    if new_role not in ('admin', 'member'):
+        return cors_response(400, {'error': 'Role must be "admin" or "member"'})
+
+    if not membership_id or not membership_id.startswith('orgmem_'):
+        return cors_response(400, {'error': 'Invalid membership ID'})
+
+    # Fetch current memberships to check guards
+    try:
+        members_data = _clerk_api_request('GET', f'/v1/organizations/{org_id}/memberships?limit=100')
+    except ValueError as exc:
+        logger.error(f'[team] Failed to fetch members for guard check: {exc}')
+        return cors_response(502, {'error': 'Failed to verify team state'})
+
+    memberships = members_data.get('data', [])
+    target = None
+    admin_count = 0
+    for m in memberships:
+        if m.get('role') == 'org:admin':
+            admin_count += 1
+        if m.get('id') == membership_id:
+            target = m
+
+    if not target:
+        return cors_response(404, {'error': 'Membership not found'})
+
+    # Check if target is a super_admin (via user publicMetadata)
+    target_user_id = target.get('public_user_data', {}).get('user_id')
+    if target_user_id and new_role == 'member':
+        try:
+            target_user = _fetch_clerk_user(target_user_id)
+            if target_user.get('public_metadata', {}).get('picasso_role') == 'super_admin':
+                return cors_response(409, {'error': 'Cannot demote a super admin'})
+        except ValueError:
+            pass
+
+    # Last-admin guard: can't demote the sole admin
+    if target.get('role') == 'org:admin' and new_role == 'member' and admin_count <= 1:
+        return cors_response(409, {'error': 'Cannot demote the last admin — at least one admin is required'})
+
+    clerk_role = _portal_role_to_clerk(new_role)
+
+    try:
+        _clerk_api_request('PATCH', f'/v1/organizations/{org_id}/memberships/{membership_id}', {
+            'role': clerk_role,
+        })
+    except ValueError as exc:
+        logger.error(f'[team] Failed to update role: {exc}')
+        return cors_response(502, {'error': 'Failed to update member role'})
+
+    # Invalidate caches
+    _org_membership_cache.clear()
+    _org_membership_cache_time.clear()
+    if target_user_id and target_user_id in _clerk_user_cache:
+        del _clerk_user_cache[target_user_id]
+        _clerk_user_cache_time.pop(target_user_id, None)
+
+    logger.info(f'[team] Updated membership {membership_id} to role={new_role} in org {org_id}')
+
+    return cors_response(200, {'membership_id': membership_id, 'role': new_role, 'updated': True})
+
+
+def handle_team_member_remove(auth_result: Dict[str, Any], tenant_id: str, membership_id: str) -> Dict[str, Any]:
+    """DELETE /team/members/{id} — Remove a member from the organization."""
+    org_id, err = _resolve_team_org_id(auth_result, tenant_id)
+    if err:
+        return err
+
+    role_error = _require_write_role(auth_result.get('role'))
+    if role_error:
+        return role_error
+    clerk_user_id = auth_result.get('clerk_user_id')
+
+    if not membership_id or not membership_id.startswith('orgmem_'):
+        return cors_response(400, {'error': 'Invalid membership ID'})
+
+    # Fetch current memberships to check guards
+    try:
+        members_data = _clerk_api_request('GET', f'/v1/organizations/{org_id}/memberships?limit=100')
+    except ValueError as exc:
+        logger.error(f'[team] Failed to fetch members for guard check: {exc}')
+        return cors_response(502, {'error': 'Failed to verify team state'})
+
+    memberships = members_data.get('data', [])
+    target = None
+    admin_count = 0
+    for m in memberships:
+        if m.get('role') == 'org:admin':
+            admin_count += 1
+        if m.get('id') == membership_id:
+            target = m
+
+    if not target:
+        return cors_response(404, {'error': 'Membership not found'})
+
+    target_user_id = target.get('public_user_data', {}).get('user_id')
+
+    # Self-removal guard
+    if target_user_id == clerk_user_id:
+        return cors_response(409, {'error': 'Cannot remove yourself — ask another admin to remove you'})
+
+    # Last-admin guard
+    if target.get('role') == 'org:admin' and admin_count <= 1:
+        return cors_response(409, {'error': 'Cannot remove the last admin — at least one admin is required'})
+
+    # Super admin guard
+    if target_user_id:
+        try:
+            target_user = _fetch_clerk_user(target_user_id)
+            if target_user.get('public_metadata', {}).get('picasso_role') == 'super_admin':
+                return cors_response(409, {'error': 'Cannot remove a super admin'})
+        except ValueError:
+            pass
+
+    try:
+        _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{membership_id}')
+    except ValueError as exc:
+        logger.error(f'[team] Failed to remove member: {exc}')
+        return cors_response(502, {'error': 'Failed to remove member'})
+
+    # Invalidate caches
+    _org_membership_cache.clear()
+    _org_membership_cache_time.clear()
+
+    logger.info(f'[team] Removed membership {membership_id} from org {org_id}')
+
+    return cors_response(200, {'membership_id': membership_id, 'removed': True})
+
+
+# =============================================================================
+# Profile Handlers (Phase 3)
+# =============================================================================
+
+def handle_profile_get(auth_result: Dict[str, Any]) -> Dict[str, Any]:
+    """GET /profile — Get the current user's profile."""
+    clerk_user_id = auth_result.get('clerk_user_id')
+    if not clerk_user_id:
+        return cors_response(400, {'error': 'No user ID associated with this account'})
+
+    try:
+        user_data = _fetch_clerk_user(clerk_user_id)
+    except ValueError as exc:
+        logger.error(f'[profile] Failed to fetch user: {exc}')
+        return cors_response(502, {'error': 'Failed to fetch profile'})
+
+    # Extract primary email
+    email = ''
+    for addr in user_data.get('email_addresses', []):
+        if addr.get('id') == user_data.get('primary_email_address_id'):
+            email = addr.get('email_address', '')
+            break
+    if not email:
+        emails = user_data.get('email_addresses', [])
+        email = emails[0].get('email_address', '') if emails else ''
+
+    return cors_response(200, {
+        'first_name': user_data.get('first_name') or '',
+        'last_name': user_data.get('last_name') or '',
+        'email': email,
+        'image_url': user_data.get('image_url'),
+    })
+
+
+def handle_profile_update(auth_result: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    """PATCH /profile — Update the current user's profile (name only)."""
+    clerk_user_id = auth_result.get('clerk_user_id')
+    if not clerk_user_id:
+        return cors_response(400, {'error': 'No user ID associated with this account'})
+
+    # Whitelist allowed fields — never forward password, metadata, etc.
+    allowed_fields = {'first_name', 'last_name'}
+    update_data = {}
+    for field in allowed_fields:
+        if field in body:
+            value = str(body[field]).strip()
+            if len(value) > 100:
+                return cors_response(400, {'error': f'{field} is too long (max 100 chars)'})
+            update_data[field] = value
+
+    if not update_data:
+        return cors_response(400, {'error': 'No valid fields to update (allowed: first_name, last_name)'})
+
+    try:
+        _clerk_api_request('PATCH', f'/v1/users/{clerk_user_id}', update_data)
+    except ValueError as exc:
+        logger.error(f'[profile] Failed to update user: {exc}')
+        return cors_response(502, {'error': 'Failed to update profile'})
+
+    # Invalidate user cache so next fetch gets fresh data
+    if clerk_user_id in _clerk_user_cache:
+        del _clerk_user_cache[clerk_user_id]
+        _clerk_user_cache_time.pop(clerk_user_id, None)
+
+    logger.info(f'[profile] Updated profile for user {clerk_user_id[:12]}...')
+
+    return cors_response(200, {
+        'first_name': update_data.get('first_name', ''),
+        'last_name': update_data.get('last_name', ''),
+        'updated': True,
+    })
