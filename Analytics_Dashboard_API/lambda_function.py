@@ -781,7 +781,15 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
         logger.error(f'[clerk-auth] Upstream error during token validation: {exc}')
         return cors_response(500, {'error': 'Authentication service unavailable'})
 
-    # Step 3 — Resolve tenant via Clerk Organization membership
+    # Step 3 — Check for super_admin flag in Clerk user publicMetadata
+    is_super_admin = False
+    if user_data:
+        picasso_role = user_data.get('public_metadata', {}).get('picasso_role')
+        if picasso_role == 'super_admin':
+            is_super_admin = True
+            logger.info(f'[clerk-auth] User {redact_email(email)} has super_admin flag')
+
+    # Step 4 — Resolve tenant via Clerk Organization membership
     user_info = None
     try:
         if user_id:
@@ -789,7 +797,7 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
             user_info = {
                 'tenant_id': org_info['tenant_id'],
                 'tenant_hash': org_info['tenant_hash'],
-                'role': org_info['role'],
+                'role': 'super_admin' if is_super_admin else org_info['role'],
                 'name': name,
                 'company': org_info['company'],
             }
@@ -806,10 +814,10 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
             logger.warning(f'[clerk-auth] No org membership and no fallback for {redact_email(email)}')
             return cors_response(403, {'error': 'User not registered — no organization membership found'})
 
-    # Step 4 — Load feature flags from S3 tenant config
+    # Step 5 — Load feature flags from S3 tenant config
     features = get_tenant_features(user_info['tenant_id'])
 
-    # Step 5 — Build and sign internal Picasso JWT
+    # Step 6 — Build and sign internal Picasso JWT
     try:
         issued_at = int(time.time())
         internal_payload = {
