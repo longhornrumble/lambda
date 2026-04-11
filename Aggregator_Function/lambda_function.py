@@ -29,6 +29,7 @@ ARCHIVE_BUCKET = os.environ.get('ARCHIVE_BUCKET', 'picasso-analytics-archive')
 LOG_GROUP_STREAMING = '/aws/lambda/Bedrock_Streaming_Handler'
 LOG_GROUP_MASTER = '/aws/lambda/Master_Function'
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'production')
+NOTIFICATION_EVENTS_TABLE = os.environ.get('NOTIFICATION_EVENTS_TABLE', 'picasso-notification-events')
 MAX_QUERY_RESULTS = 1000
 
 def lambda_handler(event, context):
@@ -53,7 +54,8 @@ def lambda_handler(event, context):
         'date': process_date,
         'tenants_processed': 0,
         'tenants_failed': [],
-        'total_conversations': 0
+        'total_conversations': 0,
+        'total_notification_events': 0
     }
     
     # Process each tenant
@@ -91,7 +93,14 @@ def lambda_handler(event, context):
             if form_metrics['total_submissions'] > 0:
                 store_form_metrics(tenant_id, tenant_hash, process_date, form_metrics)
                 logger.info(f"Stored {form_metrics['total_submissions']} form submissions for {tenant_id}")
-            
+
+            # Archive notification events for the day
+            notification_data = aggregate_notification_events(tenant_id, process_date)
+            if notification_data['total_events'] > 0:
+                archive_notification_events(tenant_id, process_date, notification_data)
+                results['total_notification_events'] += notification_data['total_events']
+                logger.info(f"Archived {notification_data['total_events']} notification events for {tenant_id}")
+
             results['tenants_processed'] += 1
             
         except Exception as e:
@@ -563,4 +572,110 @@ def store_metrics(tenant_id, tenant_hash, process_date, metrics):
         logger.error(f"Error archiving metrics to S3: {str(e)}")
         # Don't raise here - we want DynamoDB write to succeed even if S3 fails
         # but log it for monitoring
+
+
+# =============================================================================
+# Notification Event Archival
+# =============================================================================
+
+def aggregate_notification_events(tenant_id: str, process_date: str) -> Dict[str, Any]:
+    """
+    Query picasso-notification-events for a single day and aggregate counts.
+    Returns both aggregate counts and individual event records for cold storage.
+    """
+    try:
+        table = dynamodb.Table(NOTIFICATION_EVENTS_TABLE)
+        pk = f'TENANT#{tenant_id}'
+        date_prefix = f'{process_date}#'
+
+        all_items = []
+        last_key = None
+
+        while True:
+            query_kwargs = {
+                'KeyConditionExpression': 'pk = :pk AND begins_with(sk, :date_prefix)',
+                'ExpressionAttributeValues': {
+                    ':pk': pk,
+                    ':date_prefix': date_prefix,
+                },
+            }
+            if last_key:
+                query_kwargs['ExclusiveStartKey'] = last_key
+
+            resp = table.query(**query_kwargs)
+            all_items.extend(resp.get('Items', []))
+            last_key = resp.get('LastEvaluatedKey')
+            if not last_key:
+                break
+
+        if not all_items:
+            return {'total_events': 0, 'counts': {}, 'unique_messages': 0, 'events': []}
+
+        # Aggregate counts by event_type
+        counts = defaultdict(int)
+        message_ids = set()
+        events = []
+
+        for item in all_items:
+            event_type = item.get('event_type', 'unknown')
+            counts[event_type] += 1
+            msg_id = item.get('message_id', '')
+            if msg_id:
+                message_ids.add(msg_id)
+            events.append(item)
+
+        return {
+            'total_events': len(all_items),
+            'counts': dict(counts),
+            'unique_messages': len(message_ids),
+            'events': events,
+        }
+
+    except Exception as e:
+        logger.error(f"Error aggregating notification events for {tenant_id}: {e}")
+        return {'total_events': 0, 'counts': {}, 'unique_messages': 0, 'events': []}
+
+
+def archive_notification_events(tenant_id: str, process_date: str, notification_data: Dict[str, Any]):
+    """
+    Write daily notification event aggregate + full event records to S3 Glacier IR.
+    Mirrors the conversation archival pattern in store_metrics().
+    """
+    try:
+        s3_data = {
+            'tenant_id': tenant_id,
+            'date': process_date,
+            'total_events': notification_data['total_events'],
+            'counts': notification_data['counts'],
+            'unique_messages': notification_data['unique_messages'],
+            'events': notification_data['events'],
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'environment': ENVIRONMENT,
+        }
+
+        json_str = json.dumps(s3_data, separators=(',', ':'), default=str)
+        compressed_data = gzip.compress(json_str.encode('utf-8'))
+
+        s3_key = f"notification-aggregates/{process_date[:4]}/{process_date[5:7]}/{process_date}/{tenant_id}.json.gz"
+
+        s3.put_object(
+            Bucket=ARCHIVE_BUCKET,
+            Key=s3_key,
+            Body=compressed_data,
+            StorageClass='GLACIER_IR',
+            ContentType='application/json',
+            ContentEncoding='gzip',
+            Metadata={
+                'tenant_id': tenant_id,
+                'date': process_date,
+                'total_events': str(notification_data['total_events']),
+                'unique_messages': str(notification_data['unique_messages']),
+                'environment': ENVIRONMENT,
+            }
+        )
+        logger.info(f"Archived notification events to S3 for {tenant_id} on {process_date}: s3://{ARCHIVE_BUCKET}/{s3_key}")
+
+    except Exception as e:
+        logger.error(f"Error archiving notification events to S3 for {tenant_id}: {e}")
+        # Non-blocking — log and continue
 
