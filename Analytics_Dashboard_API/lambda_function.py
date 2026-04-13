@@ -376,6 +376,20 @@ def lambda_handler(event, context):
             admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
             return handle_admin_tenant_employees(user_role, admin_tenant_id)
 
+        # Admin tenant invitation revoke (must be before invitations list — more specific)
+        elif '/admin/tenants/' in path and '/invitations/' in path and path.endswith('/revoke') and method == 'POST':
+            parts = path.split('/admin/tenants/')[1].split('/')
+            admin_tenant_id = parts[0]
+            # parts = [tenant_id, 'invitations', invitation_id, 'revoke']
+            invitation_id = parts[2]
+            return handle_admin_tenant_invitation_revoke(user_role, admin_tenant_id, invitation_id)
+
+        # Admin tenant invitations list (must be before tenant detail)
+        elif '/admin/tenants/' in path and path.endswith('/invitations') and method == 'GET':
+            parts = path.split('/admin/tenants/')[1].split('/')
+            admin_tenant_id = parts[0]
+            return handle_admin_tenant_invitations(user_role, admin_tenant_id)
+
         elif '/admin/tenants/' in path and method == 'GET':
             admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
             return handle_admin_tenant_detail(user_role, admin_tenant_id)
@@ -1436,6 +1450,54 @@ def handle_admin_tenant_employees(user_role: Optional[str], tenant_id: str) -> D
     except Exception as e:
         logger.exception(f"[admin] Error fetching employees for {tenant_id}: {e}")
         return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_tenant_invitations(user_role: Optional[str], tenant_id: str) -> Dict[str, Any]:
+    """GET /admin/tenants/{id}/invitations — Pending Clerk invitations for a tenant."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    try:
+        org_id = _find_org_id_by_tenant_id(tenant_id)
+        if not org_id:
+            return cors_response(200, {'invitations': []})
+
+        data = _clerk_api_request('GET', f'/v1/organizations/{org_id}/invitations?status=pending')
+        invitations = []
+        for inv in data.get('data', []):
+            invitations.append({
+                'invitation_id': inv.get('id', ''),
+                'email': inv.get('email_address', ''),
+                'role': _clerk_role_to_portal(inv.get('role', '')),
+                'status': inv.get('status', ''),
+                'created_at': inv.get('created_at', ''),
+                'tenant_id': tenant_id,
+            })
+
+        return cors_response(200, {'invitations': invitations})
+    except Exception as e:
+        logger.exception(f"[admin] Error fetching invitations for {tenant_id}: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_tenant_invitation_revoke(user_role: Optional[str], tenant_id: str, invitation_id: str) -> Dict[str, Any]:
+    """POST /admin/tenants/{id}/invitations/{invitation_id}/revoke — Revoke a pending invitation."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    try:
+        org_id = _find_org_id_by_tenant_id(tenant_id)
+        if not org_id:
+            return cors_response(404, {'error': 'No Clerk organization found for tenant'})
+
+        _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations/{invitation_id}/revoke')
+        logger.info(f'[admin] Revoked invitation {invitation_id} for tenant {tenant_id}')
+        return cors_response(200, {'invitation_id': invitation_id, 'revoked': True})
+    except ValueError as exc:
+        logger.error(f'[admin] Failed to revoke invitation: {exc}')
+        return cors_response(502, {'error': 'Failed to revoke invitation'})
 
 
 def handle_admin_employees_list(user_role: Optional[str], params: Dict[str, str]) -> Dict[str, Any]:
