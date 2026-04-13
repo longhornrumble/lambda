@@ -388,6 +388,23 @@ def lambda_handler(event, context):
         elif path.endswith('/admin/tenants') and method == 'GET':
             return handle_admin_tenants(user_role)
 
+        # Admin employee endpoints (super_admin only)
+        # More specific routes first: /invite POST before PATCH update before list GET
+        elif path.endswith('/admin/employees/invite') and method == 'POST':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_admin_employee_invite(user_role, body)
+
+        elif '/admin/employees/' in path and method == 'PATCH' and not path.endswith('/admin/employees/'):
+            parts = path.split('/admin/employees/')[1].split('/')
+            if len(parts) >= 2:
+                emp_tenant_id = parts[0]
+                emp_clerk_user_id = parts[1]
+                body = json.loads(event.get('body', '{}') or '{}')
+                return handle_admin_employee_update(user_role, emp_tenant_id, emp_clerk_user_id, body)
+
+        elif path.endswith('/admin/employees') and method == 'GET':
+            return handle_admin_employees_list(user_role, params)
+
         # Settings — Notification Recipients & Templates (Phase 2b/2c)
         # NOTE: More specific paths must come first within this block.
         elif path.endswith('/settings/notifications/recipients/test-send') and method == 'POST':
@@ -1402,6 +1419,203 @@ def handle_admin_tenant_employees(user_role: Optional[str], tenant_id: str) -> D
     except Exception as e:
         logger.exception(f"[admin] Error fetching employees for {tenant_id}: {e}")
         return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_employees_list(user_role: Optional[str], params: Dict[str, str]) -> Dict[str, Any]:
+    """GET /admin/employees — Cross-tenant employee list with optional filters."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    try:
+        tenant_id_filter = params.get('tenant_id', '')
+        search = (params.get('search', '') or '').strip().lower()
+
+        if tenant_id_filter:
+            employees = tenant_registry_ops.list_employees(tenant_id_filter)
+        else:
+            employees = tenant_registry_ops.list_all_employees()
+
+        # Client-side search filter (acceptable at current scale)
+        if search:
+            employees = [
+                e for e in employees
+                if search in (e.get('email', '') or '').lower()
+                or search in (e.get('name', '') or '').lower()
+            ]
+
+        # Enrich with company name for cross-tenant view
+        if not tenant_id_filter:
+            all_tenants = tenant_registry_ops.list_all_tenants()
+            tenant_names = {t['tenantId']: t.get('companyName', t['tenantId']) for t in all_tenants}
+            for e in employees:
+                e['companyName'] = tenant_names.get(e.get('tenantId', ''), '')
+
+        employees.sort(key=lambda e: (e.get('name', '') or e.get('email', '')).lower())
+
+        return cors_response(200, {'employees': employees, 'total': len(employees)})
+    except Exception as e:
+        logger.exception(f"[admin] Error listing employees: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_employee_invite(user_role: Optional[str], body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /admin/employees/invite — Invite employee to any tenant."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    tenant_id = (body.get('tenant_id') or '').strip()
+    email = (body.get('email') or '').strip().lower()
+    role = (body.get('role') or '').strip().lower()
+
+    if not tenant_id:
+        return cors_response(400, {'error': 'tenant_id is required'})
+    if not email or '@' not in email:
+        return cors_response(400, {'error': 'Valid email address is required'})
+    if role not in ('admin', 'member'):
+        return cors_response(400, {'error': 'Role must be "admin" or "member"'})
+
+    # Resolve Clerk org for this tenant
+    org_id = _find_org_id_by_tenant_id(tenant_id)
+    if not org_id:
+        return cors_response(404, {'error': f'No Clerk organization found for tenant {tenant_id}'})
+
+    # SINGLE-ORG ENFORCEMENT — super admin does NOT bypass this
+    try:
+        existing_users = _clerk_api_request('GET', f'/v1/users?email_address={email}')
+        if isinstance(existing_users, list) and existing_users:
+            existing_user_id = existing_users[0].get('id')
+            if existing_user_id:
+                existing_memberships = _fetch_user_org_memberships(existing_user_id)
+                for m in existing_memberships:
+                    existing_org_id = m.get('organization', {}).get('id')
+                    if existing_org_id and existing_org_id != org_id:
+                        return cors_response(409, {
+                            'error': 'This user already belongs to another organization. '
+                                     'Users can only belong to one organization.'
+                        })
+    except ValueError:
+        pass  # User doesn't exist yet — fine
+
+    clerk_role = _portal_role_to_clerk(role)
+
+    try:
+        invite_body = {
+            'email_address': email,
+            'role': clerk_role,
+        }
+        result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations', invite_body)
+    except ValueError as exc:
+        error_str = str(exc)
+        if '422' in error_str or 'duplicate' in error_str.lower():
+            return cors_response(409, {'error': 'An invitation for this email is already pending'})
+        if 'already' in error_str.lower() and 'member' in error_str.lower():
+            return cors_response(409, {'error': 'This user is already a member of the organization'})
+        logger.error(f'[admin] Failed to invite: {exc}')
+        return cors_response(502, {'error': 'Failed to send invitation'})
+
+    # Write to employee registry (no clerk_user_id yet — webhook will update on acceptance)
+    try:
+        tenant_registry_ops.put_employee(tenant_id, '', {
+            'email': email,
+            'name': '',
+            'role': role,
+            'status': 'invited',
+        })
+    except Exception as exc:
+        logger.warning(f'[admin] Employee registry write failed (invite still sent): {exc}')
+
+    # Bust cache
+    _org_membership_cache.clear()
+    _org_membership_cache_time.clear()
+
+    logger.info(f'[admin] Invited {redact_email(email)} as {role} to tenant {tenant_id} (org {org_id})')
+
+    return cors_response(200, {
+        'invitation_id': result.get('id', ''),
+        'email': email,
+        'role': role,
+        'tenant_id': tenant_id,
+        'status': 'pending',
+    })
+
+
+def handle_admin_employee_update(user_role: Optional[str], tenant_id: str, clerk_user_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """PATCH /admin/employees/{tenant_id}/{clerk_user_id} — Update role or deactivate."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    new_role = body.get('role')
+    new_status = body.get('status')
+
+    if not new_role and not new_status:
+        return cors_response(400, {'error': 'Provide role or status to update'})
+
+    org_id = _find_org_id_by_tenant_id(tenant_id)
+    if not org_id:
+        return cors_response(404, {'error': f'No Clerk organization found for tenant {tenant_id}'})
+
+    # Handle role change
+    if new_role:
+        if new_role not in ('admin', 'member'):
+            return cors_response(400, {'error': 'Role must be "admin" or "member"'})
+
+        try:
+            memberships = _clerk_api_request('GET', f'/v1/organizations/{org_id}/memberships?limit=100')
+            members_data = memberships if isinstance(memberships, list) else memberships.get('data', [])
+            membership_id = None
+            for m in members_data:
+                if m.get('public_user_data', {}).get('user_id') == clerk_user_id:
+                    membership_id = m.get('id')
+                    break
+
+            if not membership_id:
+                return cors_response(404, {'error': 'User membership not found in organization'})
+
+            clerk_role = _portal_role_to_clerk(new_role)
+            _clerk_api_request('PATCH', f'/v1/organizations/{org_id}/memberships/{membership_id}', {'role': clerk_role})
+        except ValueError as exc:
+            logger.error(f'[admin] Failed to update role: {exc}')
+            return cors_response(502, {'error': 'Failed to update role in Clerk'})
+
+    # Handle deactivation
+    if new_status == 'inactive':
+        try:
+            memberships = _clerk_api_request('GET', f'/v1/organizations/{org_id}/memberships?limit=100')
+            members_data = memberships if isinstance(memberships, list) else memberships.get('data', [])
+            membership_id = None
+            for m in members_data:
+                if m.get('public_user_data', {}).get('user_id') == clerk_user_id:
+                    membership_id = m.get('id')
+                    break
+
+            if membership_id:
+                _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{membership_id}')
+        except ValueError as exc:
+            logger.error(f'[admin] Failed to remove from org: {exc}')
+            return cors_response(502, {'error': 'Failed to remove from organization'})
+
+    # Update employee registry
+    update_fields = {}
+    if new_role:
+        update_fields['role'] = new_role
+    if new_status:
+        update_fields['status'] = new_status
+
+    try:
+        tenant_registry_ops.update_employee(tenant_id, clerk_user_id, update_fields)
+    except Exception as exc:
+        logger.warning(f'[admin] Employee registry update failed: {exc}')
+
+    # Bust caches
+    _org_membership_cache.pop(clerk_user_id, None)
+    _org_membership_cache_time.pop(clerk_user_id, None)
+
+    logger.info(f'[admin] Updated employee {clerk_user_id} in tenant {tenant_id}: {update_fields}')
+
+    return cors_response(200, {'tenant_id': tenant_id, 'clerk_user_id': clerk_user_id, **update_fields})
 
 
 def validate_feature_access(tenant_id: str, required_feature: str) -> Optional[Dict[str, Any]]:
@@ -5830,6 +6044,41 @@ def _handle_membership_created(data: Dict[str, Any]):
     _org_membership_cache.pop(user_id, None)
     _org_membership_cache_time.pop(user_id, None)
 
+    # Sync to employee registry
+    try:
+        all_tenants = tenant_registry_ops.list_all_tenants()
+        tenant_id = None
+        for t in all_tenants:
+            if t.get('clerkOrgId') == org_id:
+                tenant_id = t['tenantId']
+                break
+
+        if tenant_id and user_id:
+            # Fetch user details from Clerk
+            try:
+                user_data = _clerk_api_request('GET', f'/v1/users/{user_id}')
+                name = f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip()
+                email = ''
+                email_addresses = user_data.get('email_addresses', [])
+                if email_addresses:
+                    email = email_addresses[0].get('email_address', '')
+
+                portal_role = _clerk_role_to_portal(role) if role else 'member'
+
+                tenant_registry_ops.put_employee(tenant_id, user_id, {
+                    'email': email,
+                    'name': name,
+                    'role': portal_role,
+                    'status': 'active',
+                })
+                logger.info(f'[clerk-webhook] Synced employee {user_id} to registry for tenant {tenant_id}')
+            except ValueError as exc:
+                logger.warning(f'[clerk-webhook] Failed to fetch user details for {user_id}: {exc}')
+        elif not tenant_id:
+            logger.info(f'[clerk-webhook] No tenant found for org {org_id} — skipping employee sync')
+    except Exception as exc:
+        logger.warning(f'[clerk-webhook] Employee registry sync failed for membership.created: {exc}')
+
 
 def _handle_membership_deleted(data: Dict[str, Any]):
     """User removed from an organization. Invalidate their cached sessions."""
@@ -5841,3 +6090,20 @@ def _handle_membership_deleted(data: Dict[str, Any]):
     _clerk_user_cache_time.pop(user_id, None)
     _org_membership_cache.pop(user_id, None)
     _org_membership_cache_time.pop(user_id, None)
+
+    # Sync to employee registry — mark inactive
+    try:
+        all_tenants = tenant_registry_ops.list_all_tenants()
+        tenant_id = None
+        for t in all_tenants:
+            if t.get('clerkOrgId') == org_id:
+                tenant_id = t['tenantId']
+                break
+
+        if tenant_id and user_id:
+            tenant_registry_ops.update_employee(tenant_id, user_id, {'status': 'inactive'})
+            logger.info(f'[clerk-webhook] Marked employee {user_id} inactive for tenant {tenant_id}')
+        elif not tenant_id:
+            logger.info(f'[clerk-webhook] No tenant found for org {org_id} — skipping employee sync')
+    except Exception as exc:
+        logger.warning(f'[clerk-webhook] Employee registry sync failed for membership.deleted: {exc}')
