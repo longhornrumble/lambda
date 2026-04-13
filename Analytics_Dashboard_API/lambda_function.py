@@ -1245,6 +1245,9 @@ TENANTS_PREFIX = 'tenants'
 
 s3_client = boto3.client('s3')
 
+# Tenants excluded from the admin panel (demo/test accounts)
+_ADMIN_EXCLUDED_TENANTS = {'MYR384719', 'TEST_REGISTRY_001'}
+
 
 def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
     """
@@ -1260,6 +1263,8 @@ def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
 
         result = []
         for t in tenants:
+            if t.get('tenantId', '') in _ADMIN_EXCLUDED_TENANTS:
+                continue
             result.append({
                 'tenantId': t.get('tenantId', ''),
                 'tenantHash': t.get('tenantHash', ''),
@@ -1345,12 +1350,8 @@ def handle_admin_tenant_billing(user_role: Optional[str], tenant_id: str) -> Dic
         if not tenant:
             return cors_response(404, {'error': 'Tenant not found'})
 
-        tenant_hash = tenant.get('tenantHash', '')
-        if not tenant_hash:
-            return cors_response(200, {'events': []})
-
-        # Query notification events table for Stripe channel events
-        pk = f'TENANT#{tenant_hash}'
+        # Stripe webhook writes pk as TENANT#{tenantId}, not tenantHash
+        pk = f'TENANT#{tenant_id}'
 
         query_kwargs: Dict[str, Any] = {
             'TableName': NOTIFICATION_EVENTS_TABLE,
@@ -1368,13 +1369,29 @@ def handle_admin_tenant_billing(user_role: Optional[str], tenant_id: str) -> Dic
 
         events = []
         for item in response.get('Items', []):
-            sk_val = item.get('sk', {}).get('S', '')
-            timestamp = sk_val.split('#')[0] if '#' in sk_val else sk_val
+            # Parse detail — stored as a DynamoDB Map (M), not a string
+            raw_detail = item.get('detail', {})
+            if 'M' in raw_detail:
+                detail = {}
+                for k, v in raw_detail['M'].items():
+                    if 'S' in v:
+                        detail[k] = v['S']
+                    elif 'N' in v:
+                        detail[k] = int(v['N']) if '.' not in v['N'] else float(v['N'])
+                    elif 'BOOL' in v:
+                        detail[k] = v['BOOL']
+                    else:
+                        detail[k] = str(v)
+            elif 'S' in raw_detail:
+                detail = json.loads(raw_detail['S'])
+            else:
+                detail = {}
+
             events.append({
-                'timestamp': timestamp,
+                'timestamp': item.get('timestamp', {}).get('S', ''),
                 'event_type': item.get('event_type', {}).get('S', ''),
-                'stripe_event_type': item.get('stripe_event_type', {}).get('S', item.get('event_type', {}).get('S', '')),
-                'detail': json.loads(item['detail']['S']) if item.get('detail', {}).get('S') else {},
+                'stripe_event_type': item.get('stripe_event_type', {}).get('S', ''),
+                'detail': detail,
             })
 
         return cors_response(200, {'events': events})
@@ -1435,6 +1452,9 @@ def handle_admin_employees_list(user_role: Optional[str], params: Dict[str, str]
             employees = tenant_registry_ops.list_employees(tenant_id_filter)
         else:
             employees = tenant_registry_ops.list_all_employees()
+
+        # Exclude demo/test tenants
+        employees = [e for e in employees if e.get('tenantId', '') not in _ADMIN_EXCLUDED_TENANTS]
 
         # Client-side search filter (acceptable at current scale)
         if search:

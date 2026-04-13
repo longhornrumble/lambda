@@ -34,6 +34,7 @@ def clerk_request(method, path):
     req = urllib.request.Request(url, method=method)
     req.add_header('Authorization', f'Bearer {CLERK_SECRET_KEY}')
     req.add_header('Content-Type', 'application/json')
+    req.add_header('User-Agent', 'picasso-backfill/1.0')
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             return json.loads(resp.read().decode('utf-8'))

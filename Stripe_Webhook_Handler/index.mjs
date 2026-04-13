@@ -232,6 +232,15 @@ function extractEventDetail(event) {
   if (obj.amount_due !== undefined) detail.amount_due = obj.amount_due;
   if (obj.amount_paid !== undefined) detail.amount_paid = obj.amount_paid;
   if (obj.subscription) detail.subscription_id = obj.subscription;
+  if (obj.due_date) detail.due_date = new Date(obj.due_date * 1000).toISOString();
+  if (obj.period_end) detail.period_end = new Date(obj.period_end * 1000).toISOString();
+  if (obj.next_payment_attempt) detail.next_payment_attempt = new Date(obj.next_payment_attempt * 1000).toISOString();
+  if (obj.description) detail.description = obj.description;
+  if (obj.number) detail.invoice_number = obj.number;
+
+  // Subscription-level dates
+  if (obj.current_period_start) detail.period_start = new Date(obj.current_period_start * 1000).toISOString();
+  if (obj.current_period_end) detail.period_end = new Date(obj.current_period_end * 1000).toISOString();
 
   return detail;
 }
