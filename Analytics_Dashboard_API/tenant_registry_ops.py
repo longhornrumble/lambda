@@ -219,6 +219,22 @@ def get_employee(tenant_id, clerk_user_id):
     return _unmarshall(item) if item else None
 
 
+def list_all_employees():
+    """Scan all employees across all tenants. Used for cross-tenant employee views in super admin."""
+    items = []
+    params = {'TableName': EMPLOYEE_TABLE}
+
+    while True:
+        response = dynamodb.scan(**params)
+        items.extend([_unmarshall(item) for item in response.get('Items', [])])
+
+        if 'LastEvaluatedKey' not in response:
+            break
+        params['ExclusiveStartKey'] = response['LastEvaluatedKey']
+
+    return items
+
+
 def get_employee_by_clerk_user_id(clerk_user_id):
     """Look up an employee by Clerk user ID (across all tenants). Returns dict or None."""
     response = dynamodb.query(

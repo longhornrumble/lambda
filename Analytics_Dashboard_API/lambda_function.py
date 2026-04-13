@@ -60,6 +60,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
 from decimal import Decimal
 from botocore.exceptions import ClientError
+import tenant_registry_ops
 
 # Configure logging
 logger = logging.getLogger()
@@ -366,9 +367,26 @@ def lambda_handler(event, context):
             if submission_id and submission_id != 'queue':
                 return handle_lead_detail(tenant_id, submission_id)
 
-        # Admin endpoints (super_admin only)
+        # Admin endpoints (super_admin only) — most specific routes first
+        elif '/admin/tenants/' in path and path.endswith('/billing') and method == 'GET':
+            admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
+            return handle_admin_tenant_billing(user_role, admin_tenant_id)
+
+        elif '/admin/tenants/' in path and path.endswith('/employees') and method == 'GET':
+            admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
+            return handle_admin_tenant_employees(user_role, admin_tenant_id)
+
+        elif '/admin/tenants/' in path and method == 'GET':
+            admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
+            return handle_admin_tenant_detail(user_role, admin_tenant_id)
+
+        elif '/admin/tenants/' in path and method == 'PATCH':
+            admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_admin_tenant_update(user_role, admin_tenant_id, body)
+
         elif path.endswith('/admin/tenants') and method == 'GET':
-            return handle_admin_tenants(auth_result.get('role'))
+            return handle_admin_tenants(user_role)
 
         # Settings — Notification Recipients & Templates (Phase 2b/2c)
         # NOTE: More specific paths must come first within this block.
@@ -1214,73 +1232,175 @@ s3_client = boto3.client('s3')
 def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
     """
     Handle GET /admin/tenants endpoint.
-    Returns list of active tenants for super_admin users.
-    Reads from S3 mapping files (source of truth).
+    Returns list of tenants from the DynamoDB tenant registry (real tenants only).
     """
-    if user_role != 'super_admin':
-        return cors_response(403, {'error': 'Forbidden: super_admin role required'})
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
 
     try:
-        # List all mapping files
-        response = s3_client.list_objects_v2(
-            Bucket=S3_CONFIG_BUCKET,
-            Prefix=f'{MAPPINGS_PREFIX}/'
-        )
+        tenants = tenant_registry_ops.list_all_tenants()
 
-        contents = response.get('Contents', [])
-        if not contents:
-            return cors_response(200, {'tenants': []})
+        result = []
+        for t in tenants:
+            result.append({
+                'tenantId': t.get('tenantId', ''),
+                'tenantHash': t.get('tenantHash', ''),
+                'companyName': t.get('companyName', ''),
+                'status': t.get('status', 'active'),
+                'subscriptionTier': t.get('subscriptionTier', 'free'),
+                'networkId': t.get('networkId'),
+                'networkName': t.get('networkName'),
+                'clerkOrgId': t.get('clerkOrgId'),
+                'stripeCustomerId': t.get('stripeCustomerId'),
+                's3ConfigPath': t.get('s3ConfigPath', ''),
+                'onboardedAt': t.get('onboardedAt', ''),
+                'updatedAt': t.get('updatedAt', ''),
+                'has_stripe': bool(t.get('stripeCustomerId')),
+                'has_clerk': bool(t.get('clerkOrgId')),
+            })
 
-        tenants = []
-        for obj in contents:
-            key = obj['Key']
-            if not key.endswith('.json'):
-                continue
+        result.sort(key=lambda t: (t.get('companyName') or '').lower())
+        logger.info(f"[admin] Returning {len(result)} tenants from registry for super_admin")
 
-            try:
-                mapping_resp = s3_client.get_object(Bucket=S3_CONFIG_BUCKET, Key=key)
-                mapping = json.loads(mapping_resp['Body'].read().decode('utf-8'))
-
-                tenant_id = mapping.get('tenant_id', '')
-                tenant_hash = mapping.get('tenant_hash', '')
-
-                if not tenant_hash:
-                    continue
-
-                # Read tenant config to get display name and active status
-                name = tenant_id  # fallback
-                active = False
-                try:
-                    config_key = f'{TENANTS_PREFIX}/{tenant_id}/{tenant_id}-config.json'
-                    config_resp = s3_client.get_object(Bucket=S3_CONFIG_BUCKET, Key=config_key)
-                    config = json.loads(config_resp['Body'].read().decode('utf-8'))
-                    name = config.get('chat_title') or config.get('organization_name') or tenant_id
-                    active = config.get('active', False)
-                except Exception:
-                    pass  # Use tenant_id as fallback name, inactive by default
-
-                if not active:
-                    continue
-
-                tenants.append({
-                    'tenant_id': tenant_id,
-                    'tenant_hash': tenant_hash,
-                    'name': name,
-                })
-
-            except Exception as e:
-                logger.warning(f"Failed to read mapping {key}: {e}")
-                continue
-
-        # Sort by name
-        tenants.sort(key=lambda t: t['name'].lower())
-
-        logger.info(f"Returning {len(tenants)} tenants from S3 for super_admin")
-
-        return cors_response(200, {'tenants': tenants})
+        return cors_response(200, {'tenants': result})
 
     except Exception as e:
-        logger.exception(f"Error fetching admin tenants: {e}")
+        logger.exception(f"[admin] Error fetching tenants: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_tenant_detail(user_role: Optional[str], tenant_id: str) -> Dict[str, Any]:
+    """GET /admin/tenants/{id} — Full tenant record from registry."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    try:
+        tenant = tenant_registry_ops.get_tenant(tenant_id)
+        if not tenant:
+            return cors_response(404, {'error': 'Tenant not found'})
+
+        tenant['has_stripe'] = bool(tenant.get('stripeCustomerId'))
+        tenant['has_clerk'] = bool(tenant.get('clerkOrgId'))
+
+        return cors_response(200, tenant)
+    except Exception as e:
+        logger.exception(f"[admin] Error fetching tenant {tenant_id}: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+_ADMIN_TENANT_EDITABLE_FIELDS = {'status', 'subscriptionTier', 'networkId', 'networkName'}
+
+
+def handle_admin_tenant_update(user_role: Optional[str], tenant_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """PATCH /admin/tenants/{id} — Update whitelisted tenant fields."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    fields = {k: v for k, v in body.items() if k in _ADMIN_TENANT_EDITABLE_FIELDS}
+    if not fields:
+        return cors_response(400, {'error': f'No editable fields provided. Allowed: {", ".join(sorted(_ADMIN_TENANT_EDITABLE_FIELDS))}'})
+
+    try:
+        tenant = tenant_registry_ops.get_tenant(tenant_id)
+        if not tenant:
+            return cors_response(404, {'error': 'Tenant not found'})
+
+        tenant_registry_ops.update_tenant(tenant_id, fields)
+        updated = tenant_registry_ops.get_tenant(tenant_id)
+        logger.info(f"[admin] Updated tenant {tenant_id}: {list(fields.keys())}")
+        return cors_response(200, updated)
+    except Exception as e:
+        logger.exception(f"[admin] Error updating tenant {tenant_id}: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_tenant_billing(user_role: Optional[str], tenant_id: str) -> Dict[str, Any]:
+    """GET /admin/tenants/{id}/billing — Stripe events from notification events table."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    try:
+        tenant = tenant_registry_ops.get_tenant(tenant_id)
+        if not tenant:
+            return cors_response(404, {'error': 'Tenant not found'})
+
+        tenant_hash = tenant.get('tenantHash', '')
+        if not tenant_hash:
+            return cors_response(200, {'events': []})
+
+        # Query notification events table for Stripe channel events
+        pk = f'TENANT#{tenant_hash}'
+
+        query_kwargs: Dict[str, Any] = {
+            'TableName': NOTIFICATION_EVENTS_TABLE,
+            'KeyConditionExpression': 'pk = :pk',
+            'ExpressionAttributeValues': {
+                ':pk': {'S': pk},
+                ':channel': {'S': 'stripe'},
+            },
+            'FilterExpression': 'channel = :channel',
+            'ScanIndexForward': False,
+            'Limit': 50,
+        }
+
+        response = dynamodb.query(**query_kwargs)
+
+        events = []
+        for item in response.get('Items', []):
+            sk_val = item.get('sk', {}).get('S', '')
+            timestamp = sk_val.split('#')[0] if '#' in sk_val else sk_val
+            events.append({
+                'timestamp': timestamp,
+                'event_type': item.get('event_type', {}).get('S', ''),
+                'stripe_event_type': item.get('stripe_event_type', {}).get('S', item.get('event_type', {}).get('S', '')),
+                'detail': json.loads(item['detail']['S']) if item.get('detail', {}).get('S') else {},
+            })
+
+        return cors_response(200, {'events': events})
+
+    except Exception as e:
+        logger.exception(f"[admin] Error fetching billing for {tenant_id}: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_tenant_employees(user_role: Optional[str], tenant_id: str) -> Dict[str, Any]:
+    """GET /admin/tenants/{id}/employees — Employees for a specific tenant."""
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    try:
+        employees = tenant_registry_ops.list_employees(tenant_id)
+
+        if not employees:
+            # Fallback: try Clerk org members
+            org_id = _find_org_id_by_tenant_id(tenant_id)
+            if org_id:
+                try:
+                    memberships = _clerk_api_request('GET', f'/v1/organizations/{org_id}/memberships?limit=100')
+                    members_data = memberships if isinstance(memberships, list) else memberships.get('data', [])
+                    for m in members_data:
+                        user_data = m.get('public_user_data', {})
+                        employees.append({
+                            'tenantId': tenant_id,
+                            'clerkUserId': user_data.get('user_id', ''),
+                            'email': user_data.get('identifier', ''),
+                            'name': f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip(),
+                            'role': _clerk_role_to_portal(m.get('role', 'org:member')),
+                            'status': 'active',
+                            'createdAt': m.get('created_at', ''),
+                            'updatedAt': m.get('updated_at', ''),
+                        })
+                except ValueError as exc:
+                    logger.warning(f"[admin] Clerk fallback failed for {tenant_id}: {exc}")
+
+        return cors_response(200, {'employees': employees})
+    except Exception as e:
+        logger.exception(f"[admin] Error fetching employees for {tenant_id}: {e}")
         return cors_response(500, {'error': 'Internal server error'})
 
 
@@ -4316,6 +4436,14 @@ def _require_write_role(user_role: Optional[str]) -> Optional[Dict[str, Any]]:
     if user_role not in _WRITE_ROLES:
         logger.warning(f"[settings] write attempt by role={user_role!r} denied")
         return cors_response(403, {'error': 'Forbidden: admin or super_admin role required'})
+    return None
+
+
+def _require_super_admin(user_role: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return a 403 response if the caller is not super_admin, else None."""
+    if user_role != 'super_admin':
+        logger.warning(f"[admin] access attempt by role={user_role!r} denied")
+        return cors_response(403, {'error': 'Forbidden: super_admin role required'})
     return None
 
 
