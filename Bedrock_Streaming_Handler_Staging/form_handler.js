@@ -20,6 +20,11 @@ const {
   getSchemaVersion,
   SCHEMA_VERSION
 } = require('./contact_extractor');
+const {
+  resolveEmailsFromUserIds,
+  resolvePhonesFromUserIds,
+  resolveQuietHoursFallbackEmails,
+} = require('./clerk_helper');
 
 // Initialize AWS SDK v3 clients
 const sesClient = new SESClient({ region: process.env.AWS_REGION || 'us-east-1' });
@@ -33,6 +38,7 @@ const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' })
 const FORM_SUBMISSIONS_TABLE = process.env.FORM_SUBMISSIONS_TABLE || 'picasso-form-submissions';
 const SMS_USAGE_TABLE = process.env.SMS_USAGE_TABLE || 'picasso-sms-usage';
 const NOTIFICATION_SENDS_TABLE = process.env.NOTIFICATION_SENDS_TABLE || 'picasso-notification-sends';
+const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent';
 const SMS_MONTHLY_LIMIT = parseInt(process.env.SMS_MONTHLY_LIMIT || '100', 10);
 
 /**
@@ -236,16 +242,35 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
       // Continue with fulfillment even if DynamoDB save fails
     }
 
-    // Route to appropriate fulfillment channel
-    const fulfillmentResult = await routeFulfillment(formId, formData, config, submissionId, priority, sessionId, conversationId);
-
-    // Send confirmation email if configured (non-blocking)
-    // Uses per-form applicant_confirmation config from tenant config (editable in portal Templates tab)
-    // Form data uses field IDs (e.g. field_1774282600263), not named keys — extract email
-    // via the same contact extractor used for DynamoDB and Bubble.
+    // Extract canonical contact early — needed for consent record and confirmation email.
+    // Form data uses field IDs (e.g. field_1774282600263), not named keys — extract via
+    // the same contact extractor used for DynamoDB and Bubble.
     const transformedForContact = transformFormDataToLabels(formData, formConfig);
     const { contact: applicantContact } = extractCanonicalContact(transformedForContact);
     const applicantEmail = applicantContact?.email;
+    const applicantPhone = applicantContact?.phone;
+
+    // Write transactional consent record only if the contact explicitly consented to SMS.
+    // Consent comes from:
+    //   1. phone_with_consent composite field → subfield value "yes" in form_data
+    //   2. Standalone "Text Message Consent" select field → value "yes" in form_data
+    //   3. Legacy: sms_consent_given field
+    // The consent subfield is identified by scanning form fields for type=select with
+    // sms_consent: true, or by checking transformed labels for consent keywords.
+    if (applicantPhone) {
+      const consentGiven = findSmsConsent(formData, formConfig);
+      if (consentGiven) {
+        const smsDisclosure = findConsentDisclosure(formConfig) || config.sms_consent_language || '';
+        writeConsentRecord(config.tenant_id, applicantPhone, formId, submissionId, smsDisclosure).catch(err => {
+          console.error('❌ Consent record write failed:', err.message);
+        });
+      } else {
+        console.log(`ℹ️ No SMS consent given for ${applicantPhone} in form ${formId} — skipping consent record`);
+      }
+    }
+
+    // Route to appropriate fulfillment channel
+    const fulfillmentResult = await routeFulfillment(formId, formData, config, submissionId, priority, sessionId, conversationId);
 
     // Applicant confirmation: per-form config takes precedence over tenant-level legacy flag.
     // - New config (notifications.applicant_confirmation): requires enabled === true (strict boolean)
@@ -265,6 +290,51 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
       sendConfirmationEmail(applicantEmail, formId, formData, config, submissionId, sessionId).catch(err => {
         console.error('❌ Confirmation email failed:', err.message);
       });
+    }
+
+    // Applicant SMS confirmation: send a transactional SMS to the contact if configured.
+    // Requires: phone number present, applicant_confirmation.sms.enabled === true in form config,
+    // and SMS not globally disabled for the tenant.
+    const applicantSmsConfig = confirmationConfig?.sms;
+    const shouldSendApplicantSms = applicantPhone
+      && applicantSmsConfig?.enabled === true
+      && config.sms_settings?.enabled !== false;
+
+    if (shouldSendApplicantSms) {
+      const isDryRun = config.sms_settings?.applicant_sms_dry_run === true;
+      const orgName = config.chat_title || config.tenant_id || '';
+      const defaultApplicantSmsBody = `${orgName}: We received your submission. Check your email for details or reply HELP for assistance.`;
+      const applicantSmsBody = applicantSmsConfig.template
+        ? renderTemplate(applicantSmsConfig.template, {
+            first_name: applicantContact?.first_name || '',
+            last_name: applicantContact?.last_name || '',
+            email: applicantEmail || '',
+            organization_name: orgName,
+            submission_id: submissionId,
+          })
+        : defaultApplicantSmsBody;
+
+      if (isDryRun) {
+        console.log(`🧪 [DRY RUN] Applicant SMS would send to ${applicantPhone}: "${applicantSmsBody}"`);
+      } else {
+        lambdaClient.send(new InvokeCommand({
+          FunctionName: process.env.SMS_SENDER_FUNCTION || 'SMS_Sender',
+          InvocationType: 'Event',
+          Payload: JSON.stringify({
+            to: applicantPhone,
+            body: applicantSmsBody,
+            tenantId: config.tenant_id,
+            formId,
+            submissionId,
+            sessionId,
+            type: 'applicant',
+            sendType: 'contact',
+            fromNumber: config.sms_settings?.from_number || '',
+          })
+        })).catch(err => {
+          console.error('❌ Applicant SMS invocation failed:', err.message);
+        });
+      }
     }
 
     return {
@@ -574,11 +644,37 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   }
 
   // Email fulfillment (notification to organization)
-  // Support both legacy fulfillment.email_to and new notifications.internal config
+  // Support: recipient_user_ids (Phase 4), legacy notifications.internal, and fulfillment.email_to
   const notifications = formConfig.notifications || {};
   const internalNotif = notifications.internal || {};
-  const emailRecipients = fulfillment.email_to ||
-    (internalNotif.enabled && internalNotif.channels?.email !== false ? internalNotif.recipients : null);
+
+  let emailRecipients;
+  let emailUserIdMap = {}; // email → userId for audit records
+
+  if (internalNotif.recipient_user_ids?.length > 0) {
+    // Phase 4: resolve user_ids to emails via Clerk API
+    try {
+      const resolvedPairs = await resolveEmailsFromUserIds(internalNotif.recipient_user_ids);
+      const quietHoursFallback = await resolveQuietHoursFallbackEmails(internalNotif.recipient_user_ids);
+      const resolvedEmails = resolvedPairs.map(p => p.email);
+      emailRecipients = [...new Set([...resolvedEmails, ...quietHoursFallback])];
+      // Build userId lookup for audit
+      for (const pair of resolvedPairs) {
+        emailUserIdMap[pair.email] = pair.userId;
+      }
+      // Merge with legacy recipients for hybrid configs
+      if (internalNotif.enabled && internalNotif.recipients?.length > 0) {
+        emailRecipients = [...new Set([...emailRecipients, ...internalNotif.recipients])];
+      }
+    } catch (e) {
+      console.error('[routeFulfillment] Unexpected error resolving emails from user_ids:', e);
+      emailRecipients = internalNotif.recipients || [];
+    }
+  } else {
+    // Legacy path: direct email strings
+    emailRecipients = fulfillment.email_to ||
+      (internalNotif.enabled && internalNotif.channels?.email !== false ? internalNotif.recipients : null);
+  }
 
   if (emailRecipients && emailRecipients.length > 0) {
     try {
@@ -598,9 +694,10 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
             TableName: NOTIFICATION_SENDS_TABLE,
             Item: {
               pk: `TENANT#${config.tenant_id || 'unknown'}`,
-              sk: `${nowIso.slice(0, 10)}#email#${sesMessageId}`,
+              sk: `${nowIso.slice(0, 10)}#email#${sesMessageId}#${recipient}`,
               channel: 'email',
               recipient: recipient,
+              user_id: emailUserIdMap[recipient] || '',
               submission_id: submissionId || 'unknown',
               form_id: formId || 'unknown',
               template: 'internal_notification',
@@ -631,6 +728,7 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
               sk: `${nowIso.slice(0, 10)}#email#failed-${submissionId || 'unknown'}-${recipient}`,
               channel: 'email',
               recipient: recipient,
+              user_id: emailUserIdMap[recipient] || '',
               submission_id: submissionId || 'unknown',
               form_id: formId || 'unknown',
               template: 'internal_notification',
@@ -648,11 +746,23 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
     }
   }
 
-  // SMS fulfillment via SMS_Sender Lambda (Twilio)
-  // Supports new notifications.internal.sms_recipients and legacy fulfillment.sms_to
-  const smsRecipients = internalNotif.enabled && internalNotif.channels?.sms
-    ? (internalNotif.sms_recipients || [])
-    : [];
+  // SMS fulfillment via SMS_Sender Lambda (Telnyx)
+  // Supports: recipient_user_ids (Phase 4), notifications.internal.sms_recipients, legacy fulfillment.sms_to
+  let smsRecipients;
+  if (internalNotif.recipient_user_ids?.length > 0 && internalNotif.enabled && internalNotif.channels?.sms) {
+    // Phase 4: resolve user_ids to phones (skips users not opted in, no phone, or in quiet hours)
+    try {
+      const resolvedPhones = await resolvePhonesFromUserIds(internalNotif.recipient_user_ids);
+      smsRecipients = [...new Set([...resolvedPhones, ...(internalNotif.sms_recipients || [])])];
+    } catch (e) {
+      console.error('[routeFulfillment] Unexpected error resolving phones from user_ids:', e);
+      smsRecipients = internalNotif.sms_recipients || [];
+    }
+  } else {
+    smsRecipients = internalNotif.enabled && internalNotif.channels?.sms
+      ? (internalNotif.sms_recipients || [])
+      : [];
+  }
   const legacySmsTo = fulfillment.sms_to ? [fulfillment.sms_to] : [];
   const allSmsRecipients = [...new Set([...smsRecipients, ...legacySmsTo])];
 
@@ -688,7 +798,9 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
               formId,
               submissionId,
               sessionId,
-              type: 'internal'
+              type: 'internal',
+              sendType: 'internal',
+              fromNumber: config.sms_settings?.from_number || '',
             })
           }));
           smsCount++;
@@ -798,6 +910,135 @@ async function incrementSMSUsage(tenantId) {
 }
 
 /**
+ * Find whether the contact gave SMS consent in this form submission.
+ * Checks form_data values against the form field config to find the consent answer.
+ *
+ * Supports:
+ * - phone_with_consent composite: subfield with sms_consent: true or type 'select' inside the composite
+ * - Standalone select field with label containing "consent" or "text message"
+ * - Explicit sms_consent_given field in form_data
+ *
+ * @returns {boolean} true if consent was explicitly given ("yes")
+ */
+function findSmsConsent(formData, formConfig) {
+  const fields = formConfig?.fields || [];
+
+  for (const field of fields) {
+    // phone_with_consent composite: check subfield values
+    if (field.type === 'phone_with_consent' && field.subfields) {
+      for (const sub of field.subfields) {
+        if (sub.type === 'select' || sub.sms_consent) {
+          // Composite subfield value is stored as field.id (the composite value object)
+          // or as a flat key matching the subfield id
+          const compositeVal = formData[field.id];
+          if (typeof compositeVal === 'object' && compositeVal !== null) {
+            if (String(compositeVal[sub.id] || '').toLowerCase() === 'yes') return true;
+          }
+          // Also check flat key (some submissions flatten composite values)
+          if (String(formData[sub.id] || '').toLowerCase() === 'yes') return true;
+        }
+      }
+    }
+
+    // Standalone select field for consent (label-based detection)
+    if (field.type === 'select') {
+      const label = (field.label || '').toLowerCase();
+      if (label.includes('consent') || label.includes('text message') || label.includes('sms')) {
+        if (String(formData[field.id] || '').toLowerCase() === 'yes') return true;
+      }
+    }
+  }
+
+  // Fallback: check for explicit sms_consent_given in form data
+  if (String(formData.sms_consent_given || '').toLowerCase() === 'yes') return true;
+
+  return false;
+}
+
+/**
+ * Find the SMS consent disclosure text from the form config.
+ * This is the exact wording shown to the contact — stored in the consent record for TCPA compliance.
+ */
+function findConsentDisclosure(formConfig) {
+  const fields = formConfig?.fields || [];
+
+  for (const field of fields) {
+    if (field.type === 'phone_with_consent' && field.subfields) {
+      const consentSub = field.subfields.find(sf => sf.type === 'select' || sf.sms_consent);
+      if (consentSub) {
+        return consentSub.disclosure || consentSub.prompt || consentSub.label || '';
+      }
+    }
+    if (field.type === 'select') {
+      const label = (field.label || '').toLowerCase();
+      if (label.includes('consent') || label.includes('text message') || label.includes('sms')) {
+        return field.prompt || field.label || '';
+      }
+    }
+  }
+
+  return '';
+}
+
+/**
+ * Write a transactional consent record when a form submission includes a phone number.
+ * Consent is per-org, per-phone, per-type. The consent_type is part of the sort key
+ * so marketing consent can be added later without a migration.
+ *
+ * @param {string} tenantId - Tenant identifier
+ * @param {string} phoneE164 - Phone in E.164 format (+1XXXXXXXXXX)
+ * @param {string} formId - Form that captured consent
+ * @param {string} submissionId - Submission that captured consent
+ * @param {string} consentLanguage - Disclosure text shown to contact
+ */
+async function writeConsentRecord(tenantId, phoneE164, formId, submissionId, consentLanguage = '') {
+  if (!SMS_CONSENT_TABLE || !tenantId || !phoneE164) {
+    return;
+  }
+
+  // Normalize to E.164 if not already
+  const phone = phoneE164.startsWith('+') ? phoneE164 : `+1${phoneE164.replace(/\D/g, '')}`;
+  if (!/^\+\d{10,15}$/.test(phone)) {
+    console.warn(`⚠️ Cannot write consent: invalid phone format ${phoneE164}`);
+    return;
+  }
+
+  const now = new Date().toISOString();
+
+  try {
+    // Conditional put: only create if no record exists yet (don't overwrite existing consent)
+    await dynamodb.send(new PutCommand({
+      TableName: SMS_CONSENT_TABLE,
+      Item: {
+        pk: `TENANT#${tenantId}`,
+        sk: `CONSENT#transactional#${phone}`,
+        phone_e164: phone,
+        consent_given: true,
+        consent_timestamp: now,
+        consent_method: 'web_form',
+        consent_language: consentLanguage,
+        consent_type: 'transactional',
+        opted_out_at: null,
+        opt_out_source: null,
+        form_id: formId || 'unknown',
+        submission_id: submissionId || 'unknown',
+        created_at: now,
+        updated_at: now,
+      },
+      ConditionExpression: 'attribute_not_exists(pk)',
+    }));
+    console.log(`✅ Consent record created for ${phone} (tenant: ${tenantId})`);
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') {
+      // Record already exists — don't overwrite (consent is immutable once given)
+      console.log(`ℹ️ Consent record already exists for ${phone} (tenant: ${tenantId})`);
+    } else {
+      console.error('Failed to write consent record:', error);
+    }
+  }
+}
+
+/**
  * Send form data via email
  */
 async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal', submissionId = 'unknown', customSubject = null, bodyTemplate = null, sessionId = null, contact = null) {
@@ -808,12 +1049,15 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
 
   // Build template variables from extracted contact (same pipeline as sendConfirmationEmail)
   const capitalize = (s) => (s && typeof s === 'string') ? s.charAt(0).toUpperCase() + s.slice(1) : '';
+  const formConfig = config.conversational_forms?.[formId] || {};
+  const formTitle = formConfig.form_title || formConfig.title || formId;
   const templateVars = {
     first_name: capitalize(contact?.first_name),
     last_name: capitalize(contact?.last_name),
     email: contact?.email || '',
     phone: contact?.phone || '',
     organization_name: config.chat_title || config.tenant_id || '',
+    form_title: formTitle,
     form_data: formDataText,
     form_type: formId,
   };
@@ -823,7 +1067,9 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
   if (customSubject) {
     subject = renderTemplate(customSubject, templateVars);
   } else {
-    subject = `New Form Submission: ${formId}`;
+    const formConfig = config.conversational_forms?.[formId] || {};
+    const formLabel = formConfig.form_title || formConfig.title || formId;
+    subject = `New ${formLabel} Submission`;
   }
 
   let htmlBody;
@@ -833,7 +1079,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
   } else {
     // Default HTML email body
     htmlBody = `
-      <h2>New ${formId} Submission</h2>
+      <h2>New ${formLabel} Submission</h2>
       <p>A new form has been submitted through the chat widget.</p>
       <h3>Form Data:</h3>
       <table border="1" cellpadding="5" cellspacing="0">
@@ -850,9 +1096,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
 
     htmlBody += `
       </table>
-      <p><strong>Priority:</strong> ${priority.toUpperCase()}</p>
-      <p>Submitted at: ${new Date().toISOString()}</p>
-      <p>Tenant: ${config.tenant_id || 'unknown'}</p>
+      <p style="color: #666; font-size: 12px; margin-top: 16px;">Submitted: ${new Date().toLocaleString('en-US', { timeZone: 'America/Chicago', month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true })} CT</p>
     `;
   }
 
@@ -912,12 +1156,14 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
   // Capitalize name fields — frontend should do this too, but ensure it server-side
   const capitalize = (s) => (s && typeof s === 'string') ? s.charAt(0).toUpperCase() + s.slice(1) : '';
 
+  const formTitle = formConfig.form_title || formConfig.title || formId;
   const templateVars = {
     first_name: capitalize(contact?.first_name),
     last_name: capitalize(contact?.last_name),
     email: userEmail,
     phone: contact?.phone || '',
     organization_name: tenantName,
+    form_title: formTitle,
     form_data: formDataText,
   };
 
@@ -1013,7 +1259,7 @@ function renderTemplate(template, variables) {
     const strVal = String(value ?? '').trim();
     const resolved = ANONYMOUS.includes(strVal.toLowerCase()) ? '' : strVal;
     // Replace placeholder, then collapse any extra space left behind
-    result = result.replace(new RegExp(`\\s*\\{${key}\\}`, 'g'), resolved ? ` ${resolved}` : '');
+    result = result.replace(new RegExp(`[^\\S\\n]*\\{${key}\\}`, 'g'), resolved ? ` ${resolved}` : '');
   }
   // Clean up artifacts from removed placeholders
   result = result.replace(/ {2,}/g, ' ');    // collapse double spaces
@@ -1022,7 +1268,7 @@ function renderTemplate(template, variables) {
   result = result.replace(/,\s*,/g, ',');    // ",," → ","
   result = result.replace(/\(\s*\)/g, '');   // "()" → remove empty parens
   result = result.replace(/^\s*,\s*/g, '');  // leading ", " → remove
-  result = result.replace(/\s+$/gm, '');     // trailing whitespace per line
+  result = result.replace(/[^\S\n]+$/gm, ''); // trailing spaces/tabs per line (preserves blank lines)
   return result.trim();
 }
 

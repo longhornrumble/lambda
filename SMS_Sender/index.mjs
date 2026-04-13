@@ -19,7 +19,7 @@
 
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const secretsClient = new SecretsManagerClient({ region });
@@ -28,6 +28,7 @@ const dynamodb = DynamoDBDocumentClient.from(ddbClient);
 
 const TELNYX_SECRET_NAME = process.env.TELNYX_SECRET_NAME || 'picasso/telnyx';
 const NOTIFICATION_SENDS_TABLE = process.env.NOTIFICATION_SENDS_TABLE || 'picasso-notification-sends';
+const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent';
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || '';
 
 // Module-level cache for Telnyx credentials (persists across warm invocations)
@@ -83,9 +84,33 @@ async function sendViaTelnyx(apiKey, from, to, text, webhookUrl) {
 }
 
 /**
+ * Calculate SMS segment count based on message content.
+ * GSM-7 encoding: 160 chars for single segment, 153 for multi-segment.
+ * UCS-2 encoding (non-GSM characters): 70 chars for single, 67 for multi.
+ */
+function calculateSegmentCount(text) {
+  if (!text) return 0;
+
+  // GSM-7 basic character set (simplified check — covers most Latin text)
+  // If any character falls outside GSM-7, the entire message uses UCS-2.
+  const GSM7_PATTERN = /^[@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞ ÆæßÉ!"#¤%&'()*+,\-.\/0-9:;<=>?¡A-ZÄÖÑÜa-zäöñüà\x1B\f^{}\\[\]~|€]*$/;
+  const isGSM7 = GSM7_PATTERN.test(text);
+
+  const len = text.length;
+
+  if (isGSM7) {
+    if (len <= 160) return 1;
+    return Math.ceil(len / 153);
+  } else {
+    if (len <= 70) return 1;
+    return Math.ceil(len / 67);
+  }
+}
+
+/**
  * Write a send record to picasso-notification-sends for audit trail
  */
-async function writeAuditRecord(tenantId, messageId, payload, status, error = '') {
+async function writeAuditRecord(tenantId, messageId, payload, status, error = '', segmentCount = 0) {
   const now = new Date().toISOString();
   try {
     await dynamodb.send(new PutCommand({
@@ -102,6 +127,7 @@ async function writeAuditRecord(tenantId, messageId, payload, status, error = ''
         status,
         error,
         message_id: messageId || '',
+        segment_count: segmentCount,
         timestamp: now,
         ttl: Math.floor(Date.now() / 1000) + 90 * 24 * 3600, // 90 days
       }
@@ -112,10 +138,48 @@ async function writeAuditRecord(tenantId, messageId, payload, status, error = ''
 }
 
 /**
+ * Check consent for contact-facing sends.
+ * Returns true only if an active consent record exists (consent_given: true, no opt-out).
+ * Returns false if no record, opted out, or consent table unavailable.
+ *
+ * TCPA requires consent BEFORE sending. No record = no consent = no send.
+ *
+ * Only called for sendType 'contact'. Staff notifications (sendType 'internal')
+ * bypass this check — they use Clerk opt-in flags instead.
+ */
+async function checkConsent(tenantId, phoneE164) {
+  try {
+    const result = await dynamodb.send(new GetCommand({
+      TableName: SMS_CONSENT_TABLE,
+      Key: {
+        pk: `TENANT#${tenantId}`,
+        sk: `CONSENT#transactional#${phoneE164}`,
+      },
+    }));
+
+    if (!result.Item) {
+      console.log(`🚫 No consent record for ${phoneE164} (tenant: ${tenantId}) — suppressing send`);
+      return false;
+    }
+
+    if (result.Item.consent_given === false || result.Item.opted_out_at) {
+      console.log(`🚫 Contact ${phoneE164} has opted out (tenant: ${tenantId}) — suppressing send`);
+      return false;
+    }
+
+    return true;
+  } catch (error) {
+    console.error('Consent check failed:', error);
+    // Fail closed — no consent verification means no send
+    return false;
+  }
+}
+
+/**
  * Lambda handler
  */
 export async function handler(event) {
-  const { to, body, tenantId, formId, submissionId, sessionId, type } = event;
+  const { to, body, tenantId, formId, submissionId, sessionId, type, sendType, fromNumber } = event;
 
   // Validate required fields
   if (!to || !body || !tenantId) {
@@ -132,6 +196,16 @@ export async function handler(event) {
     return { success: false, error };
   }
 
+  // Pre-send consent check for contact-facing sends only.
+  // Staff notifications (type: 'internal') use Clerk opt-in flags, not the consent table.
+  if (sendType === 'contact') {
+    const hasConsent = await checkConsent(tenantId, to);
+    if (!hasConsent) {
+      await writeAuditRecord(tenantId, null, event, 'suppressed', 'contact opted out');
+      return { success: false, error: 'suppressed', reason: 'opted_out' };
+    }
+  }
+
   try {
     const credentials = await getTelnyxCredentials();
 
@@ -146,28 +220,33 @@ export async function handler(event) {
       ? `${WEBHOOK_BASE_URL}?${callbackParams.toString()}`
       : undefined;
 
+    // Use per-org number if provided, otherwise fall back to Secrets Manager default
+    const senderNumber = fromNumber || credentials.fromNumber;
+
     // Send via Telnyx API
     const message = await sendViaTelnyx(
       credentials.apiKey,
-      credentials.fromNumber,
+      senderNumber,
       to,
       body,
       webhookUrl
     );
 
     const messageId = message.id;
-    console.log(`✅ SMS sent to ${to} (ID: ${messageId}, type: ${type || 'internal'})`);
+    const segments = calculateSegmentCount(body);
+    console.log(`✅ SMS sent to ${to} (ID: ${messageId}, type: ${type || 'internal'}, segments: ${segments})`);
 
     // Write success audit record
-    await writeAuditRecord(tenantId, messageId, event, 'sent');
+    await writeAuditRecord(tenantId, messageId, event, 'sent', '', segments);
 
-    return { success: true, messageId };
+    return { success: true, messageId, segments };
 
   } catch (error) {
     console.error(`❌ SMS send failed for ${to}:`, error.message);
 
     // Write failure audit record
-    await writeAuditRecord(tenantId, null, event, 'failed', error.message);
+    const segments = calculateSegmentCount(body);
+    await writeAuditRecord(tenantId, null, event, 'failed', error.message, segments);
 
     return { success: false, error: error.message };
   }

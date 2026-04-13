@@ -6,9 +6,15 @@
  */
 
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { DynamoDBClient, QueryCommand } = require('@aws-sdk/client-dynamodb');
 
-// Initialize S3 client
+// Initialize AWS clients
 const s3Client = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'us-east-1' });
+
+// Tenant registry feature flag
+const USE_REGISTRY = (process.env.USE_REGISTRY_FOR_RESOLUTION || '').toLowerCase() === 'true';
+const TENANT_REGISTRY_TABLE = process.env.TENANT_REGISTRY_TABLE || `picasso-tenant-registry-${process.env.ENVIRONMENT || 'staging'}`;
 
 // Simple cache for tenant configs (5 minute TTL)
 const configCache = {};
@@ -34,9 +40,30 @@ function getConfigBucket() {
 }
 
 /**
- * Resolve tenant hash to tenant ID via S3 mapping
+ * Resolve tenant hash to tenant ID (DynamoDB registry first, S3 fallback)
  */
 async function resolveTenantHash(tenantHash) {
+    // Try DynamoDB registry first
+    if (USE_REGISTRY) {
+        try {
+            const result = await dynamoClient.send(new QueryCommand({
+                TableName: TENANT_REGISTRY_TABLE,
+                IndexName: 'TenantHashIndex',
+                KeyConditionExpression: 'tenantHash = :hash',
+                ExpressionAttributeValues: { ':hash': { S: tenantHash } },
+                Limit: 1,
+            }));
+            const items = result.Items || [];
+            if (items.length > 0 && items[0].status?.S === 'active') {
+                console.log(`📍 Resolved via DynamoDB registry: ${items[0].tenantId.S}`);
+                return items[0].tenantId.S;
+            }
+        } catch (registryErr) {
+            console.warn(`⚠️ Registry lookup failed, falling back to S3: ${registryErr.message}`);
+        }
+    }
+
+    // S3 mapping fallback
     try {
         const mappingKey = `mappings/${tenantHash}.json`;
         const command = new GetObjectCommand({

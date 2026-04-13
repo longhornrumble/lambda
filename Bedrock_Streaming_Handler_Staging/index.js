@@ -16,6 +16,7 @@
 const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { BedrockAgentRuntimeClient, RetrieveCommand } = require('@aws-sdk/client-bedrock-agent-runtime');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { DynamoDBClient, QueryCommand } = require('@aws-sdk/client-dynamodb');
 const { SQSClient, SendMessageCommand, SendMessageBatchCommand } = require('@aws-sdk/client-sqs');
 const crypto = require('crypto');
 const { enhanceResponse } = require('./response_enhancer');
@@ -55,6 +56,11 @@ const bedrock = new BedrockRuntimeClient({ region: AWS_REGION });
 const bedrockAgent = new BedrockAgentRuntimeClient({ region: AWS_REGION });
 const s3 = new S3Client({ region: AWS_REGION });
 const sqs = new SQSClient({ region: AWS_REGION });
+const dynamodb = new DynamoDBClient({ region: AWS_REGION });
+
+// Tenant registry feature flag
+const USE_REGISTRY = (process.env.USE_REGISTRY_FOR_RESOLUTION || '').toLowerCase() === 'true';
+const TENANT_REGISTRY_TABLE = process.env.TENANT_REGISTRY_TABLE || `picasso-tenant-registry-${process.env.ENVIRONMENT || 'staging'}`;
 
 // Analytics SQS queue URL
 const ANALYTICS_QUEUE_URL = process.env.ANALYTICS_QUEUE_URL || 'https://sqs.us-east-1.amazonaws.com/614056832592/picasso-analytics-events';
@@ -158,14 +164,39 @@ async function loadConfig(tenantHash, { skipCache = false } = {}) {
 
     const bucket = process.env.CONFIG_BUCKET || 'myrecruiter-picasso';
     console.log(`🪣 Loading config from bucket: ${bucket}`);
-    
-    const mappingResponse = await s3.send(new GetObjectCommand({
-      Bucket: bucket,
-      Key: `mappings/${tenantHash}.json`
-    }));
-    
-    const mapping = JSON.parse(await mappingResponse.Body.transformToString());
-    console.log(`📍 Mapping found - tenant_id: ${mapping.tenant_id}`);
+
+    // Resolve tenant hash → tenant_id (DynamoDB first, S3 fallback)
+    let mapping = null;
+
+    if (USE_REGISTRY) {
+      try {
+        const registryResult = await dynamodb.send(new QueryCommand({
+          TableName: TENANT_REGISTRY_TABLE,
+          IndexName: 'TenantHashIndex',
+          KeyConditionExpression: 'tenantHash = :hash',
+          ExpressionAttributeValues: { ':hash': { S: tenantHash } },
+          Limit: 1,
+        }));
+        const items = registryResult.Items || [];
+        if (items.length > 0 && items[0].status?.S === 'active') {
+          mapping = { tenant_id: items[0].tenantId.S };
+          console.log(`📍 Resolved via DynamoDB registry: ${mapping.tenant_id}`);
+        } else if (items.length > 0) {
+          console.warn(`⚠️ Registry record found but status=${items[0].status?.S}, falling back to S3`);
+        }
+      } catch (registryErr) {
+        console.warn(`⚠️ Registry lookup failed, falling back to S3: ${registryErr.message}`);
+      }
+    }
+
+    if (!mapping) {
+      const mappingResponse = await s3.send(new GetObjectCommand({
+        Bucket: bucket,
+        Key: `mappings/${tenantHash}.json`
+      }));
+      mapping = JSON.parse(await mappingResponse.Body.transformToString());
+      console.log(`📍 Resolved via S3 mapping: ${mapping.tenant_id}`);
+    }
     
     if (mapping.tenant_id) {
       // Try both possible config filenames

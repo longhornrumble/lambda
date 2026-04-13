@@ -20,6 +20,9 @@ cached_config = {}  # Cache by hash, not tenant_id
 cache_timestamps = {}
 hash_to_tenant_cache = {}  # Cache hash→tenant_id mappings for S3 access
 
+# Tenant registry feature flag — flip to True after backfill + 48hr staging validation
+USE_REGISTRY = os.environ.get("USE_REGISTRY_FOR_RESOLUTION", "").lower() in ("true", "1", "yes")
+
 # 🛡️ SECURITY: Dynamic hash validation against S3 mapping files
 # No hardcoded whitelist - validation happens against actual S3 mapping files
 
@@ -27,33 +30,55 @@ hash_to_tenant_cache = {}  # Cache hash→tenant_id mappings for S3 access
 TENANT_HASH_PATTERN = re.compile(r'^[a-zA-Z0-9]{10,20}$')  # Alphanumeric, 10-20 chars
 
 def is_valid_tenant_hash(tenant_hash):
-    """🛡️ SECURITY: Strict tenant hash validation with dynamic S3 mapping check"""
+    """🛡️ SECURITY: Strict tenant hash validation with dynamic mapping check"""
     if not tenant_hash:
         return False
-    
+
     # Check basic format requirements
     if not isinstance(tenant_hash, str):
         return False
-        
+
     # Check length constraints
     if len(tenant_hash) < 10 or len(tenant_hash) > 20:
         return False
-    
+
     # Check pattern matching (alphanumeric only)
     if not TENANT_HASH_PATTERN.match(tenant_hash):
         return False
-    
-    # 🛡️ SECURITY: Dynamic validation against S3 mapping files
-    # This ensures only hashes with valid mapping files are allowed
+
+    # If hash is already in the warm cache, it's valid — skip network I/O entirely
+    if tenant_hash in hash_to_tenant_cache:
+        cache_age = time.time() - hash_to_tenant_cache[tenant_hash].get("timestamp", 0)
+        if cache_age < 300:
+            logger.debug(f"[{tenant_hash[:8]}...] ✅ Hash validation passed via warm cache")
+            return True
+
+    # Try DynamoDB registry first (if enabled)
+    if USE_REGISTRY:
+        try:
+            from tenant_registry import get_tenant_by_hash
+            record = get_tenant_by_hash(tenant_hash)
+            if record and record.get('status') == 'active':
+                logger.debug(f"[{tenant_hash[:8]}...] ✅ Hash validation passed via DynamoDB registry")
+                return True
+            elif record:
+                logger.warning(f"[{tenant_hash[:8]}...] ⚠️ Hash found in registry but status={record.get('status')}")
+                return False
+            # record is None — fall through to S3
+            logger.info(f"[{tenant_hash[:8]}...] Registry returned no result, falling back to S3 validation")
+        except Exception as e:
+            logger.warning(f"[{tenant_hash[:8]}...] Registry validation failed, falling back to S3: {e}")
+
+    # 🛡️ SECURITY: Fallback — validate against S3 mapping files
     try:
         mapping_key = f"{MAPPINGS_PREFIX}/{tenant_hash}.json"
         logger.debug(f"[{tenant_hash[:8]}...] 🔍 Validating hash against S3: s3://{S3_BUCKET}/{mapping_key}")
-        
+
         # Quick check if mapping file exists (HEAD request is faster than GET)
         s3.head_object(Bucket=S3_BUCKET, Key=mapping_key)
         logger.debug(f"[{tenant_hash[:8]}...] ✅ Hash validation passed - mapping file exists")
         return True
-        
+
     except ClientError as e:
         error_code = e.response['Error']['Code']
         if error_code == 'NoSuchKey':
@@ -138,43 +163,64 @@ def log_security_event(event_type, tenant_hash, additional_data=None):
 
 def resolve_tenant_hash(tenant_hash):
     """🔒 SECURITY: Resolve tenant hash to internal tenant_id for S3 access only"""
-    
-    # Check cache first
+
+    # Check cache first — skip all network I/O if warm
     if tenant_hash in hash_to_tenant_cache:
         cache_age = time.time() - hash_to_tenant_cache[tenant_hash].get("timestamp", 0)
         if cache_age < 300:  # 5-minute cache for hash mappings
             tenant_id = hash_to_tenant_cache[tenant_hash]["tenant_id"]
             logger.info(f"[{tenant_hash[:8]}...] ✅ Using cached hash resolution: {tenant_id}")
             return tenant_id
-    
+
+    # Try DynamoDB registry first (if enabled)
+    if USE_REGISTRY:
+        try:
+            from tenant_registry import get_tenant_by_hash
+            record = get_tenant_by_hash(tenant_hash)
+            if record and record.get('status') == 'active':
+                tenant_id = record['tenantId']
+                # Cache the mapping
+                hash_to_tenant_cache[tenant_hash] = {
+                    "tenant_id": tenant_id,
+                    "timestamp": time.time()
+                }
+                logger.info(f"[{tenant_hash[:8]}...] ✅ Resolved via DynamoDB registry: {tenant_id}")
+                return tenant_id
+            # record is None or inactive — fall through to S3
+            if record:
+                logger.warning(f"[{tenant_hash[:8]}...] ⚠️ Registry record found but status={record.get('status')}, falling back to S3")
+            else:
+                logger.info(f"[{tenant_hash[:8]}...] Registry returned no result, falling back to S3")
+        except Exception as e:
+            logger.warning(f"[{tenant_hash[:8]}...] ⚠️ Resolved via S3 fallback (DynamoDB failed: {e})")
+
+    # S3 mapping file resolution (original path)
     try:
         mapping_key = f"{MAPPINGS_PREFIX}/{tenant_hash}.json"
         logger.info(f"[{tenant_hash[:8]}...] 🔍 Resolving hash from S3: s3://{S3_BUCKET}/{mapping_key}")
-        
+
         obj = s3.get_object(Bucket=S3_BUCKET, Key=mapping_key)
         mapping_data = json.loads(obj["Body"].read())
-        
-        # 🔧 FIXED: Better error handling for mapping data
+
         tenant_id = mapping_data.get("tenant_id")
-        
+
         if not tenant_id:
             logger.error(f"[{tenant_hash[:8]}...] ❌ Mapping file exists but no tenant_id found: {mapping_data}")
             return None
-        
-        # 🔧 FIXED: Validate tenant_id format
+
         if not isinstance(tenant_id, str) or len(tenant_id) < 3:
             logger.error(f"[{tenant_hash[:8]}...] ❌ Invalid tenant_id format: {tenant_id}")
             return None
-        
+
         # Cache the mapping
         hash_to_tenant_cache[tenant_hash] = {
             "tenant_id": tenant_id,
             "timestamp": time.time()
         }
-        
-        logger.info(f"[{tenant_hash[:8]}...] ✅ Hash resolved for S3 access: {tenant_id}")
+
+        logger.info(f"[{tenant_hash[:8]}...] ✅ Hash resolved via S3: {tenant_id}")
         return tenant_id
-        
+
     except ClientError as e:
         error_code = e.response['Error']['Code']
         if error_code == 'NoSuchKey':
@@ -182,11 +228,11 @@ def resolve_tenant_hash(tenant_hash):
         else:
             logger.error(f"[{tenant_hash[:8]}...] ❌ S3 error resolving hash: {e.response['Error']['Message']}")
         return None
-        
+
     except json.JSONDecodeError as e:
         logger.error(f"[{tenant_hash[:8]}...] ❌ Invalid JSON in mapping file: {str(e)}")
         return None
-        
+
     except Exception as e:
         logger.error(f"[{tenant_hash[:8]}...] ❌ Unexpected error resolving hash: {str(e)}")
         return None

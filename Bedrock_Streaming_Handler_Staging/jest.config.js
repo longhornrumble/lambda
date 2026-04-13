@@ -5,6 +5,7 @@ module.exports = {
     'form_handler.js',
     'response_enhancer.js',
     'index.js',
+    'clerk_helper.js',
     '!node_modules/**',
     '!coverage/**',
     '!__tests__/**'

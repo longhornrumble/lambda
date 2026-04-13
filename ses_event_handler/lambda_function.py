@@ -1,30 +1,20 @@
 """
 SES Event Handler Lambda Function
 
-This Lambda receives SES event notifications (bounce, complaint, delivery, etc.)
-from SNS and forwards them to Bubble via webhook.
+Receives SES event notifications (bounce, complaint, delivery, etc.)
+from SNS and writes them to DynamoDB for the notification dashboard.
 """
 
 import json
 import logging
 import os
 import time
-import urllib.request
-import urllib.error
 
 import boto3
 
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
-# Configuration
-BUBBLE_WEBHOOK_URL = os.environ.get(
-    'BUBBLE_WEBHOOK_URL',
-    'https://hrfx.bubbleapps.io/api/1.1/wf/ses_event'
-)
-WEBHOOK_TIMEOUT = int(os.environ.get('WEBHOOK_TIMEOUT', '10'))
-BUBBLE_FORWARDING_ENABLED = os.environ.get('BUBBLE_FORWARDING_ENABLED', 'true').lower() == 'true'
 
 # DynamoDB
 _dynamodb = boto3.resource('dynamodb')
@@ -33,7 +23,7 @@ notification_events_table = _dynamodb.Table('picasso-notification-events')
 
 def lambda_handler(event, context):
     """
-    Process SES events from SNS and forward to Bubble.
+    Process SES events from SNS and write to DynamoDB.
 
     SNS delivers events in the Records array, where each record contains
     an Sns object with the Message field containing the SES notification JSON.
@@ -57,7 +47,7 @@ def lambda_handler(event, context):
             # Extract mail object (common to all event types)
             mail = sns_message.get('mail', {})
 
-            # Build base payload for Bubble
+            # Build base payload
             payload = {
                 'event_type': event_type.lower(),
                 'message_id': mail.get('messageId'),
@@ -88,10 +78,7 @@ def lambda_handler(event, context):
                         tags[tag_name] = tag_values[0] if len(tag_values) == 1 else tag_values
             payload['tags'] = tags
 
-            # Transition guard: check for tenant_id tag added by Phase 1 migration.
-            # Pre-migration emails (sent before ConfigurationSet/Tags were added) will
-            # not carry tenant_id. For those, we skip future DynamoDB writes but still
-            # forward to Bubble for backwards compatibility.
+            # Tenant ID from SES tags (added by Phase 1 migration)
             tenant_id = tags.get('tenant_id')
             if not tenant_id:
                 logger.warning(
@@ -99,7 +86,7 @@ def lambda_handler(event, context):
                     "pre-migration email, skipping DynamoDB write"
                 )
 
-            # Add event-specific details (MUST run before DynamoDB write so detail field is populated)
+            # Add event-specific details
             if event_type.lower() == 'bounce':
                 bounce = sns_message.get('bounce', {})
                 payload.update({
@@ -139,21 +126,17 @@ def lambda_handler(event, context):
                 })
 
             elif event_type.lower() == 'send':
-                # Send event - minimal additional data
-                send_info = sns_message.get('send', {})
                 payload.update({
                     'send_timestamp': mail.get('timestamp'),
                 })
 
             elif event_type.lower() == 'reject':
-                # Reject event
                 reject = sns_message.get('reject', {})
                 payload.update({
                     'reject_reason': reject.get('reason'),
                 })
 
             elif event_type.lower() == 'open':
-                # Open tracking event
                 open_info = sns_message.get('open', {})
                 payload.update({
                     'open_timestamp': open_info.get('timestamp'),
@@ -162,7 +145,6 @@ def lambda_handler(event, context):
                 })
 
             elif event_type.lower() == 'click':
-                # Click tracking event
                 click = sns_message.get('click', {})
                 payload.update({
                     'click_timestamp': click.get('timestamp'),
@@ -173,8 +155,6 @@ def lambda_handler(event, context):
                 })
 
             # Write to picasso-notification-events (post-migration emails only)
-            # Runs AFTER event-specific payload updates so detail field captures
-            # bounce_type, bounce_subtype, complaint_type, etc.
             if tenant_id:
                 try:
                     event_type_lower = payload['event_type']
@@ -182,7 +162,7 @@ def lambda_handler(event, context):
                     iso_date = (payload.get('timestamp') or '').split('T')[0] or \
                         __import__('datetime').datetime.utcnow().strftime('%Y-%m-%d')
 
-                    # Build event-specific detail map from payload (now includes bounce/complaint fields)
+                    # Build event-specific detail map
                     skip_keys = {
                         'event_type', 'message_id', 'timestamp', 'source',
                         'destination', 'source_arn', 'source_ip',
@@ -218,16 +198,8 @@ def lambda_handler(event, context):
                         exc_info=True
                     )
 
-            # Forward to Bubble (controlled by BUBBLE_FORWARDING_ENABLED env var)
-            bubble_success = True
-            if BUBBLE_FORWARDING_ENABLED:
-                bubble_success = forward_to_bubble(payload)
-
-            if bubble_success:
-                processed += 1
-                logger.info(f"Processed {event_type} event for message {mail.get('messageId')}")
-            else:
-                errors += 1
+            processed += 1
+            logger.info(f"Processed {event_type} event for message {mail.get('messageId')}")
 
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse SNS message: {str(e)}")
@@ -239,7 +211,6 @@ def lambda_handler(event, context):
     logger.info(f"Completed: {processed} processed, {errors} errors")
 
     # Return non-200 when all records failed so SNS will retry delivery.
-    # Partial failures still return 200 — individual error details are in logs.
     if errors > 0 and processed == 0:
         return {
             'statusCode': 500,
@@ -256,46 +227,3 @@ def lambda_handler(event, context):
             'errors': errors
         })
     }
-
-
-def forward_to_bubble(payload):
-    """
-    POST event to Bubble webhook.
-
-    Returns True if successful, False otherwise.
-    """
-    data = json.dumps(payload).encode('utf-8')
-
-    req = urllib.request.Request(
-        BUBBLE_WEBHOOK_URL,
-        data=data,
-        headers={
-            'Content-Type': 'application/json',
-            'User-Agent': 'SES-Event-Handler/1.0'
-        },
-        method='POST'
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as response:
-            status = response.status
-            logger.info(f"Forwarded {payload['event_type']} event to Bubble: HTTP {status}")
-            return True
-
-    except urllib.error.HTTPError as e:
-        logger.error(f"Bubble webhook HTTP error {e.code}: {e.reason}")
-        # Read response body for more details
-        try:
-            error_body = e.read().decode('utf-8')
-            logger.error(f"Bubble error response: {error_body[:500]}")
-        except Exception:
-            pass
-        return False
-
-    except urllib.error.URLError as e:
-        logger.error(f"Bubble webhook URL error: {str(e)}")
-        return False
-
-    except Exception as e:
-        logger.error(f"Failed to forward to Bubble: {str(e)}")
-        return False

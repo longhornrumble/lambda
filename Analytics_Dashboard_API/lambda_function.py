@@ -97,7 +97,7 @@ S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
 # JWKS URL: move to env var CLERK_JWKS_URL for production.
 CLERK_JWKS_URL = os.environ.get(
     'CLERK_JWKS_URL',
-    'https://capable-peacock-51.clerk.accounts.dev/.well-known/jwks.json'
+    'https://divine-impala-48.clerk.accounts.dev/.well-known/jwks.json'
 )
 
 # JWKS cache (TTL: 1 hour)
@@ -388,7 +388,7 @@ def lambda_handler(event, context):
             return handle_settings_notifications_get(tenant_id)
         elif path.endswith('/settings/notifications') and method == 'PATCH':
             body = json.loads(event.get('body', '{}') or '{}')
-            return handle_settings_notifications_patch(tenant_id, body, user_role)
+            return handle_settings_notifications_patch(auth_result, tenant_id, body)
 
         # =================================================================
         # Team Management endpoints (Phase 3)
@@ -418,6 +418,13 @@ def lambda_handler(event, context):
         elif path.endswith('/profile') and method == 'PATCH':
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_profile_update(auth_result, body)
+
+        # Notification Preferences endpoints (Phase 4)
+        elif path.endswith('/preferences') and method == 'GET':
+            return handle_preferences_get(auth_result)
+        elif path.endswith('/preferences') and method == 'PATCH':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_preferences_patch(auth_result, body)
 
         else:
             return cors_response(404, {'error': f'Unknown endpoint: {path}'})
@@ -501,7 +508,7 @@ def _decode_clerk_jwt_claims(token: str) -> Dict[str, Any]:
 
     # Verify issuer belongs to our Clerk domain
     iss = payload.get('iss', '')
-    if 'capable-peacock-51.clerk.accounts.dev' not in iss and 'clerk.accounts.dev' not in iss:
+    if 'clerk.myrecruiter.ai' not in iss and 'clerk.accounts.dev' not in iss:
         raise ValueError(f'Unexpected Clerk token issuer: {iss}')
 
     # Verify JWKS kid exists (confirms token was issued by our Clerk instance)
@@ -569,6 +576,16 @@ def _extract_email_from_clerk_user(user_data: Dict[str, Any]) -> str:
     if email_addresses:
         return email_addresses[0]['email_address'].lower().strip()
     raise ValueError('Clerk user has no email addresses')
+
+
+def _extract_phone_from_clerk_user(user_data: Dict[str, Any]) -> Optional[str]:
+    """Extract phone from Clerk user unsafeMetadata.notification_preferences.phone."""
+    return (user_data.get('unsafe_metadata') or {}).get('notification_preferences', {}).get('phone') or None
+
+
+def _extract_sms_opted_in(user_data: Dict[str, Any]) -> bool:
+    """Check if user has opted into SMS via notification preferences."""
+    return bool((user_data.get('unsafe_metadata') or {}).get('notification_preferences', {}).get('sms', False))
 
 
 def _extract_name_from_clerk_user(user_data: Dict[str, Any]) -> Optional[str]:
@@ -4034,6 +4051,14 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
     if access_error:
         return access_error
 
+    # Build form_id → title map for human-readable display
+    tenant_config = get_tenant_config(tenant_id)
+    form_titles: Dict[str, str] = {}
+    if tenant_config:
+        for fid, fdef in tenant_config.get('conversational_forms', {}).items():
+            if isinstance(fdef, dict):
+                form_titles[fid] = fdef.get('form_title') or fdef.get('title') or fid
+
     range_str = params.get('range', '7d')
     start_date = _notification_date_range_start(range_str)
     pk = f'TENANT#{tenant_id}'
@@ -4049,6 +4074,7 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
 
     channel_filter = params.get('channel', '').strip().lower()
     status_filter = params.get('status', '').strip().lower()
+    email_type_filter = params.get('email_type', '').strip().lower()
     search = params.get('search', '').strip().lower()
 
     logger.info(
@@ -4093,18 +4119,41 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
                 dest_list = item.get('destination', {}).get('L', [])
                 recipient = dest_list[0].get('S', '') if dest_list else ''
 
-                # search filter on recipient
-                if search and search not in recipient.lower():
-                    continue
+                # search filter moved below after form_title resolution
+
+                # SES tags — read early for form_id fallback and email_type
+                tags = item.get('tags', {}).get('M', {})
 
                 context = item.get('context', {}).get('M', {})
                 form_id = context.get('form_id', {}).get('S', '')
+                # Fallback: form_id may be in tags as 'form_type' (SES tag name)
+                if not form_id:
+                    form_id = tags.get('form_type', {}).get('S', '')
 
                 # SK: <ISO_DATE>#<event_type>#<message_id>
                 sk = item.get('sk', {}).get('S', '')
                 sk_parts = sk.split('#')
                 message_id = sk_parts[2] if len(sk_parts) >= 3 else ''
-                timestamp = item.get('sk', {}).get('S', '').split('#')[0] if sk else ''
+
+                # Full ISO timestamp from event_type_timestamp GSI SK:
+                # format: <event_type>#<ISO_timestamp>
+                et_ts = item.get('event_type_timestamp', {}).get('S', '')
+                et_ts_parts = et_ts.split('#', 1)
+                timestamp = et_ts_parts[1] if len(et_ts_parts) == 2 else sk_parts[0] if sk_parts else ''
+
+                # email_type from SES tags (internal_notification | applicant_confirmation)
+                email_type = tags.get('email_type', {}).get('S', '')
+
+                # email_type filter
+                if email_type_filter and email_type != email_type_filter:
+                    continue
+
+                # Resolve form title
+                form_title = form_titles.get(form_id, form_id) if form_id else ''
+
+                # Search on recipient and form title
+                if search and search not in recipient.lower() and search not in form_title.lower():
+                    continue
 
                 # Extract event-specific detail (bounce_type, complaint_type, etc.)
                 detail_raw = item.get('detail', {}).get('M', {})
@@ -4126,10 +4175,11 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
                     'event_type': event_type,
                     'channel': item.get('channel', {}).get('S', ''),
                     'recipient': recipient,
-                    'form_id': form_id,
+                    'form_title': form_title,
                     'status': event_type,
                     'message_id': message_id,
                     'detail': detail,
+                    'email_type': email_type,
                 })
             last_key = resp.get('LastEvaluatedKey')
             if not last_key:
@@ -4219,6 +4269,9 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
             'detail': detail,
         })
 
+    # Sort chronologically (send first) — GSI order is by event_type, not timestamp
+    events.sort(key=lambda e: e['timestamp'])
+
     return cors_response(200, {
         'message_id': message_id,
         'events': events,
@@ -4246,7 +4299,7 @@ SAMPLE_DATA: Dict[str, str] = {
 # Variables surfaced to the frontend template editor.
 AVAILABLE_VARIABLES: List[str] = [
     '{first_name}', '{last_name}', '{email}', '{phone}',
-    '{organization_name}', '{form_data}',
+    '{organization_name}', '{form_title}', '{form_data}',
 ]
 
 # Role guard for all write operations on settings endpoints.
@@ -4458,28 +4511,51 @@ def handle_settings_notifications_get(tenant_id: str) -> Dict[str, Any]:
     """
     GET /settings/notifications
 
-    Returns the notification config for every conversational form that has
-    a notifications block, keyed by form_id.
+    Returns the notification config for every conversational form, keyed by
+    form_id.  Forms without an existing notifications block get a default
+    scaffold so the portal can display and configure them.
     """
     config = get_tenant_config(tenant_id)
     if not config:
         return cors_response(404, {'error': 'Tenant configuration not found'})
 
+    DEFAULT_NOTIFICATIONS: Dict[str, Any] = {
+        'internal': {
+            'enabled': False,
+            'recipients': [],
+            'subject': '',
+            'body_template': '',
+            'channels': {'email': True, 'sms': False},
+        },
+        'applicant_confirmation': {
+            'enabled': False,
+            'subject': '',
+            'body_template': '',
+            'use_tenant_branding': True,
+        },
+    }
+
     forms_out: Dict[str, Any] = {}
     for form_id, form in config.get('conversational_forms', {}).items():
         if not isinstance(form, dict):
             continue
-        if 'notifications' in form:
-            forms_out[form_id] = {
-                'form_title': form.get('form_title', form_id),
-                'notifications': form['notifications'],
-            }
+        forms_out[form_id] = {
+            'form_title': form.get('form_title', form_id),
+            'notifications': form.get('notifications', DEFAULT_NOTIFICATIONS),
+        }
+
+    # SMS provisioning check: tenant has a dedicated Telnyx number assigned
+    sms_settings = config.get('sms_settings', {})
+    sms_provisioned = bool(sms_settings.get('from_number'))
 
     logger.info(
         f"[settings/notifications] GET "
-        f"tenant={redact_tenant_id(tenant_id)} forms={len(forms_out)}"
+        f"tenant={redact_tenant_id(tenant_id)} forms={len(forms_out)} sms_provisioned={sms_provisioned}"
     )
-    return cors_response(200, {'forms': forms_out})
+    return cors_response(200, {
+        'forms': forms_out,
+        'sms_provisioned': sms_provisioned,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -4487,9 +4563,9 @@ def handle_settings_notifications_get(tenant_id: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def handle_settings_notifications_patch(
+    auth_result: Dict[str, Any],
     tenant_id: str,
     body: Dict[str, Any],
-    user_role: Optional[str],
 ) -> Dict[str, Any]:
     """
     PATCH /settings/notifications
@@ -4497,6 +4573,7 @@ def handle_settings_notifications_patch(
     Deep-merges the supplied notifications sub-fields for a specific form.
     Body: { "form_id": str, "notifications": { ... } }
     """
+    user_role = auth_result.get('role')
     role_error = _require_write_role(user_role)
     if role_error:
         return role_error
@@ -4523,6 +4600,34 @@ def handle_settings_notifications_patch(
                 return cors_response(400, {
                     'error': f'Invalid phone number format: {phone}. Must be E.164 US format (e.g. +15125551234)'
                 })
+
+    # Validate recipient_user_ids — Clerk user IDs for member-based recipients
+    recipient_user_ids = (notifications.get('internal') or {}).get('recipient_user_ids')
+    if recipient_user_ids is not None:
+        if not isinstance(recipient_user_ids, list):
+            return cors_response(400, {'error': 'recipient_user_ids must be an array'})
+        if len(recipient_user_ids) > 20:
+            return cors_response(400, {'error': 'recipient_user_ids cannot exceed 20 entries'})
+        for uid in recipient_user_ids:
+            if not isinstance(uid, str) or not re.match(r'^user_[a-zA-Z0-9]+$', uid):
+                return cors_response(400, {'error': f'Invalid user_id format: {uid}'})
+        # Verify all user_ids are current members of the tenant's org
+        if recipient_user_ids:
+            org_id, org_err = _resolve_team_org_id(auth_result, tenant_id)
+            if org_err:
+                return org_err
+            try:
+                membership_data = _clerk_api_request('GET', f'/v1/organizations/{org_id}/memberships?limit=100')
+            except ValueError as exc:
+                logger.error(f'[settings/notifications] Clerk membership check failed: {exc}')
+                return cors_response(502, {'error': 'Could not verify org membership — Clerk API unavailable'})
+            member_user_ids = {
+                m.get('public_user_data', {}).get('user_id')
+                for m in membership_data.get('data', [])
+            }
+            invalid = [uid for uid in recipient_user_ids if uid not in member_user_ids]
+            if invalid:
+                return cors_response(400, {'error': f'user_ids not in org: {invalid}'})
 
     logger.info(
         f"[settings/notifications] PATCH "
@@ -4561,17 +4666,27 @@ def handle_notification_recipients_test_send(
 
     Sends a test email to the supplied address using the form's internal
     notification template filled with sample data.
-    Body: { "email": str, "form_id": str }
+    Body: { "email"?: str, "user_id"?: str, "form_id": str }
+    At least one of email or user_id is required.
     """
     role_error = _require_write_role(user_role)
     if role_error:
         return role_error
 
     email = body.get('email', '').strip()
+    user_id = body.get('user_id', '').strip()
     form_id = body.get('form_id', '').strip()
 
+    # Resolve email from user_id if provided
+    if user_id:
+        try:
+            user_data = _fetch_clerk_user(user_id)
+            email = _extract_email_from_clerk_user(user_data)
+        except ValueError as exc:
+            return cors_response(400, {'error': f'Could not resolve user_id: {exc}'})
+
     if not email or '@' not in email:
-        return cors_response(400, {'error': 'A valid email address is required'})
+        return cors_response(400, {'error': 'A valid email address or user_id is required'})
     if not form_id or not re.match(r'^[A-Za-z0-9_-]+$', form_id):
         return cors_response(400, {'error': 'A valid form_id is required'})
     if len(email) > 254:
@@ -4638,24 +4753,30 @@ def handle_notification_templates_get(tenant_id: str) -> Dict[str, Any]:
     if not config:
         return cors_response(404, {'error': 'Tenant configuration not found'})
 
+    DEFAULT_TEMPLATES: Dict[str, Any] = {
+        'internal': {'subject': '', 'body_template': ''},
+        'applicant_confirmation': {'subject': '', 'body_template': ''},
+    }
+
     forms_out: Dict[str, Any] = {}
     for form_id, form in config.get('conversational_forms', {}).items():
         if not isinstance(form, dict):
             continue
         notif = form.get('notifications', {})
-        if not notif:
-            continue
 
         entry: Dict[str, Any] = {
             'form_title': form.get('form_title', form_id),
             'available_variables': AVAILABLE_VARIABLES,
         }
-        for notif_type, notif_cfg in notif.items():
-            if isinstance(notif_cfg, dict):
-                entry[notif_type] = {
-                    'subject': notif_cfg.get('subject', ''),
-                    'body_template': notif_cfg.get('body_template', ''),
-                }
+        if notif:
+            for notif_type, notif_cfg in notif.items():
+                if isinstance(notif_cfg, dict):
+                    entry[notif_type] = {
+                        'subject': notif_cfg.get('subject', ''),
+                        'body_template': notif_cfg.get('body_template', ''),
+                    }
+        else:
+            entry.update(DEFAULT_TEMPLATES)
         forms_out[form_id] = entry
 
     logger.info(
@@ -4902,20 +5023,35 @@ def handle_team_members_list(auth_result: Dict[str, Any], tenant_id: str) -> Dic
         if portal_role == 'admin':
             admin_count += 1
 
-        user_data = m.get('public_user_data', {})
-        first = user_data.get('first_name') or ''
-        last = user_data.get('last_name') or ''
-        name = f'{first} {last}'.strip() or user_data.get('identifier', '')
+        public_data = m.get('public_user_data', {})
+        user_id = public_data.get('user_id', '')
+        first = public_data.get('first_name') or ''
+        last = public_data.get('last_name') or ''
+        name = f'{first} {last}'.strip() or public_data.get('identifier', '')
+
+        # Fetch full user object to get unsafeMetadata (phone, SMS opt-in)
+        # public_user_data does NOT include unsafe_metadata
+        phone = None
+        sms_opted_in = False
+        if user_id:
+            try:
+                full_user = _fetch_clerk_user(user_id)
+                phone = _extract_phone_from_clerk_user(full_user)
+                sms_opted_in = _extract_sms_opted_in(full_user)
+            except ValueError:
+                pass  # Cache miss + API failure — skip phone, not critical
 
         members.append({
             'membership_id': m.get('id', ''),
-            'user_id': user_data.get('user_id', ''),
+            'user_id': user_id,
             'name': name,
-            'email': user_data.get('identifier', ''),
+            'email': public_data.get('identifier', ''),
             'role': portal_role,
             'status': 'active',
-            'image_url': user_data.get('image_url'),
+            'image_url': public_data.get('image_url'),
             'joined_at': m.get('created_at', ''),
+            'phone': phone,
+            'sms_opted_in': sms_opted_in,
         })
 
     return cors_response(200, {
@@ -5267,3 +5403,147 @@ def handle_profile_update(auth_result: Dict[str, Any], body: Dict[str, Any]) -> 
         'last_name': update_data.get('last_name', ''),
         'updated': True,
     })
+
+
+# =============================================================================
+# Notification Preferences Handlers (Phase 4)
+# =============================================================================
+
+_PREFERENCES_DEFAULTS = {
+    'email': True,
+    'sms': False,
+    'phone': None,
+    'sms_quiet_hours': {
+        'enabled': False,
+        'start': None,
+        'end': None,
+        'timezone': None,
+        'fallback_to_email': False,
+    },
+}
+
+
+def handle_preferences_get(auth_result: Dict[str, Any]) -> Dict[str, Any]:
+    """GET /preferences — Return the current user's notification preferences."""
+    clerk_user_id = auth_result.get('clerk_user_id')
+    if not clerk_user_id:
+        return cors_response(400, {'error': 'No user ID associated with this account'})
+
+    try:
+        user_data = _fetch_clerk_user(clerk_user_id)
+    except ValueError as exc:
+        logger.error(f'[preferences] Failed to fetch user: {exc}')
+        return cors_response(502, {'error': 'Failed to fetch preferences — Clerk API unavailable'})
+
+    prefs = user_data.get('unsafe_metadata', {}).get('notification_preferences', {})
+
+    # Merge with defaults so the frontend always gets a complete shape
+    merged = {
+        'email': prefs.get('email', _PREFERENCES_DEFAULTS['email']),
+        'sms': prefs.get('sms', _PREFERENCES_DEFAULTS['sms']),
+        'phone': prefs.get('phone', _PREFERENCES_DEFAULTS['phone']),
+        'sms_quiet_hours': {
+            'enabled': prefs.get('sms_quiet_hours', {}).get('enabled', False),
+            'start': prefs.get('sms_quiet_hours', {}).get('start'),
+            'end': prefs.get('sms_quiet_hours', {}).get('end'),
+            'timezone': prefs.get('sms_quiet_hours', {}).get('timezone'),
+            'fallback_to_email': prefs.get('sms_quiet_hours', {}).get('fallback_to_email', False),
+        },
+    }
+
+    return cors_response(200, {'preferences': merged})
+
+
+def handle_preferences_patch(auth_result: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+    """PATCH /preferences — Update the current user's notification preferences."""
+    clerk_user_id = auth_result.get('clerk_user_id')
+    if not clerk_user_id:
+        return cors_response(400, {'error': 'No user ID associated with this account'})
+
+    # --- Validation ---
+    if 'phone' in body and body['phone'] is not None:
+        phone = str(body['phone']).strip()
+        if not re.match(r'^\+1\d{10}$', phone):
+            return cors_response(400, {'error': 'Invalid phone number — must be E.164 US format (e.g. +15125551234)'})
+        body['phone'] = phone
+
+    if 'email' in body and not isinstance(body['email'], bool):
+        return cors_response(400, {'error': 'email must be a boolean'})
+    if 'sms' in body and not isinstance(body['sms'], bool):
+        return cors_response(400, {'error': 'sms must be a boolean'})
+
+    qh = body.get('sms_quiet_hours')
+    if qh and isinstance(qh, dict):
+        time_pattern = re.compile(r'^\d{2}:\d{2}$')
+        if 'start' in qh and qh['start'] is not None:
+            if not time_pattern.match(str(qh['start'])):
+                return cors_response(400, {'error': 'sms_quiet_hours.start must be HH:MM format (e.g. 19:00)'})
+        if 'end' in qh and qh['end'] is not None:
+            if not time_pattern.match(str(qh['end'])):
+                return cors_response(400, {'error': 'sms_quiet_hours.end must be HH:MM format (e.g. 07:00)'})
+        if 'timezone' in qh and qh['timezone'] is not None:
+            try:
+                ZoneInfo(qh['timezone'])
+            except (KeyError, Exception):
+                return cors_response(400, {'error': f'Invalid timezone: {qh["timezone"]}'})
+        if 'enabled' in qh and not isinstance(qh['enabled'], bool):
+            return cors_response(400, {'error': 'sms_quiet_hours.enabled must be a boolean'})
+        if 'fallback_to_email' in qh and not isinstance(qh['fallback_to_email'], bool):
+            return cors_response(400, {'error': 'sms_quiet_hours.fallback_to_email must be a boolean'})
+
+    # --- Read-merge-write (Clerk unsafe_metadata is full replace, not deep merge) ---
+    try:
+        user_data = _fetch_clerk_user(clerk_user_id)
+    except ValueError as exc:
+        logger.error(f'[preferences] Failed to fetch user for merge: {exc}')
+        return cors_response(502, {'error': 'Failed to update preferences — Clerk API unavailable'})
+
+    existing_metadata = user_data.get('unsafe_metadata', {})
+    existing_prefs = existing_metadata.get('notification_preferences', {})
+
+    # Deep merge: top-level pref keys
+    allowed_keys = {'email', 'sms', 'phone', 'sms_quiet_hours'}
+    for key in allowed_keys:
+        if key in body:
+            if key == 'sms_quiet_hours' and isinstance(body[key], dict):
+                existing_qh = existing_prefs.get('sms_quiet_hours', {})
+                if not isinstance(existing_qh, dict):
+                    existing_qh = {}
+                existing_qh.update(body[key])
+                existing_prefs['sms_quiet_hours'] = existing_qh
+            else:
+                existing_prefs[key] = body[key]
+
+    # Rebuild full unsafe_metadata preserving other keys
+    merged_metadata = {**existing_metadata, 'notification_preferences': existing_prefs}
+
+    try:
+        _clerk_api_request('PATCH', f'/v1/users/{clerk_user_id}', {
+            'unsafe_metadata': merged_metadata,
+        })
+    except ValueError as exc:
+        logger.error(f'[preferences] Failed to update Clerk user: {exc}')
+        return cors_response(502, {'error': 'Failed to save preferences'})
+
+    # Invalidate user cache so subsequent reads get fresh data
+    if clerk_user_id in _clerk_user_cache:
+        del _clerk_user_cache[clerk_user_id]
+        _clerk_user_cache_time.pop(clerk_user_id, None)
+
+    logger.info(f'[preferences] Updated notification preferences for user {clerk_user_id[:12]}...')
+
+    # Return the full merged preferences (same shape as GET)
+    result_prefs = {
+        'email': existing_prefs.get('email', _PREFERENCES_DEFAULTS['email']),
+        'sms': existing_prefs.get('sms', _PREFERENCES_DEFAULTS['sms']),
+        'phone': existing_prefs.get('phone', _PREFERENCES_DEFAULTS['phone']),
+        'sms_quiet_hours': {
+            'enabled': existing_prefs.get('sms_quiet_hours', {}).get('enabled', False),
+            'start': existing_prefs.get('sms_quiet_hours', {}).get('start'),
+            'end': existing_prefs.get('sms_quiet_hours', {}).get('end'),
+            'timezone': existing_prefs.get('sms_quiet_hours', {}).get('timezone'),
+            'fallback_to_email': existing_prefs.get('sms_quiet_hours', {}).get('fallback_to_email', False),
+        },
+    }
+
+    return cors_response(200, {'preferences': result_prefs})
