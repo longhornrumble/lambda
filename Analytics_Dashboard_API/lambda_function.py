@@ -249,6 +249,11 @@ def lambda_handler(event, context):
     if method == 'OPTIONS':
         return cors_response(200, {})
 
+    # /webhooks/clerk — PRE-AUTH: Clerk webhook events (user.created, etc.)
+    # Verified via Svix signature, not JWT.
+    if path.endswith('/webhooks/clerk') and method == 'POST':
+        return handle_clerk_webhook(event)
+
     # /auth/clerk — PRE-AUTH: exchange Clerk session token for internal Picasso JWT.
     # Must be checked BEFORE authenticate_request since no internal JWT exists yet.
     if path.endswith('/auth/clerk') and method == 'POST':
@@ -5547,3 +5552,164 @@ def handle_preferences_patch(auth_result: Dict[str, Any], body: Dict[str, Any]) 
     }
 
     return cors_response(200, {'preferences': result_prefs})
+
+
+# =============================================================================
+# Clerk Webhook Handler
+# =============================================================================
+
+CLERK_WEBHOOK_SECRET = os.environ.get('CLERK_WEBHOOK_SECRET', '')
+
+
+def _verify_svix_signature(payload_bytes: bytes, headers: Dict[str, str]) -> bool:
+    """
+    Verify Clerk/Svix webhook signature.
+    Clerk uses Svix under the hood. The signing secret starts with 'whsec_'.
+    Signature format: v1,<base64-hmac-sha256>
+    Message to sign: "{msg_id}.{timestamp}.{body}"
+    """
+    secret = CLERK_WEBHOOK_SECRET
+    if not secret:
+        logger.error('[clerk-webhook] CLERK_WEBHOOK_SECRET env var not set')
+        return False
+
+    # Strip 'whsec_' prefix if present
+    if secret.startswith('whsec_'):
+        secret = secret[6:]
+
+    # Decode base64 secret
+    try:
+        secret_bytes = base64.b64decode(secret)
+    except Exception:
+        logger.error('[clerk-webhook] Failed to decode webhook secret')
+        return False
+
+    # Extract Svix headers (case-insensitive)
+    h = {k.lower(): v for k, v in headers.items()}
+    msg_id = h.get('svix-id', '')
+    timestamp = h.get('svix-timestamp', '')
+    signature_header = h.get('svix-signature', '')
+
+    if not msg_id or not timestamp or not signature_header:
+        logger.warning('[clerk-webhook] Missing svix headers')
+        return False
+
+    # Reject old timestamps (5 min tolerance)
+    try:
+        ts = int(timestamp)
+        if abs(time.time() - ts) > 300:
+            logger.warning(f'[clerk-webhook] Timestamp too old: {ts}')
+            return False
+    except ValueError:
+        return False
+
+    # Compute expected signature
+    to_sign = f'{msg_id}.{timestamp}.{payload_bytes.decode("utf-8")}'
+    expected = hmac.new(secret_bytes, to_sign.encode('utf-8'), hashlib.sha256).digest()
+    expected_b64 = base64.b64encode(expected).decode('utf-8')
+
+    # Compare against all signatures in header (comma-separated, prefixed with v1,)
+    for sig in signature_header.split(' '):
+        parts = sig.split(',', 1)
+        if len(parts) == 2 and parts[0] == 'v1':
+            if hmac.compare_digest(parts[1], expected_b64):
+                return True
+
+    logger.warning('[clerk-webhook] Signature verification failed')
+    return False
+
+
+def handle_clerk_webhook(event: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Handle Clerk webhook events.
+    Events: user.created, user.updated, user.deleted,
+            organizationMembership.created, organizationMembership.deleted
+    """
+    # Extract headers and body
+    headers = event.get('headers', {})
+    body_str = event.get('body', '')
+    if event.get('isBase64Encoded'):
+        body_bytes = base64.b64decode(body_str)
+    else:
+        body_bytes = body_str.encode('utf-8') if isinstance(body_str, str) else body_str
+
+    # Verify signature
+    if not _verify_svix_signature(body_bytes, headers):
+        return cors_response(401, {'error': 'Invalid webhook signature'})
+
+    try:
+        payload = json.loads(body_bytes)
+    except json.JSONDecodeError:
+        return cors_response(400, {'error': 'Invalid JSON'})
+
+    event_type = payload.get('type', '')
+    data = payload.get('data', {})
+
+    logger.info(f'[clerk-webhook] Received {event_type} (id={payload.get("data", {}).get("id", "unknown")[:20]})')
+
+    if event_type == 'user.created':
+        _handle_user_created(data)
+    elif event_type == 'user.updated':
+        _handle_user_updated(data)
+    elif event_type == 'user.deleted':
+        _handle_user_deleted(data)
+    elif event_type == 'organizationMembership.created':
+        _handle_membership_created(data)
+    elif event_type == 'organizationMembership.deleted':
+        _handle_membership_deleted(data)
+    else:
+        logger.info(f'[clerk-webhook] Ignoring unhandled event: {event_type}')
+
+    return cors_response(200, {'received': True})
+
+
+def _handle_user_created(data: Dict[str, Any]):
+    """New user completed signup via invitation."""
+    user_id = data.get('id', '')
+    emails = data.get('email_addresses', [])
+    email = emails[0].get('email_address', '') if emails else ''
+    name = f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
+    logger.info(f'[clerk-webhook] user.created: {email} ({user_id}) name="{name}"')
+    # Bust user cache so next auth bridge call fetches fresh data
+    _clerk_user_cache.pop(user_id, None)
+    _clerk_user_cache_time.pop(user_id, None)
+
+
+def _handle_user_updated(data: Dict[str, Any]):
+    """User profile changed (email, name, metadata)."""
+    user_id = data.get('id', '')
+    logger.info(f'[clerk-webhook] user.updated: {user_id}')
+    # Bust caches — next request will re-fetch from Clerk API
+    _clerk_user_cache.pop(user_id, None)
+    _clerk_user_cache_time.pop(user_id, None)
+
+
+def _handle_user_deleted(data: Dict[str, Any]):
+    """User account deleted."""
+    user_id = data.get('id', '')
+    logger.info(f'[clerk-webhook] user.deleted: {user_id}')
+    _clerk_user_cache.pop(user_id, None)
+    _clerk_user_cache_time.pop(user_id, None)
+
+
+def _handle_membership_created(data: Dict[str, Any]):
+    """User added to an organization."""
+    user_id = data.get('public_user_data', {}).get('user_id', '')
+    org_id = data.get('organization', {}).get('id', '')
+    role = data.get('role', '')
+    logger.info(f'[clerk-webhook] membership.created: user={user_id} org={org_id} role={role}')
+    # Bust org membership cache
+    _org_membership_cache.pop(user_id, None)
+    _org_membership_cache_time.pop(user_id, None)
+
+
+def _handle_membership_deleted(data: Dict[str, Any]):
+    """User removed from an organization. Invalidate their cached sessions."""
+    user_id = data.get('public_user_data', {}).get('user_id', '')
+    org_id = data.get('organization', {}).get('id', '')
+    logger.info(f'[clerk-webhook] membership.deleted: user={user_id} org={org_id}')
+    # Bust all caches for this user
+    _clerk_user_cache.pop(user_id, None)
+    _clerk_user_cache_time.pop(user_id, None)
+    _org_membership_cache.pop(user_id, None)
+    _org_membership_cache_time.pop(user_id, None)
