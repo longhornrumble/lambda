@@ -1545,7 +1545,21 @@ def handle_admin_tenant_invitation_revoke(user_role: Optional[str], tenant_id: s
         if not org_id:
             return cors_response(404, {'error': 'No Clerk organization found for tenant'})
 
-        _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations/{invitation_id}/revoke')
+        result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations/{invitation_id}/revoke')
+
+        # Clean up the invited registry record
+        revoked_email = result.get('email_address', '') if isinstance(result, dict) else ''
+        if revoked_email:
+            try:
+                tenant_employees = tenant_registry_ops.list_employees(tenant_id)
+                for emp in tenant_employees:
+                    if emp.get('email', '').lower() == revoked_email.lower() and emp.get('status') == 'invited':
+                        tenant_registry_ops.delete_employee(tenant_id, emp['employeeId'])
+                        logger.info(f'[admin] Deleted invited registry record for {revoked_email}')
+                        break
+            except Exception as del_exc:
+                logger.warning(f'[admin] Failed to clean up invited record: {del_exc}')
+
         logger.info(f'[admin] Revoked invitation {invitation_id} for tenant {tenant_id}')
         return cors_response(200, {'invitation_id': invitation_id, 'revoked': True})
     except ValueError as exc:
@@ -5937,10 +5951,23 @@ def handle_team_invitation_revoke(auth_result: Dict[str, Any], tenant_id: str, i
         return cors_response(400, {'error': 'Invalid invitation ID'})
 
     try:
-        _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations/{invitation_id}/revoke')
+        result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations/{invitation_id}/revoke')
     except ValueError as exc:
         logger.error(f'[team] Failed to revoke invitation: {exc}')
         return cors_response(502, {'error': 'Failed to revoke invitation'})
+
+    # Clean up the invited registry record
+    revoked_email = result.get('email_address', '') if isinstance(result, dict) else ''
+    if revoked_email:
+        try:
+            tenant_employees = tenant_registry_ops.list_employees(tenant_id)
+            for emp in tenant_employees:
+                if emp.get('email', '').lower() == revoked_email.lower() and emp.get('status') == 'invited':
+                    tenant_registry_ops.delete_employee(tenant_id, emp['employeeId'])
+                    logger.info(f'[team] Deleted invited registry record for {revoked_email}')
+                    break
+        except Exception as del_exc:
+            logger.warning(f'[team] Failed to clean up invited record: {del_exc}')
 
     logger.info(f'[team] Revoked invitation {invitation_id} in org {org_id}')
 
