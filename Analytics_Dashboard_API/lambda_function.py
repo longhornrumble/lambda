@@ -280,6 +280,10 @@ def lambda_handler(event, context):
     user_email = auth_result.get('email', 'unknown')
     user_role = auth_result.get('role')
 
+    # Set module-level role for validate_feature_access to use
+    global _request_user_role
+    _request_user_role = user_role
+
     # Super admin tenant override - allows viewing other tenants' data
     headers = event.get('headers', {}) or {}
     tenant_override = headers.get('X-Tenant-Override') or headers.get('x-tenant-override')
@@ -398,6 +402,9 @@ def lambda_handler(event, context):
             admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_admin_tenant_update(user_role, admin_tenant_id, body)
+
+        elif path.endswith('/admin/tenant-switcher') and method == 'GET':
+            return handle_tenant_switcher(user_role)
 
         elif path.endswith('/admin/tenants') and method == 'GET':
             return handle_admin_tenants(user_role)
@@ -1272,6 +1279,62 @@ s3_client = boto3.client('s3')
 _ADMIN_EXCLUDED_TENANTS = {'MYR384719', 'TEST_REGISTRY_001'}
 
 
+def handle_tenant_switcher(user_role: Optional[str]) -> Dict[str, Any]:
+    """
+    Handle GET /admin/tenant-switcher endpoint.
+    Returns list of ALL active tenants from S3 (including demo/test) for the tenant switcher dropdown.
+    This is separate from /admin/tenants which reads from the registry for the admin panel.
+    """
+    if user_role != 'super_admin':
+        return cors_response(403, {'error': 'Forbidden: super_admin role required'})
+
+    try:
+        response = s3_client.list_objects_v2(Bucket=S3_CONFIG_BUCKET, Prefix=f'{MAPPINGS_PREFIX}/')
+        contents = response.get('Contents', [])
+        if not contents:
+            return cors_response(200, {'tenants': []})
+
+        tenants = []
+        for obj in contents:
+            key = obj['Key']
+            if not key.endswith('.json'):
+                continue
+            try:
+                mapping_resp = s3_client.get_object(Bucket=S3_CONFIG_BUCKET, Key=key)
+                mapping = json.loads(mapping_resp['Body'].read().decode('utf-8'))
+                tenant_id = mapping.get('tenant_id', '')
+                tenant_hash = mapping.get('tenant_hash', '')
+                if not tenant_hash:
+                    continue
+                name = tenant_id
+                active = False
+                try:
+                    config_key = f'{TENANTS_PREFIX}/{tenant_id}/{tenant_id}-config.json'
+                    config_resp = s3_client.get_object(Bucket=S3_CONFIG_BUCKET, Key=config_key)
+                    config = json.loads(config_resp['Body'].read().decode('utf-8'))
+                    name = config.get('chat_title') or config.get('organization_name') or tenant_id
+                    active = config.get('active', False)
+                except Exception:
+                    pass
+                if not active:
+                    continue
+                tenants.append({
+                    'tenant_id': tenant_id,
+                    'tenant_hash': tenant_hash,
+                    'name': name,
+                })
+            except Exception as e:
+                logger.warning(f"Failed to read mapping {key}: {e}")
+                continue
+
+        tenants.sort(key=lambda t: t['name'].lower())
+        return cors_response(200, {'tenants': tenants})
+
+    except Exception as e:
+        logger.exception(f"Error fetching tenant switcher list: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
 def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
     """
     Handle GET /admin/tenants endpoint.
@@ -1373,17 +1436,16 @@ def handle_admin_tenant_billing(user_role: Optional[str], tenant_id: str) -> Dic
         if not tenant:
             return cors_response(404, {'error': 'Tenant not found'})
 
-        # Stripe webhook writes pk as TENANT#{tenantId}, not tenantHash
+        # Stripe events live in their own dedicated table
+        BILLING_EVENTS_TABLE = os.environ.get('BILLING_EVENTS_TABLE', 'picasso-billing-events')
         pk = f'TENANT#{tenant_id}'
 
         query_kwargs: Dict[str, Any] = {
-            'TableName': NOTIFICATION_EVENTS_TABLE,
+            'TableName': BILLING_EVENTS_TABLE,
             'KeyConditionExpression': 'pk = :pk',
             'ExpressionAttributeValues': {
                 ':pk': {'S': pk},
-                ':channel': {'S': 'stripe'},
             },
-            'FilterExpression': 'channel = :channel',
             'ScanIndexForward': False,
             'Limit': 50,
         }
@@ -1765,11 +1827,11 @@ def handle_admin_employee_update(user_role: Optional[str], tenant_id: str, emplo
                             membership_id = m.get('id')
                             break
 
-                    if membership_id:
+                    if emp_clerk_user_id:
                         clerk_role = _portal_role_to_clerk(new_role)
-                        _clerk_api_request('PATCH', f'/v1/organizations/{org_id}/memberships/{membership_id}', {'role': clerk_role})
+                        _clerk_api_request('PATCH', f'/v1/organizations/{org_id}/memberships/{emp_clerk_user_id}', {'role': clerk_role})
                     else:
-                        logger.warning(f'[admin] Clerk membership not found for {emp_clerk_user_id} — role change in registry only')
+                        logger.warning(f'[admin] No clerkUserId for employee — role change in registry only')
                 except ValueError as exc:
                     logger.error(f'[admin] Failed to update role in Clerk: {exc}')
                     return cors_response(502, {'error': 'Failed to update role in Clerk'})
@@ -1787,8 +1849,8 @@ def handle_admin_employee_update(user_role: Optional[str], tenant_id: str, emplo
                         membership_id = m.get('id')
                         break
 
-                if membership_id:
-                    _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{membership_id}')
+                if emp_clerk_user_id:
+                    _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{emp_clerk_user_id}')
             except ValueError as exc:
                 logger.error(f'[admin] Failed to remove from org: {exc}')
                 return cors_response(502, {'error': 'Failed to remove from organization'})
@@ -1815,16 +1877,20 @@ def handle_admin_employee_update(user_role: Optional[str], tenant_id: str, emplo
     return cors_response(200, {'tenant_id': tenant_id, 'employee_id': employee_id, **update_fields})
 
 
-def validate_feature_access(tenant_id: str, required_feature: str) -> Optional[Dict[str, Any]]:
+def validate_feature_access(tenant_id: str, required_feature: str, user_role: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
     Validate that tenant has access to a premium feature.
     Returns None if access granted, or a 403 error response if denied.
+    Super admins bypass all feature checks.
 
     Usage:
-        error = validate_feature_access(tenant_id, 'dashboard_forms')
+        error = validate_feature_access(tenant_id, 'dashboard_forms', user_role)
         if error:
             return error
     """
+    if user_role == 'super_admin':
+        return None
+
     features = get_tenant_features(tenant_id)
 
     if not features.get(required_feature, False):
@@ -2423,7 +2489,7 @@ def handle_form_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any
     Performance: ~100-500ms (vs 5-30s for Athena)
     """
     # Validate premium feature access
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -2491,7 +2557,7 @@ def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     Performance: ~100-500ms (vs 5-30s for Athena)
     """
     # Validate premium feature access
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -2617,7 +2683,7 @@ def handle_form_submissions(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     - search: Search query for name/email (optional)
     """
     # Validate premium feature access
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -2951,7 +3017,7 @@ def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[s
     Performance: ~100-500ms (vs 5-30s for Athena)
     """
     # Validate premium feature access
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -3963,7 +4029,7 @@ def handle_lead_detail(tenant_id: str, submission_id: str) -> Dict[str, Any]:
     Returns full lead details for the workspace drawer.
     """
     # Validate feature access
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -4117,7 +4183,7 @@ def handle_lead_status_update(
     PATCH /leads/{submission_id}/status
     Update lead pipeline status.
     """
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -4210,7 +4276,7 @@ def handle_lead_notes_update(
     PATCH /leads/{submission_id}/notes
     Update lead internal notes.
     """
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -4286,7 +4352,7 @@ def handle_lead_reactivate(
     - Audit Trail: Prepends [System] restoration note to internal_notes
     - State Reset: Returns lead to 'new' status
     """
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -4392,7 +4458,7 @@ def handle_lead_queue(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any]:
     - status: Filter by pipeline status (default: 'new')
     - current_id: Current submission_id to find next after
     """
-    access_error = validate_feature_access(tenant_id, 'dashboard_forms')
+    access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
     if access_error:
         return access_error
 
@@ -4492,7 +4558,7 @@ def handle_notification_summary(tenant_id: str, params: Dict[str, str]) -> Dict[
         "period": str
     }
     """
-    access_error = validate_feature_access(tenant_id, 'dashboard_notifications')
+    access_error = validate_feature_access(tenant_id, 'dashboard_notifications', _request_user_role)
     if access_error:
         return access_error
 
@@ -4583,7 +4649,7 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
         "total": int, "page": int, "limit": int, "has_more": bool
     }
     """
-    access_error = validate_feature_access(tenant_id, 'dashboard_notifications')
+    access_error = validate_feature_access(tenant_id, 'dashboard_notifications', _request_user_role)
     if access_error:
         return access_error
 
@@ -4751,7 +4817,7 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
         "events": [ { "event_type": str, "timestamp": str, "detail": dict } ]
     }
     """
-    access_error = validate_feature_access(tenant_id, 'dashboard_notifications')
+    access_error = validate_feature_access(tenant_id, 'dashboard_notifications', _request_user_role)
     if access_error:
         return access_error
 
@@ -4839,6 +4905,10 @@ AVAILABLE_VARIABLES: List[str] = [
 ]
 
 # Role guard for all write operations on settings endpoints.
+# Per-request user role — set by lambda_handler before dispatching to handlers.
+# Used by validate_feature_access to bypass feature checks for super_admin.
+_request_user_role: Optional[str] = None
+
 _WRITE_ROLES = {'admin', 'super_admin'}
 
 
@@ -5902,7 +5972,7 @@ def handle_team_member_update(
     # --- 5. Side-effect: update Clerk membership (best-effort; webhook will reconcile on failure) ---
     clerk_role = _portal_role_to_clerk(new_role)
     try:
-        _clerk_api_request('PATCH', f'/v1/organizations/{org_id}/memberships/{membership_id}', {
+        _clerk_api_request('PATCH', f'/v1/organizations/{org_id}/memberships/{target_clerk_user_id}', {
             'role': clerk_role,
         })
     except ValueError as exc:
@@ -6001,10 +6071,14 @@ def handle_team_member_remove(auth_result: Dict[str, Any], tenant_id: str, membe
         logger.warning(f'[team] No registry record for clerk_user_id={target_clerk_user_id} — proceeding with Clerk delete')
 
     # --- 5. Side-effect: DELETE Clerk membership (best-effort) ---
-    try:
-        _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{membership_id}')
-    except ValueError as exc:
-        logger.warning(f'[team] Clerk membership delete failed (registry already updated, webhook will reconcile): {exc}')
+    # Clerk DELETE uses user_id, not membership_id
+    if target_clerk_user_id:
+        try:
+            _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{target_clerk_user_id}')
+        except ValueError as exc:
+            logger.warning(f'[team] Clerk membership delete failed (registry already updated, webhook will reconcile): {exc}')
+    else:
+        logger.warning(f'[team] No clerk_user_id to delete membership for {membership_id}')
 
     # Invalidate caches
     _org_membership_cache.clear()

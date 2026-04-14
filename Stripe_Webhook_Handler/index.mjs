@@ -30,7 +30,7 @@ const dynamodb = DynamoDBDocumentClient.from(ddbClient);
 const secretsClient = new SecretsManagerClient({ region });
 
 const TENANT_REGISTRY_TABLE = process.env.TENANT_REGISTRY_TABLE || `picasso-tenant-registry-${process.env.ENVIRONMENT || 'staging'}`;
-const NOTIFICATION_EVENTS_TABLE = process.env.NOTIFICATION_EVENTS_TABLE || 'picasso-notification-events';
+const BILLING_EVENTS_TABLE = process.env.BILLING_EVENTS_TABLE || 'picasso-billing-events';
 const STRIPE_SECRET_NAME = process.env.STRIPE_SECRET_NAME || 'picasso/stripe';
 const TIMESTAMP_TOLERANCE = 300; // 5 minutes
 
@@ -191,7 +191,7 @@ async function writeAuditEvent(tenantId, stripeEvent) {
   const eventType = stripeEvent.type.replace(/\./g, '_');
 
   await dynamodb.send(new PutCommand({
-    TableName: NOTIFICATION_EVENTS_TABLE,
+    TableName: BILLING_EVENTS_TABLE,
     Item: {
       pk: `TENANT#${tenantId}`,
       sk: `${isoDate}#stripe#${eventType}#${stripeEvent.id}`,
