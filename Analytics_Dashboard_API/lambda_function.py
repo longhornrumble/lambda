@@ -6449,6 +6449,10 @@ def handle_clerk_webhook(event: Dict[str, Any]) -> Dict[str, Any]:
         _handle_user_updated(data)
     elif event_type == 'user.deleted':
         _handle_user_deleted(data)
+    elif event_type == 'organization.created':
+        _handle_org_created(data)
+    elif event_type == 'organization.updated':
+        _handle_org_updated(data)
     elif event_type == 'organizationMembership.created':
         _handle_membership_created(data)
     elif event_type == 'organizationMembership.deleted':
@@ -6457,6 +6461,45 @@ def handle_clerk_webhook(event: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f'[clerk-webhook] Ignoring unhandled event: {event_type}')
 
     return cors_response(200, {'received': True})
+
+
+def _handle_org_created(data: Dict[str, Any]):
+    """Organization created — link clerkOrgId to tenant registry."""
+    org_id = data.get('id', '')
+    tenant_id = data.get('public_metadata', {}).get('tenant_id', '')
+    logger.info(f'[clerk-webhook] organization.created: org={org_id} tenant={tenant_id}')
+
+    if not tenant_id or not org_id:
+        logger.info(f'[clerk-webhook] organization.created: missing tenant_id or org_id — skipping')
+        return
+
+    try:
+        tenant = tenant_registry_ops.get_tenant(tenant_id)
+        if tenant:
+            tenant_registry_ops.update_tenant(tenant_id, {'clerkOrgId': org_id})
+            logger.info(f'[clerk-webhook] Linked org {org_id} to tenant {tenant_id} in registry')
+        else:
+            logger.warning(f'[clerk-webhook] Tenant {tenant_id} not found in registry — cannot link org {org_id}')
+    except Exception as exc:
+        logger.warning(f'[clerk-webhook] Failed to link org to tenant: {exc}')
+
+
+def _handle_org_updated(data: Dict[str, Any]):
+    """Organization updated — refresh clerkOrgId and metadata if tenant_id changed."""
+    org_id = data.get('id', '')
+    tenant_id = data.get('public_metadata', {}).get('tenant_id', '')
+    logger.info(f'[clerk-webhook] organization.updated: org={org_id} tenant={tenant_id}')
+
+    if not tenant_id or not org_id:
+        return
+
+    try:
+        tenant = tenant_registry_ops.get_tenant(tenant_id)
+        if tenant and tenant.get('clerkOrgId') != org_id:
+            tenant_registry_ops.update_tenant(tenant_id, {'clerkOrgId': org_id})
+            logger.info(f'[clerk-webhook] Updated org link for tenant {tenant_id} → {org_id}')
+    except Exception as exc:
+        logger.warning(f'[clerk-webhook] Failed to update org link: {exc}')
 
 
 def _handle_user_created(data: Dict[str, Any]):
