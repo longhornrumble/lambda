@@ -5333,7 +5333,11 @@ def handle_settings_notifications_patch(
             }
             invalid = [uid for uid in recipient_user_ids if uid not in member_user_ids]
             if invalid:
-                return cors_response(400, {'error': f'user_ids not in org: {invalid}'})
+                # Auto-clean stale user IDs instead of blocking the save
+                logger.warning(f'[settings/notifications] Removing stale recipient_user_ids: {invalid}')
+                notifications['internal']['recipient_user_ids'] = [
+                    uid for uid in recipient_user_ids if uid in member_user_ids
+                ]
 
     logger.info(
         f"[settings/notifications] PATCH "
