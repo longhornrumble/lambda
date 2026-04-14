@@ -6685,14 +6685,18 @@ def _handle_membership_created(data: Dict[str, Any]):
             notification_prefs = unsafe_meta.get('notification_preferences')
 
         # Check for an existing 'invited' record for this tenant by email
+        # Must search all records for this email (not just first) since the same
+        # email may exist across multiple tenants
         existing_invited = None
         if email:
             try:
-                candidate = tenant_registry_ops.get_employee_by_email(email)
-                if candidate and candidate.get('tenantId') == tenant_id and candidate.get('status') == 'invited':
-                    existing_invited = candidate
+                employees_for_tenant = tenant_registry_ops.list_employees(tenant_id)
+                for emp in employees_for_tenant:
+                    if emp.get('email', '').lower() == email.lower() and emp.get('status') == 'invited':
+                        existing_invited = emp
+                        break
             except Exception as exc:
-                logger.warning(f'[clerk-webhook] Email index lookup failed for {email}: {exc}')
+                logger.warning(f'[clerk-webhook] Employee lookup failed for {email} in {tenant_id}: {exc}')
 
         # If Clerk has no name, try to preserve the name from the invited registry record
         if not name and existing_invited:
