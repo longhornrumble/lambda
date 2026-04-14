@@ -1790,6 +1790,7 @@ def handle_admin_employee_invite(user_role: Optional[str], body: Dict[str, Any])
         invite_body = {
             'email_address': email,
             'role': clerk_role,
+            'redirect_url': 'https://app.myrecruiter.ai/sign-up',
             'public_metadata': {'first_name': first_name, 'last_name': last_name} if (first_name or last_name) else {},
         }
         result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations', invite_body)
@@ -5865,6 +5866,7 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
         invite_body = {
             'email_address': email,
             'role': clerk_role,
+            'redirect_url': 'https://app.myrecruiter.ai/sign-up',
             'public_metadata': {'first_name': first_name, 'last_name': last_name} if (first_name or last_name) else {},
         }
         # Only set inviter_user_id if the caller is a member of the target org.
