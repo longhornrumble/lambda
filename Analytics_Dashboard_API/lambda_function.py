@@ -5141,6 +5141,26 @@ def handle_settings_notifications_patch(
                     'error': f'Invalid phone number format: {phone}. Must be E.164 US format (e.g. +15125551234)'
                 })
 
+    # Validate recipient_employee_ids — registry employee UUIDs
+    recipient_employee_ids = (notifications.get('internal') or {}).get('recipient_employee_ids')
+    if recipient_employee_ids is not None:
+        if not isinstance(recipient_employee_ids, list):
+            return cors_response(400, {'error': 'recipient_employee_ids must be an array'})
+        if len(recipient_employee_ids) > 20:
+            return cors_response(400, {'error': 'recipient_employee_ids cannot exceed 20 entries'})
+        for eid in recipient_employee_ids:
+            if not isinstance(eid, str) or len(eid) < 10:
+                return cors_response(400, {'error': f'Invalid employee_id format: {eid}'})
+        # Verify all employee_ids exist and are active in this tenant's registry
+        if recipient_employee_ids:
+            invalid = []
+            for eid in recipient_employee_ids:
+                emp = tenant_registry_ops.get_employee(tenant_id, eid)
+                if not emp or emp.get('status') != 'active':
+                    invalid.append(eid)
+            if invalid:
+                return cors_response(400, {'error': f'employee_ids not found or inactive: {invalid}'})
+
     # Validate recipient_user_ids — Clerk user IDs for member-based recipients
     recipient_user_ids = (notifications.get('internal') or {}).get('recipient_user_ids')
     if recipient_user_ids is not None:
@@ -6310,12 +6330,50 @@ def _handle_user_created(data: Dict[str, Any]):
 
 
 def _handle_user_updated(data: Dict[str, Any]):
-    """User profile changed (email, name, metadata)."""
+    """User profile updated — sync notification preferences to registry."""
     user_id = data.get('id', '')
-    logger.info(f'[clerk-webhook] user.updated: {user_id}')
-    # Bust caches — next request will re-fetch from Clerk API
+    logger.info(f'[clerk-webhook] user.updated: id={user_id}')
+
+    # Bust caches (existing behavior)
     _clerk_user_cache.pop(user_id, None)
     _clerk_user_cache_time.pop(user_id, None)
+
+    # Sync notification preferences to registry
+    try:
+        unsafe_meta = data.get('unsafe_metadata', {})
+        notif_prefs = unsafe_meta.get('notification_preferences', {})
+        if not notif_prefs:
+            return  # No notification preferences to sync
+
+        # Find employee by clerkUserId
+        employee = tenant_registry_ops.get_employee_by_clerk_user_id(user_id)
+        if not employee:
+            logger.info(f'[clerk-webhook] user.updated: no registry record for {user_id} — skipping prefs sync')
+            return
+
+        update_fields = {}
+        phone = notif_prefs.get('phone')
+        if phone:
+            update_fields['phone'] = phone
+
+        # Build notificationPrefs map
+        prefs_map = {
+            'email': notif_prefs.get('email', True),
+            'sms': notif_prefs.get('sms', False),
+        }
+        quiet_hours = notif_prefs.get('sms_quiet_hours', {})
+        if quiet_hours:
+            prefs_map['sms_quiet_hours'] = quiet_hours
+        update_fields['notificationPrefs'] = prefs_map
+
+        tenant_registry_ops.update_employee(
+            employee['tenantId'],
+            employee['employeeId'],
+            update_fields
+        )
+        logger.info(f'[clerk-webhook] user.updated: synced notification prefs for {user_id} to registry')
+    except Exception as exc:
+        logger.warning(f'[clerk-webhook] user.updated: failed to sync prefs for {user_id}: {exc}')
 
 
 def _handle_user_deleted(data: Dict[str, Any]):

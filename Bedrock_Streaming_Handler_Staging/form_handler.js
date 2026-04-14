@@ -21,6 +21,11 @@ const {
   resolvePhonesFromUserIds,
   resolveQuietHoursFallbackEmails,
 } = require('./clerk_helper');
+const {
+  resolveEmailsFromEmployeeIds,
+  resolvePhonesFromEmployeeIds,
+  resolveQuietHoursFallbackFromEmployeeIds,
+} = require('./recipient_resolver');
 
 // Initialize AWS SDK v3 clients
 const sesClient = new SESClient({ region: process.env.AWS_REGION || 'us-east-1' });
@@ -626,8 +631,26 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   let emailRecipients;
   let emailUserIdMap = {}; // email → userId for audit records
 
-  if (internalNotif.recipient_user_ids?.length > 0) {
-    // Phase 4: resolve user_ids to emails via Clerk API
+  if (internalNotif.recipient_employee_ids?.length > 0) {
+    // Registry-based resolution (preferred)
+    try {
+      const tenantId = config.tenant_id || '';
+      const resolvedPairs = await resolveEmailsFromEmployeeIds(tenantId, internalNotif.recipient_employee_ids);
+      const quietHoursFallback = await resolveQuietHoursFallbackFromEmployeeIds(tenantId, internalNotif.recipient_employee_ids);
+      const resolvedEmails = resolvedPairs.map(p => p.email);
+      emailRecipients = [...new Set([...resolvedEmails, ...quietHoursFallback])];
+      for (const pair of resolvedPairs) {
+        emailUserIdMap[pair.email] = pair.employeeId;
+      }
+      if (internalNotif.enabled && internalNotif.recipients?.length > 0) {
+        emailRecipients = [...new Set([...emailRecipients, ...internalNotif.recipients])];
+      }
+    } catch (e) {
+      console.error('[routeFulfillment] Error resolving emails from employee_ids:', e);
+      emailRecipients = internalNotif.recipients || [];
+    }
+  } else if (internalNotif.recipient_user_ids?.length > 0) {
+    // Phase 4 legacy: resolve user_ids to emails via Clerk API
     try {
       const resolvedPairs = await resolveEmailsFromUserIds(internalNotif.recipient_user_ids);
       const quietHoursFallback = await resolveQuietHoursFallbackEmails(internalNotif.recipient_user_ids);
@@ -724,8 +747,18 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   // SMS fulfillment via SMS_Sender Lambda (Telnyx)
   // Supports: recipient_user_ids (Phase 4), notifications.internal.sms_recipients, legacy fulfillment.sms_to
   let smsRecipients;
-  if (internalNotif.recipient_user_ids?.length > 0 && internalNotif.enabled && internalNotif.channels?.sms) {
-    // Phase 4: resolve user_ids to phones (skips users not opted in, no phone, or in quiet hours)
+  if (internalNotif.recipient_employee_ids?.length > 0 && internalNotif.enabled && internalNotif.channels?.sms) {
+    // Registry-based SMS resolution (preferred)
+    try {
+      const tenantId = config.tenant_id || '';
+      const resolvedPhones = await resolvePhonesFromEmployeeIds(tenantId, internalNotif.recipient_employee_ids);
+      smsRecipients = [...new Set([...resolvedPhones, ...(internalNotif.sms_recipients || [])])];
+    } catch (e) {
+      console.error('[routeFulfillment] Error resolving phones from employee_ids:', e);
+      smsRecipients = internalNotif.sms_recipients || [];
+    }
+  } else if (internalNotif.recipient_user_ids?.length > 0 && internalNotif.enabled && internalNotif.channels?.sms) {
+    // Phase 4 legacy: resolve user_ids to phones (skips users not opted in, no phone, or in quiet hours)
     try {
       const resolvedPhones = await resolvePhonesFromUserIds(internalNotif.recipient_user_ids);
       smsRecipients = [...new Set([...resolvedPhones, ...(internalNotif.sms_recipients || [])])];
