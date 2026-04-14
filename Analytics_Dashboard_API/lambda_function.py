@@ -5133,6 +5133,22 @@ def handle_settings_notifications_get(tenant_id: str) -> Dict[str, Any]:
     if not config:
         return cors_response(404, {'error': 'Tenant configuration not found'})
 
+    def _deep_merge_notifications(defaults: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """Deep-merge notification defaults with partial tenant config.
+        Ensures all required fields (enabled, recipients, channels) exist even
+        when the tenant config only has subject/body_template."""
+        result = {}
+        for key in set(list(defaults.keys()) + list(overrides.keys())):
+            d_val = defaults.get(key)
+            o_val = overrides.get(key)
+            if isinstance(d_val, dict) and isinstance(o_val, dict):
+                result[key] = {**d_val, **o_val}
+            elif o_val is not None:
+                result[key] = o_val
+            else:
+                result[key] = d_val
+        return result
+
     DEFAULT_NOTIFICATIONS: Dict[str, Any] = {
         'internal': {
             'enabled': False,
@@ -5155,7 +5171,7 @@ def handle_settings_notifications_get(tenant_id: str) -> Dict[str, Any]:
             continue
         forms_out[form_id] = {
             'form_title': form.get('form_title', form_id),
-            'notifications': form.get('notifications', DEFAULT_NOTIFICATIONS),
+            'notifications': _deep_merge_notifications(DEFAULT_NOTIFICATIONS, form.get('notifications', {})),
         }
 
     # SMS provisioning check: tenant has a dedicated Telnyx number assigned
