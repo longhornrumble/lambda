@@ -1879,6 +1879,15 @@ def handle_admin_employee_update(user_role: Optional[str], tenant_id: str, emplo
 
                 if emp_clerk_user_id:
                     _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{emp_clerk_user_id}')
+
+                    # Delete orphaned Clerk user if no remaining org memberships (single-org rule)
+                    try:
+                        remaining = _fetch_user_org_memberships(emp_clerk_user_id)
+                        if not remaining:
+                            _clerk_api_request('DELETE', f'/v1/users/{emp_clerk_user_id}')
+                            logger.info(f'[admin] Deleted orphaned Clerk user {emp_clerk_user_id}')
+                    except ValueError as del_exc:
+                        logger.warning(f'[admin] Failed to delete orphaned Clerk user: {del_exc}')
             except ValueError as exc:
                 logger.error(f'[admin] Failed to remove from org: {exc}')
                 return cors_response(502, {'error': 'Failed to remove from organization'})
@@ -6121,6 +6130,18 @@ def handle_team_member_remove(auth_result: Dict[str, Any], tenant_id: str, membe
             _clerk_api_request('DELETE', f'/v1/organizations/{org_id}/memberships/{target_clerk_user_id}')
         except ValueError as exc:
             logger.warning(f'[team] Clerk membership delete failed (registry already updated, webhook will reconcile): {exc}')
+
+        # --- 6. Delete orphaned Clerk user if they have no remaining org memberships ---
+        # Single-org rule: a user with no org is an orphan and should be deleted
+        try:
+            remaining = _fetch_user_org_memberships(target_clerk_user_id)
+            if not remaining:
+                _clerk_api_request('DELETE', f'/v1/users/{target_clerk_user_id}')
+                logger.info(f'[team] Deleted orphaned Clerk user {target_clerk_user_id} (no remaining org memberships)')
+            else:
+                logger.info(f'[team] Clerk user {target_clerk_user_id} still has {len(remaining)} org(s) — not deleting')
+        except ValueError as exc:
+            logger.warning(f'[team] Failed to check/delete orphaned Clerk user: {exc}')
     else:
         logger.warning(f'[team] No clerk_user_id to delete membership for {membership_id}')
 
