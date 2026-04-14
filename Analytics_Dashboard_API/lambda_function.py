@@ -1238,23 +1238,25 @@ def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
     config = get_tenant_config(tenant_id)
 
     if not config:
-        # No config = legacy tenant, give them conversations + forms
+        # No config = legacy tenant, conversations only
         return {
             'dashboard_conversations': True,
-            'dashboard_forms': True,
+            'dashboard_forms': False,
             'dashboard_attribution': False,
             'dashboard_notifications': False,
             'dashboard_settings': False,
         }
 
     features = config.get('features', {})
+    feature_flags = config.get('feature_flags', {})
 
     return {
         'dashboard_conversations': features.get('dashboard_conversations', True),
-        'dashboard_forms': features.get('dashboard_forms', True),
-        'dashboard_attribution': features.get('dashboard_attribution', False),
-        'dashboard_notifications': features.get('dashboard_notifications', False),
-        'dashboard_settings': features.get('dashboard_settings', False),
+        # Check both 'features' and 'feature_flags' for dashboard flags
+        'dashboard_forms': features.get('dashboard_forms', False) or feature_flags.get('dashboard_forms', False),
+        'dashboard_attribution': features.get('dashboard_attribution', False) or feature_flags.get('dashboard_attribution', False),
+        'dashboard_notifications': features.get('dashboard_notifications', False) or feature_flags.get('dashboard_notifications', False),
+        'dashboard_settings': features.get('dashboard_settings', False) or feature_flags.get('dashboard_settings', False),
     }
 
 
