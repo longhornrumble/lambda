@@ -1643,6 +1643,9 @@ def handle_admin_employee_invite(user_role: Optional[str], body: Dict[str, Any])
     tenant_id = (body.get('tenant_id') or '').strip()
     email = (body.get('email') or '').strip().lower()
     role = (body.get('role') or '').strip().lower()
+    first_name = (body.get('first_name') or '').strip()
+    last_name = (body.get('last_name') or '').strip()
+    full_name = f'{first_name} {last_name}'.strip()
 
     if not tenant_id:
         return cors_response(400, {'error': 'tenant_id is required'})
@@ -1679,6 +1682,7 @@ def handle_admin_employee_invite(user_role: Optional[str], body: Dict[str, Any])
         invite_body = {
             'email_address': email,
             'role': clerk_role,
+            'public_metadata': {'first_name': first_name, 'last_name': last_name} if (first_name or last_name) else {},
         }
         result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations', invite_body)
     except ValueError as exc:
@@ -1688,14 +1692,14 @@ def handle_admin_employee_invite(user_role: Optional[str], body: Dict[str, Any])
         if 'already' in error_str.lower() and 'member' in error_str.lower():
             return cors_response(409, {'error': 'This user is already a member of the organization'})
         logger.error(f'[admin] Failed to invite: {exc}')
-        return cors_response(502, {'error': 'Failed to send invitation'})
+        return cors_response(502, {'error': f'Failed to send invitation: {error_str[:200]}'})
 
     # Write to employee registry (no clerk_user_id yet — webhook will upgrade on acceptance)
     try:
         reg_employee_id = tenant_registry_ops.generate_employee_id()
         tenant_registry_ops.put_employee(tenant_id, reg_employee_id, {
             'email': email,
-            'name': '',
+            'name': full_name,
             'role': role,
             'status': 'invited',
             'type': 'clerk_user',
@@ -5650,6 +5654,9 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
 
     email = (body.get('email') or '').strip().lower()
     role = (body.get('role') or '').strip().lower()
+    first_name = (body.get('first_name') or '').strip()
+    last_name = (body.get('last_name') or '').strip()
+    full_name = f'{first_name} {last_name}'.strip()
 
     if not email or '@' not in email:
         return cors_response(400, {'error': 'Valid email address is required'})
@@ -5683,12 +5690,21 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
         except ValueError:
             pass  # User doesn't exist yet — fine
 
+    # Check for existing record with same email in this tenant (prevent duplicates)
+    existing = tenant_registry_ops.get_employee_by_email(email)
+    if existing and existing.get('tenantId') == tenant_id:
+        existing_status = existing.get('status', '')
+        if existing_status == 'active':
+            return cors_response(409, {'error': 'This user is already a member of this organization'})
+        if existing_status == 'invited':
+            return cors_response(409, {'error': 'An invitation for this email is already pending'})
+
     # Write registry record BEFORE sending invitation (so it exists immediately)
     employee_id = tenant_registry_ops.generate_employee_id()
     try:
         tenant_registry_ops.put_employee(tenant_id, employee_id, {
             'email': email,
-            'name': '',
+            'name': full_name,
             'role': role,
             'status': 'invited',
             'type': 'clerk_user',
@@ -5703,8 +5719,14 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
         invite_body = {
             'email_address': email,
             'role': clerk_role,
+            'public_metadata': {'first_name': first_name, 'last_name': last_name} if (first_name or last_name) else {},
         }
-        if caller_clerk_user_id:
+        # Only set inviter_user_id if the caller is a member of the target org.
+        # Super admins using tenant override are NOT members of the target org —
+        # omitting inviter_user_id lets the Clerk Backend API key handle it.
+        caller_home_tenant = auth_result.get('tenant_id', '')
+        is_cross_tenant = caller_home_tenant != tenant_id
+        if caller_clerk_user_id and not is_cross_tenant:
             invite_body['inviter_user_id'] = caller_clerk_user_id
 
         result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations', invite_body)
@@ -5720,8 +5742,10 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
             return cors_response(409, {'error': 'An invitation for this email is already pending'})
         if 'already' in error_str.lower() and 'member' in error_str.lower():
             return cors_response(409, {'error': 'This user is already a member of the organization'})
+        if 'not_a_member' in error_str.lower() or 'not a member' in error_str.lower():
+            return cors_response(403, {'error': 'You are not a member of this organization. Use the Admin panel to invite to other tenants.'})
         logger.error(f'[team] Failed to invite: {exc}')
-        return cors_response(502, {'error': 'Failed to send invitation'})
+        return cors_response(502, {'error': f'Failed to send invitation: {error_str[:200]}'})
 
     # Invalidate org membership cache
     _org_membership_cache.clear()
@@ -6414,7 +6438,9 @@ def _handle_membership_created(data: Dict[str, Any]):
         # Fetch user details from Clerk
         try:
             user_data = _clerk_api_request('GET', f'/v1/users/{user_id}')
-            name = f"{user_data.get('first_name', '')} {user_data.get('last_name', '')}".strip()
+            clerk_first = user_data.get('first_name') or ''
+            clerk_last = user_data.get('last_name') or ''
+            name = f'{clerk_first} {clerk_last}'.strip()
             email = ''
             email_addresses = user_data.get('email_addresses', [])
             if email_addresses:
@@ -6430,6 +6456,7 @@ def _handle_membership_created(data: Dict[str, Any]):
             logger.warning(f'[clerk-webhook] Failed to fetch user details for {user_id}: {exc}')
             name = ''
             email = ''
+            user_data = None
 
         portal_role = _clerk_role_to_portal(role) if role else 'member'
 
@@ -6450,6 +6477,22 @@ def _handle_membership_created(data: Dict[str, Any]):
                     existing_invited = candidate
             except Exception as exc:
                 logger.warning(f'[clerk-webhook] Email index lookup failed for {email}: {exc}')
+
+        # If Clerk has no name, try to preserve the name from the invited registry record
+        if not name and existing_invited:
+            name = existing_invited.get('name', '')
+
+        # If we now have a name but Clerk user still has none, push it back to Clerk (best-effort)
+        if name and user_data and not (user_data.get('first_name') or user_data.get('last_name')):
+            name_parts = name.split(' ', 1)
+            try:
+                _clerk_api_request('PATCH', f'/v1/users/{user_id}', {
+                    'first_name': name_parts[0],
+                    'last_name': name_parts[1] if len(name_parts) > 1 else '',
+                })
+                logger.info(f'[clerk-webhook] Updated Clerk user {user_id} name from registry')
+            except ValueError:
+                pass  # Non-critical — name update is best-effort
 
         new_employee_id = tenant_registry_ops.generate_employee_id()
         new_record = {

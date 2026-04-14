@@ -188,12 +188,42 @@ def put_employee(tenant_id, employee_id, record):
         'updatedAt': {'S': record.get('updatedAt', new_timestamp())},
     }
 
-    # clerkUserId is now a regular (non-key) field — nullable
+    # clerkUserId is a non-key field indexed by ClerkUserIdIndex GSI.
+    # Omit entirely when absent — DynamoDB skips the GSI for missing attributes.
+    # Writing NULL causes a type mismatch error on the GSI.
     clerk_user_id = record.get('clerkUserId')
     if clerk_user_id:
         item['clerkUserId'] = {'S': clerk_user_id}
-    else:
-        item['clerkUserId'] = {'NULL': True}
+
+    # type: clerk_user or local_only
+    emp_type = record.get('type')
+    if emp_type:
+        item['type'] = {'S': emp_type}
+
+    # phone: optional, E.164 format
+    phone = record.get('phone')
+    if phone:
+        item['phone'] = {'S': phone}
+
+    # notificationPrefs: optional Map
+    notif_prefs = record.get('notificationPrefs')
+    if notif_prefs and isinstance(notif_prefs, dict):
+        prefs_map = {}
+        for k, v in notif_prefs.items():
+            if isinstance(v, bool):
+                prefs_map[k] = {'BOOL': v}
+            elif isinstance(v, str):
+                prefs_map[k] = {'S': v}
+            elif isinstance(v, dict):
+                # Nested map (e.g., sms_quiet_hours)
+                nested = {}
+                for nk, nv in v.items():
+                    if isinstance(nv, bool):
+                        nested[nk] = {'BOOL': nv}
+                    elif isinstance(nv, str):
+                        nested[nk] = {'S': nv}
+                prefs_map[k] = {'M': nested}
+        item['notificationPrefs'] = {'M': prefs_map}
 
     dynamodb.put_item(TableName=EMPLOYEE_TABLE, Item=item)
     return _unmarshall(item)
