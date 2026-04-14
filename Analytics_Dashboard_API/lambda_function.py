@@ -463,6 +463,9 @@ def lambda_handler(event, context):
         elif path.endswith('/team/contacts') and method == 'POST':
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_team_contact_add(auth_result, tenant_id, body)
+        elif '/team/contacts/' in path and method == 'DELETE':
+            contact_employee_id = path.split('/team/contacts/')[1].split('/')[0]
+            return handle_team_contact_remove(auth_result, tenant_id, contact_employee_id)
 
         elif path.endswith('/team/members') and method == 'GET':
             return handle_team_members_list(auth_result, tenant_id)
@@ -1694,6 +1697,31 @@ def handle_team_contact_add(auth_result: Dict[str, Any], tenant_id: str, body: D
         'name': name,
         'type': 'local_only',
     })
+
+
+def handle_team_contact_remove(auth_result: Dict[str, Any], tenant_id: str, employee_id: str) -> Dict[str, Any]:
+    """DELETE /team/contacts/{employee_id} — Remove a local_only contact."""
+    role_error = _require_write_role(auth_result.get('role'))
+    if role_error:
+        return role_error
+
+    if not employee_id:
+        return cors_response(400, {'error': 'employee_id is required'})
+
+    try:
+        employee = tenant_registry_ops.get_employee(tenant_id, employee_id)
+        if not employee:
+            return cors_response(404, {'error': 'Contact not found'})
+
+        if employee.get('type') != 'local_only':
+            return cors_response(400, {'error': 'Use the Remove button for portal users — this endpoint is for contacts only'})
+
+        tenant_registry_ops.update_employee(tenant_id, employee_id, {'status': 'inactive'})
+        logger.info(f'[team] Removed contact {employee_id} from tenant {tenant_id}')
+        return cors_response(200, {'employee_id': employee_id, 'removed': True})
+    except Exception as exc:
+        logger.exception(f'[team] Failed to remove contact {employee_id}: {exc}')
+        return cors_response(500, {'error': 'Failed to remove contact'})
 
 
 def handle_admin_employee_invite(user_role: Optional[str], body: Dict[str, Any]) -> Dict[str, Any]:
