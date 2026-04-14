@@ -6453,8 +6453,12 @@ def handle_clerk_webhook(event: Dict[str, Any]) -> Dict[str, Any]:
         _handle_org_created(data)
     elif event_type == 'organization.updated':
         _handle_org_updated(data)
+    elif event_type == 'organization.deleted':
+        _handle_org_deleted(data)
     elif event_type == 'organizationMembership.created':
         _handle_membership_created(data)
+    elif event_type == 'organizationMembership.updated':
+        _handle_membership_updated(data)
     elif event_type == 'organizationMembership.deleted':
         _handle_membership_deleted(data)
     else:
@@ -6500,6 +6504,57 @@ def _handle_org_updated(data: Dict[str, Any]):
             logger.info(f'[clerk-webhook] Updated org link for tenant {tenant_id} → {org_id}')
     except Exception as exc:
         logger.warning(f'[clerk-webhook] Failed to update org link: {exc}')
+
+
+def _handle_org_deleted(data: Dict[str, Any]):
+    """Organization deleted — clear clerkOrgId from tenant registry."""
+    org_id = data.get('id', '')
+    logger.info(f'[clerk-webhook] organization.deleted: org={org_id}')
+
+    if not org_id:
+        return
+
+    try:
+        # Find which tenant had this org
+        all_tenants = tenant_registry_ops.list_all_tenants()
+        for t in all_tenants:
+            if t.get('clerkOrgId') == org_id:
+                tenant_registry_ops.update_tenant(t['tenantId'], {'clerkOrgId': ''})
+                logger.info(f'[clerk-webhook] Cleared clerkOrgId for tenant {t["tenantId"]} (org {org_id} deleted)')
+                break
+    except Exception as exc:
+        logger.warning(f'[clerk-webhook] Failed to handle org deletion: {exc}')
+
+
+def _handle_membership_updated(data: Dict[str, Any]):
+    """Membership role changed (e.g., via Clerk Dashboard). Sync role to registry."""
+    user_id = data.get('public_user_data', {}).get('user_id', '')
+    org_id = data.get('organization', {}).get('id', '')
+    new_role = data.get('role', '')
+    logger.info(f'[clerk-webhook] membership.updated: user={user_id} org={org_id} role={new_role}')
+
+    if not user_id or not org_id:
+        return
+
+    try:
+        # Find employee by clerkUserId
+        employee = tenant_registry_ops.get_employee_by_clerk_user_id(user_id)
+        if not employee:
+            logger.info(f'[clerk-webhook] membership.updated: no registry record for {user_id} — skipping')
+            return
+
+        portal_role = _clerk_role_to_portal(new_role) if new_role else 'member'
+        current_role = employee.get('role', '')
+
+        if portal_role != current_role:
+            tenant_registry_ops.update_employee(
+                employee['tenantId'],
+                employee['employeeId'],
+                {'role': portal_role}
+            )
+            logger.info(f'[clerk-webhook] Updated role for {user_id}: {current_role} → {portal_role}')
+    except Exception as exc:
+        logger.warning(f'[clerk-webhook] Failed to sync membership role update: {exc}')
 
 
 def _handle_user_created(data: Dict[str, Any]):
