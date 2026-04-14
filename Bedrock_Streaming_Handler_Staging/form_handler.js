@@ -631,7 +631,10 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   let emailRecipients;
   let emailUserIdMap = {}; // email → userId for audit records
 
-  if (internalNotif.recipient_employee_ids?.length > 0) {
+  if (internalNotif.enabled === false) {
+    // Internal notifications explicitly disabled — skip all resolution
+    emailRecipients = null;
+  } else if (internalNotif.recipient_employee_ids?.length > 0) {
     // Registry-based resolution (preferred)
     try {
       const tenantId = config.tenant_id || '';
