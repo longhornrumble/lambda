@@ -1616,9 +1616,10 @@ def handle_admin_employee_add(user_role: Optional[str], body: Dict[str, Any]) ->
 
     # Check for duplicate active email in this tenant
     try:
-        existing = tenant_registry_ops.get_employee_by_email(email)
-        if existing and existing.get('tenantId') == tenant_id and existing.get('status') == 'active':
-            return cors_response(409, {'error': 'A member with this email already exists in this tenant'})
+        tenant_employees = tenant_registry_ops.list_employees(tenant_id)
+        for emp in tenant_employees:
+            if emp.get('email', '').lower() == email.lower() and emp.get('status') == 'active':
+                return cors_response(409, {'error': 'A member with this email already exists in this tenant'})
     except Exception as exc:
         logger.warning(f'[admin] Email duplicate check failed: {exc}')
 
@@ -1668,9 +1669,10 @@ def handle_team_contact_add(auth_result: Dict[str, Any], tenant_id: str, body: D
 
     # Check for duplicate active email in this tenant
     try:
-        existing = tenant_registry_ops.get_employee_by_email(email)
-        if existing and existing.get('tenantId') == tenant_id and existing.get('status') == 'active':
-            return cors_response(409, {'error': 'A member with this email already exists in this tenant'})
+        tenant_employees = tenant_registry_ops.list_employees(tenant_id)
+        for emp in tenant_employees:
+            if emp.get('email', '').lower() == email.lower() and emp.get('status') == 'active':
+                return cors_response(409, {'error': 'A member with this email already exists in this tenant'})
     except Exception as exc:
         logger.warning(f'[team] Email duplicate check failed: {exc}')
 
@@ -5786,14 +5788,16 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
     if role not in ('admin', 'member'):
         return cors_response(400, {'error': 'Role must be "admin" or "member"'})
 
-    # Single-org check: if this email already exists in the registry under a different active tenant, reject
+    # Single-org check: if this email is active in a DIFFERENT tenant, reject
     try:
-        existing = tenant_registry_ops.get_employee_by_email(email)
-        if existing and existing.get('status') == 'active' and existing.get('tenantId') != tenant_id:
-            return cors_response(409, {
-                'error': 'This user already belongs to another organization. '
-                         'Users can only belong to one organization.'
-            })
+        all_employees = tenant_registry_ops.list_all_employees()
+        for emp in all_employees:
+            if emp.get('email', '').lower() == email.lower() and emp.get('status') == 'active' and emp.get('tenantId') != tenant_id:
+                return cors_response(409, {
+                    'error': 'This user already belongs to another organization. '
+                             'Users can only belong to one organization.'
+                })
+                break
     except Exception as exc:
         logger.warning(f'[team] Registry single-org check failed, falling back to Clerk check: {exc}')
         # Fallback: check Clerk directly
@@ -5814,13 +5818,16 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
             pass  # User doesn't exist yet — fine
 
     # Check for existing record with same email in this tenant (prevent duplicates)
-    existing = tenant_registry_ops.get_employee_by_email(email)
-    if existing and existing.get('tenantId') == tenant_id:
-        existing_status = existing.get('status', '')
-        if existing_status == 'active':
-            return cors_response(409, {'error': 'This user is already a member of this organization'})
-        if existing_status == 'invited':
-            return cors_response(409, {'error': 'An invitation for this email is already pending'})
+    try:
+        tenant_employees = tenant_registry_ops.list_employees(tenant_id)
+        for emp in tenant_employees:
+            if emp.get('email', '').lower() == email.lower():
+                if emp.get('status') == 'active':
+                    return cors_response(409, {'error': 'This user is already a member of this organization'})
+                if emp.get('status') == 'invited':
+                    return cors_response(409, {'error': 'An invitation for this email is already pending'})
+    except Exception:
+        pass  # Non-critical — proceed with invite
 
     # Write registry record BEFORE sending invitation (so it exists immediately)
     employee_id = tenant_registry_ops.generate_employee_id()
