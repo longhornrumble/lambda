@@ -148,8 +148,8 @@ jobs:
           needs.detect-changes.outputs.shared == 'true'
         working-directory: ${{ matrix.lambda }}
         # --no-cache prevents stale transform cache across CI runs.
-        # --forceExit guards against lingering async handles in mocks.
-        run: npx jest --no-cache --forceExit --coverage --coverageReporters=text --coverageReporters=lcov
+        # --detectOpenHandles reports lingering async handles without forcing exit code 1.
+        run: npx jest --no-cache --detectOpenHandles --coverage --coverageReporters=text --coverageReporters=lcov
 
       - name: Upload test coverage
         # Always upload so coverage is available even when tests fail.
