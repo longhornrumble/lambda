@@ -151,16 +151,13 @@ jobs:
         # --forceExit prevents hanging on open async handles from SDK mocks.
         # Jest 30 may exit 1 on open handles even when tests pass — the
         # --json output is authoritative, so we check success from that.
+        shell: bash {0}
         run: |
-          set +e
           npx jest --no-cache --forceExit --json --outputFile=/tmp/jest-results.json \
-            --coverage --coverageReporters=text --coverageReporters=lcov 2>&1
-          JEST_EXIT=$?
-          set -e
-          # Print human-readable summary
-          cat /tmp/jest-results.json | python3 -c "
+            --coverage --coverageReporters=text --coverageReporters=lcov 2>&1 || true
+          python3 -c "
           import sys, json
-          d = json.load(sys.stdin)
+          d = json.load(open('/tmp/jest-results.json'))
           passed = d.get('numPassedTests', 0)
           failed = d.get('numFailedTests', 0)
           suites = d.get('numPassedTestSuites', 0)
