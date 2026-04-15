@@ -1,0 +1,5 @@
+# Meta_OAuth_Handler Lambda dependencies
+# boto3 is provided by the Lambda runtime and does not need to be bundled.
+# PyJWT must be included in the deployment package or a shared Lambda Layer.
+
+PyJWT>=2.8.0
