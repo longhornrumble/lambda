@@ -3,3 +3,4 @@
 # PyJWT must be included in the deployment package or a shared Lambda Layer.
 
 PyJWT>=2.8.0
+boto3>=1.34.0
