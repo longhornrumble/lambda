@@ -7,6 +7,7 @@ const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
   '@aws-sdk/client-kms',
   '@aws-sdk/client-s3',
+  '@aws-sdk/client-sqs',
   '@aws-sdk/lib-dynamodb',
 ];
 

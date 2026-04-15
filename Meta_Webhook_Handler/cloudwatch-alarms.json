@@ -1,0 +1,65 @@
+{
+  "Description": "CloudWatch alarms for Meta Messenger integration",
+  "Alarms": [
+    {
+      "AlarmName": "meta-webhook-handler-errors-{ENV}",
+      "Description": "Webhook handler Lambda errors",
+      "MetricName": "Errors",
+      "Namespace": "AWS/Lambda",
+      "FunctionName": "Meta_Webhook_Handler",
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "Threshold": 5,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+    },
+    {
+      "AlarmName": "meta-webhook-handler-duration-{ENV}",
+      "Description": "Webhook handler approaching Meta's 5-second deadline",
+      "MetricName": "Duration",
+      "Namespace": "AWS/Lambda",
+      "FunctionName": "Meta_Webhook_Handler",
+      "Statistic": "p99",
+      "Period": 300,
+      "EvaluationPeriods": 2,
+      "Threshold": 4000,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+    },
+    {
+      "AlarmName": "meta-response-processor-errors-{ENV}",
+      "Description": "Response processor Lambda errors (messages failing to send)",
+      "MetricName": "Errors",
+      "Namespace": "AWS/Lambda",
+      "FunctionName": "Meta_Response_Processor",
+      "Statistic": "Sum",
+      "Period": 300,
+      "EvaluationPeriods": 1,
+      "Threshold": 3,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+    },
+    {
+      "AlarmName": "meta-response-processor-dlq-depth-{ENV}",
+      "Description": "DLQ has messages — failed Messenger responses need investigation",
+      "MetricName": "ApproximateNumberOfMessagesVisible",
+      "Namespace": "AWS/SQS",
+      "QueueName": "meta-response-processor-dlq-{ENV}",
+      "Statistic": "Maximum",
+      "Period": 60,
+      "EvaluationPeriods": 1,
+      "Threshold": 0,
+      "ComparisonOperator": "GreaterThanThreshold"
+    },
+    {
+      "AlarmName": "meta-response-processor-duration-{ENV}",
+      "Description": "Response processor taking too long (>20s indicates Bedrock slowness)",
+      "MetricName": "Duration",
+      "Namespace": "AWS/Lambda",
+      "FunctionName": "Meta_Response_Processor",
+      "Statistic": "p95",
+      "Period": 300,
+      "EvaluationPeriods": 2,
+      "Threshold": 20000,
+      "ComparisonOperator": "GreaterThanOrEqualToThreshold"
+    }
+  ]
+}

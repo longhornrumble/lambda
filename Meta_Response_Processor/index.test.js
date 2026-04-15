@@ -28,6 +28,7 @@ const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 
 // ─── Mock shared bedrock-core before requiring the handler ────────────────────
 jest.mock('../shared/bedrock-core', () => ({
@@ -42,6 +43,7 @@ const { loadConfig, retrieveKB } = require('../shared/bedrock-core');
 const ddbMock = mockClient(DynamoDBDocumentClient);
 const kmsMock = mockClient(KMSClient);
 const bedrockMock = mockClient(BedrockRuntimeClient);
+const sqsMock = mockClient(SQSClient);
 
 // ─── Fetch mock ───────────────────────────────────────────────────────────────
 let fetchMock;
@@ -112,7 +114,11 @@ beforeEach(() => {
   ddbMock.reset();
   kmsMock.reset();
   bedrockMock.reset();
+  sqsMock.reset();
   jest.clearAllMocks();
+
+  // Default SQS stub: analytics emissions succeed silently
+  sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
 
   // Default: loadConfig returns a minimal config
   loadConfig.mockResolvedValue({
@@ -657,6 +663,90 @@ describe('Meta_Response_Processor handler', () => {
       expect(setIntervalSpy).not.toHaveBeenCalled();
 
       setIntervalSpy.mockRestore();
+    });
+  });
+
+  // ── Analytics event emission ───────────────────────────────────────────────
+
+  describe('Analytics event emission', () => {
+    test('emits MESSENGER_MESSAGE_RECEIVED and MESSENGER_RESPONSE_SENT on successful processing', async () => {
+      await handler(buildEvent());
+
+      // Two SQS SendMessageCommand calls: one for RECEIVED, one for SENT
+      expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 2);
+
+      const sqsCalls = sqsMock.commandCalls(SendMessageCommand);
+
+      // First event: MESSENGER_MESSAGE_RECEIVED
+      const receivedBody = JSON.parse(sqsCalls[0].args[0].input.MessageBody);
+      expect(receivedBody.event.type).toBe('MESSENGER_MESSAGE_RECEIVED');
+      expect(receivedBody.schema_version).toBe('1.0');
+      expect(receivedBody.session_id).toBe('meta:PAGE_456:PSID_123');
+      expect(receivedBody.tenant_id).toBe('TENANT_789');
+      expect(receivedBody.event.payload.channel_type).toBe('messenger');
+      expect(receivedBody.event.payload.page_id).toBe('PAGE_456');
+      expect(receivedBody.event.payload.psid).toBe('PSID_123');
+      expect(typeof receivedBody.event.payload.message_length).toBe('number');
+      expect(receivedBody.event.payload.is_postback).toBe(false);
+
+      // Second event: MESSENGER_RESPONSE_SENT
+      const sentBody = JSON.parse(sqsCalls[1].args[0].input.MessageBody);
+      expect(sentBody.event.type).toBe('MESSENGER_RESPONSE_SENT');
+      expect(sentBody.schema_version).toBe('1.0');
+      expect(sentBody.session_id).toBe('meta:PAGE_456:PSID_123');
+      expect(sentBody.tenant_id).toBe('TENANT_789');
+      expect(sentBody.event.payload.channel_type).toBe('messenger');
+      expect(sentBody.event.payload.page_id).toBe('PAGE_456');
+      expect(sentBody.event.payload.psid).toBe('PSID_123');
+      expect(typeof sentBody.event.payload.response_length).toBe('number');
+      expect(typeof sentBody.event.payload.model_used).toBe('string');
+      expect(typeof sentBody.event.payload.kb_context_length).toBe('number');
+    });
+
+    test('does NOT emit analytics when message is dropped due to invalid event shape', async () => {
+      const event = buildEvent({ psid: undefined });
+      await expect(handler(event)).resolves.toBeUndefined();
+
+      // Validation fails before analytics emission
+      expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    });
+
+    test('does NOT emit analytics when message is dropped due to stale 24-hour window', async () => {
+      const staleTimestamp = Date.now() - (25 * 60 * 60 * 1000); // 25 hours ago
+      await handler(buildEvent({ timestamp: staleTimestamp }));
+
+      // Stale drop happens before analytics emission
+      expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    });
+
+    test('does NOT emit MESSENGER_RESPONSE_SENT when Meta Send API fails', async () => {
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing_on
+        { ok: false, status: 500, body: { error: { message: 'Server error' } } },
+        { ok: false, status: 500, body: { error: { message: 'Server error' } } },
+        { ok: false, status: 500, body: { error: { message: 'Server error' } } },
+      ]);
+      global.fetch = fetchMock;
+
+      await expect(handler(buildEvent())).rejects.toThrow('Meta Send API error: 500');
+
+      // RECEIVED was emitted (after validation), but SENT was not (delivery failed)
+      expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 1);
+      const sqsCalls = sqsMock.commandCalls(SendMessageCommand);
+      const body = JSON.parse(sqsCalls[0].args[0].input.MessageBody);
+      expect(body.event.type).toBe('MESSENGER_MESSAGE_RECEIVED');
+    });
+
+    test('SQS failure does not crash the handler — analytics is best-effort', async () => {
+      sqsMock.on(SendMessageCommand).rejects(new Error('SQS service unavailable'));
+
+      // Handler should complete normally despite SQS failures
+      await expect(handler(buildEvent())).resolves.toBeUndefined();
+
+      // Fetch (typing + send) should still have been called
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // Bedrock should have been called
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
     });
   });
 });

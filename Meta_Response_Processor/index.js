@@ -42,6 +42,7 @@ const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-be
 const { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
+const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 
 // ─── AWS client initialisation ────────────────────────────────────────────────
@@ -58,6 +59,8 @@ const dynamodb = DynamoDBDocumentClient.from(dynamodbRaw, {
 
 const kms = new KMSClient({ region: AWS_REGION });
 
+const sqs = new SQSClient({ region: AWS_REGION });
+
 // ─── Configuration constants ──────────────────────────────────────────────────
 
 const CHANNEL_MAPPINGS_TABLE =
@@ -65,6 +68,9 @@ const CHANNEL_MAPPINGS_TABLE =
 const RECENT_MESSAGES_TABLE =
   process.env.RECENT_MESSAGES_TABLE || `${ENVIRONMENT}-recent-messages`;
 const KMS_KEY_ID = process.env.KMS_KEY_ID || 'alias/picasso-channel-tokens';
+const ANALYTICS_QUEUE_URL =
+  process.env.ANALYTICS_QUEUE_URL ||
+  'https://sqs.us-east-1.amazonaws.com/614056832592/picasso-analytics-events';
 
 const DEFAULT_MODEL_ID = 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
 const DEFAULT_TONE = 'You are a helpful assistant.';
@@ -106,6 +112,49 @@ function log(level, message, meta = {}) {
   console[level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'log'](
     JSON.stringify({ level, message, service: 'MetaResponseProcessor', ...meta })
   );
+}
+
+// ─── Analytics emission ───────────────────────────────────────────────────────
+
+/**
+ * Best-effort emission of an analytics event to the shared SQS analytics queue.
+ * Failures are logged as warnings and never propagate — analytics must not affect
+ * the critical message-delivery path.
+ *
+ * Event envelope matches the schema expected by Analytics_Event_Processor:
+ *   { schema_version, session_id, tenant_id, timestamp, event: { type, payload } }
+ *
+ * @param {string} eventType — e.g. 'MESSENGER_MESSAGE_RECEIVED'
+ * @param {Record<string, unknown>} payload — Event-specific fields
+ * @returns {Promise<void>}
+ */
+async function emitAnalyticsEvent(eventType, payload) {
+  try {
+    const body = JSON.stringify({
+      schema_version: '1.0',
+      session_id: payload.session_id,
+      tenant_id: payload.tenant_id,
+      timestamp: new Date().toISOString(),
+      event: {
+        type: eventType,
+        payload,
+      },
+    });
+
+    await sqs.send(
+      new SendMessageCommand({
+        QueueUrl: ANALYTICS_QUEUE_URL,
+        MessageBody: body,
+      })
+    );
+
+    log('INFO', 'Analytics event emitted', { eventType });
+  } catch (err) {
+    log('WARN', 'Failed to emit analytics event — continuing', {
+      eventType,
+      error: err.message,
+    });
+  }
 }
 
 // ─── KMS decryption ───────────────────────────────────────────────────────────
@@ -646,6 +695,17 @@ exports.handler = async function handler(event) {
     return;
   }
 
+  // Emit MESSENGER_MESSAGE_RECEIVED after successful input validation (best-effort)
+  emitAnalyticsEvent('MESSENGER_MESSAGE_RECEIVED', {
+    session_id: `meta:${pageId}:${psid}`,
+    tenant_id: tenantId,
+    channel_type: channelType,
+    page_id: pageId,
+    psid,
+    message_length: sanitizedInput.length,
+    is_postback: event.isPostback === true,
+  });
+
   // ── 1. Load page access token ────────────────────────────────────────────
   let pageAccessToken;
   try {
@@ -754,13 +814,15 @@ exports.handler = async function handler(event) {
   // ── 4. RAG pipeline: retrieve KB → generate response ─────────────────────
   // Config was already loaded in step 0b.
   let responseText;
+  let kbContextLength = 0;
 
   try {
     const kbContext = await retrieveKB(sanitizedInput, config);
+    kbContextLength = kbContext?.length || 0;
 
     log('INFO', 'KB retrieval complete', {
       tenantHash: tenantHash.substring(0, 8),
-      kbContextLength: kbContext?.length || 0,
+      kbContextLength,
     });
 
     responseText = await generateBedrockResponse(
@@ -791,6 +853,18 @@ exports.handler = async function handler(event) {
       pageId,
       psid,
       responseLength: responseText.length,
+    });
+
+    // Emit MESSENGER_RESPONSE_SENT after successful delivery (best-effort)
+    emitAnalyticsEvent('MESSENGER_RESPONSE_SENT', {
+      session_id: `meta:${pageId}:${psid}`,
+      tenant_id: tenantId,
+      channel_type: channelType,
+      page_id: pageId,
+      psid,
+      response_length: responseText.length,
+      model_used: config.model_id || DEFAULT_MODEL_ID,
+      kb_context_length: kbContextLength,
     });
   } catch (sendErr) {
     // Re-throw so Lambda retries (or DLQ captures)
