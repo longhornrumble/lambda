@@ -141,7 +141,7 @@ jobs:
           matrix.changed == 'true' ||
           needs.detect-changes.outputs.shared == 'true'
         working-directory: ${{ matrix.lambda }}
-        run: npm ci
+        run: npm install
 
       - name: Run Jest tests
         if: |
@@ -286,7 +286,7 @@ jobs:
         if: steps.lockfile_check.outputs.has_lockfile == 'true'
         working-directory: ${{ matrix.lambda }}
         # --ignore-scripts prevents postinstall hooks from running in CI.
-        run: npm ci --omit=dev --ignore-scripts
+        run: npm install --omit=dev --ignore-scripts
 
       - name: Run npm audit (high severity)
         if: steps.lockfile_check.outputs.has_lockfile == 'true'
@@ -356,7 +356,7 @@ jobs:
           matrix.changed == 'true' ||
           needs.detect-changes.outputs.shared == 'true'
         working-directory: ${{ matrix.lambda }}
-        run: npm ci
+        run: npm install
 
       - name: Run esbuild
         if: |
