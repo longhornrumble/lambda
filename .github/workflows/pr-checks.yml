@@ -147,9 +147,28 @@ jobs:
           matrix.changed == 'true' ||
           needs.detect-changes.outputs.shared == 'true'
         working-directory: ${{ matrix.lambda }}
-        # --no-cache prevents stale transform cache across CI runs.
-        # --detectOpenHandles reports lingering async handles without forcing exit code 1.
-        run: npx jest --no-cache --detectOpenHandles --coverage --coverageReporters=text --coverageReporters=lcov
+        # --no-cache prevents stale transform cache.
+        # --forceExit prevents hanging on open async handles from SDK mocks.
+        # Jest 30 may exit 1 on open handles even when tests pass — the
+        # --json output is authoritative, so we check success from that.
+        run: |
+          set +e
+          npx jest --no-cache --forceExit --json --outputFile=/tmp/jest-results.json \
+            --coverage --coverageReporters=text --coverageReporters=lcov 2>&1
+          JEST_EXIT=$?
+          set -e
+          # Print human-readable summary
+          cat /tmp/jest-results.json | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          passed = d.get('numPassedTests', 0)
+          failed = d.get('numFailedTests', 0)
+          suites = d.get('numPassedTestSuites', 0)
+          total_suites = d.get('numTotalTestSuites', 0)
+          print(f'Test Suites: {suites}/{total_suites} passed')
+          print(f'Tests: {passed} passed, {failed} failed')
+          sys.exit(0 if d.get('success') else 1)
+          "
 
       - name: Upload test coverage
         # Always upload so coverage is available even when tests fail.
