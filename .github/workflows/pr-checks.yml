@@ -79,7 +79,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: detect-changes
-
     # Run this job when:
     #   - shared/ changed (forces all Node.js tests), OR
     #   - the specific Lambda directory for this matrix entry changed.

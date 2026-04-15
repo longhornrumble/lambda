@@ -484,8 +484,13 @@ const streamingHandler = async (event, responseStream, context) => {
       }
     }
 
-    // Get KB context
-    const kbContext = await retrieveKB(kbQuery, config);
+    // Get KB context — errors are handled gracefully so Bedrock can still respond
+    let kbContext = '';
+    try {
+      kbContext = await retrieveKB(kbQuery, config);
+    } catch (kbError) {
+      console.error('❌ KB retrieval failed, continuing without KB context:', kbError.message);
+    }
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
     const prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);

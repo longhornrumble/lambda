@@ -803,6 +803,31 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
     }
   }
 
+  // Bubble webhook — send enriched payload when bubble_integration is configured or BUBBLE_WEBHOOK_URL is set
+  const bubbleWebhookUrl = (config.bubble_integration && config.bubble_integration.webhook_url)
+    || process.env.BUBBLE_WEBHOOK_URL;
+
+  if (bubbleWebhookUrl) {
+    const bubbleApiKey = config.bubble_integration?.api_key || null;
+    try {
+      await sendBubbleWebhook(
+        bubbleWebhookUrl,
+        formId,
+        formData,
+        submissionId,
+        config.tenant_id,
+        sessionId,
+        conversationId,
+        bubbleApiKey
+      );
+      results.push({ channel: 'bubble', status: 'sent' });
+      console.log(`✅ Bubble webhook sent to ${bubbleWebhookUrl}`);
+    } catch (error) {
+      console.error('Bubble webhook failed:', error);
+      results.push({ channel: 'bubble', status: 'failed', error: error.message });
+    }
+  }
+
   return results;
 }
 
@@ -1054,7 +1079,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
   } else {
     // Default HTML email body
     htmlBody = `
-      <h2>New ${formLabel} Submission</h2>
+      <h2>New ${formTitle} Submission</h2>
       <p>A new form has been submitted through the chat widget.</p>
       <h3>Form Data:</h3>
       <table border="1" cellpadding="5" cellspacing="0">
@@ -1623,6 +1648,165 @@ function getFieldPriority(key) {
 
   // All other fields: alphabetical (100+)
   return 100;
+}
+
+// ============================================================================
+// BUBBLE INTEGRATION — send form data to a Bubble.io webhook
+// ============================================================================
+
+/**
+ * Build a human-readable plain-text block of all form fields.
+ * Contact fields (name, email, phone, address) appear first.
+ *
+ * @param {Object} formData - Raw form field values
+ * @returns {string} Formatted text block
+ */
+function buildEmailDetailsText(formData) {
+  if (!formData || typeof formData !== 'object') {
+    return '';
+  }
+
+  const entries = Object.entries(formData)
+    .map(([key, value]) => {
+      const label = humanizeKey(key);
+      const formatted = formatValue(value);
+      if (formatted === null) return null;
+      return { key, label, value: formatted, priority: getFieldPriority(key) };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.priority - b.priority || a.label.localeCompare(b.label));
+
+  return entries.map(e => `${e.label}: ${e.value}`).join('\n');
+}
+
+/**
+ * Build an email subject suffix from the submitter's name.
+ *
+ * @param {Object} formData - Raw form field values
+ * @returns {string} Full name if present, first name if partial, "New submission" otherwise
+ */
+function buildEmailSubjectSuffix(formData) {
+  if (!formData || typeof formData !== 'object') return 'New submission';
+
+  const firstName = (formData.first_name || '').toString().trim();
+  const lastName = (formData.last_name || '').toString().trim();
+
+  if (firstName && lastName) return `${firstName} ${lastName}`;
+  if (firstName) return firstName;
+  return 'New submission';
+}
+
+/**
+ * Build a contact object from raw form data.
+ * Returns only the fields that are present and non-empty.
+ *
+ * @param {Object} formData - Raw form field values
+ * @returns {Object} Contact fields (name, email, phone, etc.)
+ */
+function buildContactObject(formData) {
+  if (!formData || typeof formData !== 'object') return {};
+
+  const contact = {};
+
+  // Name
+  const firstName = (formData.first_name || '').toString().trim();
+  const lastName = (formData.last_name || '').toString().trim();
+  if (firstName || lastName) {
+    contact.name = [firstName, lastName].filter(Boolean).join(' ');
+  }
+
+  // Email
+  const email = formData.email || formData.email_address || '';
+  if (email) contact.email = email.toString().trim();
+
+  // Phone — check multiple field names
+  const phoneFields = ['phone', 'mobile', 'cell', 'telephone', 'mobile_number', 'cell_number', 'phone_number'];
+  for (const field of phoneFields) {
+    if (formData[field]) {
+      contact.phone = formData[field].toString().trim();
+      break;
+    }
+  }
+
+  return contact;
+}
+
+/**
+ * Send form data to a Bubble.io webhook via HTTPS.
+ * Includes email_details_text, email_subject_suffix, and contact fields.
+ *
+ * @param {string} webhookUrl - The full Bubble webhook URL
+ * @param {string} formId - Form identifier
+ * @param {Object} formData - Raw form field values
+ * @param {string} submissionId - Unique submission ID
+ * @param {string} tenantId - Tenant ID
+ * @param {string|null} sessionId - Session ID
+ * @param {string|null} conversationId - Conversation ID
+ * @param {string|null} apiKey - Optional Bearer token for Authorization header
+ * @returns {Promise<void>}
+ */
+function sendBubbleWebhook(webhookUrl, formId, formData, submissionId, tenantId, sessionId, conversationId, apiKey) {
+  return new Promise((resolve, reject) => {
+    let url;
+    try {
+      url = new URL(webhookUrl);
+    } catch (e) {
+      return reject(new Error(`Invalid Bubble webhook URL: ${webhookUrl}`));
+    }
+
+    // Build flat payload — all form fields as top-level properties
+    const payload = {
+      ...formData,
+      submission_id: submissionId,
+      tenant_id: tenantId,
+      form_type: formId,
+      timestamp: new Date().toISOString(),
+      email_details_text: buildEmailDetailsText(formData),
+      email_subject_suffix: buildEmailSubjectSuffix(formData),
+      contact: buildContactObject(formData),
+    };
+
+    if (sessionId) payload.session_id = sessionId;
+    if (conversationId) payload.conversation_id = conversationId;
+
+    const body = JSON.stringify(payload);
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body)
+    };
+    if (apiKey) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'https:' ? 443 : 80),
+      path: url.pathname + (url.search || ''),
+      method: 'POST',
+      headers
+    };
+
+    const https = require('https');
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve();
+        } else {
+          reject(new Error(`Bubble webhook returned ${res.statusCode}: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      reject(err);
+    });
+
+    req.write(body);
+    req.end();
+  });
 }
 
 module.exports = {
