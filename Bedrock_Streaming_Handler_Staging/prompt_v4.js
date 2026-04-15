@@ -301,6 +301,27 @@ function buildV4FinalInstruction(hasKb, detailLevel = 'balanced') {
  * @param {Object} config
  * @returns {string} — empty string if no constraints
  */
+/**
+ * Strip role-boundary sequences that could allow prompt injection.
+ * Removes patterns like "Human:", "Assistant:", "System:", XML-style
+ * role tags, and other sequences that could escape the prompt context.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function stripRoleBoundarySequences(text) {
+  if (!text || typeof text !== 'string') return '';
+
+  return text
+    // Remove Claude/Bedrock role-boundary markers
+    .replace(/\b(Human|Assistant|System|User)\s*:/gi, '')
+    // Remove XML-style role tags (e.g., </s>, <|im_end|>, <|system|>)
+    .replace(/<\/?(?:s|im_start|im_end|system|user|assistant|endoftext)\|?>/gi, '')
+    // Remove prompt injection anchors
+    .replace(/\[INST\]|\[\/INST\]|<<SYS>>|<\/SYS>>/gi, '')
+    .trim();
+}
+
 function buildV4CustomConstraints(config) {
   const instructions = config?.bedrock_instructions;
   if (!instructions || !Array.isArray(instructions.custom_constraints) || instructions.custom_constraints.length === 0) {
@@ -309,10 +330,14 @@ function buildV4CustomConstraints(config) {
 
   // Filter out constraints that would conflict with locked loop/engagement rules
   const blocked = ['follow-up question', 'follow up question', 'end with a question'];
-  const filtered = instructions.custom_constraints.filter(c => {
-    const lower = c.toLowerCase();
-    return !blocked.some(phrase => lower.includes(phrase));
-  });
+  const filtered = instructions.custom_constraints
+    .filter(c => typeof c === 'string' && c.length <= 500)
+    .map(c => stripRoleBoundarySequences(c))
+    .filter(c => {
+      if (!c) return false;
+      const lower = c.toLowerCase();
+      return !blocked.some(phrase => lower.includes(phrase));
+    });
 
   if (filtered.length === 0) return '';
 
@@ -330,6 +355,14 @@ function buildV4CustomConstraints(config) {
 function sanitizeTonePromptV4(tonePrompt) {
   if (!tonePrompt) return '';
 
+  // Strip role-boundary injection sequences first
+  let sanitized = stripRoleBoundarySequences(tonePrompt);
+
+  // Enforce length limit on tone prompt
+  if (sanitized.length > 2000) {
+    sanitized = sanitized.slice(0, 2000);
+  }
+
   const blockedPhrases = [
     'inline link',
     'calls to action',
@@ -339,7 +372,7 @@ function sanitizeTonePromptV4(tonePrompt) {
     'insert links',
   ];
 
-  return tonePrompt
+  return sanitized
     .split('.')
     .filter(sentence => {
       const lower = sentence.toLowerCase();
