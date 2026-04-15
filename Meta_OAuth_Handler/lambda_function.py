@@ -72,8 +72,11 @@ _KMS_KEY_ID = os.environ.get("KMS_KEY_ID", "alias/picasso-channel-tokens")
 _GRAPH_API_VERSION = "v21.0"
 _GRAPH_BASE = f"https://graph.facebook.com/{_GRAPH_API_VERSION}"
 
-# OAuth scopes required for Messenger
-_OAUTH_SCOPES = "pages_show_list,pages_messaging,pages_read_engagement"
+# OAuth scopes required for Messenger and Instagram DMs.
+# Note: Instagram Professional accounts no longer require a linked Facebook Page
+# as of July 2024 — instagram_basic and instagram_manage_messages are sufficient
+# for direct Instagram DM access when the account is a Professional account.
+_OAUTH_SCOPES = "pages_show_list,pages_messaging,pages_read_engagement,instagram_basic,instagram_manage_messages"
 
 # State JWT lifetime in seconds (10 minutes)
 _STATE_JWT_TTL = 600

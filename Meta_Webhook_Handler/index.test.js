@@ -347,14 +347,78 @@ describe('POST /webhook — postback events', () => {
 // ─── Tests: POST — object types ──────────────────────────────────────────────────
 
 describe('POST /webhook — object types', () => {
-  test('acknowledges instagram webhook without processing (MVP)', async () => {
-    const igBody = { object: 'instagram', entry: [] };
+  test('processes instagram webhook through the messaging pipeline', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        tenantId:   { S: TENANT_ID },
+        tenantHash: { S: TENANT_HASH },
+        enabled:    { BOOL: true },
+      },
+    });
+    ddbMock.on(PutItemCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+    const igBody = {
+      object: 'instagram',
+      entry: [
+        {
+          id: PAGE_ID,
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: PSID },
+              recipient: { id: PAGE_ID },
+              timestamp: Date.now(),
+              message: { mid: MESSAGE_MID, text: MESSAGE_TEXT },
+            },
+          ],
+        },
+      ],
+    };
     const rawBody = JSON.stringify(igBody);
     const event = makePostEvent({ body: rawBody, signature: makeSignature(rawBody) });
 
     const res = await handler(event);
     expect(res.statusCode).toBe(200);
-    expect(lambdaMock).not.toHaveReceivedCommand(InvokeCommand);
+    expect(lambdaMock).toHaveReceivedCommandTimes(InvokeCommand, 1);
+  });
+
+  test('sets channelType instagram in payload for instagram object type', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        tenantId:   { S: TENANT_ID },
+        tenantHash: { S: TENANT_HASH },
+        enabled:    { BOOL: true },
+      },
+    });
+    ddbMock.on(PutItemCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+    const igBody = {
+      object: 'instagram',
+      entry: [
+        {
+          id: PAGE_ID,
+          time: Date.now(),
+          messaging: [
+            {
+              sender: { id: PSID },
+              recipient: { id: PAGE_ID },
+              timestamp: Date.now(),
+              message: { mid: MESSAGE_MID, text: MESSAGE_TEXT },
+            },
+          ],
+        },
+      ],
+    };
+    const rawBody = JSON.stringify(igBody);
+    const event = makePostEvent({ body: rawBody, signature: makeSignature(rawBody) });
+
+    await handler(event);
+
+    const invokeCall = lambdaMock.commandCalls(InvokeCommand)[0];
+    const payload = JSON.parse(Buffer.from(invokeCall.args[0].input.Payload).toString('utf8'));
+    expect(payload.channelType).toBe('instagram');
   });
 
   test('acknowledges unknown object types without crashing', async () => {

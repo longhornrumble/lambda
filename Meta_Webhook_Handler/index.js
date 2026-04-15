@@ -279,9 +279,10 @@ function handleVerification(queryParams) {
  *
  * @param {object} messagingEvent  - Single entry from entry.messaging[].
  * @param {string} pageId          - The Facebook Page ID from entry.id.
+ * @param {string} [objectType]    - The webhook object type ('page' or 'instagram').
  * @returns {Promise<void>}
  */
-async function processMessagingEvent(messagingEvent, pageId) {
+async function processMessagingEvent(messagingEvent, pageId, objectType) {
   const sender = messagingEvent.sender?.id;
   if (!sender) {
     console.warn('[Meta_Webhook_Handler] messaging event missing sender.id — skipping');
@@ -367,7 +368,7 @@ async function processMessagingEvent(messagingEvent, pageId) {
     pageId,
     tenantId:    mapping.tenantId,
     tenantHash:  mapping.tenantHash,
-    channelType: 'messenger',
+    channelType: objectType === 'instagram' ? 'instagram' : 'messenger',
     messageMid,
     isPostback,
   };
@@ -389,8 +390,8 @@ async function processMessagingEvent(messagingEvent, pageId) {
  *
  * Meta sends a JSON body containing one or more "entries", each with zero or
  * more "messaging" events.  The body.object field is either "page" (Messenger)
- * or "instagram".  For MVP we fully handle "page"; "instagram" is accepted
- * without processing (to avoid Meta retries) and logged for future use.
+ * or "instagram".  Both are processed through the same processMessagingEvent
+ * pipeline; the objectType is forwarded so channelType is set correctly.
  *
  * @param {string} rawBody       - Raw request body (used for HMAC verification).
  * @param {object} headers       - HTTP headers from the Lambda event.
@@ -424,15 +425,13 @@ async function handlePost(rawBody, headers) {
 
   const objectType = body.object;
 
-  if (objectType === 'instagram') {
-    // Instagram DMs — not yet handled in MVP; accept to prevent Meta retries
-    console.log('[Meta_Webhook_Handler] Instagram webhook received — not yet handled, acknowledging');
+  if (objectType !== 'page' && objectType !== 'instagram') {
+    console.warn(`[Meta_Webhook_Handler] Unknown object type: ${objectType} — acknowledging`);
     return ok();
   }
 
-  if (objectType !== 'page') {
-    console.warn(`[Meta_Webhook_Handler] Unknown object type: ${objectType} — acknowledging`);
-    return ok();
+  if (objectType === 'instagram') {
+    console.log('[Meta_Webhook_Handler] Instagram webhook received — routing through processMessagingEvent pipeline');
   }
 
   // ── Process each entry / messaging event ──
@@ -448,7 +447,7 @@ async function handlePost(rawBody, headers) {
     const messaging = Array.isArray(entry.messaging) ? entry.messaging : [];
 
     for (const messagingEvent of messaging) {
-      eventPromises.push(processMessagingEvent(messagingEvent, pageId));
+      eventPromises.push(processMessagingEvent(messagingEvent, pageId, objectType));
     }
   }
 

@@ -19,11 +19,14 @@
  * }
  *
  * Processing order:
+ *   0. Input validation
+ *   0a. 24-hour window check (drop stale DLQ retries)
+ *   0b. Postback handling — GET_STARTED sends welcome_message; other payloads fall through to RAG
  *   1. Load page access token from DynamoDB (decrypt with KMS)
- *   2. Send typing indicator
+ *   2. Send typing indicator + start refresh interval (every 8 s)
  *   3. Load conversation context from DynamoDB recent-messages table
  *   4. Run RAG pipeline via shared bedrock-core (loadConfig → retrieveKB → InvokeModel)
- *   5. Send response via Meta Send API (splitting at 2000-char boundary if needed)
+ *   5. Stop typing refresh, send response via Meta Send API (splitting at 2000-char boundary if needed)
  *   6. Persist Q&A pair to recent-messages (keep last 10 pairs)
  *   7. Update lastUserMessageAt on the channel-mapping record
  *
@@ -82,6 +85,12 @@ const MAX_STORED_PAIRS = 10;
 
 /** Delay between sequential Messenger messages when splitting (ms) */
 const SPLIT_MESSAGE_DELAY_MS = 200;
+
+/** Meta messaging window: bot may only send within 24 h of the user's last message */
+const MESSAGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** How often to refresh the typing indicator while waiting for Bedrock (ms) */
+const TYPING_REFRESH_INTERVAL_MS = 8000;
 
 // ─── Observability helpers ────────────────────────────────────────────────────
 
@@ -610,6 +619,22 @@ exports.handler = async function handler(event) {
   const { psid, messageText, pageId, tenantId, tenantHash, messageMid } = event;
   const channelType = event.channelType || 'messenger';
 
+  // ── 0a. 24-hour messaging-window check ───────────────────────────────────
+  // Protects against stale DLQ retries arriving long after the user messaged us.
+  // Meta policy: bots may only send within 24 h of the user's last message.
+  if (event.timestamp) {
+    const messageAge = Date.now() - event.timestamp;
+    if (messageAge > MESSAGE_WINDOW_MS) {
+      log('WARN', '24-hour messaging window exceeded — dropping response', {
+        pageId,
+        psid,
+        messageMid,
+        messageAgeHours: Math.round(messageAge / (60 * 60 * 1000)),
+      });
+      return;
+    }
+  }
+
   // Sanitise user input before any processing
   const sanitizedInput = sanitizeUserInput(messageText);
   if (!sanitizedInput) {
@@ -635,8 +660,83 @@ exports.handler = async function handler(event) {
     return;
   }
 
+  // ── 0b. Load tenant config (needed for postback handling and RAG) ─────────
+  // Config is loaded early so the GET_STARTED postback can read welcome_message
+  // without running the full RAG pipeline.
+  let config = {};
+  try {
+    config = await loadConfig(tenantHash);
+    if (!config) {
+      log('WARN', 'loadConfig returned null — using defaults', { tenantHash });
+      config = {};
+    }
+  } catch (configErr) {
+    log('WARN', 'Failed to load tenant config — using defaults', {
+      tenantHash,
+      error: configErr.message,
+    });
+    config = {};
+  }
+
+  // ── 0c. Postback handling ────────────────────────────────────────────────
+  // GET_STARTED: short-circuit to welcome_message; skip RAG pipeline entirely.
+  // Other postback payloads fall through to the RAG pipeline so the AI can
+  // respond contextually (the payload string becomes the user query).
+  if (event.isPostback === true && messageText === 'GET_STARTED') {
+    const welcomeMessage =
+      config.welcome_message ||
+      "Hello! I'm here to help. What can I do for you today?";
+
+    log('INFO', 'GET_STARTED postback — sending welcome message', {
+      pageId,
+      psid,
+      welcomeLength: welcomeMessage.length,
+    });
+
+    // Send typing indicator (best-effort) then welcome message
+    await sendTypingIndicator(pageId, psid, pageAccessToken);
+
+    try {
+      await sendResponseMessages(pageId, psid, welcomeMessage, pageAccessToken);
+    } catch (sendErr) {
+      log('ERROR', 'Failed to send welcome message — will retry', {
+        pageId, psid, error: sendErr.message,
+      });
+      throw sendErr;
+    }
+
+    // Still store context and update lastUserMessageAt
+    try {
+      await storeConversationContext(pageId, psid, messageText, welcomeMessage);
+    } catch (storeErr) {
+      log('WARN', 'Failed to store GET_STARTED context', { pageId, psid, error: storeErr.message });
+    }
+    try {
+      await updateLastUserMessageAt(pageId, channelType);
+    } catch (updateErr) {
+      log('WARN', 'Failed to update lastUserMessageAt after GET_STARTED', {
+        pageId, channelType, error: updateErr.message,
+      });
+    }
+
+    const durationMs = Date.now() - startTime;
+    log('INFO', 'Handler complete (GET_STARTED postback)', { pageId, psid, durationMs });
+    return;
+  }
+
   // ── 2. Send typing indicator (best-effort) ───────────────────────────────
   await sendTypingIndicator(pageId, psid, pageAccessToken);
+
+  // Start typing-indicator refresh so the indicator stays alive while Bedrock
+  // processes (Meta expires typing_on after ~10 s; we refresh every 8 s).
+  const typingRefreshInterval = setInterval(async () => {
+    try {
+      await sendTypingIndicator(pageId, psid, pageAccessToken);
+    } catch (e) {
+      // Non-fatal — don't disrupt the main pipeline
+      log('WARN', 'Typing indicator refresh failed', { pageId, psid, error: e.message });
+    }
+  }, TYPING_REFRESH_INTERVAL_MS);
 
   // ── 3. Load conversation context ─────────────────────────────────────────
   let conversationHistory = [];
@@ -651,23 +751,9 @@ exports.handler = async function handler(event) {
     });
   }
 
-  // ── 4. RAG pipeline: load config → retrieve KB → generate response ───────
+  // ── 4. RAG pipeline: retrieve KB → generate response ─────────────────────
+  // Config was already loaded in step 0b.
   let responseText;
-  let config = {};
-
-  try {
-    config = await loadConfig(tenantHash);
-    if (!config) {
-      log('WARN', 'loadConfig returned null — using defaults', { tenantHash });
-      config = {};
-    }
-  } catch (configErr) {
-    log('WARN', 'Failed to load tenant config — using defaults', {
-      tenantHash,
-      error: configErr.message,
-    });
-    config = {};
-  }
 
   try {
     const kbContext = await retrieveKB(sanitizedInput, config);
@@ -696,7 +782,9 @@ exports.handler = async function handler(event) {
     responseText = config.bedrock_instructions?.fallback_message || DEFAULT_FALLBACK_MESSAGE;
   }
 
-  // ── 5. Send response via Meta Send API ───────────────────────────────────
+  // ── 5. Stop typing refresh and send response via Meta Send API ───────────
+  clearInterval(typingRefreshInterval);
+
   try {
     await sendResponseMessages(pageId, psid, responseText, pageAccessToken);
     log('INFO', 'Response delivered to Messenger', {

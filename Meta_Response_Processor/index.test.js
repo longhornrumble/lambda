@@ -14,6 +14,11 @@
  *   - Invalid event shape drops message without throwing
  *   - 5xx Meta Send API retries up to 3 times
  *   - Conversation history is trimmed to rolling window
+ *   - GET_STARTED postback sends welcome_message, skips RAG
+ *   - Other postback payloads go through normal RAG pipeline
+ *   - Stale message (timestamp > 24 h) is dropped with warning log
+ *   - Recent message (timestamp < 24 h) is processed normally
+ *   - Typing refresh interval is started and cleared
  */
 
 const { mockClient } = require('aws-sdk-client-mock');
@@ -446,6 +451,212 @@ describe('Meta_Response_Processor handler', () => {
       const body = JSON.parse(bedrockCall.args[0].input.body);
       expect(body.system).toContain('Do not use markdown formatting');
       expect(body.system).toContain('Facebook Messenger');
+    });
+  });
+
+  // ── Enhancement 1: Postback handling ──────────────────────────────────────
+
+  describe('Postback handling', () => {
+    test('GET_STARTED postback sends welcome_message from config and skips RAG', async () => {
+      loadConfig.mockResolvedValueOnce({
+        welcome_message: 'Welcome to our service! How can I help you?',
+        tone_prompt: 'Helpful.',
+      });
+
+      // GET_STARTED only needs: typing + welcome send
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing_on
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.welcome' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      // Bedrock must NOT be invoked
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 0);
+
+      // retrieveKB must NOT be called
+      expect(retrieveKB).not.toHaveBeenCalled();
+
+      // Two fetch calls: typing + welcome send
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+
+      // Second call is the actual message send
+      const [, sendOptions] = fetchMock.mock.calls[1];
+      const body = JSON.parse(sendOptions.body);
+      expect(body.message.text).toBe('Welcome to our service! How can I help you?');
+      expect(body.messaging_type).toBe('RESPONSE');
+
+      // Context stored and lastUserMessageAt updated
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 1);
+      expect(ddbMock).toHaveReceivedCommandTimes(UpdateCommand, 1);
+    });
+
+    test('GET_STARTED uses default welcome when config has no welcome_message', async () => {
+      loadConfig.mockResolvedValueOnce({ tone_prompt: 'Helpful.' }); // no welcome_message
+
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} },
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.1' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      const [, sendOptions] = fetchMock.mock.calls[1];
+      const body = JSON.parse(sendOptions.body);
+      expect(body.message.text).toContain("Hello!");
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 0);
+    });
+
+    test('non-GET_STARTED postback goes through normal RAG pipeline', async () => {
+      // MENU_VOLUNTEER payload — should reach Bedrock
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing_on
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.1' } }, // response
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'MENU_VOLUNTEER' }));
+
+      // Bedrock was called with the postback payload as the user query
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+      const bedrockCall = bedrockMock.commandCalls(InvokeModelCommand)[0];
+      const body = JSON.parse(bedrockCall.args[0].input.body);
+      const lastMessage = body.messages[body.messages.length - 1];
+      expect(lastMessage.content[0].text).toBe('MENU_VOLUNTEER');
+    });
+
+    test('event without isPostback goes through RAG pipeline normally', async () => {
+      await handler(buildEvent()); // no isPostback field
+
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+    });
+  });
+
+  // ── Enhancement 2: 24-hour messaging-window enforcement ───────────────────
+
+  describe('24-hour messaging window', () => {
+    test('drops response and logs warning when message timestamp is > 24 h old', async () => {
+      const consoleWarnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+      const staleTimestamp = Date.now() - (25 * 60 * 60 * 1000); // 25 hours ago
+      await handler(buildEvent({ timestamp: staleTimestamp }));
+
+      // No fetch calls — nothing should be sent
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      // A WARN log line should have been emitted
+      const warnCalls = consoleWarnSpy.mock.calls.map((c) => c[0]);
+      const windowWarn = warnCalls.find((line) => {
+        try {
+          return JSON.parse(line).message.includes('24-hour messaging window');
+        } catch {
+          return false;
+        }
+      });
+      expect(windowWarn).toBeDefined();
+
+      consoleWarnSpy.mockRestore();
+    });
+
+    test('processes message normally when timestamp is within 24 h', async () => {
+      const recentTimestamp = Date.now() - (30 * 60 * 1000); // 30 minutes ago
+      await handler(buildEvent({ timestamp: recentTimestamp }));
+
+      // Full pipeline ran
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+      expect(fetchMock).toHaveBeenCalledTimes(2); // typing + send
+    });
+
+    test('processes message normally when no timestamp is provided (backward compat)', async () => {
+      // Events without a timestamp field should not be dropped
+      const event = buildEvent();
+      delete event.timestamp;
+
+      await handler(event);
+
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+    });
+  });
+
+  // ── Enhancement 3: Typing indicator refresh ───────────────────────────────
+
+  describe('Typing indicator refresh', () => {
+    test('setInterval is started for typing refresh and cleared after response', async () => {
+      const setIntervalSpy = jest.spyOn(global, 'setInterval');
+      const clearIntervalSpy = jest.spyOn(global, 'clearInterval');
+
+      await handler(buildEvent());
+
+      // setInterval called once with 8000 ms
+      expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+      expect(setIntervalSpy).toHaveBeenCalledWith(expect.any(Function), 8000);
+
+      // clearInterval called once with the timer returned by setInterval
+      const timerId = setIntervalSpy.mock.results[0].value;
+      expect(clearIntervalSpy).toHaveBeenCalledWith(timerId);
+
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
+    });
+
+    test('typing refresh callback sends typing_on when invoked', async () => {
+      // Capture the callback registered with setInterval
+      let capturedCallback;
+      const setIntervalSpy = jest
+        .spyOn(global, 'setInterval')
+        .mockImplementation((fn, ms) => {
+          capturedCallback = fn;
+          return 999; // fake timer id
+        });
+      const clearIntervalSpy = jest
+        .spyOn(global, 'clearInterval')
+        .mockImplementation(() => {});
+
+      // Provide enough fetch stubs for: initial typing + 1 refresh invocation + send
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // initial typing_on
+        { ok: true, body: {} }, // refresh call
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.1' } }, // message send
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent());
+
+      // clearInterval was called with the id returned by setInterval
+      expect(clearIntervalSpy).toHaveBeenCalledWith(999);
+
+      // Manually invoke the captured callback to verify it sends typing_on
+      expect(capturedCallback).toBeDefined();
+      const fetchCallsBefore = fetchMock.mock.calls.length;
+      await capturedCallback();
+      expect(fetchMock).toHaveBeenCalledTimes(fetchCallsBefore + 1);
+      const refreshBody = JSON.parse(
+        fetchMock.mock.calls[fetchCallsBefore][1].body
+      );
+      expect(refreshBody.sender_action).toBe('typing_on');
+
+      setIntervalSpy.mockRestore();
+      clearIntervalSpy.mockRestore();
+    });
+
+    test('typing refresh interval is not started for GET_STARTED postback', async () => {
+      const setIntervalSpy = jest.spyOn(global, 'setInterval');
+
+      loadConfig.mockResolvedValueOnce({ welcome_message: 'Hi there!' });
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} },
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.1' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      // GET_STARTED path skips RAG and the typing refresh interval
+      expect(setIntervalSpy).not.toHaveBeenCalled();
+
+      setIntervalSpy.mockRestore();
     });
   });
 });

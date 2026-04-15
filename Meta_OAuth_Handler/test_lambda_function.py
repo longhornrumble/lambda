@@ -93,6 +93,8 @@ class TestGetOAuthUrl(unittest.TestCase):
         self.assertIn("facebook.com", url)
         self.assertIn("client_id=TEST_APP_ID", url)
         self.assertIn("pages_messaging", url)
+        self.assertIn("instagram_basic", url)
+        self.assertIn("instagram_manage_messages", url)
         self.assertIn("state=", url)
 
     def test_missing_tenant_id_returns_400(self):
