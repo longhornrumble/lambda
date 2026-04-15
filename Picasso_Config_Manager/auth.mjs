@@ -1,212 +1,147 @@
 /**
- * JWT Authentication Module for Picasso Config Manager
- * Implements HS256 JWT validation using native Node.js crypto
+ * Clerk JWT Authentication Module for Picasso Config Manager
  *
- * JWT Structure:
- * - Header: {alg: "HS256", typ: "JWT"}
- * - Payload: {tenant_id, tenant_hash, email, name, role, company, features, tenants, exp, iat}
- * - Signature: HMAC-SHA256(header.payload, signing_key)
+ * Verifies Clerk RS256 JWTs via JWKS and reads claims from the
+ * 'picasso-config' JWT template. No Clerk API calls needed.
+ *
+ * Required env vars:
+ * - CLERK_JWKS_URL (optional): Override JWKS endpoint
  */
 
 import crypto from 'crypto';
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+import https from 'https';
 
-// In-memory cache for signing key
-let signingKeyCache = null;
-let signingKeyCacheTime = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+// ─── JWKS cache ─────────────────────────────────────────────────────────────
+const CLERK_JWKS_URL = process.env.CLERK_JWKS_URL ||
+  'https://present-skunk-55.clerk.accounts.dev/.well-known/jwks.json';
+const JWKS_CACHE_TTL = 3600_000; // 1 hour
+let jwksCache = null;
+let jwksCacheTime = 0;
 
-const secretsClient = new SecretsManagerClient({ region: 'us-east-1' });
-
-/**
- * Fetch JWT signing key from AWS Secrets Manager with 5-minute caching
- * @returns {Promise<string>} - The signing key
- */
-async function getSigningKey() {
-  const now = Date.now();
-
-  // Return cached key if valid
-  if (signingKeyCache && (now - signingKeyCacheTime) < CACHE_TTL) {
-    console.log('Using cached signing key');
-    return signingKeyCache;
-  }
-
-  console.log('Fetching signing key from Secrets Manager');
-  try {
-    const command = new GetSecretValueCommand({
-      SecretId: 'picasso/staging/jwt/signing-key'
+// ─── HTTP helper ────────────────────────────────────────────────────────────
+function httpsGet(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { headers, timeout: 5000 }, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode >= 400) {
+          reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+        } else {
+          resolve(JSON.parse(data));
+        }
+      });
     });
-
-    const response = await secretsClient.send(command);
-    const secret = response.SecretString;
-
-    // Secret may be JSON or plain string
-    let signingKey;
-    try {
-      const parsed = JSON.parse(secret);
-      signingKey = parsed.signing_key || parsed.key || secret;
-    } catch {
-      signingKey = secret;
-    }
-
-    // Update cache
-    signingKeyCache = signingKey;
-    signingKeyCacheTime = now;
-
-    return signingKey;
-  } catch (error) {
-    console.error('Failed to fetch signing key:', error);
-    throw new Error('Unable to fetch JWT signing key');
-  }
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timeout')); });
+  });
 }
 
-/**
- * Decode base64url string to UTF-8 string
- * @param {string} str - Base64url encoded string
- * @returns {string} - Decoded string
- */
+// ─── JWKS fetch ─────────────────────────────────────────────────────────────
+async function fetchJwks() {
+  const now = Date.now();
+  if (jwksCache && (now - jwksCacheTime) < JWKS_CACHE_TTL) {
+    return jwksCache;
+  }
+  console.log(`[clerk-auth] Fetching JWKS from ${CLERK_JWKS_URL}`);
+  const data = await httpsGet(CLERK_JWKS_URL, { Accept: 'application/json' });
+  jwksCache = data;
+  jwksCacheTime = now;
+  return data;
+}
+
+// ─── JWT verification ───────────────────────────────────────────────────────
 function base64urlDecode(str) {
-  // Convert base64url to base64
-  const base64 = str.replace(/-/g, '+').replace(/_/g, '/');
-  // Decode base64 to buffer, then to UTF-8
-  return Buffer.from(base64, 'base64').toString('utf-8');
+  return Buffer.from(str, 'base64url');
 }
 
-/**
- * Validate and decode JWT token
- * @param {string} token - JWT token string
- * @returns {Promise<Object>} - Decoded JWT payload
- * @throws {Error} - If token is invalid or expired
- */
-export async function validateJwt(token) {
-  if (!token) {
-    throw new Error('Token is required');
-  }
-
-  // Split token into parts
+async function verifyClerkJwt(token) {
   const parts = token.split('.');
-  if (parts.length !== 3) {
-    throw new Error('Invalid token format');
-  }
+  if (parts.length !== 3) throw new Error('Invalid token format');
 
   const [headerB64, payloadB64, signatureB64] = parts;
+  const header = JSON.parse(base64urlDecode(headerB64).toString());
+  const payload = JSON.parse(base64urlDecode(payloadB64).toString());
 
-  // Decode header and payload
-  let header, payload;
-  try {
-    header = JSON.parse(base64urlDecode(headerB64));
-    payload = JSON.parse(base64urlDecode(payloadB64));
-  } catch (error) {
-    throw new Error('Invalid token encoding');
-  }
-
-  // Verify algorithm
-  if (header.alg !== 'HS256') {
+  if (!header.alg || !header.alg.startsWith('RS')) {
     throw new Error(`Unsupported algorithm: ${header.alg}`);
   }
 
-  // Fetch signing key
-  const signingKey = await getSigningKey();
+  const kid = header.kid;
+  if (!kid) throw new Error('JWT missing kid header');
 
-  // Compute expected signature using HMAC-SHA256
-  const expectedSig = crypto
-    .createHmac('sha256', signingKey)
-    .update(`${headerB64}.${payloadB64}`)
-    .digest();
+  // Find matching key in JWKS
+  const jwks = await fetchJwks();
+  const jwk = (jwks.keys || []).find((k) => k.kid === kid);
+  if (!jwk) throw new Error(`Unknown key id: ${kid}`);
 
-  // Decode actual signature from base64url
-  const actualSig = Buffer.from(signatureB64, 'base64url');
+  // Convert JWK to public key and verify signature
+  const publicKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+  const signatureInput = Buffer.from(`${headerB64}.${payloadB64}`);
+  const signature = base64urlDecode(signatureB64);
 
-  // Constant-time comparison to prevent timing attacks
-  if (expectedSig.length !== actualSig.length) {
-    throw new Error('Invalid signature');
-  }
+  const isValid = crypto.verify('sha256', signatureInput, publicKey, signature);
+  if (!isValid) throw new Error('Invalid JWT signature');
 
-  if (!crypto.timingSafeEqual(expectedSig, actualSig)) {
-    throw new Error('Invalid signature');
-  }
-
-  // Check expiration
+  // Verify expiry
   const now = Math.floor(Date.now() / 1000);
-  if (payload.exp && payload.exp < now) {
-    throw new Error('Token has expired');
-  }
-
-  // Verify required claims
-  if (!payload.tenant_id && !payload.role) {
-    throw new Error('Token missing required claims');
-  }
+  if (payload.exp && payload.exp < now) throw new Error('Token has expired');
+  if (payload.nbf && payload.nbf > now) throw new Error('Token not yet valid');
 
   return payload;
 }
 
+// ─── Main auth function ─────────────────────────────────────────────────────
 /**
- * Authenticate request by extracting and validating JWT from Authorization header
- * @param {Object} event - Lambda event object
- * @returns {Promise<Object>} - Authentication result
+ * Authenticate request by verifying Clerk JWT.
+ * Claims come from the 'picasso-config' JWT template — no API calls needed.
  *
- * Success: {success: true, tenant_id, tenant_hash, email, role, tenants, ...}
- * Failure: {success: false, error: string}
+ * @param {Object} event - Lambda event
+ * @returns {Promise<Object>} - Auth result
  */
 export async function authenticateRequest(event) {
   try {
-    // Extract Authorization header (case-insensitive)
     const headers = event.headers || {};
     const authHeader = headers.Authorization || headers.authorization;
 
     if (!authHeader) {
-      return {
-        success: false,
-        error: 'Missing Authorization header'
-      };
+      return { success: false, error: 'Missing Authorization header' };
     }
 
-    // Extract Bearer token
     const match = authHeader.match(/^Bearer\s+(.+)$/i);
     if (!match) {
-      return {
-        success: false,
-        error: 'Invalid Authorization header format. Expected: Bearer <token>'
-      };
+      return { success: false, error: 'Invalid Authorization header format' };
     }
 
     const token = match[1];
+    const payload = await verifyClerkJwt(token);
 
-    // Validate JWT
-    const payload = await validateJwt(token);
+    // Claims come directly from the picasso-config JWT template
+    const email = payload.email || '';
+    const name = payload.name || '';
+    const role = payload.role || 'member';
+    const tenantId = payload.tenant_id || null;
+    const tenantHash = payload.tenant_hash || null;
+    const company = payload.company || '';
 
-    // Extract relevant fields
-    const {
-      tenant_id,
-      tenant_hash,
-      email,
-      name,
-      role,
-      company,
-      features,
-      tenants,
-      exp,
-      iat
-    } = payload;
+    // Build tenants array — for super_admin all tenants are accessible,
+    // for regular users just their org's tenant
+    const tenants = tenantId ? [tenantId] : [];
+
+    console.log(`[clerk-auth] Authenticated: ${email} role=${role} tenant=${tenantId}`);
 
     return {
       success: true,
-      tenant_id,
-      tenant_hash,
       email,
-      name,
+      name: name || undefined,
       role,
+      tenant_id: tenantId,
+      tenant_hash: tenantHash,
       company,
-      features,
-      tenants: tenants || [],
-      exp,
-      iat
+      tenants,
     };
   } catch (error) {
-    console.error('Authentication failed:', error.message);
-    return {
-      success: false,
-      error: error.message
-    };
+    console.error('[clerk-auth] Authentication failed:', error.message);
+    return { success: false, error: error.message };
   }
 }
