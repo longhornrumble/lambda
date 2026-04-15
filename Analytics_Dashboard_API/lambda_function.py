@@ -539,63 +539,62 @@ def _fetch_clerk_jwks() -> Dict[str, Any]:
         raise
 
 
-def _decode_clerk_jwt_claims(token: str) -> Dict[str, Any]:
+def _get_clerk_signing_key(token: str) -> 'Any':
     """
-    Decode and validate Clerk JWT claims.
-
-    SECURITY NOTE (trial): This verifies expiry, not-before, and issuer claims.
-    Full RS256 signature verification requires the `cryptography` package
-    (not in base Lambda runtime). Add PyJWT[cryptography] as a Lambda layer
-    before using in production with untrusted tokens.
-
-    The Clerk token is obtained server-side via getToken() which already
-    validates the session with Clerk's servers, providing defence-in-depth.
+    Extract the RSA public key matching the token's kid from Clerk JWKS.
+    Returns a jwt.algorithms.RSAAlgorithm public key object.
+    Raises ValueError if no matching key is found.
     """
-    parts = token.split('.')
-    if len(parts) != 3:
-        raise ValueError('Clerk token must have 3 parts')
+    import jwt as pyjwt
 
-    header_b64, payload_b64, _signature_b64 = parts
+    # Decode header without verification to get kid
+    unverified_header = pyjwt.get_unverified_header(token)
+    kid = unverified_header.get('kid')
+    alg = unverified_header.get('alg', '')
 
-    # Decode header
-    header_json = base64.urlsafe_b64decode(header_b64 + '==')
-    header = json.loads(header_json)
-
-    alg = header.get('alg', '')
     if alg not in ('RS256', 'RS384', 'RS512'):
         raise ValueError(f'Unexpected Clerk JWT algorithm: {alg}')
 
-    # Decode payload
-    payload_json = base64.urlsafe_b64decode(payload_b64 + '==')
-    payload = json.loads(payload_json)
+    if not kid:
+        raise ValueError('Clerk JWT missing kid in header')
 
-    # Verify expiry
-    exp = payload.get('exp')
-    if not exp or time.time() > exp:
-        raise ValueError('Clerk token is expired')
+    jwks = _fetch_clerk_jwks()
+    for key_data in jwks.get('keys', []):
+        if key_data.get('kid') == kid:
+            from jwt.algorithms import RSAAlgorithm
+            return RSAAlgorithm.from_jwk(key_data)
 
-    # Verify not-before
-    nbf = payload.get('nbf')
-    if nbf and time.time() < nbf:
-        raise ValueError('Clerk token not yet valid (nbf)')
+    raise ValueError(f'Unknown Clerk key id: {kid}')
 
-    # Verify issuer belongs to our Clerk domain
-    iss = payload.get('iss', '')
-    if 'clerk.myrecruiter.ai' not in iss and 'clerk.accounts.dev' not in iss:
-        raise ValueError(f'Unexpected Clerk token issuer: {iss}')
 
-    # Verify JWKS kid exists (confirms token was issued by our Clerk instance)
-    kid = header.get('kid')
-    if kid:
-        jwks = _fetch_clerk_jwks()
-        known_kids = {k.get('kid') for k in jwks.get('keys', [])}
-        if kid not in known_kids:
-            raise ValueError(f'Unknown Clerk key id: {kid}')
-    else:
-        # No kid in header — still fetch JWKS to confirm connectivity
-        _fetch_clerk_jwks()
+def _decode_clerk_jwt_claims(token: str) -> Dict[str, Any]:
+    """
+    Decode and validate Clerk JWT with full RS256 signature verification.
 
-    logger.info(f"[clerk-auth] Clerk JWT claims valid (sub={payload.get('sub', 'unknown')[:12]}...)")
+    Requires PyJWT[cryptography] Lambda layer.
+    Verifies: RS256 signature, expiry, not-before, and issuer claims.
+    """
+    import jwt as pyjwt
+
+    signing_key = _get_clerk_signing_key(token)
+
+    payload = pyjwt.decode(
+        token,
+        signing_key,
+        algorithms=['RS256'],
+        options={
+            'require': ['exp', 'iss', 'sub'],
+            'verify_exp': True,
+            'verify_nbf': True,
+            'verify_iss': True,
+        },
+        issuer=[
+            'https://clerk.myrecruiter.ai',
+            'https://immune-catfish-56.clerk.accounts.dev',
+        ],
+    )
+
+    logger.info(f"[clerk-auth] Clerk JWT signature verified (sub={payload.get('sub', 'unknown')[:12]}...)")
     return payload
 
 
@@ -753,8 +752,6 @@ def _resolve_org_tenant(user_id: str, requested_org_id: Optional[str]) -> Dict[s
     if not memberships:
         raise ValueError('User has no organization memberships')
 
-    is_multi_org = len(memberships) > 1
-
     # Find the target membership
     if requested_org_id:
         membership = None
@@ -768,6 +765,8 @@ def _resolve_org_tenant(user_id: str, requested_org_id: Optional[str]) -> Dict[s
     elif len(memberships) == 1:
         membership = memberships[0]
     else:
+        # SECURITY: multi-org users must specify which org to use.
+        # super_admin is granted exclusively via publicMetadata.picasso_role.
         raise ValueError(
             'Access denied — your account belongs to multiple organizations. '
             'Contact your administrator to resolve this.'
@@ -787,10 +786,9 @@ def _resolve_org_tenant(user_id: str, requested_org_id: Optional[str]) -> Dict[s
         )
 
     # Map Clerk org role to Picasso role
+    # SECURITY: super_admin is NEVER granted here — only via publicMetadata.picasso_role
     clerk_role = membership.get('role', '')
-    if is_multi_org:
-        role = 'super_admin'
-    elif clerk_role == 'org:admin':
+    if clerk_role == 'org:admin':
         role = 'admin'
     else:
         role = 'member'

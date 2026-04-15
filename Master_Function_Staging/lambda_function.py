@@ -162,31 +162,16 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
 
 def handle_options(event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
-    Handle OPTIONS requests for CORS preflight
+    Handle OPTIONS requests for CORS preflight.
+    Routes through add_cors_headers() so the allowlist is applied.
     """
     logger.info("OPTIONS request received for CORS preflight")
 
-    # Determine origin from request for preflight
-    origin = 'https://chat.myrecruiter.ai'  # Safe default
-    if event and 'headers' in event:
-        headers = event.get('headers', {})
-        for key in ['origin', 'Origin', 'ORIGIN']:
-            if key in headers:
-                origin = headers[key]
-                break
-
-    # For OPTIONS, we just need to return CORS headers with 200 status
-    # Don't process the body or try to add nested headers
-    return {
+    response = {
         'statusCode': 200,
-        'headers': {
-            'Access-Control-Allow-Origin': origin,
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-            'Content-Type': 'application/json'
-        },
-        'body': ''
+        'body': '',
     }
+    return add_cors_headers(response, event)
 
 def health_check(event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
@@ -1817,16 +1802,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         # Handle OPTIONS requests immediately for CORS preflight
         if http_method == 'OPTIONS':
             logger.info("OPTIONS request - returning CORS headers immediately")
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-                    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-                    'Content-Type': 'application/json'
-                },
-                'body': ''
-            }
+            return handle_options(event)
 
         # Log the incoming request for debugging
         logger.info(f"Received {http_method} event: {json.dumps(event, default=str)[:500]}")

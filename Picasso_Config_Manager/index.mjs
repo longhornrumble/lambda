@@ -38,6 +38,24 @@ import { authenticateRequest } from './auth.mjs';
 const ENFORCE_AUTH = true;
 
 /**
+ * Validate tenantId format. Returns null if valid, or an error response object if invalid.
+ */
+const TENANT_ID_REGEX = /^[A-Za-z0-9_-]{1,50}$/;
+function validateTenantId(tenantId, headers) {
+  if (!tenantId || !TENANT_ID_REGEX.test(tenantId)) {
+    return {
+      statusCode: 400,
+      headers,
+      body: JSON.stringify({
+        error: 'Bad Request',
+        message: 'tenantId must be alphanumeric (hyphens/underscores allowed), max 50 characters',
+      }),
+    };
+  }
+  return null;
+}
+
+/**
  * Main Lambda handler
  * Routes requests to appropriate functions based on HTTP method and path
  * Supports both API Gateway and Lambda Function URL event formats
@@ -301,6 +319,8 @@ export const handler = async (event) => {
     // GET /config/{tenantId}/metadata - Get tenant metadata only
     if (httpMethod === 'GET' && path.match(/^\/config\/([^/]+)\/metadata$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)\/metadata$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
 
       // Authorization check: verify user has access to this tenant
       if (auth.success && auth.role !== 'super_admin') {
@@ -334,6 +354,8 @@ export const handler = async (event) => {
     // GET /config/{tenantId}/backups - List backups for tenant
     if (httpMethod === 'GET' && path.match(/^\/config\/([^/]+)\/backups$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)\/backups$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
 
       // Authorization check: verify user has access to this tenant
       if (auth.success && auth.role !== 'super_admin') {
@@ -367,6 +389,8 @@ export const handler = async (event) => {
     // GET /config/{tenantId} - Load full tenant config
     if (httpMethod === 'GET' && path.match(/^\/config\/([^/]+)$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
       const editableOnly = queryStringParameters?.editable_only === 'true';
 
       // Authorization check: verify user has access to this tenant
@@ -411,6 +435,8 @@ export const handler = async (event) => {
     // PUT /config/{tenantId} - Save tenant config
     if (httpMethod === 'PUT' && path.match(/^\/config\/([^/]+)$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
 
       // Authorization check: verify user has access to this tenant
       if (auth.success && auth.role !== 'super_admin') {
@@ -442,21 +468,18 @@ export const handler = async (event) => {
         validate_only = false,
       } = requestBody;
 
-      // Only validate sections if merge=true (section-based editing)
-      // When merge=false, full config replacement is allowed
-      if (merge) {
-        const validation = validateEditedSections(editedConfig);
-        if (!validation.isValid) {
-          return {
-            statusCode: 400,
-            headers,
-            body: JSON.stringify({
-              error: 'Invalid edited sections',
-              message: `Validation failed: ${validation.errors.join('; ')}`,
-              details: validation.errors,
-            }),
-          };
-        }
+      // Validate config structure regardless of merge mode
+      const validation = validateEditedSections(editedConfig);
+      if (!validation.isValid) {
+        return {
+          statusCode: 400,
+          headers,
+          body: JSON.stringify({
+            error: 'Invalid config sections',
+            message: `Validation failed: ${validation.errors.join('; ')}`,
+            details: validation.errors,
+          }),
+        };
       }
 
       // If validation only, return without saving
@@ -509,6 +532,8 @@ export const handler = async (event) => {
     // DELETE /config/{tenantId} - Delete tenant config
     if (httpMethod === 'DELETE' && path.match(/^\/config\/([^/]+)$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
 
       // Authorization check: verify user has access to this tenant
       if (auth.success && auth.role !== 'super_admin') {
@@ -546,6 +571,8 @@ export const handler = async (event) => {
     // PUT /config/{tenantId}/draft - Save draft config
     if (httpMethod === 'PUT' && path.match(/^\/config\/([^/]+)\/draft$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)\/draft$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
 
       // Authorization check: verify user has access to this tenant
       if (auth.success && auth.role !== 'super_admin') {
@@ -595,6 +622,8 @@ export const handler = async (event) => {
     // GET /config/{tenantId}/draft - Load draft config
     if (httpMethod === 'GET' && path.match(/^\/config\/([^/]+)\/draft$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)\/draft$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
 
       // Authorization check: verify user has access to this tenant
       if (auth.success && auth.role !== 'super_admin') {
@@ -630,6 +659,8 @@ export const handler = async (event) => {
     // DELETE /config/{tenantId}/draft - Delete draft config
     if (httpMethod === 'DELETE' && path.match(/^\/config\/([^/]+)\/draft$/)) {
       const tenantId = path.match(/^\/config\/([^/]+)\/draft$/)[1];
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
 
       // Authorization check: verify user has access to this tenant
       if (auth.success && auth.role !== 'super_admin') {
