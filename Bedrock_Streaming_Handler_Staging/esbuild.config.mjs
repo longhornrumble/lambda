@@ -8,6 +8,8 @@ const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-sns',
   '@aws-sdk/client-ses',
   '@aws-sdk/client-lambda',
+  '@aws-sdk/client-bedrock-runtime',
+  '@aws-sdk/client-bedrock-agent-runtime',
   '@aws-sdk/lib-dynamodb',
 ];
 
