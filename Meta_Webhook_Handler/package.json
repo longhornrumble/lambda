@@ -1,0 +1,31 @@
+{
+  "name": "meta-webhook-handler",
+  "version": "1.0.0",
+  "description": "Meta Messenger webhook handler for Picasso multi-tenant chat platform",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-lambda": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
