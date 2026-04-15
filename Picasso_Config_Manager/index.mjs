@@ -35,7 +35,7 @@ import { authenticateRequest } from './auth.mjs';
  * Set to false during initial deployment to allow permissive mode (log warnings only)
  * Set to true to enforce 401/403 responses on auth failures
  */
-const ENFORCE_AUTH = false;
+const ENFORCE_AUTH = true;
 
 /**
  * Main Lambda handler
