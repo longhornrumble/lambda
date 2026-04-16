@@ -1038,12 +1038,12 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
   };
 
   // Use renderTemplate() for consistent variable substitution with cleanup
+  const formMeta = config.conversational_forms?.[formId] || {};
+  const formLabel = formMeta.form_title || formMeta.title || formId;
   let subject;
   if (customSubject) {
     subject = renderTemplate(customSubject, templateVars);
   } else {
-    const formConfig = config.conversational_forms?.[formId] || {};
-    const formLabel = formConfig.form_title || formConfig.title || formId;
     subject = `New ${formLabel} Submission`;
   }
 
