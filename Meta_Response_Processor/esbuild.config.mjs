@@ -2,14 +2,12 @@ import * as esbuild from 'esbuild';
 
 // Lambda Node.js 20.x has these built-in - don't bundle them
 const LAMBDA_EXTERNALS = [
-  '@aws-sdk/client-s3',
-  '@aws-sdk/client-sqs',
-  '@aws-sdk/client-dynamodb',
-  '@aws-sdk/client-sns',
-  '@aws-sdk/client-ses',
-  '@aws-sdk/client-lambda',
   '@aws-sdk/client-bedrock-runtime',
   '@aws-sdk/client-bedrock-agent-runtime',
+  '@aws-sdk/client-dynamodb',
+  '@aws-sdk/client-kms',
+  '@aws-sdk/client-s3',
+  '@aws-sdk/client-sqs',
   '@aws-sdk/lib-dynamodb',
 ];
 
@@ -30,4 +28,4 @@ await esbuild.build({
   keepNames: true,
 });
 
-console.log('✅ Bundle complete: dist/index.js');
+console.log('Bundle complete: dist/index.js');

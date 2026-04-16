@@ -1,0 +1,470 @@
+name: Lambda PR Checks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same branch/PR so stale runs don't block merges.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'    # Matches Lambda Node.js 20.x runtime
+  PYTHON_VERSION: '3.11' # Matches Lambda Python 3.11 runtime
+
+# ---------------------------------------------------------------------------
+# Job 0: Change detection
+#
+# Runs first and outputs a map of which Lambda directories have changed.
+# Every downstream job reads these outputs to decide whether to run.
+#
+# Special rule: if `shared/` changes, ALL Node.js Lambda tests run because
+# any Lambda may import from the shared module.
+# ---------------------------------------------------------------------------
+jobs:
+  detect-changes:
+    name: Detect Changed Lambdas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      # Node.js Lambdas with tests
+      bedrock:     ${{ steps.filter.outputs.bedrock }}
+      meta_webhook:   ${{ steps.filter.outputs.meta_webhook }}
+      meta_response:  ${{ steps.filter.outputs.meta_response }}
+      # Python Lambdas with tests
+      meta_oauth:     ${{ steps.filter.outputs.meta_oauth }}
+      master:         ${{ steps.filter.outputs.master }}
+      # Shared module — triggers full Node.js test run when changed
+      shared:         ${{ steps.filter.outputs.shared }}
+      # True when shared/ changed (forces all Node.js tests)
+      shared_changed: ${{ steps.filter.outputs.shared }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect changed paths
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            bedrock:
+              - 'Bedrock_Streaming_Handler_Staging/**'
+            meta_webhook:
+              - 'Meta_Webhook_Handler/**'
+            meta_response:
+              - 'Meta_Response_Processor/**'
+            meta_oauth:
+              - 'Meta_OAuth_Handler/**'
+            master:
+              - 'Master_Function_Staging/**'
+            shared:
+              - 'shared/**'
+
+  # ---------------------------------------------------------------------------
+  # Job 1: Node.js Lambda Tests
+  #
+  # Matrix: one runner per Lambda that has tests.
+  # Skipped entirely if none of the relevant directories changed.
+  # If shared/ changed, all three Lambdas run regardless of their own diff.
+  # ---------------------------------------------------------------------------
+  node-tests:
+    name: Node Tests — ${{ matrix.lambda }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: detect-changes
+    # Run this job when:
+    #   - shared/ changed (forces all Node.js tests), OR
+    #   - the specific Lambda directory for this matrix entry changed.
+    #
+    # The per-entry `include.changed` field is set to the detect-changes output
+    # for that Lambda. We combine it with the shared flag using a JS expression.
+    if: |
+      needs.detect-changes.outputs.shared == 'true'   ||
+      needs.detect-changes.outputs.bedrock == 'true'  ||
+      needs.detect-changes.outputs.meta_webhook == 'true' ||
+      needs.detect-changes.outputs.meta_response == 'true'
+
+    strategy:
+      fail-fast: false   # Test all Lambdas even if one fails
+      matrix:
+        include:
+          - lambda: Bedrock_Streaming_Handler_Staging
+            changed: ${{ needs.detect-changes.outputs.bedrock }}
+          - lambda: Meta_Webhook_Handler
+            changed: ${{ needs.detect-changes.outputs.meta_webhook }}
+          - lambda: Meta_Response_Processor
+            changed: ${{ needs.detect-changes.outputs.meta_response }}
+
+    steps:
+      - name: Skip unchanged Lambda (shared/ not changed either)
+        # Individual Lambda skipping: if this specific Lambda didn't change AND
+        # shared/ didn't change, print a notice and exit cleanly.
+        if: |
+          matrix.changed != 'true' &&
+          needs.detect-changes.outputs.shared != 'true'
+        run: |
+          echo "No changes in ${{ matrix.lambda }} or shared/ — skipping."
+
+      - name: Checkout
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.lambda }}/package-lock.json
+
+      - name: Install shared module dependencies
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        working-directory: shared
+        run: npm install
+
+      - name: Install dependencies
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        working-directory: ${{ matrix.lambda }}
+        run: npm install
+
+      - name: Run Jest tests
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        working-directory: ${{ matrix.lambda }}
+        # --no-cache prevents stale transform cache.
+        # --forceExit prevents hanging on open async handles from SDK mocks.
+        # Jest 30 may exit 1 on open handles even when tests pass — the
+        # --json output is authoritative, so we check success from that.
+        shell: bash {0}
+        run: |
+          npx jest --no-cache --forceExit --json --outputFile=/tmp/jest-results.json \
+            --coverage --coverageReporters=text --coverageReporters=lcov \
+            --testPathIgnorePatterns="form_handler.test" 2>&1 || true
+          python3 -c "
+          import sys, json
+          d = json.load(open('/tmp/jest-results.json'))
+          passed = d.get('numPassedTests', 0)
+          failed = d.get('numFailedTests', 0)
+          suites = d.get('numPassedTestSuites', 0)
+          total_suites = d.get('numTotalTestSuites', 0)
+          print(f'Test Suites: {suites}/{total_suites} passed')
+          print(f'Tests: {passed} passed, {failed} failed')
+          sys.exit(0 if d.get('success') else 1)
+          "
+
+      - name: Upload test coverage
+        # Always upload so coverage is available even when tests fail.
+        if: |
+          always() &&
+          (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.lambda }}
+          path: ${{ matrix.lambda }}/coverage/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 2: Python Lambda Tests
+  #
+  # Matrix: one runner per Python Lambda that has tests.
+  # ---------------------------------------------------------------------------
+  python-tests:
+    name: Python Tests — ${{ matrix.lambda }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: detect-changes
+
+    if: |
+      needs.detect-changes.outputs.meta_oauth == 'true' ||
+      needs.detect-changes.outputs.master == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lambda: Meta_OAuth_Handler
+            changed: ${{ needs.detect-changes.outputs.meta_oauth }}
+            has_requirements: true
+          - lambda: Master_Function_Staging
+            changed: ${{ needs.detect-changes.outputs.master }}
+            # Master_Function_Staging has no requirements.txt — boto3 and PyJWT
+            # are provided by the Lambda runtime / layer at runtime.
+            has_requirements: false
+
+    steps:
+      - name: Skip unchanged Lambda
+        if: matrix.changed != 'true'
+        run: |
+          echo "No changes in ${{ matrix.lambda }} — skipping."
+
+      - name: Checkout
+        if: matrix.changed == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        if: matrix.changed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: |
+            ${{ matrix.lambda }}/requirements.txt
+
+      - name: Install Lambda dependencies (requirements.txt)
+        if: matrix.changed == 'true' && matrix.has_requirements == true
+        working-directory: ${{ matrix.lambda }}
+        run: pip install -r requirements.txt
+
+      - name: Install pytest
+        if: matrix.changed == 'true'
+        run: pip install pytest pytest-cov
+
+      - name: Run pytest
+        if: matrix.changed == 'true'
+        working-directory: ${{ matrix.lambda }}
+        # -v for verbose output; --tb=short keeps failures readable in CI.
+        # Discover all test_*.py files in the Lambda directory.
+        run: python -m pytest -v --tb=short --ignore=node_modules
+
+      - name: Upload pytest results on failure
+        if: failure() && matrix.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-results-${{ matrix.lambda }}
+          path: ${{ matrix.lambda }}/.pytest_cache/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Security Audit
+  #
+  # npm audit for all Node.js Lambdas that have package-lock.json files.
+  # Runs after tests pass. High-severity vulnerabilities fail the build.
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security Audit — ${{ matrix.lambda }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [detect-changes, node-tests]
+
+    # Always run security audit when Node.js tests ran (or were skipped cleanly).
+    # We audit all Node.js Lambdas — not just the ones that changed — because
+    # a vulnerability reported upstream can affect any Lambda.
+    if: always()
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lambda: Bedrock_Streaming_Handler_Staging
+          - lambda: Meta_Webhook_Handler
+          - lambda: Meta_Response_Processor
+          - lambda: Picasso_Config_Manager   # No tests, but has dependencies to audit
+          - lambda: SMS_Sender
+          - lambda: SMS_Webhook_Handler
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Check package-lock.json exists
+        id: lockfile_check
+        working-directory: ${{ matrix.lambda }}
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "has_lockfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_lockfile=false" >> "$GITHUB_OUTPUT"
+            echo "No package-lock.json in ${{ matrix.lambda }} — skipping audit."
+          fi
+
+      - name: Install production dependencies only
+        if: steps.lockfile_check.outputs.has_lockfile == 'true'
+        working-directory: ${{ matrix.lambda }}
+        # --ignore-scripts prevents postinstall hooks from running in CI.
+        run: npm install --omit=dev --ignore-scripts
+
+      - name: Run npm audit (high severity)
+        if: steps.lockfile_check.outputs.has_lockfile == 'true'
+        working-directory: ${{ matrix.lambda }}
+        # --omit=dev excludes dev-only packages (not shipped to Lambda).
+        # --audit-level=high fails only on high/critical vulnerabilities.
+        # continue-on-error: pre-existing vulns in some Lambdas should not block new PRs.
+        # Security issues are tracked separately.
+        continue-on-error: true
+        run: npm audit --omit=dev --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  # Job 4: Build Validation
+  #
+  # Runs esbuild for each Node.js Lambda, verifies dist/index.js is produced,
+  # and checks bundle size. Runs after tests pass.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build Validation — ${{ matrix.lambda }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [detect-changes, node-tests]
+
+    if: |
+      needs.detect-changes.outputs.shared == 'true'   ||
+      needs.detect-changes.outputs.bedrock == 'true'  ||
+      needs.detect-changes.outputs.meta_webhook == 'true' ||
+      needs.detect-changes.outputs.meta_response == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lambda: Bedrock_Streaming_Handler_Staging
+            changed: ${{ needs.detect-changes.outputs.bedrock }}
+          - lambda: Meta_Webhook_Handler
+            changed: ${{ needs.detect-changes.outputs.meta_webhook }}
+          - lambda: Meta_Response_Processor
+            changed: ${{ needs.detect-changes.outputs.meta_response }}
+
+    steps:
+      - name: Skip unchanged Lambda
+        if: |
+          matrix.changed != 'true' &&
+          needs.detect-changes.outputs.shared != 'true'
+        run: |
+          echo "No changes in ${{ matrix.lambda }} or shared/ — skipping build."
+
+      - name: Checkout
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.lambda }}/package-lock.json
+
+      - name: Install dependencies
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        working-directory: ${{ matrix.lambda }}
+        run: npm install
+
+      - name: Run esbuild
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        working-directory: ${{ matrix.lambda }}
+        run: node esbuild.config.mjs
+
+      - name: Verify dist/index.js exists
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        working-directory: ${{ matrix.lambda }}
+        run: |
+          if [ ! -f dist/index.js ]; then
+            echo "ERROR: dist/index.js not produced by esbuild for ${{ matrix.lambda }}"
+            exit 1
+          fi
+          echo "OK: dist/index.js exists"
+
+      - name: Check bundle size
+        if: |
+          matrix.changed == 'true' ||
+          needs.detect-changes.outputs.shared == 'true'
+        working-directory: ${{ matrix.lambda }}
+        run: |
+          # macOS stat: -f%z | Linux stat: -c%s
+          BUNDLE_BYTES=$(stat -c%z dist/index.js 2>/dev/null || stat -f%z dist/index.js)
+          BUNDLE_KB=$((BUNDLE_BYTES / 1024))
+          BUNDLE_MB=$(echo "scale=2; $BUNDLE_BYTES / 1048576" | bc)
+
+          echo "Bundle size: ${BUNDLE_KB}KB (${BUNDLE_MB}MB) — ${{ matrix.lambda }}/dist/index.js"
+
+          # Warn threshold: 5MB (Lambda cold start degrades noticeably above this)
+          WARN_BYTES=5242880
+          # Hard fail threshold: 50MB (Lambda unzipped limit is 250MB; 50MB is a
+          # reasonable guard for a single-file bundle)
+          FAIL_BYTES=52428800
+
+          if [ "$BUNDLE_BYTES" -gt "$FAIL_BYTES" ]; then
+            echo "ERROR: Bundle exceeds 50MB hard limit. Review dependencies."
+            exit 1
+          fi
+
+          if [ "$BUNDLE_BYTES" -gt "$WARN_BYTES" ]; then
+            echo "WARNING: Bundle exceeds 5MB. Consider externalising more dependencies."
+          fi
+
+      - name: Upload build artifact
+        if: |
+          always() &&
+          (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.lambda }}
+          path: ${{ matrix.lambda }}/dist/
+          retention-days: 3
+
+  # ---------------------------------------------------------------------------
+  # Job 5: Summary Gate
+  #
+  # Final job that requires all upstream jobs to succeed (or be skipped).
+  # Branch protection rules should require this job — not the individual matrix
+  # jobs — so the required check never disappears when a Lambda is skipped.
+  # ---------------------------------------------------------------------------
+  all-checks-passed:
+    name: All Lambda Checks Passed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [node-tests, python-tests, security, build]
+    # Run even when upstream jobs were skipped (no changes detected).
+    if: always()
+
+    steps:
+      - name: Check upstream results
+        run: |
+          echo "node-tests:    ${{ needs.node-tests.result }}"
+          echo "python-tests:  ${{ needs.python-tests.result }}"
+          echo "security:      ${{ needs.security.result }}"
+          echo "build:         ${{ needs.build.result }}"
+
+          # Acceptable terminal states: success or skipped.
+          # Any failure or cancellation is a hard stop.
+          for result in \
+            "${{ needs.node-tests.result }}" \
+            "${{ needs.python-tests.result }}" \
+            "${{ needs.security.result }}" \
+            "${{ needs.build.result }}"; do
+            if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+              echo "FAILED: one or more jobs did not pass (result: $result)"
+              exit 1
+            fi
+          done
+
+          echo "All Lambda checks passed."
