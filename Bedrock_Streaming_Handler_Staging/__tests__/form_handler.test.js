@@ -21,6 +21,19 @@ const dynamoMock = mockClient(DynamoDBDocumentClient);
 const lambdaMock = mockClient(LambdaClient);
 const s3Mock = mockClient(S3Client);
 
+// Capture the real https.request at load time. Several tests below override
+// https.request via direct assignment (not jest.spyOn), which jest.restoreAllMocks()
+// does NOT undo. If Jest schedules this file in the same worker as a sibling
+// (e.g. clerk_helper.test.js), the leftover fake pollutes the sibling's
+// jest.spyOn-based mocks — manifesting as an intermittent "Expected 1, Received 6"
+// failure in clerk_helper's cache test. Restoring the real reference in a
+// top-level afterEach cleans up after every test in this file.
+const _https = require('https');
+const _ORIGINAL_HTTPS_REQUEST = _https.request;
+afterEach(() => {
+  _https.request = _ORIGINAL_HTTPS_REQUEST;
+});
+
 // Import module under test
 const {
   handleFormMode,
