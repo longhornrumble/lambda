@@ -406,12 +406,13 @@ def _validate_state_token(event):
                     raise ConversationError("TOKEN_REVOKED", "Authentication token has been revoked", 401)
                     
             except TokenBlacklistError as e:
-                # Blacklist service error - decide whether to fail open or closed
+                # Blacklist service error — fail closed for security
                 logger.error(f"❌ Blacklist check failed: {e.message}")
                 if e.error_type in ["BLACKLIST_UNAVAILABLE", "BLACKLIST_CHECK_TIMEOUT", "BLACKLIST_TIMEOUT"]:
-                    # Service temporarily unavailable - fail open for availability
-                    logger.warning("⚠️ Blacklist service temporarily unavailable - proceeding with JWT validation only")
-                    # Continue to JWT validation
+                    # SECURITY: DynamoDB blacklist unavailable — refuse request rather than
+                    # allowing potentially revoked tokens through.
+                    logger.error("🔒 Blacklist service unavailable — failing closed (503)")
+                    raise ConversationError("SERVICE_UNAVAILABLE", "Authentication service temporarily unavailable. Please retry.", 503)
                 else:
                     # Other errors - fail closed for security
                     raise ConversationError("TOKEN_VALIDATION_FAILED", "Token security verification failed", 500)

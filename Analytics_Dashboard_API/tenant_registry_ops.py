@@ -8,6 +8,7 @@ Uses boto3 low-level client (consistent with existing Analytics Dashboard API pa
 import os
 import logging
 import time
+import uuid
 import boto3
 from botocore.exceptions import ClientError
 from decimal import Decimal
@@ -16,9 +17,14 @@ logger = logging.getLogger()
 
 REGION = os.environ.get('AWS_REGION', 'us-east-1')
 TENANT_TABLE = os.environ.get('TENANT_REGISTRY_TABLE', f"picasso-tenant-registry-{os.environ.get('ENVIRONMENT', 'staging')}")
-EMPLOYEE_TABLE = os.environ.get('EMPLOYEE_REGISTRY_TABLE', f"picasso-employee-registry-{os.environ.get('ENVIRONMENT', 'staging')}")
+EMPLOYEE_TABLE = os.environ.get('EMPLOYEE_REGISTRY_TABLE', f"picasso-employee-registry-v2-{os.environ.get('ENVIRONMENT', 'staging')}")
 
 dynamodb = boto3.client('dynamodb', region_name=REGION)
+
+
+def generate_employee_id():
+    """Generate a unique employee ID (UUID4)."""
+    return str(uuid.uuid4())
 
 
 def _unmarshall(item):
@@ -169,11 +175,11 @@ def update_tenant(tenant_id, fields):
 
 # --- Employee Operations ---
 
-def put_employee(tenant_id, clerk_user_id, record):
+def put_employee(tenant_id, employee_id, record):
     """Write a full employee record."""
     item = {
         'tenantId': {'S': tenant_id},
-        'clerkUserId': {'S': clerk_user_id},
+        'employeeId': {'S': employee_id},
         'email': {'S': record.get('email', '')},
         'name': {'S': record.get('name', '')},
         'role': {'S': record.get('role', 'member')},
@@ -181,6 +187,43 @@ def put_employee(tenant_id, clerk_user_id, record):
         'createdAt': {'S': record.get('createdAt', new_timestamp())},
         'updatedAt': {'S': record.get('updatedAt', new_timestamp())},
     }
+
+    # clerkUserId is a non-key field indexed by ClerkUserIdIndex GSI.
+    # Omit entirely when absent — DynamoDB skips the GSI for missing attributes.
+    # Writing NULL causes a type mismatch error on the GSI.
+    clerk_user_id = record.get('clerkUserId')
+    if clerk_user_id:
+        item['clerkUserId'] = {'S': clerk_user_id}
+
+    # type: clerk_user or local_only
+    emp_type = record.get('type')
+    if emp_type:
+        item['type'] = {'S': emp_type}
+
+    # phone: optional, E.164 format
+    phone = record.get('phone')
+    if phone:
+        item['phone'] = {'S': phone}
+
+    # notificationPrefs: optional Map
+    notif_prefs = record.get('notificationPrefs')
+    if notif_prefs and isinstance(notif_prefs, dict):
+        prefs_map = {}
+        for k, v in notif_prefs.items():
+            if isinstance(v, bool):
+                prefs_map[k] = {'BOOL': v}
+            elif isinstance(v, str):
+                prefs_map[k] = {'S': v}
+            elif isinstance(v, dict):
+                # Nested map (e.g., sms_quiet_hours)
+                nested = {}
+                for nk, nv in v.items():
+                    if isinstance(nv, bool):
+                        nested[nk] = {'BOOL': nv}
+                    elif isinstance(nv, str):
+                        nested[nk] = {'S': nv}
+                prefs_map[k] = {'M': nested}
+        item['notificationPrefs'] = {'M': prefs_map}
 
     dynamodb.put_item(TableName=EMPLOYEE_TABLE, Item=item)
     return _unmarshall(item)
@@ -206,17 +249,33 @@ def list_employees(tenant_id):
     return items
 
 
-def get_employee(tenant_id, clerk_user_id):
-    """Get a specific employee. Returns dict or None."""
+def get_employee(tenant_id, employee_id):
+    """Get a specific employee by composite key. Returns dict or None."""
     response = dynamodb.get_item(
         TableName=EMPLOYEE_TABLE,
         Key={
             'tenantId': {'S': tenant_id},
-            'clerkUserId': {'S': clerk_user_id},
+            'employeeId': {'S': employee_id},
         }
     )
     item = response.get('Item')
     return _unmarshall(item) if item else None
+
+
+def list_all_employees():
+    """Scan all employees across all tenants. Used for cross-tenant employee views in super admin."""
+    items = []
+    params = {'TableName': EMPLOYEE_TABLE}
+
+    while True:
+        response = dynamodb.scan(**params)
+        items.extend([_unmarshall(item) for item in response.get('Items', [])])
+
+        if 'LastEvaluatedKey' not in response:
+            break
+        params['ExclusiveStartKey'] = response['LastEvaluatedKey']
+
+    return items
 
 
 def get_employee_by_clerk_user_id(clerk_user_id):
@@ -245,7 +304,7 @@ def get_employee_by_email(email):
     return _unmarshall(items[0]) if items else None
 
 
-def update_employee(tenant_id, clerk_user_id, fields):
+def update_employee(tenant_id, employee_id, fields):
     """Update specific fields on an employee record. Always sets updatedAt."""
     if not fields:
         return
@@ -267,11 +326,22 @@ def update_employee(tenant_id, clerk_user_id, fields):
         TableName=EMPLOYEE_TABLE,
         Key={
             'tenantId': {'S': tenant_id},
-            'clerkUserId': {'S': clerk_user_id},
+            'employeeId': {'S': employee_id},
         },
         UpdateExpression='SET ' + ', '.join(update_parts),
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
+    )
+
+
+def delete_employee(tenant_id, employee_id):
+    """Delete an employee record by composite key."""
+    dynamodb.delete_item(
+        TableName=EMPLOYEE_TABLE,
+        Key={
+            'tenantId': {'S': tenant_id},
+            'employeeId': {'S': employee_id},
+        }
     )
 
 

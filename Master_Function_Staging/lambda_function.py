@@ -162,31 +162,16 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
 
 def handle_options(event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
-    Handle OPTIONS requests for CORS preflight
+    Handle OPTIONS requests for CORS preflight.
+    Routes through add_cors_headers() so the allowlist is applied.
     """
     logger.info("OPTIONS request received for CORS preflight")
 
-    # Determine origin from request for preflight
-    origin = 'https://chat.myrecruiter.ai'  # Safe default
-    if event and 'headers' in event:
-        headers = event.get('headers', {})
-        for key in ['origin', 'Origin', 'ORIGIN']:
-            if key in headers:
-                origin = headers[key]
-                break
-
-    # For OPTIONS, we just need to return CORS headers with 200 status
-    # Don't process the body or try to add nested headers
-    return {
+    response = {
         'statusCode': 200,
-        'headers': {
-            'Access-Control-Allow-Origin': origin,
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-            'Content-Type': 'application/json'
-        },
-        'body': ''
+        'body': '',
     }
+    return add_cors_headers(response, event)
 
 def health_check(event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
@@ -941,26 +926,9 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
                 logger.info(f"JWT token decoded: turn {conversation_context['turn']}, {len(messages)} messages")
                 
             except Exception as jwt_error:
-                # Fall back to base64 decoding for backward compatibility
-                logger.warning(f"JWT decode failed, trying base64: {jwt_error}")
-                try:
-                    import base64
-                    decoded = base64.b64decode(state_token).decode('utf-8')
-                    token_data = json.loads(decoded)
-                    
-                    request_context = body.get('conversation_context', {})
-                    messages = request_context.get('recentMessages', request_context.get('messages', []))
-                    conversation_context = {
-                        'session_id': token_data.get('sessionId', token_data.get('session_id')),
-                        'turn': token_data.get('turn', 0),
-                        'conversation_id': body.get('conversation_id'),
-                        'messages': messages,
-                        'recentMessages': messages,
-                        'previous_messages': messages
-                    }
-                    logger.info(f"Base64 token decoded: turn {conversation_context['turn']}, {len(messages)} messages")
-                except Exception as e:
-                    logger.warning(f"Could not decode state token: {e}")
+                # SECURITY FIX: Removed base64 fallback — unsigned tokens bypass auth and blacklist
+                logger.error(f"JWT decode failed, rejecting token: {jwt_error}")
+                logger.warning("Base64 token fallback has been removed for security — only signed JWTs are accepted")
         else:
             logger.info("No Authorization header found - starting new conversation")
         
@@ -1578,18 +1546,11 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
             }
             state_token = jwt.encode(state_token_payload, jwt_signing_key, algorithm='HS256')
             logger.info("Created JWT token in fallback mode")
-        except:
-            # Ultimate fallback to base64 (still use camelCase for compatibility)
-            import base64
-            state_token_data = {
-                'sessionId': session_id,  # Still use camelCase
-                'tenantId': tenant_id,
-                'turn': 0,
-                'iat': int(time.time()),
-                'exp': int(time.time()) + (24 * 3600)
-            }
-            state_token = base64.b64encode(json.dumps(state_token_data).encode()).decode()
-            logger.warning("Using base64 token as ultimate fallback")
+        except Exception as e:
+            # SECURITY FIX: Removed base64 fallback — unsigned tokens are a security risk
+            # If JWT signing fails, the session cannot be established securely
+            logger.error(f"JWT signing failed, cannot create secure session: {e}")
+            raise ValueError("Unable to create secure session token — JWT signing key unavailable")
         
         response_data = {
             'session_id': session_id,
@@ -1841,16 +1802,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         # Handle OPTIONS requests immediately for CORS preflight
         if http_method == 'OPTIONS':
             logger.info("OPTIONS request - returning CORS headers immediately")
-            return {
-                'statusCode': 200,
-                'headers': {
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, DELETE',
-                    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
-                    'Content-Type': 'application/json'
-                },
-                'body': ''
-            }
+            return handle_options(event)
 
         # Log the incoming request for debugging
         logger.info(f"Received {http_method} event: {json.dumps(event, default=str)[:500]}")
