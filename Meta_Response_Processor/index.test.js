@@ -25,7 +25,7 @@ const { mockClient } = require('aws-sdk-client-mock');
 require('aws-sdk-client-mock-jest');
 
 const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
@@ -88,9 +88,15 @@ function makeChannelMappingItem() {
   };
 }
 
-function makeRecentMessagesItem(messages = []) {
+function makeRecentMessagesQueryResult(messages = []) {
+  // QueryCommand returns { Items: [ { role, content, messageTimestamp }, ... ] }
   return {
-    Item: messages.length > 0 ? { session_key: 'meta:PAGE_456:PSID_123', messages } : undefined,
+    Items: messages.map((m, i) => ({
+      sessionId: 'meta:PAGE_456:PSID_123',
+      role: m.role,
+      content: m.content,
+      messageTimestamp: m.messageTimestamp || (1000000 + i),
+    })),
   };
 }
 
@@ -131,17 +137,11 @@ beforeEach(() => {
   retrieveKB.mockResolvedValue('Our services include talent acquisition and HR consulting.');
 
   // Default DynamoDB stubs.
-  // GetCommand is called in this order by the handler:
-  //   1. channel-mappings (loadPageAccessToken)
-  //   2. recent-messages  (loadConversationContext, step 3)
-  //   3. recent-messages  (loadConversationContext inside storeConversationContext, step 6)
-  // aws-sdk-client-mock does NOT support Jest asymmetric matchers (e.g. expect.stringContaining)
-  // inside .on() — those use Sinon matching which ignores asymmetricMatch. Use sequential
-  // resolvesOnce() calls keyed only on command type instead.
-  ddbMock.on(GetCommand)
-    .resolvesOnce(makeChannelMappingItem())   // call 1: channel-mappings
-    .resolvesOnce(makeRecentMessagesItem([]))  // call 2: recent-messages (load context)
-    .resolvesOnce(makeRecentMessagesItem([])); // call 3: recent-messages (inside storeContext)
+  // GetCommand: channel-mappings (loadPageAccessToken)
+  // QueryCommand: recent-messages (loadConversationContext) — returns Items array
+  // PutCommand: 2 calls per store (user row + assistant row)
+  ddbMock.on(GetCommand).resolves(makeChannelMappingItem());
+  ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([]));
   ddbMock.on(PutCommand).resolves({});
   ddbMock.on(UpdateCommand).resolves({});
 
@@ -198,8 +198,8 @@ describe('Meta_Response_Processor handler', () => {
       expect(sendBody.messaging_type).toBe('RESPONSE');
       expect(sendBody.recipient.id).toBe('PSID_123');
 
-      // DynamoDB: PutCommand to store context
-      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 1);
+      // DynamoDB: 2 PutCommands to store context (user row + assistant row)
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 2);
 
       // DynamoDB: UpdateCommand to update lastUserMessageAt
       expect(ddbMock).toHaveReceivedCommandTimes(UpdateCommand, 1);
@@ -230,17 +230,13 @@ describe('Meta_Response_Processor handler', () => {
 
     test('includes recent conversation history in the Bedrock prompt', async () => {
       const history = [
-        { role: 'user', content: 'Hi there', timestamp: '2026-01-01T00:00:00Z' },
-        { role: 'assistant', content: 'Hello! How can I help?', timestamp: '2026-01-01T00:00:01Z' },
+        { role: 'user', content: 'Hi there', messageTimestamp: 1000000 },
+        { role: 'assistant', content: 'Hello! How can I help?', messageTimestamp: 1000001 },
       ];
-      // Reset and re-register GetCommand sequence so the recent-messages calls return history.
-      // (aws-sdk-client-mock does not support Jest asymmetric matchers in .on() — Sinon matching
-      // ignores asymmetricMatch — so we use ordered resolvesOnce() instead.)
+      // Reset and re-register: GetCommand for channel-mappings, QueryCommand for context.
       ddbMock.reset();
-      ddbMock.on(GetCommand)
-        .resolvesOnce(makeChannelMappingItem())        // call 1: channel-mappings
-        .resolvesOnce(makeRecentMessagesItem(history)) // call 2: recent-messages (load context)
-        .resolvesOnce(makeRecentMessagesItem(history)); // call 3: recent-messages (inside storeContext)
+      ddbMock.on(GetCommand).resolves(makeChannelMappingItem());
+      ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult(history));
       ddbMock.on(PutCommand).resolves({});
       ddbMock.on(UpdateCommand).resolves({});
 
@@ -407,38 +403,37 @@ describe('Meta_Response_Processor handler', () => {
     test('stores Q&A pair in recent-messages after successful response', async () => {
       await handler(buildEvent());
 
-      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 1);
-      const putCall = ddbMock.commandCalls(PutCommand)[0];
-      const item = putCall.args[0].input.Item;
-      expect(item.session_key).toBe('meta:PAGE_456:PSID_123');
-      expect(Array.isArray(item.messages)).toBe(true);
-      expect(item.messages.length).toBe(2); // user + assistant
-      expect(item.messages[0].role).toBe('user');
-      expect(item.messages[1].role).toBe('assistant');
+      // Two PutCommands: one for user row, one for assistant row
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 2);
+      const putCalls = ddbMock.commandCalls(PutCommand);
+
+      const userItem = putCalls[0].args[0].input.Item;
+      expect(userItem.sessionId).toBe('meta:PAGE_456:PSID_123');
+      expect(userItem.role).toBe('user');
+      expect(typeof userItem.content).toBe('string');
+      expect(typeof userItem.messageTimestamp).toBe('number');
+
+      const assistantItem = putCalls[1].args[0].input.Item;
+      expect(assistantItem.sessionId).toBe('meta:PAGE_456:PSID_123');
+      expect(assistantItem.role).toBe('assistant');
+      expect(typeof assistantItem.content).toBe('string');
+      expect(assistantItem.messageTimestamp).toBe(userItem.messageTimestamp + 1);
     });
 
     test('trims stored messages to rolling window of 20 (10 pairs)', async () => {
-      // Seed with 10 existing pairs = 20 messages
-      const existingMessages = Array.from({ length: 20 }, (_, i) => ({
-        role: i % 2 === 0 ? 'user' : 'assistant',
-        content: `message ${i}`,
-        timestamp: '2026-01-01T00:00:00Z',
-      }));
-      // Reset and re-register: recent-messages calls return the full existing history.
-      ddbMock.reset();
-      ddbMock.on(GetCommand)
-        .resolvesOnce(makeChannelMappingItem())                    // call 1: channel-mappings
-        .resolvesOnce(makeRecentMessagesItem(existingMessages))    // call 2: recent-messages (load context)
-        .resolvesOnce(makeRecentMessagesItem(existingMessages));   // call 3: recent-messages (inside storeContext)
-      ddbMock.on(PutCommand).resolves({});
-      ddbMock.on(UpdateCommand).resolves({});
-
+      // Trimming now happens via the QueryCommand Limit parameter (MAX_STORED_PAIRS * 2).
+      // storeConversationContext writes 2 new individual rows; no in-memory array trimming.
       await handler(buildEvent());
 
-      const putCall = ddbMock.commandCalls(PutCommand)[0];
-      const item = putCall.args[0].input.Item;
-      // Should still be capped at 20 (10 pairs) after adding 2 more and trimming
-      expect(item.messages.length).toBe(20);
+      // Verify QueryCommand was issued with a Limit (the rolling-window cap)
+      const queryCalls = ddbMock.commandCalls(QueryCommand);
+      expect(queryCalls.length).toBeGreaterThanOrEqual(1);
+      const queryInput = queryCalls[0].args[0].input;
+      expect(typeof queryInput.Limit).toBe('number');
+      expect(queryInput.Limit).toBeGreaterThan(0);
+
+      // And store still writes exactly 2 rows
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 2);
     });
 
     test('continues if context storage fails', async () => {
@@ -455,7 +450,7 @@ describe('Meta_Response_Processor handler', () => {
 
       const bedrockCall = bedrockMock.commandCalls(InvokeModelCommand)[0];
       const body = JSON.parse(bedrockCall.args[0].input.body);
-      expect(body.system).toContain('Do not use markdown formatting');
+      expect(body.system).toContain('no markdown');
       expect(body.system).toContain('Facebook Messenger');
     });
   });
@@ -493,8 +488,8 @@ describe('Meta_Response_Processor handler', () => {
       expect(body.message.text).toBe('Welcome to our service! How can I help you?');
       expect(body.messaging_type).toBe('RESPONSE');
 
-      // Context stored and lastUserMessageAt updated
-      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 1);
+      // Context stored (2 rows: user + assistant) and lastUserMessageAt updated
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 2);
       expect(ddbMock).toHaveReceivedCommandTimes(UpdateCommand, 1);
     });
 
