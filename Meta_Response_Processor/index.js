@@ -397,7 +397,10 @@ async function callMetaSendApi(pageId, payload, accessToken, attempt = 1) {
  * @param {string} accessToken
  * @returns {Promise<void>}
  */
-async function sendTypingIndicator(pageId, psid, accessToken) {
+async function sendTypingIndicator(pageId, psid, accessToken, channelType) {
+  // Instagram API doesn't support typing indicators via the same endpoint
+  if (channelType === 'instagram') return;
+
   await callMetaSendApi(
     pageId,
     {
@@ -420,18 +423,33 @@ async function sendTypingIndicator(pageId, psid, accessToken) {
  * @param {string} accessToken
  * @returns {Promise<object>}
  */
-async function sendMessengerMessage(pageId, psid, text, accessToken) {
-  const url = `${META_SEND_API_BASE}/${pageId}/messages`;
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+async function sendMessengerMessage(pageId, psid, text, accessToken, channelType) {
+  let url, headers, body;
+
+  if (channelType === 'instagram') {
+    // Instagram uses graph.instagram.com with Bearer auth
+    url = 'https://graph.instagram.com/v25.0/me/messages';
+    headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`,
+    };
+    body = JSON.stringify({
+      recipient: { id: psid },
+      message: { text },
+    });
+  } else {
+    // Facebook Messenger uses graph.facebook.com with access_token in body
+    url = `${META_SEND_API_BASE}/${pageId}/messages`;
+    headers = { 'Content-Type': 'application/json' };
+    body = JSON.stringify({
       recipient: { id: psid },
       message: { text },
       messaging_type: 'RESPONSE',
       access_token: accessToken,
-    }),
-  });
+    });
+  }
+
+  const response = await fetch(url, { method: 'POST', headers, body });
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
     throw new Error(`Meta Send API error: ${response.status} — ${JSON.stringify(error)}`);
@@ -493,15 +511,15 @@ function splitMessage(text) {
  * @param {string} accessToken
  * @returns {Promise<void>}
  */
-async function sendResponseMessages(pageId, psid, text, accessToken) {
+async function sendResponseMessages(pageId, psid, text, accessToken, channelType) {
   const chunks = splitMessage(text);
-  log('INFO', 'Sending response', { pageId, psid, chunks: chunks.length, totalChars: text.length });
+  log('INFO', 'Sending response', { pageId, psid, chunks: chunks.length, totalChars: text.length, channelType });
 
   for (let i = 0; i < chunks.length; i++) {
     if (i > 0) {
       await sleep(SPLIT_MESSAGE_DELAY_MS);
     }
-    await sendMessengerMessage(pageId, psid, chunks[i], accessToken);
+    await sendMessengerMessage(pageId, psid, chunks[i], accessToken, channelType);
     log('INFO', 'Sent message chunk', { pageId, psid, chunk: i + 1, of: chunks.length });
   }
 }
@@ -766,10 +784,10 @@ exports.handler = async function handler(event) {
     });
 
     // Send typing indicator (best-effort) then welcome message
-    await sendTypingIndicator(pageId, psid, pageAccessToken);
+    await sendTypingIndicator(pageId, psid, pageAccessToken, channelType);
 
     try {
-      await sendResponseMessages(pageId, psid, welcomeMessage, pageAccessToken);
+      await sendResponseMessages(pageId, psid, welcomeMessage, pageAccessToken, channelType);
     } catch (sendErr) {
       log('ERROR', 'Failed to send welcome message — will retry', {
         pageId, psid, error: sendErr.message,
@@ -797,13 +815,13 @@ exports.handler = async function handler(event) {
   }
 
   // ── 2. Send typing indicator (best-effort) ───────────────────────────────
-  await sendTypingIndicator(pageId, psid, pageAccessToken);
+  await sendTypingIndicator(pageId, psid, pageAccessToken, channelType);
 
   // Start typing-indicator refresh so the indicator stays alive while Bedrock
   // processes (Meta expires typing_on after ~10 s; we refresh every 8 s).
   const typingRefreshInterval = setInterval(async () => {
     try {
-      await sendTypingIndicator(pageId, psid, pageAccessToken);
+      await sendTypingIndicator(pageId, psid, pageAccessToken, channelType);
     } catch (e) {
       // Non-fatal — don't disrupt the main pipeline
       log('WARN', 'Typing indicator refresh failed', { pageId, psid, error: e.message });
@@ -860,7 +878,7 @@ exports.handler = async function handler(event) {
   clearInterval(typingRefreshInterval);
 
   try {
-    await sendResponseMessages(pageId, psid, responseText, pageAccessToken);
+    await sendResponseMessages(pageId, psid, responseText, pageAccessToken, channelType);
     log('INFO', 'Response delivered to Messenger', {
       pageId,
       psid,

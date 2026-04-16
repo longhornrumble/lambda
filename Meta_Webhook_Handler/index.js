@@ -36,6 +36,7 @@ const CHANNEL_MAPPINGS_TABLE   = process.env.CHANNEL_MAPPINGS_TABLE || `picasso-
 const DEDUP_TABLE              = process.env.DEDUP_TABLE || `picasso-webhook-dedup-${ENV}`;
 const RESPONSE_PROCESSOR_FN    = process.env.RESPONSE_PROCESSOR_FUNCTION || 'Meta_Response_Processor';
 const META_APP_SECRET_ARN      = process.env.META_APP_SECRET_ARN || '';
+const IG_APP_SECRET_ARN        = process.env.IG_APP_SECRET_ARN || '';
 const MESSENGER_VERIFY_TOKEN   = process.env.MESSENGER_VERIFY_TOKEN || '';
 
 // ─── App Secret cache (module-scope, refreshed every 5 minutes) ─────────────────
@@ -79,6 +80,39 @@ async function getAppSecret() {
 
   _appSecretCache = secret;
   _appSecretFetchedAt = now;
+  return secret;
+}
+
+// ─── Instagram App Secret cache ────────────────────────────────────────────────
+
+let _igSecretCache = null;
+let _igSecretFetchedAt = 0;
+
+/**
+ * Retrieve the Instagram App Secret from Secrets Manager.
+ * Instagram webhooks are signed with a separate secret from Facebook Messenger.
+ * Returns null if IG_APP_SECRET_ARN is not configured (IG not enabled).
+ */
+async function getIgAppSecret() {
+  if (!IG_APP_SECRET_ARN) return null;
+
+  const now = Date.now();
+  if (_igSecretCache && now - _igSecretFetchedAt < SECRET_TTL_MS) {
+    return _igSecretCache;
+  }
+
+  const result = await secretsClient.send(
+    new GetSecretValueCommand({ SecretId: IG_APP_SECRET_ARN })
+  );
+
+  let secret = result.SecretString;
+  try {
+    const parsed = JSON.parse(secret);
+    if (parsed.appSecret) secret = parsed.appSecret;
+  } catch (_) {}
+
+  _igSecretCache = secret;
+  _igSecretFetchedAt = now;
   return secret;
 }
 
@@ -126,7 +160,7 @@ function validateSignature(rawBody, signatureHdr, appSecret) {
  *
  * Table: picasso-channel-mappings-{ENV}
  *   PK: "PAGE#{pageId}"
- *   SK: "CHANNEL#messenger"
+ *   SK: "CHANNEL#{channelType}"
  *
  * Expected attributes on success:
  *   tenantId   {S}  — internal tenant identifier
@@ -134,15 +168,16 @@ function validateSignature(rawBody, signatureHdr, appSecret) {
  *   enabled    {BOOL} — if false, page is paused; skip processing
  *
  * @param {string} pageId
+ * @param {string} channelType — 'messenger' or 'instagram'
  * @returns {Promise<object|null>} Parsed item attributes, or null if not found.
  */
-async function getChannelMapping(pageId) {
+async function getChannelMapping(pageId, channelType) {
   const result = await dynamo.send(
     new GetItemCommand({
       TableName: CHANNEL_MAPPINGS_TABLE,
       Key: {
         PK: { S: `PAGE#${pageId}` },
-        SK: { S: 'CHANNEL#messenger' },
+        SK: { S: `CHANNEL#${channelType || 'messenger'}` },
       },
       // Only fetch what we need — reduces read cost
       ProjectionExpression: 'tenantId, tenantHash, enabled',
@@ -325,9 +360,10 @@ async function processMessagingEvent(messagingEvent, pageId, objectType) {
   }
 
   // ── 1. Channel mapping lookup ──
+  const channelType = objectType === 'instagram' ? 'instagram' : 'messenger';
   let mapping;
   try {
-    mapping = await getChannelMapping(pageId);
+    mapping = await getChannelMapping(pageId, channelType);
   } catch (err) {
     console.error('[Meta_Webhook_Handler] DynamoDB getChannelMapping error:', err.message);
     return; // Non-retryable from Meta's perspective
@@ -410,7 +446,24 @@ async function handlePost(rawBody, headers) {
   const signatureHeader =
     headers['x-hub-signature-256'] || headers['X-Hub-Signature-256'] || '';
 
-  if (!validateSignature(rawBody, signatureHeader, appSecret)) {
+  // Try Facebook App Secret first, then Instagram App Secret.
+  // Instagram webhooks are signed with a separate secret.
+  let signatureValid = validateSignature(rawBody, signatureHeader, appSecret);
+  if (!signatureValid) {
+    try {
+      const igSecret = await getIgAppSecret();
+      if (igSecret) {
+        signatureValid = validateSignature(rawBody, signatureHeader, igSecret);
+        if (signatureValid) {
+          console.log('[Meta_Webhook_Handler] Signature validated with Instagram App Secret');
+        }
+      }
+    } catch (err) {
+      console.warn('[Meta_Webhook_Handler] Could not fetch IG app secret:', err.message);
+    }
+  }
+
+  if (!signatureValid) {
     return forbidden('Invalid X-Hub-Signature-256');
   }
 
