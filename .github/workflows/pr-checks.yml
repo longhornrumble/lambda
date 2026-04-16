@@ -154,8 +154,7 @@ jobs:
         shell: bash {0}
         run: |
           npx jest --no-cache --forceExit --json --outputFile=/tmp/jest-results.json \
-            --coverage --coverageReporters=text --coverageReporters=lcov \
-            --testPathIgnorePatterns="form_handler.test" 2>&1 || true
+            --coverage --coverageReporters=text --coverageReporters=lcov 2>&1 || true
           python3 -c "
           import sys, json
           d = json.load(open('/tmp/jest-results.json'))
