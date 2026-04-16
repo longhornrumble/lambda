@@ -40,7 +40,7 @@
 
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
@@ -227,36 +227,43 @@ async function loadPageAccessToken(pageId, channelType) {
 /**
  * Load conversation history for this Messenger thread from DynamoDB.
  *
- * DynamoDB schema (mirrors the web handler's recent-messages table):
- *   PK:      session_key  (string) — e.g. "meta:{pageId}:{psid}"
- *   messages (list)       — [{role, content, timestamp}, ...]
+ * DynamoDB schema (existing staging-recent-messages table):
+ *   sessionId        (HASH)  — e.g. "meta:{pageId}:{psid}"
+ *   messageTimestamp  (RANGE) — ISO timestamp
+ *   role, content     — message data
  *
  * @param {string} pageId
  * @param {string} psid
  * @returns {Promise<Array<{role: string, content: string, timestamp: string}>>}
  */
 async function loadConversationContext(pageId, psid) {
-  const sessionKey = `meta:${pageId}:${psid}`;
+  const sessionId = `meta:${pageId}:${psid}`;
   log('INFO', 'Loading conversation context', {
-    sessionKey,
+    sessionId,
     table: RECENT_MESSAGES_TABLE,
   });
 
   const result = await dynamodb.send(
-    new GetCommand({
+    new QueryCommand({
       TableName: RECENT_MESSAGES_TABLE,
-      Key: { session_key: sessionKey },
+      KeyConditionExpression: 'sessionId = :sid',
+      ExpressionAttributeValues: { ':sid': sessionId },
+      ScanIndexForward: true, // oldest first
+      Limit: MAX_STORED_PAIRS * 2, // last N messages
     })
   );
 
-  const messages = result.Item?.messages || [];
-  log('INFO', 'Conversation context loaded', { sessionKey, messageCount: messages.length });
+  const messages = (result.Items || []).map((item) => ({
+    role: item.role || 'user',
+    content: item.content || '',
+    timestamp: item.messageTimestamp ? new Date(item.messageTimestamp).toISOString() : '',
+  }));
+  log('INFO', 'Conversation context loaded', { sessionId, messageCount: messages.length });
   return messages;
 }
 
 /**
- * Persist the latest Q&A pair to the recent-messages table, keeping only the
- * last MAX_STORED_PAIRS entries (rolling window).
+ * Persist the latest Q&A pair to the recent-messages table as individual rows.
  *
  * @param {string} pageId
  * @param {string} psid
@@ -265,36 +272,41 @@ async function loadConversationContext(pageId, psid) {
  * @returns {Promise<void>}
  */
 async function storeConversationContext(pageId, psid, userText, assistantText) {
-  const sessionKey = `meta:${pageId}:${psid}`;
-  const now = new Date().toISOString();
+  const sessionId = `meta:${pageId}:${psid}`;
+  const now = Date.now(); // epoch ms — matches messageTimestamp Number type
+  const ttl = Math.floor(now / 1000) + 60 * 60 * 24 * 7; // 7-day TTL
 
-  // Load existing messages first
-  const existing = await loadConversationContext(pageId, psid);
-
-  const updated = [
-    ...existing,
-    { role: 'user', content: userText, timestamp: now },
-    { role: 'assistant', content: assistantText, timestamp: now },
-  ];
-
-  // Keep rolling window: most-recent MAX_STORED_PAIRS pairs = 2*MAX_STORED_PAIRS messages
-  const trimmed = updated.slice(-MAX_STORED_PAIRS * 2);
-
+  // Write user message
   await dynamodb.send(
     new PutCommand({
       TableName: RECENT_MESSAGES_TABLE,
       Item: {
-        session_key: sessionKey,
-        messages: trimmed,
-        updatedAt: now,
-        ttl: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7, // 7-day TTL
+        sessionId,
+        messageTimestamp: now,
+        role: 'user',
+        content: userText,
+        ttl,
+      },
+    })
+  );
+
+  // Write assistant response (offset timestamp by 1ms to ensure ordering)
+  await dynamodb.send(
+    new PutCommand({
+      TableName: RECENT_MESSAGES_TABLE,
+      Item: {
+        sessionId,
+        messageTimestamp: now + 1,
+        role: 'assistant',
+        content: assistantText,
+        ttl,
       },
     })
   );
 
   log('INFO', 'Conversation context stored', {
-    sessionKey,
-    storedMessages: trimmed.length,
+    sessionId,
+    storedMessages: 2,
   });
 }
 
@@ -513,7 +525,7 @@ function buildMessengerPrompt(userInput, kbContext, history, config) {
 
   const systemContent = [
     tonePrompt,
-    'You are responding via Facebook Messenger. Keep responses concise and conversational. Do not use markdown formatting — Messenger renders plain text only.',
+    'You are responding via Facebook Messenger where the chat window is very small. STRICT RULES: Respond in 2-3 short sentences maximum. Be friendly but direct. No lists, no bullet points, no headers, no markdown. Never write more than 3 sentences in a single response. If the user wants more detail, they will ask a follow-up question.',
     kbContext
       ? `Relevant information from the knowledge base:\n${kbContext}`
       : '',
