@@ -1,0 +1,17 @@
+{
+  "name": "kb_proposal_applier",
+  "version": "0.1.0",
+  "description": "Applies approved KB-freshness proposals: KB markdown splices, tenant config mutations, Dub shortlink upserts.",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-agent": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0"
+  },
+  "scripts": {
+    "package": "zip -r deployment.zip . -x 'node_modules/aws-sdk/*' -x '*.test.mjs' -x 'test-fixtures/*' -x 'README.md'"
+  }
+}
