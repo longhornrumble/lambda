@@ -9,6 +9,7 @@
 import {
   listTenantConfigs,
   loadConfig,
+  loadConfigWithETag,
   getTenantMetadata,
   saveConfig,
   deleteConfig,
@@ -17,6 +18,7 @@ import {
   saveDraft,
   loadDraft,
   deleteDraft,
+  ConfigETagMismatchError,
 } from './s3Operations.mjs';
 import crypto from 'crypto';
 
@@ -78,7 +80,8 @@ export const handler = async (event) => {
     ...(!isFunctionUrl && {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, If-Match',
+      'Access-Control-Expose-Headers': 'ETag',
     }),
   };
 
@@ -414,21 +417,22 @@ export const handler = async (event) => {
         }
       }
 
-      const config = await loadConfig(tenantId);
+      const { config, etag } = await loadConfigWithETag(tenantId);
+      const responseHeaders = { ...headers, ETag: etag };
 
       if (editableOnly) {
         const editableConfig = extractEditableSections(config);
         return {
           statusCode: 200,
-          headers,
-          body: JSON.stringify({ config: editableConfig }),
+          headers: responseHeaders,
+          body: JSON.stringify({ config: editableConfig, etag }),
         };
       }
 
       return {
         statusCode: 200,
-        headers,
-        body: JSON.stringify({ config }),
+        headers: responseHeaders,
+        body: JSON.stringify({ config, etag }),
       };
     }
 
@@ -516,12 +520,53 @@ export const handler = async (event) => {
         }
       }
 
+      // Optimistic concurrency: if the caller provides an If-Match
+      // header, the save only proceeds if the current S3 ETag matches.
+      // Callers that omit If-Match (e.g., deploy_tenant_stack until it
+      // adopts ETag support) are allowed through with a warning —
+      // remove the soft path once all writers have migrated.
+      const ifMatch =
+        event.headers?.['If-Match'] ||
+        event.headers?.['if-match'] ||
+        event.headers?.['IF-MATCH'];
+
+      if (!ifMatch) {
+        console.warn(
+          `PUT /config/${tenantId} without If-Match header — ` +
+          'concurrency check skipped. Caller should migrate to send If-Match.'
+        );
+      }
+
       // Save the config
-      const result = await saveConfig(tenantId, finalConfig, create_backup);
+      let result;
+      try {
+        result = await saveConfig(tenantId, finalConfig, create_backup, ifMatch);
+      } catch (error) {
+        if (error instanceof ConfigETagMismatchError) {
+          return {
+            statusCode: 409,
+            headers: {
+              ...headers,
+              ...(error.currentETag && { ETag: error.currentETag }),
+            },
+            body: JSON.stringify({
+              error: 'Conflict',
+              message:
+                'Config was modified since you loaded it. Reload to see the latest version and reapply your changes.',
+              currentConfig: error.currentConfig,
+              currentETag: error.currentETag,
+            }),
+          };
+        }
+        throw error;
+      }
 
       return {
         statusCode: 200,
-        headers,
+        headers: {
+          ...headers,
+          ...(result.etag && { ETag: result.etag }),
+        },
         body: JSON.stringify({
           success: true,
           ...result,

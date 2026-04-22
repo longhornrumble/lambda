@@ -79,6 +79,17 @@ export async function listTenantConfigs() {
  * @returns {Promise<Object>} The tenant configuration object
  */
 export async function loadConfig(tenantId) {
+  const { config } = await loadConfigWithETag(tenantId);
+  return config;
+}
+
+/**
+ * Load a tenant configuration along with its S3 ETag, so callers can
+ * implement optimistic concurrency control on subsequent writes.
+ * @param {string} tenantId - The tenant ID
+ * @returns {Promise<{config: Object, etag: string}>}
+ */
+export async function loadConfigWithETag(tenantId) {
   try {
     const key = `tenants/${tenantId}/${tenantId}-config.json`;
     const command = new GetObjectCommand({
@@ -90,7 +101,7 @@ export async function loadConfig(tenantId) {
     const configString = await streamToString(response.Body);
     const config = JSON.parse(configString);
 
-    return config;
+    return { config, etag: response.ETag };
   } catch (error) {
     if (error.name === 'NoSuchKey') {
       throw new Error(`Config not found for tenant: ${tenantId}`);
@@ -127,14 +138,54 @@ export async function getTenantMetadata(tenantId) {
 }
 
 /**
+ * Error thrown when an optimistic-concurrency check fails on save.
+ * Carries the current config + etag so callers can show the user the
+ * latest server state.
+ */
+export class ConfigETagMismatchError extends Error {
+  constructor(currentConfig, currentETag) {
+    super('Config was modified since it was loaded');
+    this.name = 'ConfigETagMismatchError';
+    this.currentConfig = currentConfig;
+    this.currentETag = currentETag;
+  }
+}
+
+/**
  * Save a tenant configuration to S3
  * @param {string} tenantId - The tenant ID
  * @param {Object} config - The configuration object
  * @param {boolean} createBackup - Whether to create a backup before saving
- * @returns {Promise<Object>} Save result
+ * @param {string} [ifMatch] - Optional S3 ETag. When provided, the save
+ *   proceeds only if the current object's ETag matches. Mismatch throws
+ *   ConfigETagMismatchError.
+ * @returns {Promise<Object>} Save result (includes the new ETag)
  */
-export async function saveConfig(tenantId, config, createBackup = true) {
+export async function saveConfig(tenantId, config, createBackup = true, ifMatch) {
   try {
+    // Optimistic concurrency: verify the current object hasn't changed
+    // since the caller loaded it. Uses a HEAD-before-PUT check because
+    // S3's native IfMatch on PutObject isn't universally supported
+    // across SDK/region combos. This is a narrow TOCTOU window in
+    // exchange for portability — acceptable for the low-concurrency
+    // config editor workflow.
+    if (ifMatch) {
+      try {
+        const { etag: currentETag, config: currentConfig } = await loadConfigWithETag(tenantId);
+        if (currentETag !== ifMatch) {
+          throw new ConfigETagMismatchError(currentConfig, currentETag);
+        }
+      } catch (error) {
+        if (error instanceof ConfigETagMismatchError) throw error;
+        // If the current object doesn't exist yet, the caller shouldn't
+        // have an ETag to match against — treat as mismatch.
+        if (error.message.includes('not found')) {
+          throw new ConfigETagMismatchError(null, null);
+        }
+        throw error;
+      }
+    }
+
     // Create backup if requested and config exists
     if (createBackup) {
       try {
@@ -161,15 +212,17 @@ export async function saveConfig(tenantId, config, createBackup = true) {
       ContentType: 'application/json',
     });
 
-    await s3Client.send(command);
+    const putResponse = await s3Client.send(command);
 
     return {
       success: true,
       tenantId,
       key,
       timestamp: config.last_updated,
+      etag: putResponse.ETag,
     };
   } catch (error) {
+    if (error instanceof ConfigETagMismatchError) throw error;
     console.error(`Error saving config for ${tenantId}:`, error);
     throw new Error(`Failed to save config: ${error.message}`);
   }
