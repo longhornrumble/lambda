@@ -419,6 +419,48 @@ export async function deleteDraft(tenantId) {
 }
 
 /**
+ * List pending KB-freshness proposals for a tenant.
+ * Proposals are written by the scanner to
+ * `pending-proposals/{tenantId}/{proposalId}.json`.
+ * Returns an array of parsed proposal objects, newest first.
+ * @param {string} tenantId
+ * @returns {Promise<Array<Object>>}
+ */
+export async function listProposals(tenantId) {
+  const prefix = `pending-proposals/${tenantId}/`;
+  try {
+    const list = await s3Client.send(new ListObjectsV2Command({
+      Bucket: BUCKET,
+      Prefix: prefix,
+    }));
+
+    const keys = (list.Contents || [])
+      .map((o) => o.Key)
+      .filter((k) => k && k.endsWith('.json'));
+
+    const proposals = await Promise.all(
+      keys.map(async (key) => {
+        try {
+          const res = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+          const body = await streamToString(res.Body);
+          return JSON.parse(body);
+        } catch (err) {
+          console.warn(`Failed to read proposal ${key}: ${err.message}`);
+          return null;
+        }
+      })
+    );
+
+    return proposals
+      .filter(Boolean)
+      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  } catch (error) {
+    console.error(`Error listing proposals for ${tenantId}:`, error);
+    throw new Error(`Failed to list proposals: ${error.message}`);
+  }
+}
+
+/**
  * Store tenant ID to hash mapping
  * @param {string} tenantId - The tenant ID
  * @param {string} tenantHash - The generated tenant hash
