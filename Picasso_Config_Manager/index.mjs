@@ -14,6 +14,7 @@ import {
   saveConfig,
   deleteConfig,
   listBackups,
+  listProposals,
   storeTenantMapping,
   saveDraft,
   loadDraft,
@@ -735,6 +736,40 @@ export const handler = async (event) => {
         statusCode: 200,
         headers,
         body: JSON.stringify({ success: true, message: 'Draft deleted' }),
+      };
+    }
+
+    // GET /proposals?tenantId=... - List pending KB-freshness proposals for a tenant.
+    // Read-only endpoint consumed by the Pending Changes review UI.
+    if (httpMethod === 'GET' && path === '/proposals') {
+      const tenantId = queryStringParameters?.tenantId;
+      const idError = validateTenantId(tenantId, headers);
+      if (idError) return idError;
+
+      if (auth.success && auth.role !== 'super_admin') {
+        const userTenants = auth.tenants || [];
+        if (!userTenants.includes(tenantId)) {
+          console.warn(`User ${auth.email} attempted to list proposals for tenant ${tenantId} without permission`);
+          if (ENFORCE_AUTH) {
+            return {
+              statusCode: 403,
+              headers,
+              body: JSON.stringify({
+                error: 'Forbidden',
+                message: 'You do not have access to this tenant',
+              }),
+            };
+          } else {
+            console.warn('PERMISSIVE MODE: Allowing unauthorized proposal listing');
+          }
+        }
+      }
+
+      const proposals = await listProposals(tenantId);
+      return {
+        statusCode: 200,
+        headers,
+        body: JSON.stringify({ proposals }),
       };
     }
 
