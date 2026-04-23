@@ -122,6 +122,11 @@ export async function getTenantMetadata(tenantId) {
 
     return {
       tenant_id: config.tenant_id,
+      // Exposed so the frontend can resolve hash-based deep links (e.g.
+      // /pending-changes?h=HASH from Slack/email). Per security policy, tenant
+      // IDs are never in open URLs — only hashes. The frontend looks up the
+      // matching entry in this already-loaded list rather than a new endpoint.
+      tenant_hash: config.tenant_hash || null,
       version: config.version,
       chat_title: config.chat_title,
       company_name: config.company_name || config.chat_title,
