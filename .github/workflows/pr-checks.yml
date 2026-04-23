@@ -42,6 +42,7 @@ jobs:
       master:         ${{ steps.filter.outputs.master }}
       # Node.js Lambda using node:test runner (no Jest)
       applier:        ${{ steps.filter.outputs.applier }}
+      notification_hub: ${{ steps.filter.outputs.notification_hub }}
       # Shared module — triggers full Node.js test run when changed
       shared:         ${{ steps.filter.outputs.shared }}
       # True when shared/ changed (forces all Node.js tests)
@@ -68,6 +69,8 @@ jobs:
               - 'Master_Function_Staging/**'
             applier:
               - 'kb_proposal_applier/**'
+            notification_hub:
+              - 'notification_hub/**'
             shared:
               - 'shared/**'
 
@@ -254,34 +257,57 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # Job 2b: kb_proposal_applier Tests (node:test)
+  # Job 2b: node:test-based Lambda Tests (matrix)
   #
-  # Separate from the Jest matrix because the applier uses Node's built-in
+  # Separate from the Jest matrix because these Lambdas use Node's built-in
   # test runner — zero deps, ESM-native. Adding Jest would mean babel + config
-  # yak-shaving for no real benefit on a ~300-line lambda.
+  # yak-shaving for no real benefit on small lambdas.
+  #
+  # When adding a new node:test-using Lambda: add it to the detect-changes
+  # filter above, add a matrix entry here, and add its dir to the security
+  # audit matrix below.
   # ---------------------------------------------------------------------------
   applier-tests:
-    name: Node Tests — kb_proposal_applier
+    name: Node Tests — ${{ matrix.lambda }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: detect-changes
-    if: needs.detect-changes.outputs.applier == 'true'
+    if: |
+      needs.detect-changes.outputs.applier == 'true' ||
+      needs.detect-changes.outputs.notification_hub == 'true'
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lambda: kb_proposal_applier
+            changed: ${{ needs.detect-changes.outputs.applier }}
+          - lambda: notification_hub
+            changed: ${{ needs.detect-changes.outputs.notification_hub }}
 
     steps:
+      - name: Skip unchanged lambda
+        if: matrix.changed != 'true'
+        run: echo "No changes in ${{ matrix.lambda }} — skipping."
+
       - name: Checkout
+        if: matrix.changed == 'true'
         uses: actions/checkout@v4
 
       - name: Setup Node.js ${{ env.NODE_VERSION }}
+        if: matrix.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
 
       - name: Install dependencies
-        working-directory: kb_proposal_applier
+        if: matrix.changed == 'true'
+        working-directory: ${{ matrix.lambda }}
         run: npm install
 
       - name: Run node:test suite
-        working-directory: kb_proposal_applier
+        if: matrix.changed == 'true'
+        working-directory: ${{ matrix.lambda }}
         run: node --test *.test.mjs
 
   # ---------------------------------------------------------------------------
@@ -312,6 +338,7 @@ jobs:
           - lambda: SMS_Sender
           - lambda: SMS_Webhook_Handler
           - lambda: kb_proposal_applier      # node:test covers logic; audit covers deps
+          - lambda: notification_hub        # node:test covers logic; audit covers deps
 
     steps:
       - name: Checkout
