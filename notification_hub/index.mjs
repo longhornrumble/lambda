@@ -39,6 +39,12 @@ const ROUTES_KEY = process.env.ROUTES_KEY || 'notification-routes.json';
 const DEFAULT_SENDER = process.env.DEFAULT_SENDER || 'notify@myrecruiter.ai';
 const CONFIGURATION_SET = process.env.CONFIGURATION_SET || 'picasso-emails';
 const CACHE_TTL_MS = 5 * 60 * 1000;
+// Optional: when set, the hub can generate Clerk sign-in tokens per email recipient
+// and embed them in the action.url so clicking from the email auto-signs the user in.
+// Slack stays tokenless because it's a multi-user channel and broadcasting a token
+// would let any channel member consume someone else's Clerk identity.
+const CLERK_SECRET_KEY = process.env.CLERK_SECRET_KEY;
+const CLERK_SIGN_IN_TOKEN_TTL_SEC = Number(process.env.CLERK_SIGN_IN_TOKEN_TTL_SEC || '3600');
 
 const s3 = new S3Client({ region: REGION });
 const ses = new SESv2Client({ region: REGION });
@@ -121,6 +127,49 @@ ${actionHtml}
 </div></body></html>`;
 }
 
+/**
+ * Generate a single-use Clerk sign-in token for `userId`.
+ * Returns the opaque token string, or throws on API error.
+ *
+ * Tokens are single-use and expire per CLERK_SIGN_IN_TOKEN_TTL_SEC (default 1h).
+ * They're safe to embed in 1:1 email but NOT in multi-user channels — the Slack
+ * path deliberately skips this. See https://clerk.com/docs/guides/development/custom-flows/embeddable-email-links
+ */
+async function createClerkSignInToken(userId) {
+  if (!CLERK_SECRET_KEY) {
+    throw new Error('CLERK_SECRET_KEY not set on notification_hub Lambda env');
+  }
+  const res = await fetch('https://api.clerk.com/v1/sign_in_tokens', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${CLERK_SECRET_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      user_id: userId,
+      expires_in_seconds: CLERK_SIGN_IN_TOKEN_TTL_SEC,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Clerk sign_in_tokens ${res.status}: ${await res.text()}`);
+  }
+  const body = await res.json();
+  if (!body.token) {
+    throw new Error(`Clerk sign_in_tokens returned no token: ${JSON.stringify(body)}`);
+  }
+  return body.token;
+}
+
+/**
+ * Append `?token=<TOKEN>` (or `&token=<TOKEN>`) to a URL, URI-encoding the token.
+ * Pure — doesn't parse the URL, just appends correctly. Testable in isolation.
+ */
+export function appendTokenToUrl(url, token) {
+  if (!url) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}token=${encodeURIComponent(token)}`;
+}
+
 async function sendEmail({ to, from, subject, html }) {
   await ses.send(new SendEmailCommand({
     Destination: { ToAddresses: to },
@@ -191,19 +240,66 @@ export const handler = async (event) => {
   }
 
   if (channels.includes('email') && route.email) {
-    try {
-      const html = buildEmailHtml({ title, summary, body_markdown, action, severity, source });
-      await sendEmail({
-        to: Array.isArray(route.email.to) ? route.email.to : [route.email.to],
-        from: route.email.from || DEFAULT_SENDER,
-        subject: `[${severity.toUpperCase()}] ${title}`,
-        html,
-      });
-      dispatched.push('email');
-    } catch (e) {
-      console.error(`email dispatch failed for source ${source}:`, e.message);
-    }
+    const emailSent = await dispatchEmail({ route, title, summary, body_markdown, action, severity, source });
+    if (emailSent > 0) dispatched.push('email');
   }
 
   return response(200, { ok: true, dispatched });
 };
+
+/**
+ * Send the email notification. Two modes:
+ *
+ *   1. `route.email.clerk_user_ids` is set (and same length as `route.email.to`):
+ *      Send ONE email per recipient, each with a unique Clerk sign-in token
+ *      appended to the action.url. This enables passwordless deep-link access —
+ *      the recipient clicks "Review Changes" and lands signed-in without the
+ *      manual Clerk sign-in gate.
+ *
+ *   2. No `clerk_user_ids`: send ONE email to all recipients with the action.url
+ *      as-is (no token). Users sign in manually on arrival.
+ *
+ * Per-recipient failures are logged but don't fail the whole dispatch. Returns
+ * the count of emails successfully sent.
+ */
+async function dispatchEmail({ route, title, summary, body_markdown, action, severity, source }) {
+  const to = Array.isArray(route.email.to) ? route.email.to : [route.email.to];
+  const from = route.email.from || DEFAULT_SENDER;
+  const subject = `[${severity.toUpperCase()}] ${title}`;
+  const clerkUserIds = Array.isArray(route.email.clerk_user_ids) ? route.email.clerk_user_ids : null;
+
+  // Mode 1: passwordless per-recipient (requires pairing + action.url to embed into).
+  const tokensEnabled =
+    clerkUserIds &&
+    clerkUserIds.length === to.length &&
+    action?.url &&
+    CLERK_SECRET_KEY;
+
+  if (tokensEnabled) {
+    let sent = 0;
+    for (let i = 0; i < to.length; i++) {
+      const recipient = to[i];
+      const userId = clerkUserIds[i];
+      try {
+        const token = await createClerkSignInToken(userId);
+        const tokenizedAction = { ...action, url: appendTokenToUrl(action.url, token) };
+        const html = buildEmailHtml({ title, summary, body_markdown, action: tokenizedAction, severity, source });
+        await sendEmail({ to: [recipient], from, subject, html });
+        sent++;
+      } catch (e) {
+        console.error(`email dispatch failed for ${recipient} (source ${source}):`, e.message);
+      }
+    }
+    return sent;
+  }
+
+  // Mode 2: fan-out to all recipients in one email (tokenless).
+  try {
+    const html = buildEmailHtml({ title, summary, body_markdown, action, severity, source });
+    await sendEmail({ to, from, subject, html });
+    return to.length;
+  } catch (e) {
+    console.error(`email dispatch failed for source ${source}:`, e.message);
+    return 0;
+  }
+}

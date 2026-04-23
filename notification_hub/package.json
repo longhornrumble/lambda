@@ -5,6 +5,7 @@
   "type": "module",
   "main": "index.mjs",
   "scripts": {
+    "test": "node --test *.test.mjs",
     "package": "npm ci --omit=dev && zip -r deployment.zip . -x '*.zip' -x 'node_modules/.cache/*' -x 'README.md'",
     "deploy": "aws lambda update-function-code --function-name notification_hub --zip-file fileb://deployment.zip --profile chris-admin"
   },
