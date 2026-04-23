@@ -40,6 +40,8 @@ jobs:
       # Python Lambdas with tests
       meta_oauth:     ${{ steps.filter.outputs.meta_oauth }}
       master:         ${{ steps.filter.outputs.master }}
+      # Node.js Lambda using node:test runner (no Jest)
+      applier:        ${{ steps.filter.outputs.applier }}
       # Shared module — triggers full Node.js test run when changed
       shared:         ${{ steps.filter.outputs.shared }}
       # True when shared/ changed (forces all Node.js tests)
@@ -64,6 +66,8 @@ jobs:
               - 'Meta_OAuth_Handler/**'
             master:
               - 'Master_Function_Staging/**'
+            applier:
+              - 'kb_proposal_applier/**'
             shared:
               - 'shared/**'
 
@@ -250,6 +254,37 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # Job 2b: kb_proposal_applier Tests (node:test)
+  #
+  # Separate from the Jest matrix because the applier uses Node's built-in
+  # test runner — zero deps, ESM-native. Adding Jest would mean babel + config
+  # yak-shaving for no real benefit on a ~300-line lambda.
+  # ---------------------------------------------------------------------------
+  applier-tests:
+    name: Node Tests — kb_proposal_applier
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: detect-changes
+    if: needs.detect-changes.outputs.applier == 'true'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        working-directory: kb_proposal_applier
+        run: npm install
+
+      - name: Run node:test suite
+        working-directory: kb_proposal_applier
+        run: node --test *.test.mjs
+
+  # ---------------------------------------------------------------------------
   # Job 3: Security Audit
   #
   # npm audit for all Node.js Lambdas that have package-lock.json files.
@@ -276,6 +311,7 @@ jobs:
           - lambda: Picasso_Config_Manager   # No tests, but has dependencies to audit
           - lambda: SMS_Sender
           - lambda: SMS_Webhook_Handler
+          - lambda: kb_proposal_applier      # node:test covers logic; audit covers deps
 
     steps:
       - name: Checkout
@@ -441,22 +477,24 @@ jobs:
     name: All Lambda Checks Passed
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [node-tests, python-tests, security, build]
+    needs: [node-tests, applier-tests, python-tests, security, build]
     # Run even when upstream jobs were skipped (no changes detected).
     if: always()
 
     steps:
       - name: Check upstream results
         run: |
-          echo "node-tests:    ${{ needs.node-tests.result }}"
-          echo "python-tests:  ${{ needs.python-tests.result }}"
-          echo "security:      ${{ needs.security.result }}"
-          echo "build:         ${{ needs.build.result }}"
+          echo "node-tests:     ${{ needs.node-tests.result }}"
+          echo "applier-tests:  ${{ needs.applier-tests.result }}"
+          echo "python-tests:   ${{ needs.python-tests.result }}"
+          echo "security:       ${{ needs.security.result }}"
+          echo "build:          ${{ needs.build.result }}"
 
           # Acceptable terminal states: success or skipped.
           # Any failure or cancellation is a hard stop.
           for result in \
             "${{ needs.node-tests.result }}" \
+            "${{ needs.applier-tests.result }}" \
             "${{ needs.python-tests.result }}" \
             "${{ needs.security.result }}" \
             "${{ needs.build.result }}"; do
