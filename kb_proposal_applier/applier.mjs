@@ -58,11 +58,114 @@ function deepClone(obj) {
 }
 
 /**
+ * Apply all ops for a single proposal item with per-item atomicity.
+ *
+ * Snapshots state before the first op. If any op throws, reverts to the snapshot and marks
+ * the item failed. Subsequent ops in the same item are NOT attempted after a failure — the
+ * item is atomic. Earlier items that already succeeded keep their mutations (no cross-item
+ * rollback).
+ *
+ * Intentionally a pure transform on caller-owned state: no S3, no HTTP, no env access.
+ * `applyOp` is injected so tests can use synthetic op handlers to force specific failures.
+ */
+export async function applyItemAtomically(item, state, ctx, applyOp) {
+  const snapshot = {
+    kb: state.kb,
+    kbDirty: state.kbDirty,
+    config: deepClone(state.config),
+    configDirty: state.configDirty,
+  };
+
+  const opResults = [];
+  let itemFailed = false;
+
+  for (let i = 0; i < (item.operations || []).length; i++) {
+    const op = item.operations[i];
+    try {
+      const result = await applyOp(op, state, ctx);
+      opResults.push({
+        index: i,
+        verb: op.verb,
+        status: 'applied',
+        ...(result && { result }),
+      });
+    } catch (error) {
+      opResults.push({
+        index: i,
+        verb: op.verb,
+        status: 'error',
+        error: error.message,
+      });
+      itemFailed = true;
+      break;
+    }
+  }
+
+  if (itemFailed) {
+    state.kb = snapshot.kb;
+    state.kbDirty = snapshot.kbDirty;
+    state.config = snapshot.config;
+    state.configDirty = snapshot.configDirty;
+  }
+
+  return { itemFailed, opResults };
+}
+
+/**
+ * Persist the in-memory KB + config state back to S3 and trigger Bedrock sync.
+ *
+ * Returns `{ configSaveError, bedrockSync, persistFailed }`:
+ *   - `configSaveError` — non-null string if config save failed (ETag mismatch or other)
+ *   - `bedrockSync` — the triggerBedrockSync result object, or null if KB not dirty
+ *   - `persistFailed` — true if any persist step failed (config save error triggers this)
+ *
+ * Dependencies are injected via `deps` so tests can substitute fakes for `writeKb`,
+ * `saveConfig`, `triggerBedrockSync`, and `ConfigETagMismatchError`. Production code wires
+ * the real dependencies from ./s3Ops.mjs and ./bedrockSync.mjs.
+ *
+ * Ordering rationale (comments in-line):
+ */
+export async function persistState({ tenantId, kbKey, state, deps }) {
+  let configSaveError = null;
+  let persistFailed = false;
+
+  // KB first — the file mutation is what the user cares about. If it fails, a later config
+  // write would point at stale markdown, so we fail fast and bubble.
+  if (state.kbDirty) {
+    await deps.writeKb(kbKey, state.kb);
+  }
+
+  // Config save with ETag. Mismatch means someone wrote between our GET and PUT; per the
+  // plan's no-rollback contract we report the conflict, not try to merge.
+  if (state.configDirty) {
+    try {
+      await deps.saveConfig(tenantId, state.config, state.configETag);
+    } catch (error) {
+      if (error instanceof deps.ConfigETagMismatchError) {
+        configSaveError = `config_changed_externally (current ETag ${error.currentETag})`;
+      } else {
+        configSaveError = error.message;
+      }
+      persistFailed = true;
+    }
+  }
+
+  // Bedrock sync fires after any KB write, regardless of config outcome — the KB is stale
+  // in Bedrock whether or not config also updated.
+  let bedrockSync = null;
+  if (state.kbDirty) {
+    bedrockSync = await deps.triggerBedrockSync(state.config);
+  }
+
+  return { configSaveError, bedrockSync, persistFailed };
+}
+
+/**
  * Dispatch a single operation against in-memory KB + config state.
  * Mutates `state.kb` (string) and `state.config` (object) in place. Returns the Dub result
  * or undefined — callers don't need anything else.
  */
-async function applyOperation(op, state, ctx) {
+export async function applyOperation(op, state, ctx) {
   switch (op.verb) {
     case 'kb.append': {
       if (!op.afterMarker || !op.markdown) {
@@ -207,53 +310,8 @@ export async function applyProposal({ tenantId, proposalId, approvedItemIds, dub
   let anyFailed = false;
 
   for (const item of itemsToApply) {
-    // Per-item atomicity: snapshot the in-memory state before this item's ops run, and revert
-    // to the snapshot if any op inside this item fails. Across-item semantics stay no-rollback
-    // — previously-succeeded items keep their mutations. If we didn't do this, a paired ops
-    // item (e.g. new_event = kb.append + showcase add + chip add) could half-land with the
-    // showcase stuck in config but no matching KB section.
-    const snapshot = {
-      kb: state.kb,
-      kbDirty: state.kbDirty,
-      config: deepClone(state.config),
-      configDirty: state.configDirty,
-    };
-
-    const opResults = [];
-    let itemFailed = false;
-
-    for (let i = 0; i < (item.operations || []).length; i++) {
-      const op = item.operations[i];
-      try {
-        const result = await applyOperation(op, state, ctx);
-        opResults.push({
-          index: i,
-          verb: op.verb,
-          status: 'applied',
-          ...(result && { result }),
-        });
-      } catch (error) {
-        opResults.push({
-          index: i,
-          verb: op.verb,
-          status: 'error',
-          error: error.message,
-        });
-        itemFailed = true;
-        // Stop processing this item's remaining ops — the item is atomic.
-        break;
-      }
-    }
-
-    if (itemFailed) {
-      // Revert in-memory state to the pre-item snapshot.
-      state.kb = snapshot.kb;
-      state.kbDirty = snapshot.kbDirty;
-      state.config = snapshot.config;
-      state.configDirty = snapshot.configDirty;
-      anyFailed = true;
-    }
-
+    const { itemFailed, opResults } = await applyItemAtomically(item, state, ctx, applyOperation);
+    if (itemFailed) anyFailed = true;
     itemResults.push({
       itemId: item.id,
       status: itemFailed ? 'error' : 'applied',
@@ -261,36 +319,13 @@ export async function applyProposal({ tenantId, proposalId, approvedItemIds, dub
     });
   }
 
-  // Persist KB once, at the end — not per operation. A single PutObject to the KB means
-  // Bedrock sees one consistent state change. If the persist itself fails, everything done
-  // in-memory is lost; the caller retries.
-  if (state.kbDirty) {
-    await writeKb(kbKey, state.kb);
-  }
-
-  // Persist config with ETag. 409 here is a real failure — someone edited config between our
-  // GET and PUT. Mark the whole proposal partial_apply_error and surface the cause.
-  let configSaveError = null;
-  if (state.configDirty) {
-    try {
-      await saveConfig(tenantId, state.config, state.configETag);
-    } catch (error) {
-      if (error instanceof ConfigETagMismatchError) {
-        configSaveError = `config_changed_externally (current ETag ${error.currentETag})`;
-      } else {
-        configSaveError = error.message;
-      }
-      anyFailed = true;
-    }
-  }
-
-  // Fire Bedrock KB ingestion sync if we wrote to the KB. We do this AFTER config save (and
-  // after the optional configSaveError) because ingestion is a bestseller — the KB write
-  // happened regardless, so the KB is stale in Bedrock regardless.
-  let bedrockSync = null;
-  if (state.kbDirty) {
-    bedrockSync = await triggerBedrockSync(state.config);
-  }
+  const { configSaveError, bedrockSync, persistFailed } = await persistState({
+    tenantId,
+    kbKey,
+    state,
+    deps: { writeKb, saveConfig, triggerBedrockSync, ConfigETagMismatchError },
+  });
+  if (persistFailed) anyFailed = true;
 
   const appliedProposal = {
     ...proposal,
