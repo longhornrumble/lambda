@@ -1,0 +1,15 @@
+{
+  "name": "n8n-scheduler-wake",
+  "version": "1.0.0",
+  "description": "EventBridge-triggered orchestrator for the KB-freshness scanner. Wakes the n8n EC2, gates biweekly via ISO-week parity, then dispatches the scanner via SSM RunCommand. Replaces the planned n8n Schedule + ExecuteCommand workflow because n8n does not register the executeCommand node at runtime in 2.14.x or 2.17.x.",
+  "type": "module",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "package": "zip -r deployment.zip index.mjs -x '*.zip' -x 'node_modules/.cache/*'",
+    "deploy": "aws lambda update-function-code --function-name n8n-scheduler-wake --zip-file fileb://deployment.zip --profile chris-admin"
+  },
+  "dependencies": {}
+}
