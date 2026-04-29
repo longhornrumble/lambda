@@ -888,6 +888,8 @@ async function selectActionsV4(responseText, conversationHistory, config, bedroc
         case 'start_form': return 'APPLY';
         case 'external_link': return 'VISIT';
         case 'show_info': return 'INFO';
+        case 'start_scheduling': return 'SCHEDULE';
+        case 'resume_scheduling': return 'SCHEDULE';
         default: return action;
       }
     };
