@@ -877,22 +877,33 @@ const V4_STEP3_INFERENCE_PARAMS = {
  * @param {Object} bedrockClient - Bedrock runtime client
  * @returns {Promise<string[]>} Array of CTA IDs (0-4), validated against config
  */
+/**
+ * Map a CTA action type to a short intent label used in the V4 Action Selector
+ * vocabulary block. Falls back to the raw action string when no mapping exists
+ * (so a misconfigured CTA renders identifiably rather than silently breaking).
+ *
+ * Exported for unit-test access — also used internally by selectActionsV4.
+ *
+ * @param {string} action - CTA action type (e.g. 'start_form', 'start_scheduling')
+ * @returns {string} Short uppercase intent label (e.g. 'APPLY', 'SCHEDULE')
+ */
+function intentLabel(action) {
+  switch (action) {
+    case 'send_query': return 'LEARN';
+    case 'start_form': return 'APPLY';
+    case 'external_link': return 'VISIT';
+    case 'show_info': return 'INFO';
+    case 'start_scheduling': return 'SCHEDULE';
+    case 'resume_scheduling': return 'SCHEDULE';
+    default: return action;
+  }
+}
+
 async function selectActionsV4(responseText, conversationHistory, config, bedrockClient) {
   const startTime = Date.now();
 
   try {
     // Build vocabulary: only ai_available CTAs, with intent labels
-    const intentLabel = (action) => {
-      switch (action) {
-        case 'send_query': return 'LEARN';
-        case 'start_form': return 'APPLY';
-        case 'external_link': return 'VISIT';
-        case 'show_info': return 'INFO';
-        case 'start_scheduling': return 'SCHEDULE';
-        case 'resume_scheduling': return 'SCHEDULE';
-        default: return action;
-      }
-    };
     const vocabulary = Object.entries(config.cta_definitions || {})
       .filter(([_, cta]) => cta.ai_available)
       .map(([id, cta]) => `  ${id} — ${cta.label} [${intentLabel(cta.action)}]`)
@@ -1000,6 +1011,7 @@ module.exports = {
 
   // V4.0 Action Selector (LLM-based, per-tenant feature flag)
   selectActionsV4,
+  intentLabel,
 
   // Config validation
   validateTopicDefinitions,
