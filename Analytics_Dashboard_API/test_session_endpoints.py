@@ -8,9 +8,11 @@ that query the DynamoDB session tables.
 import pytest
 import json
 import base64
+import time
 from unittest.mock import patch, MagicMock
 from datetime import datetime
 
+import lambda_function
 # Import functions under test
 from lambda_function import (
     get_tenant_hash,
@@ -20,25 +22,61 @@ from lambda_function import (
 )
 
 
+def _mock_s3_mappings(mock_s3, mappings):
+    """Wire mock_s3 to serve the given {tenant_id: tenant_hash} mappings via the
+    list_objects_v2 paginator + get_object pattern that get_tenant_hash uses."""
+    contents = [{'Key': f'mappings/{h}.json'} for h in mappings.values()]
+    mock_paginator = MagicMock()
+    mock_paginator.paginate.return_value = [{'Contents': contents}]
+    mock_s3.get_paginator.return_value = mock_paginator
+
+    def fake_get_object(Bucket, Key):
+        candidate_hash = Key.split('/')[-1].replace('.json', '')
+        tenant_id = next(tid for tid, h in mappings.items() if h == candidate_hash)
+        body = MagicMock()
+        body.read.return_value = json.dumps({
+            'tenant_id': tenant_id,
+            'tenant_hash': candidate_hash
+        }).encode('utf-8')
+        return {'Body': body}
+
+    mock_s3.get_object.side_effect = fake_get_object
+
+
+@pytest.fixture(autouse=True)
+def _reset_tenant_hash_cache():
+    """Cache leaks across tests will mask mock setup — reset before every test."""
+    lambda_function._tenant_hash_cache = {}
+    lambda_function._tenant_hash_cache_time = 0
+    yield
+
+
 class TestGetTenantHash:
     """Tests for tenant hash generation."""
 
-    @pytest.mark.skip(reason="get_tenant_hash now requires AWS credentials (looks up via DynamoDB/S3) — test was written against a pure-function version. Needs credential mocking or function restored to pure hashing. See PR documenting stale test_session_endpoints failures.")
-    def test_tenant_hash_format(self):
-        """Hash should be prefix + 12 char MD5."""
+    @patch('lambda_function.s3')
+    def test_tenant_hash_format(self, mock_s3):
+        """Hash should be the 14-char value resolved from the S3 mapping (2-char prefix + 12-char hash)."""
+        _mock_s3_mappings(mock_s3, {'FOS123': 'fo70c7c68b4dd6'})
         result = get_tenant_hash('FOS123')
         assert len(result) == 14  # 2 char prefix + 12 char hash
         assert result.startswith('fo')  # lowercase prefix
 
-    def test_tenant_hash_consistency(self):
-        """Same input should produce same hash."""
+    @patch('lambda_function.s3')
+    def test_tenant_hash_consistency(self, mock_s3):
+        """Same input should produce same hash (cache hit on second call)."""
+        _mock_s3_mappings(mock_s3, {'TEST_TENANT': 'te1234567890ab'})
         hash1 = get_tenant_hash('TEST_TENANT')
         hash2 = get_tenant_hash('TEST_TENANT')
         assert hash1 == hash2
 
-    @pytest.mark.skip(reason="Same root cause as test_tenant_hash_format — both inputs return None when AWS creds are unavailable. See PR documenting stale test_session_endpoints failures.")
-    def test_tenant_hash_different_tenants(self):
+    @patch('lambda_function.s3')
+    def test_tenant_hash_different_tenants(self, mock_s3):
         """Different tenants should have different hashes."""
+        _mock_s3_mappings(mock_s3, {
+            'TENANT_A': 'te0000000000aa',
+            'TENANT_B': 'te0000000000bb',
+        })
         hash1 = get_tenant_hash('TENANT_A')
         hash2 = get_tenant_hash('TENANT_B')
         assert hash1 != hash2
@@ -47,9 +85,9 @@ class TestGetTenantHash:
 class TestHandleSessionDetail:
     """Tests for handle_session_detail() function."""
 
-    @pytest.mark.skip(reason="Cascades from get_tenant_hash credential issue: tenant resolves to None, downstream tenant-mismatch check returns 403. Needs get_tenant_hash mocked alongside dynamodb.")
+    @patch('lambda_function.get_tenant_hash', return_value='fo70c7c68b4dd6')
     @patch('lambda_function.dynamodb')
-    def test_session_detail_success(self, mock_dynamodb):
+    def test_session_detail_success(self, mock_dynamodb, mock_get_tenant_hash):
         """Should return session with all events."""
         mock_dynamodb.query.return_value = {
             'Items': [
@@ -139,9 +177,9 @@ class TestHandleSessionDetail:
         assert result['statusCode'] == 400
         assert 'required' in body['error'].lower()
 
-    @pytest.mark.skip(reason="Same get_tenant_hash credential cascade as test_session_detail_success — tenant_hash is None, never reaches the outcome assertion (KeyError 'summary' on the 403 response body).")
+    @patch('lambda_function.get_tenant_hash', return_value='fo70c7c68b4dd6')
     @patch('lambda_function.dynamodb')
-    def test_session_detail_outcome_tracking(self, mock_dynamodb):
+    def test_session_detail_outcome_tracking(self, mock_dynamodb, mock_get_tenant_hash):
         """Should correctly determine outcome from events."""
         mock_dynamodb.query.return_value = {
             'Items': [
@@ -174,15 +212,19 @@ class TestHandleSessionDetail:
 class TestHandleSessionsList:
     """Tests for handle_sessions_list() function."""
 
-    @pytest.mark.skip(reason="Stale test: response shape evolved. Test asserts body['sessions'][0]['session_id'] == 'sess_123', but actual returns the started_at timestamp '2025-12-26T10:00:00Z' in that field. Either the response builder regressed (mapping started_at → session_id) or the test is asserting against an older shape and needs updating.")
+    @patch('lambda_function.enrich_sessions_with_events',
+           return_value={'sess_123': {'event_count': 5, 'outcome': 'form_completed'}})
+    @patch('lambda_function.get_tenant_hash', return_value='fo85e6a06dcdf4')
     @patch('lambda_function.dynamodb')
-    def test_sessions_list_success(self, mock_dynamodb):
+    def test_sessions_list_success(self, mock_dynamodb, mock_get_tenant_hash, mock_enrich):
         """Should return paginated list of sessions."""
+        # SK format is SESSION#{session_id} (the timestamp-prefixed legacy format
+        # was retired — see lambda_function.py:3947).
         mock_dynamodb.query.return_value = {
             'Items': [
                 {
                     'pk': {'S': 'TENANT#fo85e6a06dcdf4'},
-                    'sk': {'S': 'SESSION#2025-12-26T10:00:00Z#sess_123'},
+                    'sk': {'S': 'SESSION#sess_123'},
                     'started_at': {'S': '2025-12-26T10:00:00Z'},
                     'ended_at': {'S': '2025-12-26T10:10:00Z'},
                     'outcome': {'S': 'form_completed'},
@@ -215,18 +257,23 @@ class TestHandleSessionsList:
         assert body['sessions'] == []
         assert body['pagination']['count'] == 0
 
-    @pytest.mark.skip(reason="Stale test: handle_sessions_list now always builds a date-range FilterExpression (started_at >= :start_date AND started_at < :end_date). The test asserts FilterExpression == '#outcome = :outcome' which is the historical behavior. Either restore an outcome-only branch (if outcome filter regressed) or update the assertion to verify outcome filter is appended after the date filter.")
+    @patch('lambda_function.get_tenant_hash', return_value='fo85e6a06dcdf4')
     @patch('lambda_function.dynamodb')
-    def test_sessions_list_with_outcome_filter(self, mock_dynamodb):
-        """Should apply outcome filter."""
+    def test_sessions_list_with_outcome_filter(self, mock_dynamodb, mock_get_tenant_hash):
+        """Outcome filter is applied post-enrichment in Python (computed outcomes
+        from the events table are authoritative), not in DynamoDB. The DynamoDB
+        FilterExpression is the date range; the visible signal that outcome
+        filtering is active is the inflated fetch_limit (3x requested limit)."""
         mock_dynamodb.query.return_value = {'Items': []}
 
-        handle_sessions_list('FOS123', {'outcome': 'form_completed'})
+        handle_sessions_list('FOS123', {'outcome': 'form_completed', 'limit': '25'})
 
-        # Verify filter was applied
         call_args = mock_dynamodb.query.call_args
-        assert 'FilterExpression' in call_args[1]
-        assert call_args[1]['FilterExpression'] == '#outcome = :outcome'
+        # Date filter is always present and is the *only* DynamoDB-side filter.
+        assert 'started_at' in call_args[1]['FilterExpression']
+        assert '#outcome' not in call_args[1]['FilterExpression']
+        # Outcome filter triggers oversampling so post-enrichment filter has headroom.
+        assert call_args[1]['Limit'] == 75  # limit (25) * 3
 
     def test_sessions_list_invalid_outcome(self):
         """Should return 400 for invalid outcome filter."""
