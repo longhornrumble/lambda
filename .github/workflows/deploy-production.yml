@@ -117,7 +117,7 @@ jobs:
           aws lambda update-function-code \
             --function-name ${{ matrix.lambda.prod_function }} \
             --zip-file fileb:///tmp/deploy.zip \
-            --publish=false \
+            --no-publish \
             --query '{State:State, LastUpdateStatus:LastUpdateStatus}'
           aws lambda wait function-updated \
             --function-name ${{ matrix.lambda.prod_function }}
