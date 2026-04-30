@@ -678,73 +678,75 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   }
 
   if (emailRecipients && emailRecipients.length > 0) {
-    try {
-      // Use notification config for subject/body if available
-      const emailSubject = internalNotif.subject || null;
-      const emailBodyTemplate = internalNotif.body_template || null;
-      const sesResponse = await sendFormEmail(emailRecipients, formId, displayData, config, priority, submissionId, emailSubject, emailBodyTemplate, sessionId, emailContact);
-      results.push({ channel: 'email', status: 'sent', recipients: Array.isArray(emailRecipients) ? emailRecipients.length : 1 });
+    // Send one SES email per recipient so each gets a unique MessageId.
+    // SES embeds an open-tracking pixel that's keyed by MessageId; with a single
+    // multi-TO send, opens/clicks can't be attributed to a specific recipient.
+    // Per-recipient sends give us full delivery + open + click attribution at the
+    // cost of recipients no longer seeing each other on the TO line.
+    const recipientList = Array.isArray(emailRecipients) ? emailRecipients : [emailRecipients];
+    const emailSubject = internalNotif.subject || null;
+    const emailBodyTemplate = internalNotif.body_template || null;
+    let successCount = 0;
 
-      // Audit: write one record per recipient to picasso-notification-sends
-      const sesMessageId = sesResponse?.MessageId || 'unknown';
+    for (const recipient of recipientList) {
       const nowIso = new Date().toISOString();
-      const recipientList = Array.isArray(emailRecipients) ? emailRecipients : [emailRecipients];
-      for (const recipient of recipientList) {
-        try {
-          await dynamodb.send(new PutCommand({
-            TableName: NOTIFICATION_SENDS_TABLE,
-            Item: {
-              pk: `TENANT#${config.tenant_id || 'unknown'}`,
-              sk: `${nowIso.slice(0, 10)}#email#${sesMessageId}#${recipient}`,
-              channel: 'email',
-              recipient: recipient,
-              user_id: emailUserIdMap[recipient] || '',
-              submission_id: submissionId || 'unknown',
-              form_id: formId || 'unknown',
-              template: 'internal_notification',
-              status: 'sent',
-              error: '',
-              message_id: sesMessageId,
-              timestamp: nowIso,
-              ttl: Math.floor(Date.now() / 1000) + 90 * 24 * 3600,
-            }
-          }));
-        } catch (ddbErr) {
-          console.error('Failed to write notification send record to DynamoDB:', ddbErr);
-        }
+      let sesMessageId = '';
+      let sendError = null;
+
+      // Peer recipients = the same form's notification list, minus the current
+      // recipient. Surfaced in the email body so each staff member can see who
+      // else on the team was notified (recovers visibility lost when we moved
+      // off multi-TO sends).
+      const otherRecipients = recipientList.filter(r => r !== recipient);
+
+      try {
+        const sesResponse = await sendFormEmail(
+          recipient, formId, displayData, config, priority,
+          submissionId, emailSubject, emailBodyTemplate, sessionId, emailContact,
+          otherRecipients
+        );
+        sesMessageId = sesResponse?.MessageId || 'unknown';
+        successCount++;
+      } catch (err) {
+        console.error(`Email fulfillment failed for ${recipient}:`, err);
+        sendError = err;
       }
-    } catch (error) {
-      console.error('Email fulfillment failed:', error);
-      results.push({ channel: 'email', status: 'failed', error: error.message });
 
-      // Audit: record failure for each intended recipient
-      const nowIso = new Date().toISOString();
-      const recipientList = Array.isArray(emailRecipients) ? emailRecipients : [emailRecipients];
-      for (const recipient of recipientList) {
-        try {
-          await dynamodb.send(new PutCommand({
-            TableName: NOTIFICATION_SENDS_TABLE,
-            Item: {
-              pk: `TENANT#${config.tenant_id || 'unknown'}`,
-              sk: `${nowIso.slice(0, 10)}#email#failed-${submissionId || 'unknown'}-${recipient}`,
-              channel: 'email',
-              recipient: recipient,
-              user_id: emailUserIdMap[recipient] || '',
-              submission_id: submissionId || 'unknown',
-              form_id: formId || 'unknown',
-              template: 'internal_notification',
-              status: 'failed',
-              error: error.message || 'unknown error',
-              message_id: '',
-              timestamp: nowIso,
-              ttl: Math.floor(Date.now() / 1000) + 90 * 24 * 3600,
-            }
-          }));
-        } catch (ddbErr) {
-          console.error('Failed to write notification failure record to DynamoDB:', ddbErr);
-        }
+      // Audit: one row per recipient, success or failure
+      try {
+        await dynamodb.send(new PutCommand({
+          TableName: NOTIFICATION_SENDS_TABLE,
+          Item: {
+            pk: `TENANT#${config.tenant_id || 'unknown'}`,
+            sk: sendError
+              ? `${nowIso.slice(0, 10)}#email#failed-${submissionId || 'unknown'}-${recipient}`
+              : `${nowIso.slice(0, 10)}#email#${sesMessageId}#${recipient}`,
+            channel: 'email',
+            recipient: recipient,
+            user_id: emailUserIdMap[recipient] || '',
+            submission_id: submissionId || 'unknown',
+            form_id: formId || 'unknown',
+            template: 'internal_notification',
+            status: sendError ? 'failed' : 'sent',
+            error: sendError ? (sendError.message || 'unknown error') : '',
+            message_id: sesMessageId,
+            timestamp: nowIso,
+            ttl: Math.floor(Date.now() / 1000) + 90 * 24 * 3600,
+          }
+        }));
+      } catch (ddbErr) {
+        console.error('Failed to write notification send record to DynamoDB:', ddbErr);
       }
     }
+
+    // 'sent' if any recipient succeeded; 'failed' only if all failed.
+    // Per-recipient outcome is in picasso-notification-sends rows.
+    results.push({
+      channel: 'email',
+      status: successCount > 0 ? 'sent' : 'failed',
+      recipients: successCount,
+      total: recipientList.length,
+    });
   }
 
   // SMS fulfillment via SMS_Sender Lambda (Telnyx)
@@ -1052,7 +1054,7 @@ async function writeConsentRecord(tenantId, phoneE164, formId, submissionId, con
 /**
  * Send form data via email
  */
-async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal', submissionId = 'unknown', customSubject = null, bodyTemplate = null, sessionId = null, contact = null) {
+async function sendFormEmail(toEmail, formId, formData, config, priority = 'normal', submissionId = 'unknown', customSubject = null, bodyTemplate = null, sessionId = null, contact = null, otherRecipients = []) {
   // Build human-readable form data for template substitution
   const formDataText = Object.entries(formData)
     .map(([key, value]) => `${key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}: ${value}`)
@@ -1111,6 +1113,17 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
     `;
   }
 
+  // Peer-recipient awareness footer. Each recipient gets their own SES send
+  // (own MessageId for per-recipient tracking), so the multi-TO header is gone.
+  // This footer lists the other staff who received the same form's notification.
+  let textBody = formDataText;
+  if (otherRecipients && otherRecipients.length > 0) {
+    const peerListText = otherRecipients.join(', ');
+    const peerListHtml = otherRecipients.map(escapeHtml).join(', ');
+    htmlBody += `<p style="color: #999; font-size: 12px; margin-top: 8px;">Also notified: ${peerListHtml}</p>`;
+    textBody += `\n\nAlso notified: ${peerListText}`;
+  }
+
   const params = {
     Source: getSESFromEmail(),
     Destination: {
@@ -1119,7 +1132,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
     Message: {
       Subject: { Data: subject },
       Body: {
-        Text: { Data: formDataText },
+        Text: { Data: textBody },
         Html: { Data: htmlBody }
       }
     },

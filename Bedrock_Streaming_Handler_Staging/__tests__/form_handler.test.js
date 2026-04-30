@@ -1560,3 +1560,176 @@ describe.skip('Email Details Builder - via Bubble Webhook Payload', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Per-recipient email send (multi-recipient internal notifications)
+//
+// SES open/click tracking embeds a tracking pixel keyed by MessageId. With one
+// SendEmail call to multiple ToAddresses, all recipients share a MessageId and
+// per-recipient open/click attribution is impossible. Sending one SES call per
+// recipient gives each its own MessageId, restoring full tracking.
+// ---------------------------------------------------------------------------
+
+describe('Form Handler - Per-recipient email sends', () => {
+  // Form config with three internal-notification recipients
+  const multiRecipientConfig = {
+    tenant_id: 'MULTI_TEST',
+    chat_title: 'Multi Org',
+    conversational_forms: {
+      multi_form: {
+        form_id: 'multi_form',
+        title: 'Multi Recipient Form',
+        fields: [
+          { id: 'first_name', type: 'text', required: true },
+          { id: 'last_name', type: 'text', required: true },
+          { id: 'email', type: 'email', required: true },
+        ],
+        notifications: {
+          internal: {
+            enabled: true,
+            recipients: ['alice@example.org', 'bob@example.org', 'carol@example.org'],
+          },
+        },
+      },
+    },
+  };
+
+  beforeEach(() => {
+    sesMock.reset();
+    snsMock.reset();
+    dynamoMock.reset();
+    lambdaMock.reset();
+    s3Mock.reset();
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({ Item: { count: 0 } });
+    dynamoMock.on(UpdateCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+  });
+
+  it('sends one SES call per internal-notification recipient with unique MessageIds', async () => {
+    let callCount = 0;
+    sesMock.on(SendEmailCommand).callsFake(() => {
+      callCount += 1;
+      return Promise.resolve({ MessageId: `msg-${callCount}` });
+    });
+
+    await submitForm('multi_form', mockFormData, multiRecipientConfig);
+
+    // 3 internal notifications + 1 applicant confirmation = 4 SES calls total.
+    const internalCalls = sesMock.commandCalls(SendEmailCommand)
+      .filter(c => c.args[0].input.Tags?.some(t => t.Name === 'email_type' && t.Value === 'internal_notification'));
+    expect(internalCalls).toHaveLength(3);
+
+    // Each internal call must have exactly one ToAddress.
+    const internalTos = internalCalls.map(c => c.args[0].input.Destination.ToAddresses);
+    expect(internalTos).toEqual([
+      ['alice@example.org'],
+      ['bob@example.org'],
+      ['carol@example.org'],
+    ]);
+  });
+
+  it('writes one notification-sends audit row per recipient with its MessageId', async () => {
+    let callCount = 0;
+    sesMock.on(SendEmailCommand).callsFake(() => {
+      callCount += 1;
+      return Promise.resolve({ MessageId: `unique-msg-${callCount}` });
+    });
+
+    await submitForm('multi_form', mockFormData, multiRecipientConfig);
+
+    // The audit table receives one row per internal recipient.
+    const sendsRows = dynamoMock.commandCalls(PutCommand)
+      .map(c => c.args[0].input)
+      .filter(input => input.TableName === (process.env.NOTIFICATION_SENDS_TABLE || 'picasso-notification-sends'));
+
+    expect(sendsRows).toHaveLength(3);
+    const recipients = sendsRows.map(r => r.Item.recipient).sort();
+    expect(recipients).toEqual(['alice@example.org', 'bob@example.org', 'carol@example.org']);
+
+    // Each row carries a distinct MessageId tying it back to its individual SES send.
+    const messageIds = new Set(sendsRows.map(r => r.Item.message_id));
+    expect(messageIds.size).toBe(3);
+    sendsRows.forEach(row => expect(row.Item.status).toBe('sent'));
+  });
+
+  it('includes "Also notified" footer listing the other recipients in each email body', async () => {
+    let i = 0;
+    sesMock.on(SendEmailCommand).callsFake(() => {
+      i += 1;
+      return Promise.resolve({ MessageId: `msg-${i}` });
+    });
+
+    await submitForm('multi_form', mockFormData, multiRecipientConfig);
+
+    const internalCalls = sesMock.commandCalls(SendEmailCommand)
+      .filter(c => c.args[0].input.Tags?.some(t => t.Name === 'email_type' && t.Value === 'internal_notification'));
+    expect(internalCalls).toHaveLength(3);
+
+    // Map each call to its (recipient → bodyHtml).
+    const bodiesByRecipient = {};
+    for (const call of internalCalls) {
+      const to = call.args[0].input.Destination.ToAddresses[0];
+      bodiesByRecipient[to] = call.args[0].input.Message.Body.Html.Data;
+    }
+
+    // Alice's body lists bob & carol but not alice.
+    expect(bodiesByRecipient['alice@example.org']).toContain('Also notified:');
+    expect(bodiesByRecipient['alice@example.org']).toContain('bob@example.org');
+    expect(bodiesByRecipient['alice@example.org']).toContain('carol@example.org');
+    expect(bodiesByRecipient['alice@example.org']).not.toMatch(/Also notified:[^<]*alice@example\.org/);
+
+    // Bob's body lists alice & carol but not bob.
+    expect(bodiesByRecipient['bob@example.org']).toContain('alice@example.org');
+    expect(bodiesByRecipient['bob@example.org']).toContain('carol@example.org');
+    expect(bodiesByRecipient['bob@example.org']).not.toMatch(/Also notified:[^<]*bob@example\.org/);
+  });
+
+  it('omits "Also notified" footer when there is only one recipient', async () => {
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'msg-1' });
+
+    const singleRecipientConfig = {
+      ...multiRecipientConfig,
+      conversational_forms: {
+        multi_form: {
+          ...multiRecipientConfig.conversational_forms.multi_form,
+          notifications: { internal: { enabled: true, recipients: ['solo@example.org'] } },
+        },
+      },
+    };
+
+    await submitForm('multi_form', mockFormData, singleRecipientConfig);
+
+    const internalCalls = sesMock.commandCalls(SendEmailCommand)
+      .filter(c => c.args[0].input.Tags?.some(t => t.Name === 'email_type' && t.Value === 'internal_notification'));
+    expect(internalCalls).toHaveLength(1);
+    expect(internalCalls[0].args[0].input.Message.Body.Html.Data).not.toContain('Also notified:');
+  });
+
+  it('records per-recipient outcome rows when one recipient fails but others succeed', async () => {
+    let i = 0;
+    sesMock.on(SendEmailCommand).callsFake(() => {
+      i += 1;
+      // Fail the second internal notification call only.
+      if (i === 2) return Promise.reject(new Error('SES throttle'));
+      return Promise.resolve({ MessageId: `msg-${i}` });
+    });
+
+    const result = await submitForm('multi_form', mockFormData, multiRecipientConfig);
+
+    // Top-level status is 'sent' because at least one succeeded; recipient
+    // count carries the granular signal.
+    const emailResult = result.fulfillment.find(r => r.channel === 'email');
+    expect(emailResult).toMatchObject({ status: 'sent', recipients: 2, total: 3 });
+
+    // Per-recipient audit rows reflect the actual per-row outcome.
+    const sendsRows = dynamoMock.commandCalls(PutCommand)
+      .map(c => c.args[0].input)
+      .filter(input => input.TableName === (process.env.NOTIFICATION_SENDS_TABLE || 'picasso-notification-sends'));
+
+    const statuses = sendsRows.map(r => r.Item.status).sort();
+    expect(statuses).toEqual(['failed', 'sent', 'sent']);
+    const failedRow = sendsRows.find(r => r.Item.status === 'failed');
+    expect(failedRow.Item.error).toContain('SES throttle');
+  });
+});
