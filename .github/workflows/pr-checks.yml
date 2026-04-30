@@ -202,6 +202,12 @@ jobs:
     timeout-minutes: 10
     needs: detect-changes
 
+    # AWS_DEFAULT_REGION mirrors the Lambda runtime environment so tests can
+    # import handlers that construct boto3 clients at module load (eager region
+    # resolution requires a region; without one, botocore raises NoRegionError).
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+
     if: |
       needs.detect-changes.outputs.meta_oauth == 'true' ||
       needs.detect-changes.outputs.master == 'true' ||
