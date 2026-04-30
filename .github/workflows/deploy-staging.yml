@@ -1,0 +1,162 @@
+name: Deploy Lambda — Staging
+
+# Auto-deploy each touched Lambda's code to its `*_Staging` counterpart on
+# merge to main. Publishes a numbered version (with commit message as the
+# description), rolls `prev` forward to the previously-live version, and flips
+# `live` to the newly-published version.
+#
+# Note: until each function's URL is rebound from $LATEST to alias `live`,
+# the alias flip is informational only — traffic still hits $LATEST.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      lambda:
+        description: Lambda name to deploy (matches matrix include)
+        type: choice
+        required: true
+        options:
+          - Analytics_Dashboard_API
+
+concurrency:
+  group: deploy-staging-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.13'
+
+jobs:
+  detect-changes:
+    name: Detect changed Lambdas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      analytics_dashboard_api: ${{ steps.filter.outputs.analytics_dashboard_api }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            analytics_dashboard_api:
+              - 'Analytics_Dashboard_API/**'
+
+  deploy:
+    name: Deploy ${{ matrix.lambda.staging_function }}
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      needs.detect-changes.outputs.analytics_dashboard_api == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        lambda:
+          - source_dir: Analytics_Dashboard_API
+            staging_function: Analytics_Dashboard_API_Staging
+            handler: lambda_function.lambda_handler
+            # Files included in the deployment zip (anything not listed is excluded).
+            # Keep this surgical — exclude tests, migration scripts, build helpers.
+            include_globs: 'lambda_function.py tenant_registry_ops.py'
+            # Smoke endpoint and expected status without auth (proves runtime is up).
+            smoke_path: /forms/summary
+            smoke_expect_status: '401'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package function
+        id: package
+        working-directory: ${{ matrix.lambda.source_dir }}
+        run: |
+          set -euo pipefail
+          zip -q -r9 /tmp/deploy.zip ${{ matrix.lambda.include_globs }}
+          echo "size=$(stat -c%s /tmp/deploy.zip)" >> "$GITHUB_OUTPUT"
+          echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
+
+      - name: Update function code
+        id: update
+        run: |
+          set -euo pipefail
+          aws lambda update-function-code \
+            --function-name ${{ matrix.lambda.staging_function }} \
+            --zip-file fileb:///tmp/deploy.zip \
+            --publish=false \
+            --query '{State:State, LastUpdateStatus:LastUpdateStatus}'
+          aws lambda wait function-updated \
+            --function-name ${{ matrix.lambda.staging_function }}
+
+      - name: Publish version
+        id: publish
+        run: |
+          set -euo pipefail
+          COMMIT_SHA=${{ github.sha }}
+          COMMIT_MSG=$(git log -1 --pretty=%s "$COMMIT_SHA")
+          # Compose version note (truncate to Lambda's 256-char description limit)
+          NOTE="${COMMIT_MSG} (${COMMIT_SHA:0:7})"
+          NOTE=${NOTE:0:256}
+          NEW_VERSION=$(aws lambda publish-version \
+            --function-name ${{ matrix.lambda.staging_function }} \
+            --description "$NOTE" \
+            --query Version --output text)
+          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "note=$NOTE" >> "$GITHUB_OUTPUT"
+          echo "Published v$NEW_VERSION: $NOTE"
+
+      - name: Roll alias prev → previous live
+        run: |
+          set -euo pipefail
+          CURRENT_LIVE=$(aws lambda get-alias \
+            --function-name ${{ matrix.lambda.staging_function }} \
+            --name live --query FunctionVersion --output text)
+          aws lambda update-alias \
+            --function-name ${{ matrix.lambda.staging_function }} \
+            --name prev \
+            --function-version "$CURRENT_LIVE"
+          echo "prev now → v$CURRENT_LIVE (rollback target)"
+
+      - name: Flip alias live → new version
+        run: |
+          set -euo pipefail
+          aws lambda update-alias \
+            --function-name ${{ matrix.lambda.staging_function }} \
+            --name live \
+            --function-version ${{ steps.publish.outputs.new_version }}
+          echo "live now → v${{ steps.publish.outputs.new_version }}"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          URL=$(aws lambda list-function-url-configs \
+            --function-name ${{ matrix.lambda.staging_function }} \
+            --query 'FunctionUrlConfigs[0].FunctionUrl' --output text)
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${URL%/}${{ matrix.lambda.smoke_path }}")
+          echo "Smoke: GET ${URL%/}${{ matrix.lambda.smoke_path }} → $STATUS"
+          if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
+            echo "::error::Expected ${{ matrix.lambda.smoke_expect_status }}, got $STATUS"
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Deployed ${{ matrix.lambda.staging_function }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **New version:** v${{ steps.publish.outputs.new_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Note:** ${{ steps.publish.outputs.note }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Smoke:** passed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rollback: \`aws lambda update-alias --function-name ${{ matrix.lambda.staging_function }} --name live --function-version \$(aws lambda get-alias --function-name ${{ matrix.lambda.staging_function }} --name prev --query FunctionVersion --output text)\`" >> "$GITHUB_STEP_SUMMARY"
