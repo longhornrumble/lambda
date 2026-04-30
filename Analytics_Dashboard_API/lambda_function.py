@@ -1275,8 +1275,20 @@ def handle_features(tenant_id: str) -> Dict[str, Any]:
     """
     Handle GET /features endpoint.
     Returns dashboard feature flags for the authenticated tenant.
+
+    Super-admins always see all dashboards regardless of the requested
+    tenant's config — same pattern as /auth/clerk JWT issuance.
     """
-    features = get_tenant_features(tenant_id)
+    if _request_user_role == 'super_admin':
+        features = {
+            'dashboard_conversations': True,
+            'dashboard_forms': True,
+            'dashboard_attribution': True,
+            'dashboard_notifications': True,
+            'dashboard_settings': True,
+        }
+    else:
+        features = get_tenant_features(tenant_id)
 
     return cors_response(200, {
         'tenant_id': tenant_id,
