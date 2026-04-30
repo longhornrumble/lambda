@@ -1078,8 +1078,7 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
     elapsed_ms = int((time.time() - start) * 1000)
     logger.info(
         f'[clerk-auth] Issued internal JWT for {redact_email(email)} '
-        f'tenant={user_info["tenant_id"]} role={user_info["role"]} '
-        f'features={features} latency={elapsed_ms}ms'
+        f'tenant={user_info["tenant_id"]} role={user_info["role"]} latency={elapsed_ms}ms'
     )
 
     return cors_response(200, {'token': internal_token})
