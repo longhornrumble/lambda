@@ -202,6 +202,12 @@ jobs:
     timeout-minutes: 10
     needs: detect-changes
 
+    # AWS_DEFAULT_REGION mirrors the Lambda runtime environment so tests can
+    # import handlers that construct boto3 clients at module load (eager region
+    # resolution requires a region; without one, botocore raises NoRegionError).
+    env:
+      AWS_DEFAULT_REGION: us-east-1
+
     if: |
       needs.detect-changes.outputs.meta_oauth == 'true' ||
       needs.detect-changes.outputs.master == 'true' ||
@@ -239,14 +245,24 @@ jobs:
         if: matrix.changed == 'true'
         uses: actions/checkout@v4
 
-      - name: Setup Python ${{ env.PYTHON_VERSION }}
-        if: matrix.changed == 'true'
+      # Two setup steps because actions/setup-python@v5 errors when
+      # cache-dependency-path doesn't match any file (no pyproject.toml fallback
+      # exists in this repo). Lambdas without requirements.txt set up Python
+      # without pip caching; the install (pytest + boto3) is fast enough that
+      # the cache wouldn't save meaningful time anyway.
+      - name: Setup Python ${{ env.PYTHON_VERSION }} (with pip cache)
+        if: matrix.changed == 'true' && matrix.has_requirements == true
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-          cache-dependency-path: |
-            ${{ matrix.lambda }}/requirements.txt
+          cache-dependency-path: ${{ matrix.lambda }}/requirements.txt
+
+      - name: Setup Python ${{ env.PYTHON_VERSION }}
+        if: matrix.changed == 'true' && matrix.has_requirements != true
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Lambda dependencies (requirements.txt)
         if: matrix.changed == 'true' && matrix.has_requirements == true
