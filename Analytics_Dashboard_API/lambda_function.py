@@ -4815,12 +4815,6 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
                 sk_parts = sk.split('#')
                 message_id = sk_parts[2] if len(sk_parts) >= 3 else ''
 
-                # Full ISO timestamp from event_type_timestamp GSI SK:
-                # format: <event_type>#<ISO_timestamp>
-                et_ts = item.get('event_type_timestamp', {}).get('S', '')
-                et_ts_parts = et_ts.split('#', 1)
-                timestamp = et_ts_parts[1] if len(et_ts_parts) == 2 else sk_parts[0] if sk_parts else ''
-
                 # email_type from SES tags (internal_notification | applicant_confirmation)
                 email_type = tags.get('email_type', {}).get('S', '')
 
@@ -4849,6 +4843,25 @@ def handle_notification_events(tenant_id: str, params: Dict[str, str]) -> Dict[s
                         detail[k] = [
                             li.get('S', '') for li in v['L'] if 'S' in li
                         ]
+
+                # Prefer the per-event timestamp captured in detail. Older rows
+                # wrote mail.timestamp into event_type_timestamp for every event
+                # type, so reading from detail.* gives true per-event chronology
+                # for both new and existing rows. Falls back to the legacy SK
+                # timestamp, then to the SK date partition.
+                timestamp = (
+                    detail.get('delivery_timestamp')
+                    or detail.get('open_timestamp')
+                    or detail.get('click_timestamp')
+                    or detail.get('bounce_timestamp')
+                    or detail.get('complaint_timestamp')
+                    or detail.get('send_timestamp')
+                    or ''
+                )
+                if not timestamp:
+                    et_ts = item.get('event_type_timestamp', {}).get('S', '')
+                    et_ts_parts = et_ts.split('#', 1)
+                    timestamp = et_ts_parts[1] if len(et_ts_parts) == 2 else (sk_parts[0] if sk_parts else '')
 
                 all_events.append({
                     'timestamp': timestamp,
