@@ -1038,8 +1038,19 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
         logger.warning(f'[clerk-auth] Org lookup failed: {exc}')
         return cors_response(403, {'error': f'Authentication failed: {exc}'})
 
-    # Step 5 — Load feature flags from S3 tenant config
-    features = get_tenant_features(user_info['tenant_id'])
+    # Step 5 — Load feature flags. Super-admins see all dashboards regardless
+    # of their home tenant's config (they can switch into other tenants and need
+    # full visibility). Everyone else gets features from their tenant's config.
+    if is_super_admin:
+        features = {
+            'dashboard_conversations': True,
+            'dashboard_forms': True,
+            'dashboard_attribution': True,
+            'dashboard_notifications': True,
+            'dashboard_settings': True,
+        }
+    else:
+        features = get_tenant_features(user_info['tenant_id'])
 
     # Step 6 — Build and sign internal Picasso JWT
     try:
