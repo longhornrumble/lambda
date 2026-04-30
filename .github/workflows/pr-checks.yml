@@ -38,8 +38,10 @@ jobs:
       meta_webhook:   ${{ steps.filter.outputs.meta_webhook }}
       meta_response:  ${{ steps.filter.outputs.meta_response }}
       # Python Lambdas with tests
-      meta_oauth:     ${{ steps.filter.outputs.meta_oauth }}
-      master:         ${{ steps.filter.outputs.master }}
+      meta_oauth:              ${{ steps.filter.outputs.meta_oauth }}
+      master:                  ${{ steps.filter.outputs.master }}
+      analytics_dashboard_api: ${{ steps.filter.outputs.analytics_dashboard_api }}
+      ses_event_handler:       ${{ steps.filter.outputs.ses_event_handler }}
       # Node.js Lambda using node:test runner (no Jest)
       applier:        ${{ steps.filter.outputs.applier }}
       notification_hub: ${{ steps.filter.outputs.notification_hub }}
@@ -67,6 +69,10 @@ jobs:
               - 'Meta_OAuth_Handler/**'
             master:
               - 'Master_Function_Staging/**'
+            analytics_dashboard_api:
+              - 'Analytics_Dashboard_API/**'
+            ses_event_handler:
+              - 'ses_event_handler/**'
             applier:
               - 'kb_proposal_applier/**'
             notification_hub:
@@ -198,7 +204,9 @@ jobs:
 
     if: |
       needs.detect-changes.outputs.meta_oauth == 'true' ||
-      needs.detect-changes.outputs.master == 'true'
+      needs.detect-changes.outputs.master == 'true' ||
+      needs.detect-changes.outputs.analytics_dashboard_api == 'true' ||
+      needs.detect-changes.outputs.ses_event_handler == 'true'
 
     strategy:
       fail-fast: false
@@ -211,6 +219,14 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.master }}
             # Master_Function_Staging has no requirements.txt — boto3 and PyJWT
             # are provided by the Lambda runtime / layer at runtime.
+            has_requirements: false
+          - lambda: Analytics_Dashboard_API
+            changed: ${{ needs.detect-changes.outputs.analytics_dashboard_api }}
+            # Uses pyjwt-layer.zip layer at runtime; no top-level requirements.txt.
+            has_requirements: false
+          - lambda: ses_event_handler
+            changed: ${{ needs.detect-changes.outputs.ses_event_handler }}
+            # boto3 from Lambda runtime; no requirements.txt.
             has_requirements: false
 
     steps:
@@ -237,9 +253,11 @@ jobs:
         working-directory: ${{ matrix.lambda }}
         run: pip install -r requirements.txt
 
-      - name: Install pytest
+      - name: Install pytest + boto3
         if: matrix.changed == 'true'
-        run: pip install pytest pytest-cov
+        # boto3 is needed at module-load for Python lambdas that have no
+        # requirements.txt (their handlers import boto3 at the top level).
+        run: pip install pytest pytest-cov boto3
 
       - name: Run pytest
         if: matrix.changed == 'true'
