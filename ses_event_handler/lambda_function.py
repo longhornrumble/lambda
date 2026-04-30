@@ -159,7 +159,24 @@ def lambda_handler(event, context):
                 try:
                     event_type_lower = payload['event_type']
                     message_id = payload.get('message_id') or 'unknown'
-                    iso_date = (payload.get('timestamp') or '').split('T')[0] or \
+
+                    # Resolve the per-event timestamp. mail.timestamp is the original
+                    # send time and is identical across send/delivery/open events for
+                    # the same message — using it for the GSI sort key collapses
+                    # ordering to alphabetical by event_type. Prefer the event-specific
+                    # timestamp (delivery_timestamp, open_timestamp, etc.) so the
+                    # ByMessageId GSI returns events in true chronological order.
+                    event_specific_ts = (
+                        payload.get('delivery_timestamp')
+                        or payload.get('open_timestamp')
+                        or payload.get('click_timestamp')
+                        or payload.get('bounce_timestamp')
+                        or payload.get('complaint_timestamp')
+                        or payload.get('send_timestamp')
+                        or payload.get('timestamp')
+                        or ''
+                    )
+                    iso_date = event_specific_ts.split('T')[0] or \
                         __import__('datetime').datetime.utcnow().strftime('%Y-%m-%d')
 
                     # Build event-specific detail map
@@ -186,7 +203,7 @@ def lambda_handler(event, context):
                         'detail': detail,
                         'tags': tags,
                         'ttl': int(time.time()) + (90 * 24 * 3600),
-                        'event_type_timestamp': f'{event_type_lower}#{payload.get("timestamp", "")}',
+                        'event_type_timestamp': f'{event_type_lower}#{event_specific_ts}',
                     })
                     logger.info(
                         f"DynamoDB write: picasso-notification-events "

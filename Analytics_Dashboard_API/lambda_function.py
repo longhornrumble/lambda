@@ -4926,11 +4926,6 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
     for item in resp.get('Items', []):
         event_type = item.get('event_type', {}).get('S', '')
 
-        # event_type_timestamp SK: <event_type>#<ISO timestamp>
-        sk = item.get('event_type_timestamp', {}).get('S', '')
-        sk_parts = sk.split('#', 1)
-        timestamp = sk_parts[1] if len(sk_parts) == 2 else ''
-
         # detail is a free-form Map attribute
         detail_raw = item.get('detail', {}).get('M', {})
         detail: Dict[str, Any] = {}
@@ -4943,13 +4938,31 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
             elif 'BOOL' in v:
                 detail[k] = v['BOOL']
 
+        # Prefer the per-event timestamp captured in `detail`. Older rows wrote
+        # mail.timestamp into event_type_timestamp for every event type, which
+        # collapsed chronological ordering to alphabetical-by-event_type. Reading
+        # from detail.* yields true chronology for both new and existing rows.
+        timestamp = (
+            detail.get('delivery_timestamp')
+            or detail.get('open_timestamp')
+            or detail.get('click_timestamp')
+            or detail.get('bounce_timestamp')
+            or detail.get('complaint_timestamp')
+            or detail.get('send_timestamp')
+            or ''
+        )
+        if not timestamp:
+            sk = item.get('event_type_timestamp', {}).get('S', '')
+            sk_parts = sk.split('#', 1)
+            timestamp = sk_parts[1] if len(sk_parts) == 2 else ''
+
         events.append({
             'event_type': event_type,
             'timestamp': timestamp,
             'detail': detail,
         })
 
-    # Sort chronologically (send first) — GSI order is by event_type, not timestamp
+    # Sort chronologically (send first)
     events.sort(key=lambda e: e['timestamp'])
 
     return cors_response(200, {
