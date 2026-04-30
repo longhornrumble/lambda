@@ -591,6 +591,7 @@ def _decode_clerk_jwt_claims(token: str) -> Dict[str, Any]:
         issuer=[
             'https://clerk.myrecruiter.ai',
             'https://immune-catfish-56.clerk.accounts.dev',
+            'https://divine-impala-48.clerk.accounts.dev',
         ],
     )
 
