@@ -773,3 +773,159 @@ describe('resolveQuietHoursFallbackEmails', () => {
     expect(result).not.toContain('bob@example.com');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Secrets Manager fallback for CLERK_SECRET_KEY
+//
+// During the env-var → Secrets Manager migration, env var must keep winning
+// when set (safe rollout). Once removed, code falls back to Secrets Manager
+// and caches the value for the Lambda's lifetime.
+// ---------------------------------------------------------------------------
+
+describe('CLERK_SECRET_KEY resolution (env var vs Secrets Manager)', () => {
+  let smGetCmdMock;
+  let originalSecretKey;
+
+  beforeEach(() => {
+    jest.resetModules();
+    originalSecretKey = process.env.CLERK_SECRET_KEY;
+
+    // Mock Secrets Manager SDK
+    smGetCmdMock = jest.fn();
+    jest.doMock('@aws-sdk/client-secrets-manager', () => ({
+      SecretsManagerClient: jest.fn().mockImplementation(() => ({
+        send: smGetCmdMock,
+      })),
+      GetSecretValueCommand: jest.fn().mockImplementation((input) => input),
+    }));
+  });
+
+  afterEach(() => {
+    if (originalSecretKey === undefined) {
+      delete process.env.CLERK_SECRET_KEY;
+    } else {
+      process.env.CLERK_SECRET_KEY = originalSecretKey;
+    }
+  });
+
+  it('uses env var when set, never calling Secrets Manager', async () => {
+    process.env.CLERK_SECRET_KEY = 'sk_test_from_env';
+    const helper = require('../clerk_helper');
+
+    const httpsMock = mockHttpsRequest(200, {
+      id: 'user_x',
+      email_addresses: [{ id: 'em_1', email_address: 'x@example.com' }],
+      primary_email_address_id: 'em_1',
+      public_metadata: {},
+    });
+    jest.spyOn(https, 'request').mockImplementation(httpsMock);
+
+    await helper.resolveEmailsFromUserIds(['user_x']);
+
+    // Env var path: Secrets Manager not called
+    expect(smGetCmdMock).not.toHaveBeenCalled();
+
+    // Confirm the env-var value reached the Clerk request
+    expect(httpsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer sk_test_from_env' }),
+      }),
+      expect.any(Function)
+    );
+  });
+
+  it('falls back to Secrets Manager when env var is absent', async () => {
+    delete process.env.CLERK_SECRET_KEY;
+    smGetCmdMock.mockResolvedValue({
+      SecretString: JSON.stringify({ secret_key: 'sk_live_from_secrets_manager' }),
+    });
+
+    const helper = require('../clerk_helper');
+
+    const httpsMock = mockHttpsRequest(200, {
+      id: 'user_y',
+      email_addresses: [{ id: 'em_2', email_address: 'y@example.com' }],
+      primary_email_address_id: 'em_2',
+      public_metadata: {},
+    });
+    jest.spyOn(https, 'request').mockImplementation(httpsMock);
+
+    await helper.resolveEmailsFromUserIds(['user_y']);
+
+    // Secrets Manager called exactly once
+    expect(smGetCmdMock).toHaveBeenCalledTimes(1);
+
+    // The fetched value reached the Clerk request
+    expect(httpsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer sk_live_from_secrets_manager' }),
+      }),
+      expect.any(Function)
+    );
+  });
+
+  it('caches the Secrets Manager fetch — only one SM call across many invocations', async () => {
+    delete process.env.CLERK_SECRET_KEY;
+    smGetCmdMock.mockResolvedValue({
+      SecretString: JSON.stringify({ secret_key: 'sk_live_cached' }),
+    });
+
+    const helper = require('../clerk_helper');
+
+    let httpsCallCount = 0;
+    jest.spyOn(https, 'request').mockImplementation((options, callback) => {
+      httpsCallCount += 1;
+      const mockReq = new EventEmitter();
+      mockReq.end = jest.fn();
+      mockReq.destroy = jest.fn();
+      const mockRes = new EventEmitter();
+      mockRes.statusCode = 200;
+      setImmediate(() => {
+        callback(mockRes);
+        mockRes.emit(
+          'data',
+          JSON.stringify({
+            id: `user_${httpsCallCount}`,
+            email_addresses: [{ id: 'em', email_address: `u${httpsCallCount}@example.com` }],
+            primary_email_address_id: 'em',
+            public_metadata: {},
+          })
+        );
+        mockRes.emit('end');
+      });
+      return mockReq;
+    });
+
+    // Three separate invocations
+    await helper.resolveEmailsFromUserIds(['user_1']);
+    await helper.resolveEmailsFromUserIds(['user_2']);
+    await helper.resolveEmailsFromUserIds(['user_3']);
+
+    expect(smGetCmdMock).toHaveBeenCalledTimes(1);
+    expect(httpsCallCount).toBe(3);
+  });
+
+  it('handles plaintext-stored secrets (no JSON wrapper)', async () => {
+    delete process.env.CLERK_SECRET_KEY;
+    smGetCmdMock.mockResolvedValue({ SecretString: 'sk_live_plaintext' });
+
+    const helper = require('../clerk_helper');
+
+    const httpsMock = mockHttpsRequest(200, {
+      id: 'user_z',
+      email_addresses: [{ id: 'em_3', email_address: 'z@example.com' }],
+      primary_email_address_id: 'em_3',
+      public_metadata: {},
+    });
+    jest.spyOn(https, 'request').mockImplementation(httpsMock);
+
+    await helper.resolveEmailsFromUserIds(['user_z']);
+
+    expect(httpsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer sk_live_plaintext' }),
+      }),
+      expect.any(Function)
+    );
+  });
+});
