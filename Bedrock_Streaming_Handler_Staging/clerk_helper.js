@@ -5,17 +5,49 @@
  */
 
 const https = require('https');
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
 const CLERK_API_BASE = 'api.clerk.com';
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const CLERK_SECRET_ID = process.env.CLERK_SECRET_KEY_SECRET_ID || 'prod/clerk/picasso/secret_key';
 
 // In-memory cache: userId → { data, fetchedAt }
 const userCache = new Map();
 
-// Startup check
-if (!process.env.CLERK_SECRET_KEY) {
-  console.error('[clerk_helper] CRITICAL: CLERK_SECRET_KEY env var is not set. ' +
-    'recipient_user_ids resolution will fail. Falling back to legacy arrays.');
+// Cached Clerk secret key. Lambda lifetime — fetched once per cold start.
+const smClient = new SecretsManagerClient({});
+let cachedSecretKey = null;
+let secretLoadingPromise = null;
+
+/**
+ * Resolve the Clerk secret key. Prefers process.env.CLERK_SECRET_KEY when set
+ * (backwards compat during the env-var → Secrets Manager migration). Once the
+ * env var is removed, falls back to Secrets Manager and caches for the
+ * Lambda's lifetime.
+ */
+async function getClerkSecretKey() {
+  if (process.env.CLERK_SECRET_KEY) {
+    return process.env.CLERK_SECRET_KEY;
+  }
+  if (cachedSecretKey) {
+    return cachedSecretKey;
+  }
+  if (!secretLoadingPromise) {
+    secretLoadingPromise = (async () => {
+      const result = await smClient.send(new GetSecretValueCommand({ SecretId: CLERK_SECRET_ID }));
+      const raw = result.SecretString || '';
+      // Console-created secrets store JSON like {"secret_key": "sk_live_..."}.
+      // Plaintext-stored secrets are just the raw key string. Handle both.
+      let value = raw;
+      try {
+        const parsed = JSON.parse(raw);
+        value = parsed.secret_key || parsed.CLERK_SECRET_KEY || parsed.value || raw;
+      } catch (_) { /* not JSON — use raw */ }
+      cachedSecretKey = value;
+      return value;
+    })();
+  }
+  return secretLoadingPromise;
 }
 
 /**
@@ -23,9 +55,9 @@ if (!process.env.CLERK_SECRET_KEY) {
  * Returns null for 404 (user deleted). Throws Error on other failures.
  */
 async function fetchClerkUser(userId) {
-  const secretKey = process.env.CLERK_SECRET_KEY;
+  const secretKey = await getClerkSecretKey();
   if (!secretKey) {
-    throw new Error('CLERK_SECRET_KEY not configured');
+    throw new Error('CLERK_SECRET_KEY not configured (env var unset and Secrets Manager fetch returned empty)');
   }
 
   // Check cache

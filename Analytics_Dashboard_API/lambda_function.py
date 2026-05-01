@@ -106,6 +106,36 @@ _clerk_jwks_cache: Optional[Dict[str, Any]] = None
 _clerk_jwks_cache_time: float = 0
 CLERK_JWKS_CACHE_TTL = 3600  # 1 hour
 
+# Clerk secret-key cache (Lambda lifetime). Migration aid — prefers env var
+# when set (backwards compat) and falls back to AWS Secrets Manager.
+_clerk_secret_cache: Dict[str, str] = {}
+CLERK_SECRET_ID = os.environ.get('CLERK_SECRET_KEY_SECRET_ID', 'prod/clerk/picasso/secret_key')
+_secrets_client = boto3.client('secretsmanager', region_name='us-east-1')
+
+
+def get_clerk_secret_key() -> str:
+    """Return the Clerk Backend API secret key. Prefers process.env.
+    CLERK_SECRET_KEY when set (so migration is safe — env var keeps winning
+    until removed), then falls back to Secrets Manager."""
+    env_value = os.environ.get('CLERK_SECRET_KEY', '')
+    if env_value:
+        return env_value
+    if 'value' in _clerk_secret_cache:
+        return _clerk_secret_cache['value']
+    resp = _secrets_client.get_secret_value(SecretId=CLERK_SECRET_ID)
+    raw = resp.get('SecretString', '')
+    # Console-created secrets store JSON like {"secret_key": "sk_live_..."}.
+    # Plaintext-stored secrets are just the raw key string. Handle both.
+    value = raw
+    try:
+        parsed = json.loads(raw)
+        value = parsed.get('secret_key') or parsed.get('CLERK_SECRET_KEY') or parsed.get('value') or raw
+    except (json.JSONDecodeError, ValueError):
+        pass
+    _clerk_secret_cache['value'] = value
+    return value
+
+
 # S3 client
 s3 = boto3.client('s3')
 
@@ -613,9 +643,9 @@ def _fetch_clerk_user(user_id: str) -> Dict[str, Any]:
         if now - _clerk_user_cache_time.get(user_id, 0) < CLERK_USER_CACHE_TTL:
             return _clerk_user_cache[user_id]
 
-    clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
+    clerk_secret = get_clerk_secret_key()
     if not clerk_secret:
-        raise ValueError('No CLERK_SECRET_KEY env var — cannot fetch user from Clerk API')
+        raise ValueError('No CLERK_SECRET_KEY (env var unset and Secrets Manager fetch returned empty) — cannot fetch user from Clerk API')
 
     clerk_url = f'https://api.clerk.com/v1/users/{user_id}'
     logger.info(f'[clerk-auth] Fetching user from {clerk_url}')
@@ -706,9 +736,9 @@ def _fetch_user_org_memberships(user_id: str) -> list:
         if now - _org_membership_cache_time.get(user_id, 0) < ORG_MEMBERSHIP_CACHE_TTL:
             return _org_membership_cache[user_id]
 
-    clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
+    clerk_secret = get_clerk_secret_key()
     if not clerk_secret:
-        raise ValueError('No CLERK_SECRET_KEY env var — cannot fetch org memberships')
+        raise ValueError('No CLERK_SECRET_KEY (env var unset and Secrets Manager fetch returned empty) — cannot fetch org memberships')
 
     clerk_url = f'https://api.clerk.com/v1/users/{user_id}/organization_memberships'
     logger.info(f'[clerk-auth] Fetching org memberships from {clerk_url}')
@@ -821,9 +851,9 @@ def _clerk_api_request(method: str, path: str, body: Optional[dict] = None) -> d
     Returns parsed JSON response.
     Raises ValueError on errors.
     """
-    clerk_secret = os.environ.get('CLERK_SECRET_KEY', '')
+    clerk_secret = get_clerk_secret_key()
     if not clerk_secret:
-        raise ValueError('No CLERK_SECRET_KEY env var')
+        raise ValueError('No CLERK_SECRET_KEY (env var unset and Secrets Manager fetch returned empty)')
 
     url = f'https://api.clerk.com{path}'
     # Always send a body for POST/PATCH/DELETE so Content-Type header is included
