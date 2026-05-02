@@ -957,6 +957,7 @@ def _generate_rotated_token(token_data, increment_turn=True):
         signing_key = _get_jwt_signing_key()
         
         new_payload = {
+            'iss': 'myrecruiter-chat',  # P0a Phase 1 (2026-05-02): claim distinguishes chat-session tokens from scheduling tokens; required by Phase 2 decoder hardening
             'sessionId': token_data['sessionId'],
             'tenantId': token_data['tenantId'],
             'turn': token_data['turn'] + (1 if increment_turn else 0),

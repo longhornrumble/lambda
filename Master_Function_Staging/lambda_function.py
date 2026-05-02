@@ -1428,6 +1428,7 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
                 if not existing_token or existing_token == 'null':
                     # Generate new token with current turn
                     state_token_payload = {
+                        'iss': 'myrecruiter-chat',  # P0a Phase 1 (2026-05-02): claim distinguishes chat-session tokens from scheduling tokens; required by Phase 2 decoder hardening
                         'sessionId': session_id,
                         'tenantId': tenant_hash,
                         'turn': existing_turn,
@@ -1487,6 +1488,7 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
         # Generate proper JWT token matching conversation handler expectations
         # CRITICAL: Use camelCase field names to match conversation_handler.py
         state_token_payload = {
+            'iss': 'myrecruiter-chat',  # P0a Phase 1 (2026-05-02): claim distinguishes chat-session tokens from scheduling tokens; required by Phase 2 decoder hardening
             'sessionId': session_id,  # camelCase required!
             'tenantId': tenant_id,     # camelCase required! Using hash as ID
             'turn': 0,                 # Initial turn
@@ -1538,6 +1540,7 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
             jwt_signing_key = get_jwt_signing_key()
 
             state_token_payload = {
+                'iss': 'myrecruiter-chat',  # P0a Phase 1 (2026-05-02): claim distinguishes chat-session tokens from scheduling tokens; required by Phase 2 decoder hardening
                 'sessionId': session_id,
                 'tenantId': tenant_id,
                 'turn': 0,
@@ -1619,6 +1622,7 @@ def handle_generate_stream_token(event: Dict[str, Any], tenant_hash: str) -> Dic
         # Generate streaming-specific JWT token
         # CRITICAL: Must include 'purpose': 'stream' for streaming handler validation
         stream_token_payload = {
+            'iss': 'myrecruiter-chat',     # P0a Phase 1 (2026-05-02): claim distinguishes chat-class tokens (state + stream) from scheduling tokens; required by Phase 2 decoder hardening
             'sessionId': session_id,      # camelCase required by streaming handler
             'tenantId': tenant_id,         # camelCase required by streaming handler
             'purpose': 'stream',           # REQUIRED for streaming authentication
