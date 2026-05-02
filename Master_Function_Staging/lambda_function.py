@@ -103,6 +103,74 @@ def sanitize_log_data(data: str, max_length: int = 100) -> str:
     # Truncate
     return sanitized[:max_length] + "..." if len(sanitized) > max_length else sanitized
 
+# Single source of truth for tenant-agnostic CORS allowlist. Used by both
+# add_cors_headers() and validate_cors_origin(). When a tenant config is
+# available, it can extend this list via `cors.allowed_origins`.
+_CORS_ALLOWED_ORIGINS_DEFAULT = [
+    'http://localhost:8000',
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'https://chat.myrecruiter.ai',
+    'https://staging.chat.myrecruiter.ai',  # Added 2026-05-02 — staging widget origin was missing
+    'https://picassocode.s3.amazonaws.com',
+    'https://picassostaging.s3.amazonaws.com',
+]
+
+
+def validate_cors_origin(request_headers, tenant_hash, config_data):
+    """
+    Validate the request's Origin header against the allowlist.
+
+    Restored 2026-05-02: response_formatter.py and state_clear_handler.py import
+    this name from lambda_function but it had been undefined, causing an
+    ImportError on every error-response code path and dropping CORS headers.
+    Implementation mirrors add_cors_headers() origin logic for consistency.
+
+    Args:
+        request_headers: dict of HTTP request headers (case-insensitive lookup).
+        tenant_hash: tenant identifier (currently unused for the allowlist
+            decision but kept in the signature for future per-tenant overrides).
+        config_data: tenant config dict (or None). When present, may carry a
+            `cors.allowed_origins` list to extend the default allowlist.
+
+    Returns:
+        (allowed_origin, is_valid):
+            - origin in allowlist → (origin_string, True)
+            - localhost (any port) → (origin_string, True)
+            - no Origin header (server-to-server) → (None, True)
+            - origin present but rejected → (None, False)
+    """
+    # Case-insensitive Origin header lookup.
+    origin = None
+    if request_headers:
+        for key in ('origin', 'Origin', 'ORIGIN'):
+            if key in request_headers and request_headers[key]:
+                origin = request_headers[key]
+                break
+
+    # No Origin header — typical for server-to-server or non-browser clients.
+    # Not a CORS violation; caller can omit the Access-Control-Allow-Origin header.
+    if not origin:
+        return (None, True)
+
+    # Build the allowlist: defaults + any tenant-config extensions.
+    allowed_origins = list(_CORS_ALLOWED_ORIGINS_DEFAULT)
+    if isinstance(config_data, dict):
+        tenant_extras = (config_data.get('cors') or {}).get('allowed_origins')
+        if isinstance(tenant_extras, list):
+            allowed_origins.extend(o for o in tenant_extras if isinstance(o, str))
+
+    # Localhost matches any port (developer machines).
+    if origin.startswith('http://localhost:') or origin.startswith('https://localhost:'):
+        return (origin, True)
+
+    if origin in allowed_origins:
+        return (origin, True)
+
+    # Origin present but not allowed — explicit CORS violation.
+    return (None, False)
+
+
 def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Add CORS headers to response. This is the ONLY place CORS headers are added.
@@ -126,16 +194,12 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
                 break
         
         if origin:
-            # Allow specific trusted origins
-            allowed_origins = [
-                'http://localhost:8000',
-                'http://localhost:5173', 
-                'http://localhost:3000',
-                'https://chat.myrecruiter.ai',
-                'https://picassocode.s3.amazonaws.com',
-                'https://picassostaging.s3.amazonaws.com'
-            ]
-            
+            # Use the shared allowlist defined above (single source of truth with
+            # validate_cors_origin). Includes staging.chat.myrecruiter.ai as of
+            # 2026-05-02 — was missing previously, causing staging widget origins
+            # to fall back to the production default.
+            allowed_origins = _CORS_ALLOWED_ORIGINS_DEFAULT
+
             # Allow any localhost origin or specific trusted origins
             if any(origin.startswith(allowed) for allowed in ['http://localhost:', 'https://localhost:']) or origin in allowed_origins:
                 allowed_origin = origin
