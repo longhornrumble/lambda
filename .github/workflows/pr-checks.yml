@@ -269,17 +269,42 @@ jobs:
         working-directory: ${{ matrix.lambda }}
         run: pip install -r requirements.txt
 
-      - name: Install pytest + boto3
+      - name: Install pytest + boto3 + moto
         if: matrix.changed == 'true'
         # boto3 is needed at module-load for Python lambdas that have no
         # requirements.txt (their handlers import boto3 at the top level).
-        run: pip install pytest pytest-cov boto3
+        # moto<5 pinned because Master_Function_Staging tests use the v4
+        # decorator API (`mock_dynamodb`, `mock_ses`, etc.); moto v5+ replaced
+        # those with a single `mock_aws` decorator. Migrating tests to v5 is
+        # out of scope for this CI fix; pinning is the surgical fix.
+        run: pip install pytest pytest-cov boto3 'moto<5'
 
       - name: Run pytest
         if: matrix.changed == 'true'
         working-directory: ${{ matrix.lambda }}
+        env:
+          # moto v4 best practice: explicit fake AWS credentials prevent
+          # botocore from trying real-AWS auth before the mock activates.
+          # Without these, tests that import boto3 at module level can
+          # surface NoCredentialsError before the @mock_* decorator runs.
+          AWS_ACCESS_KEY_ID: testing
+          AWS_SECRET_ACCESS_KEY: testing
+          AWS_SESSION_TOKEN: testing
+          AWS_DEFAULT_REGION: us-east-1
         # -v for verbose output; --tb=short keeps failures readable in CI.
         # Discover all test_*.py files in the Lambda directory.
+        #
+        # KNOWN TEST DEBT (Master_Function_Staging, surfaced 2026-05-02):
+        # Once moto<5 was installed (this PR), 101 pre-existing logic
+        # failures were exposed in test_form_handler.py, test_error_handling.py,
+        # test_lambda_integration.py, test_notification_services.py,
+        # test_sms_rate_limiting.py, test_dynamodb_operations.py,
+        # test_contact_extractor.py, test_template_renderer.py. These were
+        # hidden behind import-time collection errors before this PR. Each
+        # file's failures are tech debt — production code drift, missing
+        # @patch parameters, moto context scoping. Tracked separately for a
+        # focused future session; not in scope for this CI infrastructure
+        # repair.
         run: python -m pytest -v --tb=short --ignore=node_modules
 
       - name: Upload pytest results on failure

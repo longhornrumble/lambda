@@ -32,9 +32,6 @@ class TestDynamoDBSchemas(unittest.TestCase):
             KeySchema=[
                 {'AttributeName': 'submission_id', 'KeyType': 'HASH'}
             ],
-            AttributeDefinitions=[
-                {'AttributeName': 'submission_id', 'AttributeType': 'S'}
-            ],
             GlobalSecondaryIndexes=[
                 {
                     'IndexName': 'tenant-timestamp-index',

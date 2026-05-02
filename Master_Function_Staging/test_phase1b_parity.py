@@ -1,19 +1,41 @@
 #!/usr/bin/env python3
 """
 Test script for Phase 1B HTTP Fallback Parity
-Tests form_cta_enhancer.py with Austin Angels config
+Tests form_cta_enhancer.py with a tenant config fixture.
+
+CI portability (2026-05-02): the original module-level `open(...)` of
+`/Users/chrismiller/Desktop/Working_Folder/Sandbox/MYR384719-config.json`
+caused a collection-time FileNotFoundError on every CI run because the
+path is local-only to the original author's workstation. The fixture path
+is now resolved via env var `AUSTIN_CONFIG_PATH` with a graceful skip when
+absent — the test still runs locally for whoever has the config and
+no longer crashes CI for everyone else.
 """
 
 import json
-import sys
-from form_cta_enhancer import (
+import os
+
+import pytest
+
+from form_cta_enhancer import (  # noqa: E402  — import after pytest for skip mechanics
     detect_conversation_branch,
     should_trigger_form,
-    enhance_response_with_form_cta
+    enhance_response_with_form_cta,
 )
 
-# Load Austin Angels config
-with open('/Users/chrismiller/Desktop/Working_Folder/Sandbox/MYR384719-config.json', 'r') as f:
+# Load tenant config — env-var driven so CI doesn't hard-fail on a local path.
+AUSTIN_CONFIG_PATH = os.environ.get(
+    'AUSTIN_CONFIG_PATH',
+    '/Users/chrismiller/Desktop/Working_Folder/Sandbox/MYR384719-config.json',
+)
+if not os.path.exists(AUSTIN_CONFIG_PATH):
+    pytest.skip(
+        f"AUSTIN_CONFIG_PATH not found: {AUSTIN_CONFIG_PATH}. "
+        "Set AUSTIN_CONFIG_PATH env var or place the fixture at the default location.",
+        allow_module_level=True,
+    )
+
+with open(AUSTIN_CONFIG_PATH, 'r') as f:
     austin_config = json.load(f)
 
 def test_conversation_branch_detection():
