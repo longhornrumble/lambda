@@ -2,6 +2,8 @@
 Analytics Event Processor Lambda
 
 Processes analytics events from SQS queue and stores them in S3 for Athena queries.
+CI: pr-checks.yml runs test_session_tables.py via the python-tests matrix
+(see issue #42 / PR #43 for the wiring).
 
 Architecture:
 - Triggered by SQS: picasso-analytics-events
