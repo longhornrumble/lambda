@@ -187,9 +187,13 @@ class TestUpdateSessionSummary:
         assert result is True
         call_args = mock_dynamodb.update_item.call_args
         update_expr = call_args[1]['UpdateExpression']
+        expr_values = call_args[1]['ExpressionAttributeValues']
         assert 'user_message_count' in update_expr
         assert 'message_count' in update_expr
         assert 'first_question' in update_expr
+        # Counter bindings must be present for counter branches
+        assert ':one' in expr_values
+        assert ':zero' in expr_values
 
     @patch('lambda_function.dynamodb')
     def test_update_session_summary_message_received(self, mock_dynamodb):
@@ -208,8 +212,12 @@ class TestUpdateSessionSummary:
         assert result is True
         call_args = mock_dynamodb.update_item.call_args
         update_expr = call_args[1]['UpdateExpression']
+        expr_values = call_args[1]['ExpressionAttributeValues']
         assert 'bot_message_count' in update_expr
         assert 'message_count' in update_expr
+        # Counter bindings must be present for counter branches
+        assert ':one' in expr_values
+        assert ':zero' in expr_values
 
     @patch('lambda_function.dynamodb')
     def test_update_session_summary_form_completed(self, mock_dynamodb):
@@ -232,6 +240,10 @@ class TestUpdateSessionSummary:
         assert ':outcome' in expr_values
         assert expr_values[':outcome']['S'] == 'form_completed'
         assert ':form_id' in expr_values
+        # Regression guard: non-counter branches must NOT bind unused :one/:zero
+        # (DynamoDB rejects unused ExpressionAttributeValues with ValidationException)
+        assert ':one' not in expr_values
+        assert ':zero' not in expr_values
 
     @patch('lambda_function.dynamodb')
     def test_update_session_summary_link_clicked(self, mock_dynamodb):
@@ -250,8 +262,82 @@ class TestUpdateSessionSummary:
         assert result is True
         call_args = mock_dynamodb.update_item.call_args
         update_expr = call_args[1]['UpdateExpression']
+        expr_values = call_args[1]['ExpressionAttributeValues']
         # Should use if_not_exists for weaker outcome
         assert 'if_not_exists' in update_expr
+        # Regression guard: no unused counter bindings
+        assert ':one' not in expr_values
+        assert ':zero' not in expr_values
+
+    @patch('lambda_function.dynamodb')
+    def test_update_session_summary_cta_clicked(self, mock_dynamodb):
+        """CTA_CLICKED should set outcome via if_not_exists and not bind unused counters."""
+        mock_dynamodb.update_item.return_value = {}
+
+        event = {
+            'session_id': 'sess_123',
+            'tenant_hash': 'fo85e6a06dcdf4',
+            'event_type': 'CTA_CLICKED',
+            'client_timestamp': '2025-12-26T10:00:00Z'
+        }
+
+        result = update_session_summary(event)
+
+        assert result is True
+        call_args = mock_dynamodb.update_item.call_args
+        expr_values = call_args[1]['ExpressionAttributeValues']
+        assert ':outcome' in expr_values
+        assert expr_values[':outcome']['S'] == 'cta_clicked'
+        assert ':one' not in expr_values
+        assert ':zero' not in expr_values
+
+    @patch('lambda_function.dynamodb')
+    def test_update_session_summary_session_end(self, mock_dynamodb):
+        """SESSION_END should set default 'conversation' outcome and not bind unused counters."""
+        mock_dynamodb.update_item.return_value = {}
+
+        event = {
+            'session_id': 'sess_123',
+            'tenant_hash': 'fo85e6a06dcdf4',
+            'event_type': 'SESSION_END',
+            'client_timestamp': '2025-12-26T10:00:00Z'
+        }
+
+        result = update_session_summary(event)
+
+        assert result is True
+        call_args = mock_dynamodb.update_item.call_args
+        expr_values = call_args[1]['ExpressionAttributeValues']
+        assert ':outcome' in expr_values
+        assert expr_values[':outcome']['S'] == 'conversation'
+        assert ':one' not in expr_values
+        assert ':zero' not in expr_values
+
+    @patch('lambda_function.dynamodb')
+    def test_update_session_summary_no_unused_bindings(self, mock_dynamodb):
+        """Generic invariant: every :placeholder bound in ExpressionAttributeValues
+        must appear in the UpdateExpression. Mirrors DynamoDB's server-side validator
+        and would have caught the original ValidationException bug."""
+        mock_dynamodb.update_item.return_value = {}
+
+        for event_type in ['WIDGET_OPENED', 'MESSAGE_SENT', 'MESSAGE_RECEIVED',
+                           'FORM_COMPLETED', 'LINK_CLICKED', 'CTA_CLICKED', 'SESSION_END']:
+            mock_dynamodb.update_item.reset_mock()
+            update_session_summary({
+                'session_id': 'sess_123',
+                'tenant_hash': 'fo85e6a06dcdf4',
+                'event_type': event_type,
+                'client_timestamp': '2025-12-26T10:00:00Z',
+                'event_payload': {'form_id': 'f1'} if event_type == 'FORM_COMPLETED' else {}
+            })
+            call_args = mock_dynamodb.update_item.call_args
+            update_expr = call_args[1]['UpdateExpression']
+            expr_values = call_args[1]['ExpressionAttributeValues']
+            for placeholder in expr_values:
+                assert placeholder in update_expr, (
+                    f"{event_type}: bound {placeholder} but it is not used in "
+                    f"UpdateExpression — DynamoDB will reject with ValidationException"
+                )
 
     @patch('lambda_function.dynamodb')
     def test_update_session_summary_dynamodb_error(self, mock_dynamodb):

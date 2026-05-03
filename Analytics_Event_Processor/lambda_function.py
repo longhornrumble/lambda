@@ -498,14 +498,14 @@ def update_session_summary(event):
         ':tenant_id': {'S': event.get('tenant_id', '')},
         ':started_at': {'S': timestamp},
         ':ttl': {'N': str(calculate_ttl())},
-        ':one': {'N': '1'},
-        ':zero': {'N': '0'}
     }
 
     expression_names = {'#ttl': 'ttl'}
 
     # Increment message counts based on event type
     if event_type == 'MESSAGE_SENT':
+        expression_values[':one'] = {'N': '1'}
+        expression_values[':zero'] = {'N': '0'}
         update_parts.append("user_message_count = if_not_exists(user_message_count, :zero) + :one")
         update_parts.append("message_count = if_not_exists(message_count, :zero) + :one")
 
@@ -516,6 +516,8 @@ def update_session_summary(event):
             expression_values[':first_question'] = {'S': payload['content_preview'][:200]}
 
     elif event_type == 'MESSAGE_RECEIVED':
+        expression_values[':one'] = {'N': '1'}
+        expression_values[':zero'] = {'N': '0'}
         update_parts.append("bot_message_count = if_not_exists(bot_message_count, :zero) + :one")
         update_parts.append("message_count = if_not_exists(message_count, :zero) + :one")
 
