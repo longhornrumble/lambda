@@ -41,6 +41,7 @@ jobs:
       meta_oauth:              ${{ steps.filter.outputs.meta_oauth }}
       master:                  ${{ steps.filter.outputs.master }}
       analytics_dashboard_api: ${{ steps.filter.outputs.analytics_dashboard_api }}
+      analytics_event_processor: ${{ steps.filter.outputs.analytics_event_processor }}
       ses_event_handler:       ${{ steps.filter.outputs.ses_event_handler }}
       # Node.js Lambda using node:test runner (no Jest)
       applier:        ${{ steps.filter.outputs.applier }}
@@ -71,6 +72,8 @@ jobs:
               - 'Master_Function_Staging/**'
             analytics_dashboard_api:
               - 'Analytics_Dashboard_API/**'
+            analytics_event_processor:
+              - 'Analytics_Event_Processor/**'
             ses_event_handler:
               - 'ses_event_handler/**'
             applier:
@@ -212,6 +215,7 @@ jobs:
       needs.detect-changes.outputs.meta_oauth == 'true' ||
       needs.detect-changes.outputs.master == 'true' ||
       needs.detect-changes.outputs.analytics_dashboard_api == 'true' ||
+      needs.detect-changes.outputs.analytics_event_processor == 'true' ||
       needs.detect-changes.outputs.ses_event_handler == 'true'
 
     strategy:
@@ -232,6 +236,10 @@ jobs:
             has_requirements: false
           - lambda: ses_event_handler
             changed: ${{ needs.detect-changes.outputs.ses_event_handler }}
+            # boto3 from Lambda runtime; no requirements.txt.
+            has_requirements: false
+          - lambda: Analytics_Event_Processor
+            changed: ${{ needs.detect-changes.outputs.analytics_event_processor }}
             # boto3 from Lambda runtime; no requirements.txt.
             has_requirements: false
 

@@ -609,3 +609,4 @@ def write_events_to_dynamodb(events):
             summaries_updated += 1
 
     logger.info(f"DynamoDB writes: {events_written}/{len(events)} events, {summaries_updated}/{len(events)} summaries")
+
