@@ -4,6 +4,16 @@ module.exports = {
   // Allow shared/ to resolve its @aws-sdk deps from BSH's node_modules when
   // shared/ has no own node_modules (the normal state in this repo).
   modulePaths: ['<rootDir>/node_modules'],
+  // Force all @aws-sdk/* imports to resolve through THIS Lambda's node_modules.
+  // Required because shared/bedrock-core.js requires @aws-sdk/* and CI's
+  // `cd shared && npm install` step creates a separate physical copy under
+  // shared/node_modules. Without this mapper, jest.doMock() targets
+  // (resolved from a test in BSH) don't match shared/'s requires (resolved
+  // from shared/'s own node_modules), so mocks silently bypass and real
+  // SDK constructors run. See PR for Issue #5 PR A CI failure post-mortem.
+  moduleNameMapper: {
+    '^(@aws-sdk/[^/]+)$': '<rootDir>/node_modules/$1',
+  },
   collectCoverageFrom: [
     'form_handler.js',
     'response_enhancer.js',
