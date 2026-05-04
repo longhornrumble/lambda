@@ -17,6 +17,7 @@ const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('
 const { SQSClient, SendMessageCommand, SendMessageBatchCommand } = require('@aws-sdk/client-sqs');
 const { enhanceResponse } = require('./response_enhancer');
 const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
+const { writeSessionSummary } = require('./analytics_writer');
 const {
   buildV4ConversationPrompt,
   classifyTopic,
@@ -52,8 +53,11 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const bedrock = new BedrockRuntimeClient({ region: AWS_REGION });
 const sqs = new SQSClient({ region: AWS_REGION });
 
-// Analytics SQS queue URL
-const ANALYTICS_QUEUE_URL = process.env.ANALYTICS_QUEUE_URL || 'https://sqs.us-east-1.amazonaws.com/614056832592/picasso-analytics-events';
+// Analytics SQS queue URL. Unset in the staging account (per Issue #5
+// batch-1 deferral — no staging SQS queue yet); handleAnalyticsEvent
+// no-ops when this is empty so cross-account writes can't accidentally
+// flow to prod.
+const ANALYTICS_QUEUE_URL = process.env.ANALYTICS_QUEUE_URL || '';
 
 /**
  * Sanitize text for SMS messages - remove special characters that could cause issues
@@ -78,6 +82,18 @@ function sanitizeForSMS(text) {
  */
 async function handleAnalyticsEvent(event) {
   console.log('📊 Analytics event handler invoked');
+
+  // Staging-account guard: when no SQS queue is configured, treat the
+  // ?action=analytics endpoint as a no-op rather than 5xx-ing on every call.
+  // The server-side writer (writeSessionSummary) is the durable analytics
+  // path here; SQS-routed browser events are deferred per Issue #5 batch 1.
+  if (!ANALYTICS_QUEUE_URL) {
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify({ status: 'noop', reason: 'analytics_queue_not_configured' }),
+    };
+  }
 
   try {
     // Parse request body
@@ -373,7 +389,7 @@ const streamingHandler = async (event, responseStream, context) => {
     if (body.form_mode === true) {
       console.log('📝 Form mode detected - handling locally without Bedrock');
       try {
-        const formResponse = await handleFormMode(body, config);
+        const formResponse = await handleFormMode(body, config, context.awsRequestId);
 
         // Send the form response as a single SSE event
         write(`data: ${JSON.stringify(formResponse)}\n\n`);
@@ -587,9 +603,29 @@ const streamingHandler = async (event, responseStream, context) => {
         }
       }));
 
-      // NOTE: MESSAGE_SENT and MESSAGE_RECEIVED events are now emitted by the frontend
-      // (StreamingChatProvider.jsx and HTTPChatProvider.jsx) via the analytics pipeline.
-      // This ensures reliable delivery since the frontend knows exactly when messages are sent/received.
+      // Server-side analytics writes (Issue #5 PR A). Streaming path is
+      // fire-and-forget — caller never sees the rejection, so the writer
+      // logs its own errors. Frontend MESSAGE_SENT/RECEIVED beacons remain
+      // until PR B (post-soak) purges them.
+      const clientTimestamp = body.client_timestamp || new Date(startTime).toISOString();
+      writeSessionSummary({
+        event_type: 'MESSAGE_SENT',
+        session_id: sessionId,
+        tenant_hash: tenantHash,
+        tenant_id: config?.tenant_id || '',
+        client_timestamp: clientTimestamp,
+        request_id: context.awsRequestId,
+        event_payload: { first_question: questionBuffer },
+      });
+      writeSessionSummary({
+        event_type: 'MESSAGE_RECEIVED',
+        session_id: sessionId,
+        tenant_hash: tenantHash,
+        tenant_id: config?.tenant_id || '',
+        client_timestamp: clientTimestamp,
+        request_id: context.awsRequestId,
+        event_payload: { response_time_ms: firstTokenTime },
+      });
     }
 
     // Enhance response with CTAs after streaming is complete
@@ -969,9 +1005,32 @@ const bufferedHandler = async (event, context) => {
         }
       }));
 
-      // NOTE: MESSAGE_SENT and MESSAGE_RECEIVED events are now emitted by the frontend
-      // (StreamingChatProvider.jsx and HTTPChatProvider.jsx) via the analytics pipeline.
-      // This ensures reliable delivery since the frontend knows exactly when messages are sent/received.
+      // Server-side analytics writes (Issue #5 PR A). Buffered path awaits;
+      // separated from the CTA-enhancement try/catch below (different timeout
+      // budget, different concern). Writer logs its own errors.
+      const clientTimestamp = body.client_timestamp || new Date(startTime).toISOString();
+      try {
+        await writeSessionSummary({
+          event_type: 'MESSAGE_SENT',
+          session_id: sessionId,
+          tenant_hash: tenantHash,
+          tenant_id: config?.tenant_id || '',
+          client_timestamp: clientTimestamp,
+          request_id: context.awsRequestId,
+          event_payload: { first_question: questionBuffer },
+        });
+        await writeSessionSummary({
+          event_type: 'MESSAGE_RECEIVED',
+          session_id: sessionId,
+          tenant_hash: tenantHash,
+          tenant_id: config?.tenant_id || '',
+          client_timestamp: clientTimestamp,
+          request_id: context.awsRequestId,
+          event_payload: { response_time_ms: firstTokenTime },
+        });
+      } catch (e) {
+        console.log(JSON.stringify({ evt: 'analytics_write_caller_failure', error: 'internal_error' }));
+      }
     }
 
     // Enhance response with CTAs after generation is complete

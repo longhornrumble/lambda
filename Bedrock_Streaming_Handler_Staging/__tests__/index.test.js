@@ -454,7 +454,8 @@ describe('Index.js Integration Tests', () => {
           action: 'validate_field',
           field_id: 'email'
         }),
-        expect.any(Object)
+        expect.any(Object),
+        undefined  // requestId from context.awsRequestId; context is {} in this test
       );
 
       // Bedrock should NOT be called in form mode
@@ -492,7 +493,8 @@ describe('Index.js Integration Tests', () => {
           action: 'submit_form',
           form_id: 'volunteer_apply'
         }),
-        expect.any(Object)
+        expect.any(Object),
+        undefined  // requestId from context.awsRequestId; context is {} in this test
       );
     });
 

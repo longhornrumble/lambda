@@ -105,7 +105,7 @@ function getSESFromEmail() {
  * @param {Object} tenantConfig - Tenant configuration
  * @returns {Object} Response for form field or submission
  */
-async function handleFormMode(body, tenantConfig) {
+async function handleFormMode(body, tenantConfig, requestId = null) {
   console.log('📝 Form mode detected, handling locally');
 
   const {
@@ -125,7 +125,7 @@ async function handleFormMode(body, tenantConfig) {
   }
 
   if (action === 'submit_form') {
-    return await submitForm(form_id, form_data, tenantConfig, session_id, conversation_id);
+    return await submitForm(form_id, form_data, tenantConfig, session_id, conversation_id, requestId, body.client_timestamp);
   }
 
   // Default validation response
@@ -220,7 +220,7 @@ async function validateFormField(fieldId, value, config) {
  * @param {string} conversationId - Conversation ID for tracking
  * @returns {Object} Submission result
  */
-async function submitForm(formId, formData, config, sessionId = null, conversationId = null) {
+async function submitForm(formId, formData, config, sessionId = null, conversationId = null, requestId = null, clientTimestamp = null) {
   console.log(`📨 Submitting form ${formId}:`, formData);
 
   try {
@@ -241,6 +241,23 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     } catch (dbError) {
       console.error('❌ DynamoDB save failed:', dbError);
       // Continue with fulfillment even if DynamoDB save fails
+    }
+
+    // Issue #5 PR A: server-side analytics write for form completion.
+    // Awaited (not fire-and-forget) — form submission is a strong outcome
+    // and the durability matters more than the few ms of latency. Writer
+    // logs its own errors; never throws.
+    if (sessionId && config.tenant_hash && requestId) {
+      const { writeSessionSummary } = require('./analytics_writer');
+      await writeSessionSummary({
+        event_type: 'FORM_COMPLETED',
+        session_id: sessionId,
+        tenant_hash: config.tenant_hash,
+        tenant_id: config.tenant_id || '',
+        client_timestamp: clientTimestamp || new Date().toISOString(),
+        request_id: requestId,
+        event_payload: { form_id: formId },
+      });
     }
 
     // Extract canonical contact early — needed for consent record and confirmation email.

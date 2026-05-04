@@ -20,7 +20,32 @@ const crypto = require('crypto');
 
 // Initialize AWS clients
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-const bedrockAgent = new BedrockAgentRuntimeClient({ region: AWS_REGION });
+// Cross-account KB access: when KB_RETRIEVER_ROLE_ARN is set (staging account
+// reaching prod-account KBs), assume that role for Bedrock-Agent-Runtime
+// calls. fromTemporaryCredentials caches and auto-refreshes via STS, so the
+// AssumeRole call only happens on first use + before credential expiry.
+// Unset env var → SDK default credential chain (legacy / prod-account behavior).
+// Lazy-require keeps prod-account consumers from needing the credential-providers dep.
+const KB_RETRIEVER_ROLE_ARN = process.env.KB_RETRIEVER_ROLE_ARN;
+const bedrockAgentClientConfig = { region: AWS_REGION };
+if (KB_RETRIEVER_ROLE_ARN) {
+  // try/catch lets esbuild treat this as a runtime require — only consumers
+  // that actually set KB_RETRIEVER_ROLE_ARN need credential-providers
+  // installed at runtime. Currently: only Bedrock_Streaming_Handler_Staging.
+  try {
+    const { fromTemporaryCredentials } = require('@aws-sdk/credential-providers');
+    bedrockAgentClientConfig.credentials = fromTemporaryCredentials({
+      params: {
+        RoleArn: KB_RETRIEVER_ROLE_ARN,
+        RoleSessionName: 'bedrock-kb-retriever',
+        DurationSeconds: 3600,
+      },
+    });
+  } catch (e) {
+    console.error('KB_RETRIEVER_ROLE_ARN is set but @aws-sdk/credential-providers is not installed; falling back to default credentials. Bedrock Retrieve will fail with cross-account KB.', e.message);
+  }
+}
+const bedrockAgent = new BedrockAgentRuntimeClient(bedrockAgentClientConfig);
 const s3 = new S3Client({ region: AWS_REGION });
 const dynamodb = new DynamoDBClient({ region: AWS_REGION });
 

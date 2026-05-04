@@ -1,0 +1,191 @@
+{
+  "_doc": "Wire-format contract between Bedrock_Streaming_Handler_Staging/analytics_writer.js and Master_Function_Staging/analytics_writer.py. Both writers must emit identical UpdateExpression / ExpressionAttribute* / ConditionExpression for each fixture. The same file is duplicated in Master_Function_Staging/. CI runs both side-by-side against this fixture. See v7 plan §'PR A' lines 244-261 and §'PR A2' line 278.",
+  "_constants": {
+    "session_id_regex": "^[a-zA-Z0-9_-]{1,128}$",
+    "tenant_hash_regex": "^[a-zA-Z0-9]{10,20}$",
+    "first_question_max_chars": 50,
+    "ttl_days": 90
+  },
+  "reason_enum": [
+    "invalid_session_id_format",
+    "invalid_tenant_hash_format",
+    "missing_session_id",
+    "missing_tenant_hash",
+    "missing_event_type",
+    "unknown_event_type",
+    "ttl_calc_failed",
+    "redact_pii_failed",
+    "request_id_missing"
+  ],
+  "error_code_enum": [
+    "ddb_throttle",
+    "ddb_validation",
+    "ddb_resource_not_found",
+    "ddb_unknown",
+    "iam_access_denied",
+    "network_timeout",
+    "circuit_breaker_open",
+    "internal_error"
+  ],
+  "redact_pii_cases": [
+    { "input": "How do I apply?", "expected": "How do I apply?" },
+    { "input": "Email me at jane.doe@example.com please", "expected": "Email me at [EMAIL] please" },
+    { "input": "Call (512) 555-1234 today", "expected": "Call [PHONE] today" },
+    { "input": "Reach me at jane@x.io or 512-555-1234", "expected": "Reach me at [EMAIL] or [PHONE]" },
+    {
+      "_doc": "50-char truncation boundary. Truncation happens after redaction at the call site (analytics_writer), not inside redactPII itself.",
+      "input": "This question is exactly fifty-one characters long!!",
+      "expected_redacted": "This question is exactly fifty-one characters long!!",
+      "expected_truncated_50": "This question is exactly fifty-one characters long"
+    }
+  ],
+  "fixtures": [
+    {
+      "name": "MESSAGE_SENT_initial",
+      "_doc": "First user message in a brand-new session. attribute_not_exists branch of ConditionExpression hits.",
+      "input": {
+        "event_type": "MESSAGE_SENT",
+        "session_id": "sess_abc123XYZ",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:00:00.000Z",
+        "request_id": "req-aaaa-1111",
+        "event_payload": { "first_question": "How do I apply?" }
+      },
+      "expected": {
+        "TableName_env": "SESSION_SUMMARIES_TABLE",
+        "Key": {
+          "pk": { "S": "TENANT#my87674d777bf9" },
+          "sk": { "S": "SESSION#sess_abc123XYZ" }
+        },
+        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, last_request_id_message_sent = :request_id, first_question = if_not_exists(first_question, :first_question) ADD message_count :one, user_message_count :one",
+        "ConditionExpression": "attribute_not_exists(last_request_id_message_sent) OR last_request_id_message_sent <> :request_id",
+        "ExpressionAttributeNames": { "#ttl": "ttl" },
+        "ExpressionAttributeValues": {
+          ":ended_at": { "S": "2026-05-04T20:00:00.000Z" },
+          ":session_id": { "S": "sess_abc123XYZ" },
+          ":tenant_id": { "S": "MYR384719" },
+          ":started_at": { "S": "2026-05-04T20:00:00.000Z" },
+          ":ttl": { "N": "1786060800" },
+          ":request_id": { "S": "req-aaaa-1111" },
+          ":one": { "N": "1" },
+          ":first_question": { "S": "How do I apply?" }
+        }
+      }
+    },
+    {
+      "name": "MESSAGE_SENT_no_first_question",
+      "_doc": "MESSAGE_SENT with empty first_question payload — first_question SET clause is omitted entirely.",
+      "input": {
+        "event_type": "MESSAGE_SENT",
+        "session_id": "sess_abc123XYZ",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:00:00.000Z",
+        "request_id": "req-aaaa-1111",
+        "event_payload": {}
+      },
+      "expected": {
+        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, last_request_id_message_sent = :request_id ADD message_count :one, user_message_count :one",
+        "ConditionExpression": "attribute_not_exists(last_request_id_message_sent) OR last_request_id_message_sent <> :request_id",
+        "ExpressionAttributeNames_omit": [":first_question"]
+      }
+    },
+    {
+      "name": "MESSAGE_RECEIVED_with_response_time",
+      "input": {
+        "event_type": "MESSAGE_RECEIVED",
+        "session_id": "sess_abc123XYZ",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:00:01.500Z",
+        "request_id": "req-bbbb-2222",
+        "event_payload": { "response_time_ms": 850 }
+      },
+      "expected": {
+        "Key": {
+          "pk": { "S": "TENANT#my87674d777bf9" },
+          "sk": { "S": "SESSION#sess_abc123XYZ" }
+        },
+        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, last_request_id_message_received = :request_id ADD message_count :one, bot_message_count :one, total_response_time_ms :response_time, response_count :one",
+        "ConditionExpression": "attribute_not_exists(last_request_id_message_received) OR last_request_id_message_received <> :request_id",
+        "ExpressionAttributeValues": {
+          ":one": { "N": "1" },
+          ":response_time": { "N": "850" },
+          ":request_id": { "S": "req-bbbb-2222" }
+        }
+      }
+    },
+    {
+      "name": "MESSAGE_RECEIVED_response_time_out_of_range",
+      "_doc": "response_time_ms outside (0, 60000) — accumulator clauses omitted.",
+      "input": {
+        "event_type": "MESSAGE_RECEIVED",
+        "session_id": "sess_abc123XYZ",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:00:01.500Z",
+        "request_id": "req-bbbb-2222",
+        "event_payload": { "response_time_ms": 75000 }
+      },
+      "expected": {
+        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, last_request_id_message_received = :request_id ADD message_count :one, bot_message_count :one"
+      }
+    },
+    {
+      "name": "FORM_COMPLETED_with_form_id",
+      "input": {
+        "event_type": "FORM_COMPLETED",
+        "session_id": "sess_abc123XYZ",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:01:00.000Z",
+        "request_id": "req-cccc-3333",
+        "event_payload": { "form_id": "volunteer_signup" }
+      },
+      "expected": {
+        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, #outcome = :outcome, last_request_id_form_completed = :request_id, form_id = :form_id",
+        "ConditionExpression": "attribute_not_exists(last_request_id_form_completed) OR last_request_id_form_completed <> :request_id",
+        "ExpressionAttributeNames": { "#ttl": "ttl", "#outcome": "outcome" },
+        "ExpressionAttributeValues": {
+          ":outcome": { "S": "form_completed" },
+          ":form_id": { "S": "volunteer_signup" }
+        }
+      }
+    },
+    {
+      "name": "validation_invalid_session_id",
+      "_doc": "session_id contains a space — regex rejects. Writer returns false; emits log with reason from REASON_ENUM. NO UpdateItem call should be made.",
+      "input": {
+        "event_type": "MESSAGE_SENT",
+        "session_id": "sess abc",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:00:00.000Z",
+        "request_id": "req-dddd-4444",
+        "event_payload": {}
+      },
+      "expected": {
+        "result": false,
+        "log": { "evt": "analytics_write_invalid", "reason": "invalid_session_id_format", "event_type": "MESSAGE_SENT" },
+        "ddb_call_count": 0
+      }
+    },
+    {
+      "name": "forward_compat_old_shape_row",
+      "_doc": "Per CLAUDE.md schema discipline. The writer is ALWAYS appending new fields via if_not_exists / SET / ADD — old rows missing new fields must not crash the writer. This fixture is a contract sanity check that the UpdateExpression uses no attribute reads that would fail on a row missing the new last_request_id_* / response_count / total_response_time_ms fields.",
+      "input": {
+        "event_type": "MESSAGE_SENT",
+        "session_id": "sess_legacy",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:00:00.000Z",
+        "request_id": "req-eeee-5555",
+        "event_payload": { "first_question": "Existing row predating Issue #5" }
+      },
+      "expected": {
+        "_invariant": "ConditionExpression uses attribute_not_exists OR <> — both branches succeed against an old-shape row that lacks last_request_id_message_sent."
+      }
+    }
+  ]
+}

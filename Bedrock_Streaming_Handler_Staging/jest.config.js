@@ -1,6 +1,9 @@
 module.exports = {
   testEnvironment: 'node',
   coverageDirectory: 'coverage',
+  // Allow shared/ to resolve its @aws-sdk deps from BSH's node_modules when
+  // shared/ has no own node_modules (the normal state in this repo).
+  modulePaths: ['<rootDir>/node_modules'],
   collectCoverageFrom: [
     'form_handler.js',
     'response_enhancer.js',
