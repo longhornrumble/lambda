@@ -46,7 +46,7 @@ class TestExtractCanonicalContact:
 
         assert result['contact']['first_name'] == 'Jane'
         assert result['contact']['last_name'] == 'Smith'
-        assert result['contact']['name_full'] == 'Jane Smith'
+        assert result['contact']['full_name'] == 'Jane Smith'
         assert result['contact']['email'] == 'jane.smith@example.com'
         assert result['contact']['phone'] == '+15125551234'
         assert result['contact']['address']['street'] == '123 Main Street'
@@ -69,7 +69,7 @@ class TestExtractCanonicalContact:
         assert result['contact']['first_name'] == 'John'
         assert result['contact']['middle_name'] is None
         assert result['contact']['last_name'] is None
-        assert result['contact']['name_full'] == 'John'
+        assert result['contact']['full_name'] == 'John'
         assert result['contact']['email'] == 'john@example.com'
         assert result['contact']['phone'] is None
         assert result['contact']['address']['street'] is None
@@ -89,7 +89,7 @@ class TestExtractCanonicalContact:
         assert result['contact']['first_name'] == 'Mary'
         assert result['contact']['middle_name'] == 'Jane'
         assert result['contact']['last_name'] == 'Doe'
-        assert result['contact']['name_full'] == 'Mary Jane Doe'
+        assert result['contact']['full_name'] == 'Mary Jane Doe'
 
     def test_alternate_first_name_keys(self):
         """Test alternate key names for first name"""
@@ -208,7 +208,7 @@ class TestExtractCanonicalContact:
         result = extract_canonical_contact({})
 
         assert result['contact']['first_name'] is None
-        assert result['contact']['name_full'] is None
+        assert result['contact']['full_name'] is None
         assert result['comments'] is None
 
     def test_case_insensitive_matching(self):
@@ -249,7 +249,7 @@ class TestExtractCanonicalContact:
 
         assert result['contact']['first_name'] is None
         assert result['contact']['last_name'] == 'Smith'
-        assert result['contact']['name_full'] == 'Smith'
+        assert result['contact']['full_name'] == 'Smith'
         assert result['contact']['email'] is None
 
 
@@ -439,7 +439,7 @@ class TestCreateEmptyContact:
         assert contact['first_name'] is None
         assert contact['middle_name'] is None
         assert contact['last_name'] is None
-        assert contact['name_full'] is None
+        assert contact['full_name'] is None
         assert contact['email'] is None
         assert contact['phone'] is None
         assert contact['address']['street'] is None

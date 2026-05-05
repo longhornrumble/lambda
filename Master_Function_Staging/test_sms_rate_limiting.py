@@ -17,11 +17,11 @@ from botocore.exceptions import ClientError
 from form_handler import FormHandler
 
 
+@mock_dynamodb
+@mock_sns
 class TestSMSRateLimiting(unittest.TestCase):
     """Test cases for SMS rate limiting functionality"""
 
-    @mock_dynamodb
-    @mock_sns
     def setUp(self):
         """Set up test environment with DynamoDB and SNS mocks"""
         # Set up DynamoDB
@@ -409,15 +409,13 @@ class TestSMSRateLimiting(unittest.TestCase):
         handler = FormHandler(self.tenant_config)
         sms_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['sms']
 
-        # Mock SNS to raise error
-        with patch('boto3.client') as mock_boto:
-            mock_sns = Mock()
-            mock_sns.publish.side_effect = ClientError(
-                {'Error': {'Code': 'InvalidParameter', 'Message': 'Invalid phone number'}},
-                'Publish'
-            )
-            mock_boto.return_value = mock_sns
-
+        # Mock the module-level sns client directly to raise error
+        mock_sns_client = Mock()
+        mock_sns_client.publish.side_effect = ClientError(
+            {'Error': {'Code': 'InvalidParameter', 'Message': 'Invalid phone number'}},
+            'Publish'
+        )
+        with patch('form_handler.sns', mock_sns_client):
             result = handler._send_sms_notifications(sms_config, self.form_data)
 
             # Should return empty list due to errors

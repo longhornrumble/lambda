@@ -17,10 +17,10 @@ import uuid
 from form_handler import FormHandler
 
 
+@mock_dynamodb
 class TestDynamoDBSchemas(unittest.TestCase):
     """Test DynamoDB table schemas and operations"""
 
-    @mock_dynamodb
     def setUp(self):
         """Set up DynamoDB tables with proper schemas"""
         self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
@@ -191,7 +191,9 @@ class TestDynamoDBSchemas(unittest.TestCase):
         self.assertEqual(item['form_type'], 'volunteer_signup')
         self.assertEqual(item['session_id'], 'session_12345')
         self.assertEqual(item['conversation_id'], 'conv_67890')
-        self.assertEqual(item['status'], 'submitted')
+        # Production sets status='pending_fulfillment' at storage time;
+        # 'submitted' was a stale test expectation. See form_handler.py:570.
+        self.assertEqual(item['status'], 'pending_fulfillment')
         self.assertIn('timestamp', item)
 
         # Verify nested responses structure
@@ -355,10 +357,12 @@ class TestDynamoDBSchemas(unittest.TestCase):
                 fulfillment_result={'type': 'none'}
             )
 
-        # Verify all entries were created
+        # Verify all entries were created. Query with ScanIndexForward=False
+        # to get DESC order by sort key (timestamp) — DDB default is ASC.
         response = self.audit_table.query(
             KeyConditionExpression='tenant_id = :tid',
-            ExpressionAttributeValues={':tid': 'test_tenant_123'}
+            ExpressionAttributeValues={':tid': 'test_tenant_123'},
+            ScanIndexForward=False,
         )
 
         self.assertEqual(len(response['Items']), 3)
