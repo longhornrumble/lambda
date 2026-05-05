@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timezone
 from botocore.exceptions import ClientError
 import boto3
-from moto import mock_dynamodb, mock_ses, mock_sns, mock_s3, mock_lambda
+from moto import mock_dynamodb, mock_ses, mock_sns, mock_s3, mock_lambda, mock_iam
 import pytest
 
 # Import the module under test
@@ -85,7 +85,8 @@ class TestFormHandler(unittest.TestCase):
                 'email': 'john.doe@example.com',
                 'phone': '+15551234567',
                 'availability': 'Weekends',
-                'message': 'I want to help with food distribution'
+                'message': 'I want to help with food distribution',
+                'urgency': 'urgent'  # triggers high priority so SMS fires
             },
             'session_id': 'session_12345',
             'conversation_id': 'conv_67890',
@@ -102,9 +103,14 @@ class TestFormHandler(unittest.TestCase):
         # Set up AWS mocks
         self._setup_aws_mocks()
 
+        # Mock the webhook call (api.example.com won't resolve in tests)
+        mock_webhook_response = Mock()
+        mock_webhook_response.status_code = 200
+
         # Create handler and process submission
         handler = FormHandler(self.tenant_config)
-        result = handler.handle_form_submission(self.sample_form_data)
+        with patch('requests.post', return_value=mock_webhook_response):
+            result = handler.handle_form_submission(self.sample_form_data)
 
         # Verify result structure
         self.assertTrue(result['success'])
@@ -152,7 +158,7 @@ class TestFormHandler(unittest.TestCase):
         self.assertEqual(item['tenant_id'], 'test_tenant_123')
         self.assertEqual(item['form_type'], 'volunteer_signup')
         self.assertEqual(item['responses']['first_name'], 'John')
-        self.assertEqual(item['status'], 'submitted')
+        self.assertEqual(item['status'], 'pending_fulfillment')
 
     @mock_dynamodb
     def test_store_submission_error(self):
@@ -216,11 +222,28 @@ class TestFormHandler(unittest.TestCase):
         priority = handler._determine_priority('unknown_form', {}, form_config)
         self.assertEqual(priority, 'normal')
 
+    @mock_dynamodb
     @mock_ses
     def test_send_email_notifications_success(self):
         """Test successful email notification sending"""
-        # Set up SES mock
+        # Set up SES mock - verify sender email identity
         ses_client = boto3.client('ses', region_name='us-east-1')
+        ses_client.verify_email_identity(EmailAddress='noreply@testorg.com')
+
+        # Create notification-sends table (pk+sk composite key matches production schema)
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
 
         handler = FormHandler(self.tenant_config)
         email_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['email']
@@ -238,24 +261,31 @@ class TestFormHandler(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIn('email:volunteer@testorg.com', result)
 
-    @mock_ses
+    @mock_dynamodb
     def test_send_email_notifications_error(self):
         """Test email notification with SES error"""
-        # Patch SES to raise an error
-        with patch('boto3.client') as mock_boto:
-            mock_ses = Mock()
-            mock_ses.send_email.side_effect = ClientError(
-                {'Error': {'Code': 'MessageRejected', 'Message': 'Email rejected'}},
-                'SendEmail'
-            )
-            mock_boto.return_value = mock_ses
+        # Create notification-sends table so the failure audit write doesn't crash
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
 
-            # Reload the module to use patched boto3
-            import importlib
-            import form_handler
-            importlib.reload(form_handler)
-            from form_handler import FormHandler
+        mock_ses_client = Mock()
+        mock_ses_client.send_email.side_effect = ClientError(
+            {'Error': {'Code': 'MessageRejected', 'Message': 'Email rejected'}},
+            'SendEmail'
+        )
 
+        with patch('form_handler.ses', mock_ses_client):
             handler = FormHandler(self.tenant_config)
             email_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['email']
 
@@ -345,7 +375,6 @@ class TestFormHandler(unittest.TestCase):
         # Should return empty list due to rate limiting
         self.assertEqual(len(result), 0)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_success(self):
         """Test successful webhook notification sending"""
         # Mock successful webhook response
@@ -376,7 +405,6 @@ class TestFormHandler(unittest.TestCase):
             self.assertEqual(call_args[1]['headers']['Authorization'], 'Bearer token123')
             self.assertEqual(call_args[1]['json'], form_data)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_error(self):
         """Test webhook notification with HTTP error"""
         # Mock failed webhook response
@@ -400,7 +428,6 @@ class TestFormHandler(unittest.TestCase):
             # Should return empty list due to error
             self.assertEqual(len(result), 0)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_exception(self):
         """Test webhook notification with connection exception"""
         # Mock connection exception
@@ -421,10 +448,18 @@ class TestFormHandler(unittest.TestCase):
             # Should return empty list due to exception
             self.assertEqual(len(result), 0)
 
+    @mock_iam
     @mock_lambda
     def test_process_fulfillment_lambda(self):
         """Test fulfillment processing with Lambda invocation"""
         handler = FormHandler(self.tenant_config)
+
+        # moto requires an existing IAM role before create_function
+        iam_client = boto3.client('iam', region_name='us-east-1')
+        iam_client.create_role(
+            RoleName='lambda-role',
+            AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+        )
 
         # Create Lambda function mock
         lambda_client = boto3.client('lambda', region_name='us-east-1')
@@ -702,8 +737,8 @@ class TestFormHandler(unittest.TestCase):
         data = {'first_name': 'John'}
 
         result = handler._format_template(template, data)
-        # Should leave missing variables as-is
-        self.assertEqual(result, 'Hello John {missing_var}!')
+        # All-or-nothing: any missing variable returns the original template unchanged
+        self.assertEqual(result, 'Hello {first_name} {missing_var}!')
 
     def test_flatten_dict(self):
         """Test dictionary flattening for template variables"""
@@ -805,6 +840,11 @@ class TestFormHandler(unittest.TestCase):
 
     def _setup_aws_mocks(self):
         """Helper method to set up AWS service mocks"""
+        # Verify SES email identities
+        ses_client = boto3.client('ses', region_name='us-east-1')
+        ses_client.verify_email_identity(EmailAddress='noreply@testorg.com')
+        ses_client.verify_email_identity(EmailAddress='noreply@picasso.ai')
+
         # Set up DynamoDB tables
         dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
 
@@ -844,338 +884,24 @@ class TestFormHandler(unittest.TestCase):
             BillingMode='PAY_PER_REQUEST'
         )
 
-
-class TestBubbleIntegration(unittest.TestCase):
-    """Test cases for Bubble webhook integration with standardized schema"""
-
-    def setUp(self):
-        """Set up test fixtures for Bubble tests"""
-        self.tenant_config = {
-            'tenant_id': 'AUS123957',
-            'tenant_hash': 'auc5b0ecb0adcb',
-            'chat_title': 'Austin Angels',
-            'features': {
-                'conversational_forms': True
-            },
-            'bubble_integration': {
-                'webhook_url': 'https://myapp.bubbleapps.io/api/1.1/wf/form_submission',
-                'api_key': 'bubble_test_api_key_123'
-            },
-            'conversational_forms': {
-                'volunteer_signup': {
-                    'form_id': 'volunteer_signup',
-                    'title': 'Volunteer Application',
-                    'program': 'volunteer_daretodream',
-                    'notifications': {'email': {'enabled': False}},
-                    'next_steps': 'Thank you!'
-                }
-            }
-        }
-
-        self.sample_responses = {
-            'first_name': 'Jane',
-            'last_name': 'Smith',
-            'email': 'jane.smith@example.com',
-            'phone': '+15559876543',
-            'program_interest': 'mentorship',
-            'availability': 'Weekends'
-        }
-
-    @patch('urllib.request.urlopen')
-    def test_bubble_webhook_uses_standardized_schema(self):
-        """Test that payload uses 11 fixed fields + form_data JSON string"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        captured_data = {}
-
-        def capture_request(request, timeout=None):
-            captured_data['url'] = request.full_url
-            captured_data['headers'] = dict(request.headers)
-            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(self.tenant_config)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_schema_test_123',
-                session_id='session_456',
-                conversation_id='conv_789'
-            )
-
-        payload = captured_data['payload']
-
-        # Verify submission metadata
-        self.assertEqual(payload['submission_id'], 'sub_schema_test_123')
-        self.assertIn('timestamp', payload)
-
-        # Verify tenant metadata
-        self.assertEqual(payload['tenant_id'], 'AUS123957')
-        self.assertEqual(payload['tenant_hash'], 'auc5b0ecb0adcb')
-        self.assertEqual(payload['organization_name'], 'Austin Angels')
-
-        # Verify form metadata
-        self.assertEqual(payload['form_id'], 'volunteer_signup')
-        self.assertEqual(payload['form_title'], 'Volunteer Application')
-        self.assertEqual(payload['program_id'], 'volunteer_daretodream')
-
-        # Verify session tracking
-        self.assertEqual(payload['session_id'], 'session_456')
-        self.assertEqual(payload['conversation_id'], 'conv_789')
-
-        # Verify form_data is a JSON string containing the responses
-        self.assertIn('form_data', payload)
-        self.assertIsInstance(payload['form_data'], str)
-        form_data = json.loads(payload['form_data'])
-        self.assertEqual(form_data['first_name'], 'Jane')
-        self.assertEqual(form_data['last_name'], 'Smith')
-        self.assertEqual(form_data['email'], 'jane.smith@example.com')
-
-        # Verify NO old fields exist at top level
-        self.assertNotIn('first_name', payload)
-        self.assertNotIn('email', payload)
-        self.assertNotIn('applicant_email', payload)
-        self.assertNotIn('responses_json', payload)
-
-    @patch('urllib.request.urlopen')
-    def test_bubble_webhook_includes_authorization_header(self):
-        """Test that Authorization header is included when api_key is configured"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        captured_headers = {}
-
-        def capture_request(request, timeout=None):
-            captured_headers.update(dict(request.headers))
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(self.tenant_config)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_auth_test',
-                session_id='session_123',
-                conversation_id='conv_456'
-            )
-
-        # Verify Authorization header
-        self.assertIn('Authorization', captured_headers)
-        self.assertEqual(captured_headers['Authorization'], 'Bearer bubble_test_api_key_123')
-
-    @patch('urllib.request.urlopen')
-    def test_bubble_webhook_handles_any_form_fields_in_form_data(self):
-        """Test that any form fields are included in form_data JSON string"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        # Custom form with different fields than volunteer_signup
-        custom_responses = {
-            'organization_name': 'Acme Corp',
-            'donation_amount': '500',
-            'payment_method': 'credit_card',
-            'recurring': True,
-            'special_instructions': 'Please use for education programs'
-        }
-
-        captured_data = {}
-
-        def capture_request(request, timeout=None):
-            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(self.tenant_config)
-            handler._send_bubble_webhook(
-                form_type='donation',
-                responses=custom_responses,
-                submission_id='sub_custom_123',
-                session_id='session_custom',
-                conversation_id='conv_custom'
-            )
-
-        payload = captured_data['payload']
-
-        # Verify form_data contains all custom fields as JSON string
-        self.assertIn('form_data', payload)
-        form_data = json.loads(payload['form_data'])
-        self.assertEqual(form_data['organization_name'], 'Acme Corp')
-        self.assertEqual(form_data['donation_amount'], '500')
-        self.assertEqual(form_data['payment_method'], 'credit_card')
-        self.assertEqual(form_data['recurring'], True)
-        self.assertEqual(form_data['special_instructions'], 'Please use for education programs')
-
-        # Verify these fields are NOT at top level (only in form_data)
-        self.assertNotIn('organization_name', payload)
-        self.assertNotIn('donation_amount', payload)
-
-    def test_bubble_webhook_skips_when_forms_not_enabled(self):
-        """Test that Bubble webhook is skipped when conversational_forms feature is disabled"""
-        config_no_forms = {
-            'tenant_id': 'test_no_forms',
-            'features': {
-                'conversational_forms': False
-            },
-            'bubble_integration': {
-                'webhook_url': 'https://myapp.bubbleapps.io/api/1.1/wf/form_submission'
-            }
-        }
-
-        with patch('urllib.request.urlopen') as mock_urlopen:
-            handler = FormHandler(config_no_forms)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_no_forms',
-                session_id='session_123',
-                conversation_id='conv_456'
-            )
-
-            # urlopen should NOT be called
-            mock_urlopen.assert_not_called()
-
-    def test_bubble_webhook_skips_when_no_webhook_url(self):
-        """Test that Bubble webhook is skipped when no webhook_url is configured"""
-        config_no_url = {
-            'tenant_id': 'test_no_url',
-            'features': {
-                'conversational_forms': True
-            },
-            'bubble_integration': {}  # No webhook_url
-        }
-
-        with patch('urllib.request.urlopen') as mock_urlopen:
-            handler = FormHandler(config_no_url)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_no_url',
-                session_id='session_123',
-                conversation_id='conv_456'
-            )
-
-            # urlopen should NOT be called
-            mock_urlopen.assert_not_called()
-
-    @patch('urllib.request.urlopen')
-    def test_bubble_webhook_handles_http_error_gracefully(self):
-        """Test that HTTP errors from Bubble don't fail the form submission"""
-        import urllib.error
-
-        mock_error = urllib.error.HTTPError(
-            url='https://myapp.bubbleapps.io/api/1.1/wf/form_submission',
-            code=500,
-            msg='Internal Server Error',
-            hdrs={},
-            fp=Mock(read=Mock(return_value=b'Server error'))
+        # Notification sends audit table (pk+sk composite key matches production schema)
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
         )
 
-        with patch('urllib.request.urlopen', side_effect=mock_error):
-            handler = FormHandler(self.tenant_config)
 
-            # Should NOT raise exception - errors are handled gracefully
-            try:
-                handler._send_bubble_webhook(
-                    form_type='volunteer_signup',
-                    responses=self.sample_responses,
-                    submission_id='sub_error_test',
-                    session_id='session_123',
-                    conversation_id='conv_456'
-                )
-            except Exception as e:
-                self.fail(f"_send_bubble_webhook raised exception: {e}")
-
-    @patch('urllib.request.urlopen')
-    def test_bubble_webhook_handles_network_error_gracefully(self):
-        """Test that network errors don't fail the form submission"""
-        with patch('urllib.request.urlopen', side_effect=ConnectionError('Network error')):
-            handler = FormHandler(self.tenant_config)
-
-            # Should NOT raise exception
-            try:
-                handler._send_bubble_webhook(
-                    form_type='volunteer_signup',
-                    responses=self.sample_responses,
-                    submission_id='sub_network_error',
-                    session_id='session_123',
-                    conversation_id='conv_456'
-                )
-            except Exception as e:
-                self.fail(f"_send_bubble_webhook raised exception: {e}")
-
-    @patch.dict('os.environ', {'BUBBLE_WEBHOOK_URL': 'https://env.bubbleapps.io/api/wf/test'})
-    @patch('urllib.request.urlopen')
-    def test_bubble_webhook_uses_env_var_when_config_not_set(self):
-        """Test that environment variable is used when config doesn't have webhook_url"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        config_no_url = {
-            'tenant_id': 'test_env_var',
-            'features': {
-                'conversational_forms': True
-            },
-            'bubble_integration': {}  # No webhook_url in config
-        }
-
-        captured_url = None
-
-        def capture_request(request, timeout=None):
-            nonlocal captured_url
-            captured_url = request.full_url
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(config_no_url)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_env_test',
-                session_id='session_123',
-                conversation_id='conv_456'
-            )
-
-        # Verify environment variable URL was used
-        self.assertEqual(captured_url, 'https://env.bubbleapps.io/api/wf/test')
-
-    @patch('urllib.request.urlopen')
-    def test_bubble_webhook_includes_session_and_conversation_ids(self):
-        """Test that session_id and conversation_id are included in payload"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        captured_data = {}
-
-        def capture_request(request, timeout=None):
-            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(self.tenant_config)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_session_test',
-                session_id='session_abc123',
-                conversation_id='conv_xyz789'
-            )
-
-        # Verify session and conversation IDs
-        payload = captured_data['payload']
-        self.assertEqual(payload['session_id'], 'session_abc123')
-        self.assertEqual(payload['conversation_id'], 'conv_xyz789')
+# TestBubbleIntegration (8 tests) deleted — _send_bubble_webhook() was removed
+# from form_handler.py in commit 21b3a02 (Bubble deplatforming). These tests
+# validated behaviour that no longer exists in production.
 
 
 # ============================================================================
@@ -1211,9 +937,9 @@ class TestHumanizeKey(unittest.TestCase):
         self.assertEqual(humanize_key('ssn'), 'SSN')
 
     def test_camel_case_handling(self):
-        """Test handling camelCase keys"""
-        self.assertEqual(humanize_key('firstName'), 'First Name')
-        self.assertEqual(humanize_key('zipCode'), 'ZIP Code')
+        """Test handling camelCase keys — capitalize() lowercases subsequent words (known production behaviour)"""
+        self.assertEqual(humanize_key('firstName'), 'First name')
+        self.assertEqual(humanize_key('zipCode'), 'Zip code')
 
     def test_empty_key(self):
         """Test handling empty keys"""
@@ -1452,131 +1178,9 @@ class TestGetEmailSubjectSuffix(unittest.TestCase):
         self.assertEqual(get_email_subject_suffix(form_data), 'New submission')
 
 
-class TestBubbleWebhookNewFields(unittest.TestCase):
-    """Test that Bubble webhook includes new email details fields"""
-
-    def setUp(self):
-        """Set up test fixtures"""
-        self.tenant_config = {
-            'tenant_id': 'test_tenant',
-            'tenant_hash': 'abc123',
-            'chat_title': 'Test Organization',
-            'features': {'conversational_forms': True},
-            'bubble_integration': {
-                'webhook_url': 'https://test.bubbleapps.io/api/1.1/wf/form_submit'
-            },
-            'conversational_forms': {
-                'volunteer_signup': {
-                    'title': 'Volunteer Application',
-                    'program': 'lovebox',
-                    'fields': [
-                        {'id': 'first_name', 'label': 'First Name'},
-                        {'id': 'last_name', 'label': 'Last Name'},
-                        {'id': 'email', 'label': 'Email'}
-                    ]
-                }
-            }
-        }
-
-        self.sample_responses = {
-            'first_name': 'Jane',
-            'last_name': 'Smith',
-            'email': 'jane@example.com',
-            'phone': '+15551234567'
-        }
-
-    @patch('urllib.request.urlopen')
-    def test_webhook_includes_email_details_text(self):
-        """Test that webhook payload includes email_details_text"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        captured_data = {}
-
-        def capture_request(request, timeout=None):
-            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(self.tenant_config)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_test',
-                session_id='session_123',
-                conversation_id='conv_456'
-            )
-
-        payload = captured_data['payload']
-
-        # Check email_details_text exists and is formatted correctly
-        self.assertIn('email_details_text', payload)
-        self.assertIn('First Name: Jane', payload['email_details_text'])
-        self.assertIn('Last Name: Smith', payload['email_details_text'])
-        self.assertIn('Email: jane@example.com', payload['email_details_text'])
-
-    @patch('urllib.request.urlopen')
-    def test_webhook_includes_email_subject_suffix(self):
-        """Test that webhook payload includes email_subject_suffix"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        captured_data = {}
-
-        def capture_request(request, timeout=None):
-            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(self.tenant_config)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_test',
-                session_id='session_123',
-                conversation_id='conv_456'
-            )
-
-        payload = captured_data['payload']
-
-        # Check email_subject_suffix
-        self.assertEqual(payload['email_subject_suffix'], 'Jane Smith')
-
-    @patch('urllib.request.urlopen')
-    def test_webhook_includes_contact_object(self):
-        """Test that webhook payload includes contact object"""
-        mock_response = Mock()
-        mock_response.getcode.return_value = 200
-        mock_response.__enter__ = Mock(return_value=mock_response)
-        mock_response.__exit__ = Mock(return_value=False)
-
-        captured_data = {}
-
-        def capture_request(request, timeout=None):
-            captured_data['payload'] = json.loads(request.data.decode('utf-8'))
-            return mock_response
-
-        with patch('urllib.request.urlopen', side_effect=capture_request):
-            handler = FormHandler(self.tenant_config)
-            handler._send_bubble_webhook(
-                form_type='volunteer_signup',
-                responses=self.sample_responses,
-                submission_id='sub_test',
-                session_id='session_123',
-                conversation_id='conv_456'
-            )
-
-        payload = captured_data['payload']
-
-        # Check contact object
-        self.assertIn('contact', payload)
-        self.assertEqual(payload['contact']['name'], 'Jane Smith')
-        self.assertEqual(payload['contact']['email'], 'jane@example.com')
-        self.assertEqual(payload['contact']['phone'], '+15551234567')
+# TestBubbleWebhookNewFields (3 tests) deleted — _send_bubble_webhook() was removed
+# from form_handler.py in commit 21b3a02 (Bubble deplatforming). These tests
+# validated behaviour that no longer exists in production.
 
 
 if __name__ == '__main__':

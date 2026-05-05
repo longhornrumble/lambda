@@ -128,6 +128,21 @@ def test_send_webhook_notifications_error(self, mock_send_email):
 
 ---
 
+## Bubble webhook tests — intentionally removed (2026-05-04)
+
+12 Bubble-specific webhook tests in `test_form_handler.py` were removed during this debt cleanup:
+- `test_bubble_webhook_handles_*` (3 tests)
+- `test_bubble_webhook_includes_*` (2 tests)
+- `test_bubble_webhook_skips_*` (2 tests)
+- `test_bubble_webhook_uses_*` (2 tests)
+- `test_webhook_includes_contact_object`, `test_webhook_includes_email_details_text`, `test_webhook_includes_email_subject_suffix`
+
+**Justification:** Per user direction (2026-05-04), Bubble integration is out of scope and being deprecated. These tests validated Bubble-specific behavior; their removal is consistent with the deprecation. See `feedback_bubble_out_of_scope.md` in the user's memory for the durable rule.
+
+The generic `_send_webhook_notifications` in `form_handler.py` (used by non-Bubble webhook configs) remains. If future test coverage is needed for the generic path, write fresh tests against the current generic shape rather than restoring the Bubble-specific ones.
+
+---
+
 ## Total estimated effort
 
 | Cluster | Effort |
