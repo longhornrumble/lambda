@@ -495,9 +495,8 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
             "max_tokens": 1000,
             "messages": messages,
             "temperature": 0.7,
-            "top_p": 0.9
         }
-        
+
         logger.info("Invoking Bedrock with streaming...")
         
         def stream_generator():
@@ -679,9 +678,8 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
             "max_tokens": 1000,
             "messages": messages,
             "temperature": 0.7,
-            "top_p": 0.9
         }
-        
+
         logger.info("Invoking Bedrock with streaming (fallback mode)...")
         
         # Call Bedrock with streaming using the model from config

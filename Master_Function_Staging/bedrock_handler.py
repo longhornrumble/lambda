@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+import time
 import boto3
 
 logger = logging.getLogger()
@@ -8,8 +9,56 @@ logger.setLevel(logging.INFO)
 
 BUBBLE_API_KEY = os.environ.get("BUBBLE_API_KEY")
 
-bedrock_agent = boto3.client("bedrock-agent-runtime")
+# Synchronous InvokeModel client — default creds, same account.
 bedrock = boto3.client("bedrock-runtime")
+
+# ---------------------------------------------------------------------------
+# Lazy KB client with cross-account assume-role + 50-minute TTL refresh.
+# Module-level client is replaced by _get_bedrock_agent_client() so tests
+# can manipulate KB_RETRIEVER_ROLE_ARN between cases without importlib.reload.
+# ---------------------------------------------------------------------------
+_kb_client_cache = {"client": None, "expires_at": 0}
+
+
+def _get_bedrock_agent_client():
+    """Return a bedrock-agent-runtime client, refreshing creds when near expiry.
+
+    If KB_RETRIEVER_ROLE_ARN is unset → default credential chain (same account).
+    If KB_RETRIEVER_ROLE_ARN is set   → sts:AssumeRole into the prod-side role,
+    cache the client for 50 min (safe margin before 1-hour STS expiry).
+    On STS failure, emit a structured analytics signal and re-raise so the
+    caller's try/except returns ("", []).
+    """
+    role_arn = os.environ.get("KB_RETRIEVER_ROLE_ARN", "")
+
+    if not role_arn:
+        # No cross-account role — default creds, no caching needed.
+        return boto3.client("bedrock-agent-runtime")
+
+    now = time.time()
+    if _kb_client_cache["client"] is not None and now < _kb_client_cache["expires_at"]:
+        return _kb_client_cache["client"]
+
+    try:
+        sts = boto3.client("sts")
+        resp = sts.assume_role(
+            RoleArn=role_arn,
+            RoleSessionName="bedrock-kb-retriever",
+            DurationSeconds=3600,
+        )
+        creds = resp["Credentials"]
+        client = boto3.client(
+            "bedrock-agent-runtime",
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+        _kb_client_cache["client"] = client
+        _kb_client_cache["expires_at"] = now + 50 * 60  # 50-minute TTL
+        return client
+    except Exception as e:
+        print(json.dumps({"evt": "analytics_kb_creds_init_failed", "error": str(e)}))
+        raise
 
 def fetch_tenant_tone(tenant_id):
     logger.info(f"[{tenant_id}] ✅ Using stub - no API call made")
@@ -25,8 +74,8 @@ def retrieve_kb_chunks(user_input, config):
 
         logger.info(f"📚 Retrieving KB chunks for input: {user_input[:40]}... using KB: {kb_id}")
         
-        response = bedrock_agent.retrieve(
-            knowledgeBaseId=kb_id,  
+        response = _get_bedrock_agent_client().retrieve(
+            knowledgeBaseId=kb_id,
             retrievalQuery={"text": user_input},
             retrievalConfiguration={
                 "vectorSearchConfiguration": {
