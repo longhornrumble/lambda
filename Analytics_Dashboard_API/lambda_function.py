@@ -3537,9 +3537,14 @@ def handle_recent_conversations(tenant_id: str, params: Dict[str, str]) -> Dict[
     conversations = []
     for session in paginated_sessions:
         question = session.get('first_question', '')
-        # Issue #5 PR C: avg_response_time_ms isn't stored — the session row
-        # holds the running total + count so we average here. Old behavior
-        # (`session.get('avg_response_time_ms', 0)`) always returned 0.
+        # Issue #5 PR C: `avg_response_time_ms` is not a field on
+        # picasso-session-summaries rows — the row holds
+        # `total_response_time_ms` + `response_count` separately, so we
+        # average here. Old behavior (`session.get('avg_response_time_ms',
+        # 0)`) always returned 0. Note: legacy aggregator paths
+        # (Aggregator_Function, Analytics_Function) do write a separately-
+        # named `avg_response_time_ms` field to a different aggregated table;
+        # that field is unrelated to this read path.
         total_ms = session.get('total_response_time_ms', 0)
         count = session.get('response_count', 0)
         avg_ms = (total_ms / count) if count > 0 else 0
