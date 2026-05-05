@@ -448,28 +448,17 @@ class TestFormHandler(unittest.TestCase):
             # Should return empty list due to exception
             self.assertEqual(len(result), 0)
 
-    @mock_iam
-    @mock_lambda
     def test_process_fulfillment_lambda(self):
-        """Test fulfillment processing with Lambda invocation"""
+        """Test fulfillment processing with Lambda invocation.
+
+        Patches the module-level `lambda_client.invoke` directly rather than
+        spinning up moto's Lambda mock — moto's `create_function` requires the
+        `docker` Python module + a Docker daemon to validate the function
+        package, which CI runners don't have. The production code path under
+        test is FormHandler._process_fulfillment's routing + invoke args, not
+        the runtime Lambda execution.
+        """
         handler = FormHandler(self.tenant_config)
-
-        # moto requires an existing IAM role before create_function
-        iam_client = boto3.client('iam', region_name='us-east-1')
-        iam_client.create_role(
-            RoleName='lambda-role',
-            AssumeRolePolicyDocument='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
-        )
-
-        # Create Lambda function mock
-        lambda_client = boto3.client('lambda', region_name='us-east-1')
-        lambda_client.create_function(
-            FunctionName='test-fulfillment-function',
-            Runtime='python3.9',
-            Role='arn:aws:iam::123456789012:role/lambda-role',
-            Handler='lambda_function.lambda_handler',
-            Code={'ZipFile': b'fake code'},
-        )
 
         form_config = {
             'fulfillment': {
@@ -479,14 +468,27 @@ class TestFormHandler(unittest.TestCase):
             }
         }
 
-        result = handler._process_fulfillment(
-            form_config=form_config,
-            form_type='volunteer_signup',
-            responses={'first_name': 'John'},
-            submission_id='sub_123'
-        )
+        with patch('form_handler.lambda_client.invoke') as mock_invoke:
+            mock_invoke.return_value = {'StatusCode': 202}
+            result = handler._process_fulfillment(
+                form_config=form_config,
+                form_type='volunteer_signup',
+                responses={'first_name': 'John'},
+                submission_id='sub_123'
+            )
 
-        # Verify Lambda was invoked
+        # Verify Lambda was invoked correctly
+        mock_invoke.assert_called_once()
+        invoke_kwargs = mock_invoke.call_args.kwargs
+        self.assertEqual(invoke_kwargs['FunctionName'], 'test-fulfillment-function')
+        self.assertEqual(invoke_kwargs['InvocationType'], 'Event')
+        payload = json.loads(invoke_kwargs['Payload'])
+        self.assertEqual(payload['action'], 'process_volunteer')
+        self.assertEqual(payload['form_type'], 'volunteer_signup')
+        self.assertEqual(payload['submission_id'], 'sub_123')
+        self.assertEqual(payload['responses'], {'first_name': 'John'})
+
+        # Verify the routing return shape
         self.assertEqual(result['type'], 'lambda')
         self.assertEqual(result['function'], 'test-fulfillment-function')
         self.assertEqual(result['status'], 'invoked')
