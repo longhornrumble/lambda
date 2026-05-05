@@ -18,7 +18,8 @@ from lambda_function import (
     get_tenant_hash,
     handle_session_detail,
     handle_sessions_list,
-    cors_response
+    handle_recent_conversations,
+    cors_response,
 )
 
 
@@ -354,6 +355,64 @@ class TestCorsResponse:
         assert result['statusCode'] == 200
         assert result['headers']['Content-Type'] == 'application/json'
         assert json.loads(result['body']) == {'test': 'data'}
+
+
+class TestRecentConversationsResponseTime:
+    """Issue #5 PR C — verify response_time_seconds is computed from
+    total_response_time_ms / response_count, not the always-zero
+    avg_response_time_ms field that doesn't exist on session rows."""
+
+    @patch('lambda_function.get_tenant_hash', return_value='hash_abc123')
+    @patch('lambda_function.fetch_session_summaries')
+    def test_response_time_seconds_averaged_correctly(self, mock_fetch, _hash):
+        mock_fetch.return_value = [{
+            'session_id': 'sess_1',
+            'started_at': '2026-05-04T12:00:00Z',
+            'first_question': 'How do I apply?',
+            'message_count': 4,
+            'outcome': 'conversation',
+            'total_response_time_ms': 3000,
+            'response_count': 2,  # avg = 1500ms = 1.5s
+        }]
+        result = handle_recent_conversations('TEST123', {})
+        body = json.loads(result['body'])
+        conv = body['conversations'][0]
+        assert conv['response_time_seconds'] == 1.5
+
+    @patch('lambda_function.get_tenant_hash', return_value='hash_abc123')
+    @patch('lambda_function.fetch_session_summaries')
+    def test_response_time_seconds_zero_when_no_responses(self, mock_fetch, _hash):
+        """response_count=0 must NOT divide by zero — should return 0."""
+        mock_fetch.return_value = [{
+            'session_id': 'sess_1',
+            'started_at': '2026-05-04T12:00:00Z',
+            'first_question': 'Hi',
+            'message_count': 1,
+            'outcome': None,
+            'total_response_time_ms': 0,
+            'response_count': 0,
+        }]
+        result = handle_recent_conversations('TEST123', {})
+        body = json.loads(result['body'])
+        assert body['conversations'][0]['response_time_seconds'] == 0
+
+    @patch('lambda_function.get_tenant_hash', return_value='hash_abc123')
+    @patch('lambda_function.fetch_session_summaries')
+    def test_forward_compat_old_shape_row(self, mock_fetch, _hash):
+        """Per CLAUDE.md schema discipline: old session rows missing the
+        new total_response_time_ms / response_count fields must not crash
+        the reader. Defaults to 0."""
+        mock_fetch.return_value = [{
+            'session_id': 'sess_legacy',
+            'started_at': '2026-05-04T12:00:00Z',
+            'first_question': 'Old session',
+            'message_count': 2,
+            'outcome': 'conversation',
+            # NO total_response_time_ms / response_count keys
+        }]
+        result = handle_recent_conversations('TEST123', {})
+        body = json.loads(result['body'])
+        assert body['conversations'][0]['response_time_seconds'] == 0
 
 
 if __name__ == '__main__':
