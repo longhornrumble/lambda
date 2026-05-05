@@ -72,8 +72,27 @@ class TestNotificationServices(unittest.TestCase):
         }
 
     @mock_ses
+    @mock_dynamodb
     def test_send_email_notifications_success(self):
         """Test successful email notification sending via SES"""
+        # Verify sender so moto SES accepts the send
+        ses_client = boto3.client('ses', region_name='us-east-1')
+        ses_client.verify_email_identity(EmailAddress='noreply@testcenter.org')
+        # Create notification-sends table used by form_handler audit trail
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
+
         handler = FormHandler(self.tenant_config)
         email_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['email']
 
@@ -85,8 +104,27 @@ class TestNotificationServices(unittest.TestCase):
         self.assertIn('email:admin@testcenter.org', result)
 
     @mock_ses
+    @mock_dynamodb
     def test_send_email_notifications_high_priority(self):
         """Test email notifications with high priority template"""
+        # Verify sender so moto SES accepts the send
+        ses_client = boto3.client('ses', region_name='us-east-1')
+        ses_client.verify_email_identity(EmailAddress='noreply@testcenter.org')
+        # Create notification-sends table
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
+
         handler = FormHandler(self.tenant_config)
         email_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['email']
 
@@ -96,8 +134,24 @@ class TestNotificationServices(unittest.TestCase):
         self.assertEqual(len(result), 2)
 
     @mock_ses
+    @mock_dynamodb
     def test_send_email_notifications_custom_sender(self):
         """Test email notifications with custom sender address"""
+        # Create notification-sends table for audit trail
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
+
         # Modify config to use custom sender
         custom_config = self.tenant_config.copy()
         custom_config['conversational_forms']['volunteer_signup']['notifications']['email']['sender'] = 'custom@testcenter.org'
@@ -105,56 +159,82 @@ class TestNotificationServices(unittest.TestCase):
         handler = FormHandler(custom_config)
         email_config = custom_config['conversational_forms']['volunteer_signup']['notifications']['email']
 
-        with patch('boto3.client') as mock_boto:
-            mock_ses = Mock()
-            mock_ses.send_email.return_value = {'MessageId': 'test-message-id'}
-            mock_boto.return_value = mock_ses
+        mock_ses_client = Mock()
+        mock_ses_client.send_email.return_value = {'MessageId': 'test-message-id'}
 
+        with patch('form_handler.ses', mock_ses_client):
             result = handler._send_email_notifications(email_config, self.form_data, 'normal')
 
             # Verify custom sender was used
-            calls = mock_ses.send_email.call_args_list
+            calls = mock_ses_client.send_email.call_args_list
             for call in calls:
                 self.assertEqual(call[1]['Source'], 'custom@testcenter.org')
 
     @mock_ses
+    @mock_dynamodb
     def test_send_email_notifications_ses_error(self):
         """Test email notification handling when SES returns error"""
+        # Create notification-sends table for audit trail
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
+
         handler = FormHandler(self.tenant_config)
         email_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['email']
 
-        with patch('boto3.client') as mock_boto:
-            mock_ses = Mock()
-            mock_ses.send_email.side_effect = ClientError(
-                {'Error': {'Code': 'MessageRejected', 'Message': 'Email address not verified'}},
-                'SendEmail'
-            )
-            mock_boto.return_value = mock_ses
-
+        mock_ses_client = Mock()
+        mock_ses_client.send_email.side_effect = ClientError(
+            {'Error': {'Code': 'MessageRejected', 'Message': 'Email address not verified'}},
+            'SendEmail'
+        )
+        with patch('form_handler.ses', mock_ses_client):
             result = handler._send_email_notifications(email_config, self.form_data, 'normal')
 
             # Should return empty list due to errors
             self.assertEqual(len(result), 0)
 
     @mock_ses
+    @mock_dynamodb
     def test_send_email_notifications_partial_failure(self):
         """Test email notification with partial failures"""
+        # Create notification-sends table for audit trail
+        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
+
         handler = FormHandler(self.tenant_config)
         email_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['email']
 
-        with patch('boto3.client') as mock_boto:
-            mock_ses = Mock()
-
-            # First call succeeds, second fails
-            mock_ses.send_email.side_effect = [
-                {'MessageId': 'success-message-id'},
-                ClientError(
-                    {'Error': {'Code': 'MessageRejected', 'Message': 'Invalid recipient'}},
-                    'SendEmail'
-                )
-            ]
-            mock_boto.return_value = mock_ses
-
+        mock_ses_client = Mock()
+        # First call succeeds, second fails
+        mock_ses_client.send_email.side_effect = [
+            {'MessageId': 'success-message-id'},
+            ClientError(
+                {'Error': {'Code': 'MessageRejected', 'Message': 'Invalid recipient'}},
+                'SendEmail'
+            )
+        ]
+        with patch('form_handler.ses', mock_ses_client):
             result = handler._send_email_notifications(email_config, self.form_data, 'normal')
 
             # Should have one success
@@ -248,20 +328,18 @@ class TestNotificationServices(unittest.TestCase):
         handler = FormHandler(self.tenant_config)
         sms_config = self.tenant_config['conversational_forms']['volunteer_signup']['notifications']['sms']
 
-        with patch('boto3.client') as mock_boto:
-            mock_sns = Mock()
-            mock_sns.publish.side_effect = ClientError(
-                {'Error': {'Code': 'InvalidParameter', 'Message': 'Invalid phone number'}},
-                'Publish'
-            )
-            mock_boto.return_value = mock_sns
-
+        # Patch the module-level sns client directly
+        mock_sns_client = Mock()
+        mock_sns_client.publish.side_effect = ClientError(
+            {'Error': {'Code': 'InvalidParameter', 'Message': 'Invalid phone number'}},
+            'Publish'
+        )
+        with patch('form_handler.sns', mock_sns_client):
             result = handler._send_sms_notifications(sms_config, self.form_data)
 
             # Should return empty list due to errors
             self.assertEqual(len(result), 0)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_success(self):
         """Test successful webhook notification sending"""
         handler = FormHandler(self.tenant_config)
@@ -298,7 +376,6 @@ class TestNotificationServices(unittest.TestCase):
             self.assertEqual(call_args[1]['json'], self.form_data)
             self.assertEqual(call_args[1]['timeout'], 10)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_http_error(self):
         """Test webhook notification with HTTP error response"""
         handler = FormHandler(self.tenant_config)
@@ -316,7 +393,6 @@ class TestNotificationServices(unittest.TestCase):
             # Should return empty list due to error
             self.assertEqual(len(result), 0)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_connection_error(self):
         """Test webhook notification with connection error"""
         handler = FormHandler(self.tenant_config)
@@ -331,7 +407,6 @@ class TestNotificationServices(unittest.TestCase):
             # Should return empty list due to exception
             self.assertEqual(len(result), 0)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_timeout(self):
         """Test webhook notification with timeout error"""
         handler = FormHandler(self.tenant_config)
@@ -346,7 +421,6 @@ class TestNotificationServices(unittest.TestCase):
             # Should return empty list due to timeout
             self.assertEqual(len(result), 0)
 
-    @patch('requests.post')
     def test_send_webhook_notifications_custom_headers(self):
         """Test webhook notification with custom headers preserved"""
         # Modify config to include additional custom headers
@@ -381,7 +455,11 @@ class TestNotificationServices(unittest.TestCase):
     @patch('requests.post')
     def test_send_notifications_integration_all_channels(self, mock_requests):
         """Test integrated notification sending across all channels"""
-        # Set up DynamoDB for SMS usage
+        # Verify sender so moto SES accepts the send
+        ses_client = boto3.client('ses', region_name='us-east-1')
+        ses_client.verify_email_identity(EmailAddress='noreply@testcenter.org')
+
+        # Set up DynamoDB for SMS usage and notification-sends audit
         dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
         dynamodb.create_table(
             TableName='picasso_sms_usage',
@@ -395,6 +473,18 @@ class TestNotificationServices(unittest.TestCase):
             ],
             BillingMode='PAY_PER_REQUEST'
         )
+        dynamodb.create_table(
+            TableName='picasso-notification-sends',
+            KeySchema=[
+                {'AttributeName': 'pk', 'KeyType': 'HASH'},
+                {'AttributeName': 'sk', 'KeyType': 'RANGE'}
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'pk', 'AttributeType': 'S'},
+                {'AttributeName': 'sk', 'AttributeType': 'S'}
+            ],
+            BillingMode='PAY_PER_REQUEST'
+        )
 
         # Mock webhook response
         mock_response = Mock()
@@ -404,7 +494,8 @@ class TestNotificationServices(unittest.TestCase):
         handler = FormHandler(self.tenant_config)
         form_config = self.tenant_config['conversational_forms']['volunteer_signup']
 
-        result = handler._send_notifications(form_config, self.form_data, 'normal')
+        # Use high priority so SMS channel is included
+        result = handler._send_notifications(form_config, self.form_data, 'high')
 
         # Should have notifications from all channels
         email_notifications = [n for n in result if n.startswith('email:')]
@@ -412,7 +503,7 @@ class TestNotificationServices(unittest.TestCase):
         webhook_notifications = [n for n in result if n.startswith('webhook:')]
 
         self.assertEqual(len(email_notifications), 2)  # 2 email recipients
-        self.assertEqual(len(sms_notifications), 2)     # 2 SMS recipients
+        self.assertEqual(len(sms_notifications), 2)     # 2 SMS recipients (high priority only)
         self.assertEqual(len(webhook_notifications), 1) # 1 webhook
 
     @mock_ses
@@ -498,7 +589,7 @@ class TestNotificationServices(unittest.TestCase):
         self.assertIn('<style>', html_body)
         self.assertIn('<table>', html_body)
         self.assertIn('<tr>', html_body)
-        self.assertIn('<td>', html_body)
+        self.assertIn('<td', html_body)  # production generates <td style="..."> not bare <td>
 
         # Verify content
         self.assertIn('John', html_body)
@@ -517,11 +608,10 @@ class TestNotificationServices(unittest.TestCase):
         """Test sending fulfillment email to form submitter"""
         handler = FormHandler(self.tenant_config)
 
-        with patch('boto3.client') as mock_boto:
-            mock_ses = Mock()
-            mock_ses.send_email.return_value = {'MessageId': 'fulfillment-message-id'}
-            mock_boto.return_value = mock_ses
+        mock_ses_client = Mock()
+        mock_ses_client.send_email.return_value = {'MessageId': 'fulfillment-message-id'}
 
+        with patch('form_handler.ses', mock_ses_client):
             handler._send_fulfillment_email(
                 recipient='john.doe@example.com',
                 template='volunteer_welcome',
@@ -529,8 +619,8 @@ class TestNotificationServices(unittest.TestCase):
             )
 
             # Verify fulfillment email was sent
-            mock_ses.send_email.assert_called_once()
-            call_args = mock_ses.send_email.call_args
+            mock_ses_client.send_email.assert_called_once()
+            call_args = mock_ses_client.send_email.call_args
 
             # Check recipient
             self.assertEqual(call_args[1]['Destination']['ToAddresses'], ['john.doe@example.com'])
@@ -552,11 +642,10 @@ class TestNotificationServices(unittest.TestCase):
 
         handler = FormHandler(template_config)
 
-        with patch('boto3.client') as mock_boto:
-            mock_ses = Mock()
-            mock_ses.send_email.return_value = {'MessageId': 'fulfillment-message-id'}
-            mock_boto.return_value = mock_ses
+        mock_ses_client = Mock()
+        mock_ses_client.send_email.return_value = {'MessageId': 'fulfillment-message-id'}
 
+        with patch('form_handler.ses', mock_ses_client):
             handler._send_fulfillment_email(
                 recipient='john.doe@example.com',
                 template='volunteer_welcome',
@@ -564,7 +653,7 @@ class TestNotificationServices(unittest.TestCase):
             )
 
             # Verify template variables were substituted
-            call_args = mock_ses.send_email.call_args
+            call_args = mock_ses_client.send_email.call_args
             subject = call_args[1]['Message']['Subject']['Data']
             body = call_args[1]['Message']['Body']['Html']['Data']
 

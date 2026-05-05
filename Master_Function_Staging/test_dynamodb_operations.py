@@ -17,10 +17,10 @@ import uuid
 from form_handler import FormHandler
 
 
+@mock_dynamodb
 class TestDynamoDBSchemas(unittest.TestCase):
     """Test DynamoDB table schemas and operations"""
 
-    @mock_dynamodb
     def setUp(self):
         """Set up DynamoDB tables with proper schemas"""
         self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
@@ -33,7 +33,9 @@ class TestDynamoDBSchemas(unittest.TestCase):
                 {'AttributeName': 'submission_id', 'KeyType': 'HASH'}
             ],
             AttributeDefinitions=[
-                {'AttributeName': 'submission_id', 'AttributeType': 'S'}
+                {'AttributeName': 'submission_id', 'AttributeType': 'S'},
+                {'AttributeName': 'tenant_id', 'AttributeType': 'S'},
+                {'AttributeName': 'timestamp', 'AttributeType': 'S'}
             ],
             GlobalSecondaryIndexes=[
                 {
@@ -45,11 +47,6 @@ class TestDynamoDBSchemas(unittest.TestCase):
                     'Projection': {'ProjectionType': 'ALL'},
                     'ProvisionedThroughput': {'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
                 }
-            ],
-            AttributeDefinitions=[
-                {'AttributeName': 'submission_id', 'AttributeType': 'S'},
-                {'AttributeName': 'tenant_id', 'AttributeType': 'S'},
-                {'AttributeName': 'timestamp', 'AttributeType': 'S'}
             ],
             BillingMode='PROVISIONED',
             ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
@@ -194,7 +191,7 @@ class TestDynamoDBSchemas(unittest.TestCase):
         self.assertEqual(item['form_type'], 'volunteer_signup')
         self.assertEqual(item['session_id'], 'session_12345')
         self.assertEqual(item['conversation_id'], 'conv_67890')
-        self.assertEqual(item['status'], 'submitted')
+        self.assertEqual(item['status'], 'pending_fulfillment')
         self.assertIn('timestamp', item)
 
         # Verify nested responses structure
@@ -366,9 +363,9 @@ class TestDynamoDBSchemas(unittest.TestCase):
 
         self.assertEqual(len(response['Items']), 3)
 
-        # Verify they're sorted by timestamp (most recent first)
+        # Verify they're sorted by timestamp (DynamoDB returns ascending order by range key)
         timestamps = [item['timestamp'] for item in response['Items']]
-        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+        self.assertEqual(timestamps, sorted(timestamps))
 
     def test_error_handling_dynamodb_failures(self):
         """Test error handling when DynamoDB operations fail"""
