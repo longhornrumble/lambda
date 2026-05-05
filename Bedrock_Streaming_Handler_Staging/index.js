@@ -17,6 +17,8 @@ const { BedrockRuntimeClient, InvokeModelWithResponseStreamCommand } = require('
 const { SQSClient, SendMessageCommand, SendMessageBatchCommand } = require('@aws-sdk/client-sqs');
 const { enhanceResponse } = require('./response_enhancer');
 const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
+const { writeSessionSummary } = require('./analytics_writer');
+const { redactPII } = require('./redactPII');
 const {
   buildV4ConversationPrompt,
   classifyTopic,
@@ -52,8 +54,11 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const bedrock = new BedrockRuntimeClient({ region: AWS_REGION });
 const sqs = new SQSClient({ region: AWS_REGION });
 
-// Analytics SQS queue URL
-const ANALYTICS_QUEUE_URL = process.env.ANALYTICS_QUEUE_URL || 'https://sqs.us-east-1.amazonaws.com/614056832592/picasso-analytics-events';
+// Analytics SQS queue URL. Unset in the staging account (per Issue #5
+// batch-1 deferral — no staging SQS queue yet); handleAnalyticsEvent
+// no-ops when this is empty so cross-account writes can't accidentally
+// flow to prod.
+const ANALYTICS_QUEUE_URL = process.env.ANALYTICS_QUEUE_URL || '';
 
 /**
  * Sanitize text for SMS messages - remove special characters that could cause issues
@@ -78,6 +83,18 @@ function sanitizeForSMS(text) {
  */
 async function handleAnalyticsEvent(event) {
   console.log('📊 Analytics event handler invoked');
+
+  // Staging-account guard: when no SQS queue is configured, treat the
+  // ?action=analytics endpoint as a no-op rather than 5xx-ing on every call.
+  // The server-side writer (writeSessionSummary) is the durable analytics
+  // path here; SQS-routed browser events are deferred per Issue #5 batch 1.
+  if (!ANALYTICS_QUEUE_URL) {
+    return {
+      statusCode: 200,
+      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      body: JSON.stringify({ status: 'noop', reason: 'analytics_queue_not_configured' }),
+    };
+  }
 
   try {
     // Parse request body
@@ -325,7 +342,7 @@ const streamingHandler = async (event, responseStream, context) => {
     // Form mode requests don't require user_input - they have form_data instead
     if (!tenantHash || (!userInput && !isFormMode)) {
       const error = !tenantHash ? 'Missing tenant_hash' : 'Missing user_input';
-      write(`data: {"type": "error", "error": "${error}"}\n\n`);
+      write(`data: ${JSON.stringify({ type: 'error', error: String(error) })}\n\n`);
       write('data: [DONE]\n\n');
       streamEnded = true;
       responseStream.end();
@@ -373,7 +390,7 @@ const streamingHandler = async (event, responseStream, context) => {
     if (body.form_mode === true) {
       console.log('📝 Form mode detected - handling locally without Bedrock');
       try {
-        const formResponse = await handleFormMode(body, config);
+        const formResponse = await handleFormMode(body, config, context.awsRequestId);
 
         // Send the form response as a single SSE event
         write(`data: ${JSON.stringify(formResponse)}\n\n`);
@@ -389,7 +406,7 @@ const streamingHandler = async (event, responseStream, context) => {
         return;
       } catch (error) {
         console.error('Form mode error:', error);
-        write(`data: {"type": "error", "error": "Form processing failed: ${error.message}"}\n\n`);
+        write(`data: ${JSON.stringify({ type: 'error', error: `Form processing failed: ${error.message}` })}\n\n`);
         write('data: [DONE]\n\n');
         streamEnded = true;
         responseStream.end();
@@ -422,7 +439,7 @@ const streamingHandler = async (event, responseStream, context) => {
           console.log(`✅ Sent showcase card: ${showcaseCard.id}`);
         } else {
           // Showcase not found - send error
-          write(`data: {"type": "error", "error": "Showcase item not found: ${routingMetadata.target_showcase_id}"}\n\n`);
+          write(`data: ${JSON.stringify({ type: 'error', error: `Showcase item not found: ${routingMetadata.target_showcase_id}` })}\n\n`);
         }
 
         write('data: [DONE]\n\n');
@@ -437,7 +454,7 @@ const streamingHandler = async (event, responseStream, context) => {
         return;
       } catch (error) {
         console.error('Showcase mode error:', error);
-        write(`data: {"type": "error", "error": "Showcase processing failed: ${error.message}"}\n\n`);
+        write(`data: ${JSON.stringify({ type: 'error', error: `Showcase processing failed: ${error.message}` })}\n\n`);
         write('data: [DONE]\n\n');
         streamEnded = true;
         responseStream.end();
@@ -559,16 +576,21 @@ const streamingHandler = async (event, responseStream, context) => {
     write(`: x-total-time-ms=${totalTime}\n`);
     console.log(`✅ Complete - ${tokenCount} tokens in ${totalTime}ms`);
     
-    // Log complete Q&A pair AFTER streaming is done (no impact on user experience)
+    // Log complete Q&A pair AFTER streaming is done (no impact on user experience).
+    // CloudWatch logs are operational, not employee-facing — redact email/phone before
+    // emitting. Employee outreach uses form submissions (full PII) and conversation
+    // history table (untouched by this redaction).
     if (questionBuffer && responseBuffer) {
+      const questionRedacted = redactPII(questionBuffer);
+      const answerRedacted = redactPII(responseBuffer);
       console.log('📝 Q&A Pair Captured:');
       console.log(`  Session: ${sessionId}`);
       console.log(`  Tenant: ${tenantHash.substring(0, 8)}...`);
-      console.log(`  Question: "${questionBuffer.substring(0, 100)}${questionBuffer.length > 100 ? '...' : ''}"`);
-      console.log(`  Answer: "${responseBuffer.substring(0, 200)}${responseBuffer.length > 200 ? '...' : ''}"`);
+      console.log(`  Question: "${questionRedacted.substring(0, 100)}${questionRedacted.length > 100 ? '...' : ''}"`);
+      console.log(`  Answer: "${answerRedacted.substring(0, 200)}${answerRedacted.length > 200 ? '...' : ''}"`);
       console.log(`  Full Q Length: ${questionBuffer.length} chars`);
       console.log(`  Full A Length: ${responseBuffer.length} chars`);
-      
+
       // Log full Q&A in structured format for analytics
       console.log(JSON.stringify({
         type: 'QA_COMPLETE',
@@ -577,8 +599,8 @@ const streamingHandler = async (event, responseStream, context) => {
         tenant_hash: tenantHash,
         tenant_id: config?.tenant_id || null,  // Add tenant_id from config
         conversation_id: body.conversation_id || sessionId,  // Add conversation_id
-        question: questionBuffer,
-        answer: responseBuffer,
+        question: questionRedacted,
+        answer: answerRedacted,
         metrics: {
           first_token_ms: firstTokenTime,
           total_tokens: tokenCount,
@@ -587,9 +609,29 @@ const streamingHandler = async (event, responseStream, context) => {
         }
       }));
 
-      // NOTE: MESSAGE_SENT and MESSAGE_RECEIVED events are now emitted by the frontend
-      // (StreamingChatProvider.jsx and HTTPChatProvider.jsx) via the analytics pipeline.
-      // This ensures reliable delivery since the frontend knows exactly when messages are sent/received.
+      // Server-side analytics writes (Issue #5 PR A). Streaming path is
+      // fire-and-forget — caller never sees the rejection, so the writer
+      // logs its own errors. Frontend MESSAGE_SENT/RECEIVED beacons remain
+      // until PR B (post-soak) purges them.
+      const clientTimestamp = body.client_timestamp || new Date(startTime).toISOString();
+      writeSessionSummary({
+        event_type: 'MESSAGE_SENT',
+        session_id: sessionId,
+        tenant_hash: tenantHash,
+        tenant_id: config?.tenant_id || '',
+        client_timestamp: clientTimestamp,
+        request_id: context.awsRequestId,
+        event_payload: { first_question: questionBuffer },
+      });
+      writeSessionSummary({
+        event_type: 'MESSAGE_RECEIVED',
+        session_id: sessionId,
+        tenant_hash: tenantHash,
+        tenant_id: config?.tenant_id || '',
+        client_timestamp: clientTimestamp,
+        request_id: context.awsRequestId,
+        event_payload: { response_time_ms: firstTokenTime },
+      });
     }
 
     // Enhance response with CTAs after streaming is complete
@@ -715,7 +757,7 @@ const streamingHandler = async (event, responseStream, context) => {
 
   } catch (error) {
     console.error('❌ Stream error:', error);
-    write(`data: {"type": "error", "error": "${error.message}"}\n\n`);
+    write(`data: ${JSON.stringify({ type: 'error', error: String(error.message) })}\n\n`);
   } finally {
     // Clean up
     if (heartbeatInterval) {
@@ -950,8 +992,12 @@ const bufferedHandler = async (event, context) => {
     
     console.log(`✅ Complete - ${tokenCount} tokens in ${totalTime}ms`);
     
-    // Log complete Q&A pair for analytics
+    // Log complete Q&A pair for analytics. CloudWatch logs are operational —
+    // redact email/phone before emitting (employee outreach uses form
+    // submissions + conversation history, both untouched by this).
     if (questionBuffer && responseBuffer) {
+      const questionRedacted = redactPII(questionBuffer);
+      const answerRedacted = redactPII(responseBuffer);
       console.log(JSON.stringify({
         type: 'QA_COMPLETE',
         timestamp: new Date().toISOString(),
@@ -959,8 +1005,8 @@ const bufferedHandler = async (event, context) => {
         tenant_hash: tenantHash,
         tenant_id: config?.tenant_id || null,  // Add tenant_id from config
         conversation_id: body.conversation_id || sessionId,  // Add conversation_id
-        question: questionBuffer,
-        answer: responseBuffer,
+        question: questionRedacted,
+        answer: answerRedacted,
         metrics: {
           first_token_ms: firstTokenTime,
           total_tokens: tokenCount,
@@ -969,9 +1015,32 @@ const bufferedHandler = async (event, context) => {
         }
       }));
 
-      // NOTE: MESSAGE_SENT and MESSAGE_RECEIVED events are now emitted by the frontend
-      // (StreamingChatProvider.jsx and HTTPChatProvider.jsx) via the analytics pipeline.
-      // This ensures reliable delivery since the frontend knows exactly when messages are sent/received.
+      // Server-side analytics writes (Issue #5 PR A). Buffered path awaits;
+      // separated from the CTA-enhancement try/catch below (different timeout
+      // budget, different concern). Writer logs its own errors.
+      const clientTimestamp = body.client_timestamp || new Date(startTime).toISOString();
+      try {
+        await writeSessionSummary({
+          event_type: 'MESSAGE_SENT',
+          session_id: sessionId,
+          tenant_hash: tenantHash,
+          tenant_id: config?.tenant_id || '',
+          client_timestamp: clientTimestamp,
+          request_id: context.awsRequestId,
+          event_payload: { first_question: questionBuffer },
+        });
+        await writeSessionSummary({
+          event_type: 'MESSAGE_RECEIVED',
+          session_id: sessionId,
+          tenant_hash: tenantHash,
+          tenant_id: config?.tenant_id || '',
+          client_timestamp: clientTimestamp,
+          request_id: context.awsRequestId,
+          event_payload: { response_time_ms: firstTokenTime },
+        });
+      } catch (e) {
+        console.log(JSON.stringify({ evt: 'analytics_write_caller_failure', error: 'internal_error' }));
+      }
     }
 
     // Enhance response with CTAs after generation is complete

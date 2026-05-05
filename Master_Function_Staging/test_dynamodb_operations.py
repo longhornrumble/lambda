@@ -32,11 +32,6 @@ class TestDynamoDBSchemas(unittest.TestCase):
             KeySchema=[
                 {'AttributeName': 'submission_id', 'KeyType': 'HASH'}
             ],
-            AttributeDefinitions=[
-                {'AttributeName': 'submission_id', 'AttributeType': 'S'},
-                {'AttributeName': 'tenant_id', 'AttributeType': 'S'},
-                {'AttributeName': 'timestamp', 'AttributeType': 'S'}
-            ],
             GlobalSecondaryIndexes=[
                 {
                     'IndexName': 'tenant-timestamp-index',
@@ -47,6 +42,11 @@ class TestDynamoDBSchemas(unittest.TestCase):
                     'Projection': {'ProjectionType': 'ALL'},
                     'ProvisionedThroughput': {'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
                 }
+            ],
+            AttributeDefinitions=[
+                {'AttributeName': 'submission_id', 'AttributeType': 'S'},
+                {'AttributeName': 'tenant_id', 'AttributeType': 'S'},
+                {'AttributeName': 'timestamp', 'AttributeType': 'S'}
             ],
             BillingMode='PROVISIONED',
             ProvisionedThroughput={'ReadCapacityUnits': 5, 'WriteCapacityUnits': 5}
@@ -191,6 +191,8 @@ class TestDynamoDBSchemas(unittest.TestCase):
         self.assertEqual(item['form_type'], 'volunteer_signup')
         self.assertEqual(item['session_id'], 'session_12345')
         self.assertEqual(item['conversation_id'], 'conv_67890')
+        # Production sets status='pending_fulfillment' at storage time;
+        # 'submitted' was a stale test expectation. See form_handler.py:570.
         self.assertEqual(item['status'], 'pending_fulfillment')
         self.assertIn('timestamp', item)
 
@@ -355,17 +357,19 @@ class TestDynamoDBSchemas(unittest.TestCase):
                 fulfillment_result={'type': 'none'}
             )
 
-        # Verify all entries were created
+        # Verify all entries were created. Query with ScanIndexForward=False
+        # to get DESC order by sort key (timestamp) — DDB default is ASC.
         response = self.audit_table.query(
             KeyConditionExpression='tenant_id = :tid',
-            ExpressionAttributeValues={':tid': 'test_tenant_123'}
+            ExpressionAttributeValues={':tid': 'test_tenant_123'},
+            ScanIndexForward=False,
         )
 
         self.assertEqual(len(response['Items']), 3)
 
-        # Verify they're sorted by timestamp (DynamoDB returns ascending order by range key)
+        # Verify they're sorted by timestamp (most recent first)
         timestamps = [item['timestamp'] for item in response['Items']]
-        self.assertEqual(timestamps, sorted(timestamps))
+        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
 
     def test_error_handling_dynamodb_failures(self):
         """Test error handling when DynamoDB operations fail"""
