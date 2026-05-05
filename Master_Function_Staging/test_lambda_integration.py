@@ -392,8 +392,9 @@ class TestLambdaFormSubmissionIntegration(unittest.TestCase):
 
             response = lambda_handler(form_event, self.mock_context)
 
-            # Verify form submission handler was called
-            mock_handle.assert_called_once_with(form_event, 'test_tenant')
+            # Verify form submission handler was called with threaded request_id
+            # (Issue #5 PR A2 added a third arg from context.aws_request_id)
+            mock_handle.assert_called_once_with(form_event, 'test_tenant', 'test-request-id')
 
     def test_cors_headers_added(self):
         """Test that CORS headers are properly added to responses.

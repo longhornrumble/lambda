@@ -349,7 +349,7 @@ def get_config_for_tenant(tenant_hash: str, event: Dict[str, Any] = None) -> Dic
     
     return add_cors_headers(response, event)
 
-def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str):
+def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None):
     """
     Handle streaming chat requests using Lambda response streaming with SSE format
     Uses awslambdaric.StreamingBody to properly stream responses
@@ -934,19 +934,24 @@ def build_ctas_for_branch(
     logger.info(f"[CTA Builder] Built {len(final_ctas)} CTAs for branch '{branch_name}'")
     return final_ctas
 
-def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
+def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None) -> Dict[str, Any]:
     """
-    Handle chat messages using real intent router with conversation memory support
+    Handle chat messages using real intent router with conversation memory support.
+
+    ``request_id`` is ``context.aws_request_id`` from lambda_handler, threaded
+    through for analytics_writer's per-event idempotency key. Defaults to None
+    for backward compatibility with older call sites; analytics writes are
+    skipped when None (writer rejects with `request_id_missing`).
     """
     logger.info(f"Chat request for tenant: {tenant_hash[:8] if tenant_hash else 'unknown'}...")
-    
+
     # Check for streaming parameter
     query_params = event.get('queryStringParameters', {}) or {}
     streaming_enabled = query_params.get('streaming', '').lower() == 'true'
-    
+
     if streaming_enabled:
         logger.info("Streaming mode detected - returning SSE response")
-        return handle_streaming_chat(event, tenant_hash)
+        return handle_streaming_chat(event, tenant_hash, request_id)
     
     try:
         # Try to use the real intent router
@@ -1195,13 +1200,20 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Could not resolve tenant_id: {e}")
         
-        # Log structured QA_COMPLETE for analytics (matching Bedrock_Streaming_Handler format)
-        # Parse the body to get the content for logging
+        # Log structured QA_COMPLETE for analytics (matching Bedrock_Streaming_Handler format).
+        # CloudWatch logs are operational — redact email/phone before emitting per
+        # Issue #5 PR A finding B1 (employee outreach uses form submissions, untouched).
         try:
             log_body = json.loads(response_data.get('body', '{}'))
             if log_body and 'content' in log_body:
                 session_id = body.get('session_id', '')
                 conversation_id = body.get('conversation_id', session_id)
+                user_input_raw = body.get('user_input', '')
+                answer_raw = log_body.get('content', '')
+
+                from redact_pii import redact_pii
+                question_redacted = redact_pii(user_input_raw)
+                answer_redacted = redact_pii(answer_raw)
 
                 qa_complete_log = {
                     "type": "QA_COMPLETE",
@@ -1210,14 +1222,40 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
                     "tenant_hash": tenant_hash,
                     "tenant_id": tenant_id,
                     "conversation_id": conversation_id,
-                    "question": body.get('user_input', ''),
-                    "answer": log_body.get('content', ''),
+                    "question": question_redacted,
+                    "answer": answer_redacted,
                     "metrics": {
                         "response_time_ms": response_time_ms,
                         "source": "master_function_http"  # Identify non-streaming source
                     }
                 }
                 logger.info(json.dumps(qa_complete_log))
+
+                # Issue #5 PR A2: server-side analytics writes. Awaited (not
+                # fire-and-forget) on the HTTP-fallback path. Writer logs its
+                # own errors; never raises. See analytics_writer.py + the
+                # analytics_writer_contract.json wire-format contract.
+                if session_id and tenant_hash and request_id:
+                    from analytics_writer import write_session_summary
+                    client_timestamp = body.get('client_timestamp') or start_time.isoformat() + 'Z'
+                    write_session_summary({
+                        'event_type': 'MESSAGE_SENT',
+                        'session_id': session_id,
+                        'tenant_hash': tenant_hash,
+                        'tenant_id': tenant_id or '',
+                        'client_timestamp': client_timestamp,
+                        'request_id': request_id,
+                        'event_payload': {'first_question': user_input_raw},
+                    })
+                    write_session_summary({
+                        'event_type': 'MESSAGE_RECEIVED',
+                        'session_id': session_id,
+                        'tenant_hash': tenant_hash,
+                        'tenant_id': tenant_id or '',
+                        'client_timestamp': client_timestamp,
+                        'request_id': request_id,
+                        'event_payload': {'response_time_ms': response_time_ms},
+                    })
         except Exception as log_error:
             logger.warning(f"Failed to log QA_COMPLETE: {log_error}")
 
@@ -1352,7 +1390,7 @@ def handle_conversation(event: Dict[str, Any], tenant_hash: str, operation: str)
         }
         return add_cors_headers(response, event)
 
-def handle_form_submission(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
+def handle_form_submission(event: Dict[str, Any], tenant_hash: str, request_id: str = None) -> Dict[str, Any]:
     """
     Handle form submission from Picasso conversational forms
     """
@@ -1391,6 +1429,12 @@ def handle_form_submission(event: Dict[str, Any], tenant_hash: str) -> Dict[str,
 
         # Initialize form handler
         handler = FormHandler(config)
+
+        # Issue #5 PR A2: thread tenant_hash + aws_request_id into the
+        # form-data body so _store_submission can fire the FORM_COMPLETED
+        # analytics write with full attribution.
+        body['_tenant_hash'] = tenant_hash
+        body['_request_id'] = request_id
 
         # Process form submission
         result = handler.handle_form_submission(body)
@@ -1896,14 +1940,14 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         elif action == 'get_config':
             return get_config_for_tenant(tenant_hash, event)
         elif action == 'chat':
-            return handle_chat(event, tenant_hash)
+            return handle_chat(event, tenant_hash, getattr(context, 'aws_request_id', None))
         elif action == 'conversation':
             operation = query_params.get('operation', 'get')
             return handle_conversation(event, tenant_hash, operation)
         elif action == 'init_session':
             return handle_init_session(event, tenant_hash)
         elif action == 'form_submission':
-            return handle_form_submission(event, tenant_hash)
+            return handle_form_submission(event, tenant_hash, getattr(context, 'aws_request_id', None))
         elif action == 'generate_stream_token':
             return handle_generate_stream_token(event, tenant_hash)
         elif action == 'cache_status':
