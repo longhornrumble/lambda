@@ -356,4 +356,41 @@ describe('Gap 3 — buffered handler: writeSessionSummary called after QA_COMPLE
       expect(call[0].request_id).toBe('req-specific-id-xyz');
     }
   });
+
+  // ─── Review B1: QA_COMPLETE log must redact email + phone ───
+  // Note: global.console.log is replaced by setup.js with a persistent jest.fn()
+  // that accumulates calls across all tests. Must mockClear() before handler()
+  // and read mock.calls directly — DO NOT spyOn (returns same mock, doesn't reset).
+  test('QA_COMPLETE structured log redacts PII from user question + bot answer', async () => {
+    const piiInput = 'Contact me at jane.doe@example.com or call (512) 555-1234.';
+    bedrockSendMock.mockResolvedValueOnce(
+      makeFakeBedrockResponse(['Sure, I will email ', 'jane.doe@example.com', ' shortly.'])
+    );
+
+    console.log.mockClear();
+    const event = {
+      body: JSON.stringify({
+        tenant_hash: 'my87674d777bf9',
+        user_input: piiInput,
+        session_id: 'sess_pii_test',
+        client_timestamp: '2026-05-04T20:00:00.000Z',
+      }),
+    };
+
+    await handler(event, { awsRequestId: 'req-pii-1' });
+
+    const qaLog = console.log.mock.calls
+      .map((c) => c[0])
+      .find((s) => typeof s === 'string' && s.includes('"QA_COMPLETE"'));
+
+    expect(qaLog).toBeDefined();
+    const parsed = JSON.parse(qaLog);
+    expect(parsed.question).not.toMatch(/jane\.doe@example\.com/);
+    expect(parsed.question).not.toMatch(/512.{0,2}555.{0,2}1234/);
+    expect(parsed.question).toMatch(/\[EMAIL\]/);
+    expect(parsed.question).toMatch(/\[PHONE\]/);
+    // Bedrock answer (Bedrock-generated) can echo prompt PII — also redacted
+    expect(parsed.answer).not.toMatch(/jane\.doe@example\.com/);
+    expect(parsed.answer).toMatch(/\[EMAIL\]/);
+  });
 });

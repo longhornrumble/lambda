@@ -258,3 +258,57 @@ describe('writeSessionSummary', () => {
     expect(sentInput.ConditionExpression).toMatch(/attribute_not_exists/);
   });
 });
+
+// ─── Review B2: log shapes lock per contract.log_shapes ───
+// Note: global.console.log is a persistent jest.fn() per setup.js — must mockClear()
+// before each writer call and read mock.calls directly.
+describe('log_shapes contract enforcement (Python A2 parity)', () => {
+  const shapes = contract.log_shapes;
+
+  test('analytics_write_invalid: required reason from REASON_ENUM, no error field', async () => {
+    console.log.mockClear();
+    await writeSessionSummary({ ...baseInput, session_id: 'bad space' });
+    const logged = console.log.mock.calls.map((c) => c[0]).find((s) => typeof s === 'string' && s.includes('analytics_write_invalid'));
+    const parsed = JSON.parse(logged);
+    expect(parsed.evt).toBe('analytics_write_invalid');
+    for (const f of shapes.analytics_write_invalid.required_fields) {
+      expect(parsed[f]).toBeDefined();
+    }
+    for (const f of shapes.analytics_write_invalid.forbidden_fields) {
+      expect(parsed[f]).toBeUndefined();
+    }
+    expect(REASON_ENUM.has(parsed.reason)).toBe(true);
+  });
+
+  test('analytics_write_failure: required error from ERROR_ENUM, no reason field', async () => {
+    const err = new Error('boom');
+    err.name = 'ThrottlingException';
+    ddbMock.on(UpdateItemCommand).rejects(err);
+    console.log.mockClear();
+    await writeSessionSummary(baseInput);
+    const logged = console.log.mock.calls.map((c) => c[0]).find((s) => typeof s === 'string' && s.includes('analytics_write_failure'));
+    const parsed = JSON.parse(logged);
+    expect(parsed.evt).toBe('analytics_write_failure');
+    for (const f of shapes.analytics_write_failure.required_fields) {
+      expect(parsed[f]).toBeDefined();
+    }
+    for (const f of shapes.analytics_write_failure.forbidden_fields) {
+      expect(parsed[f]).toBeUndefined();
+    }
+    expect(ERROR_ENUM.has(parsed.error)).toBe(true);
+  });
+
+  test('analytics_write_duplicate: error must equal ddb_validation, no reason field', async () => {
+    const err = new Error('cond');
+    err.name = 'ConditionalCheckFailedException';
+    ddbMock.on(UpdateItemCommand).rejects(err);
+    console.log.mockClear();
+    await writeSessionSummary(baseInput);
+    const logged = console.log.mock.calls.map((c) => c[0]).find((s) => typeof s === 'string' && s.includes('analytics_write_duplicate'));
+    const parsed = JSON.parse(logged);
+    for (const f of shapes.analytics_write_duplicate.forbidden_fields) {
+      expect(parsed[f]).toBeUndefined();
+    }
+    expect(parsed.error).toBe(shapes.analytics_write_duplicate.error_must_equal);
+  });
+});

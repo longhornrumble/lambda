@@ -6,6 +6,59 @@
     "first_question_max_chars": 50,
     "ttl_days": 90
   },
+  "reader_compatibility": {
+    "_doc": "Per CLAUDE.md schema discipline: every reader of picasso-session-summaries must tolerate missing fields. Verified for known readers as of 2026-05-04 (PR A audit). When adding a new reader, add it to the verified list and include an old-shape fixture test.",
+    "fields_added_by_pr_a": [
+      "last_request_id_message_sent",
+      "last_request_id_message_received",
+      "last_request_id_form_completed",
+      "total_response_time_ms",
+      "response_count"
+    ],
+    "verified_readers": [
+      {
+        "lambda": "Analytics_Dashboard_API",
+        "file": "lambda_function.py",
+        "lines": "2081-2114, 3277-3278",
+        "pattern": "item.get('field', {}).get('N'|'S', default) — tolerates missing fields with safe defaults",
+        "verified_at": "2026-05-04 PR A review"
+      },
+      {
+        "lambda": "Analytics_Aggregator",
+        "file": "lambda_function.py",
+        "reads_from": "Athena/S3, not DDB session-summaries directly",
+        "applies": false
+      }
+    ],
+    "write_only_fields": [
+      "last_request_id_message_sent",
+      "last_request_id_message_received",
+      "last_request_id_form_completed"
+    ],
+    "_doc_write_only": "These three fields are idempotency markers consumed only by the writer's own ConditionExpression. No reader should query them. If a future reader needs them, treat as optional (attribute may not exist on rows written by writers older than PR A)."
+  },
+  "log_shapes": {
+    "_doc": "v7 plan §line 100 originally said 'all log lines use {evt, reason, error}'. After implementation it became clear that `reason` (validation enum) and `error` (runtime enum) are NOT both meaningful on every state. This contract section locks the canonical shape per state so JS and Python writers emit identical log lines.",
+    "analytics_write_invalid": {
+      "_when": "Validation rejection BEFORE the DDB call. Input failed regex/enum check.",
+      "required_fields": ["evt", "reason"],
+      "optional_fields": ["event_type"],
+      "forbidden_fields": ["error"],
+      "reason_must_be_in_enum": "reason_enum"
+    },
+    "analytics_write_failure": {
+      "_when": "DDB call threw a non-ConditionalCheckFailed exception. Runtime/IAM/network problem.",
+      "required_fields": ["evt", "error", "event_type"],
+      "forbidden_fields": ["reason"],
+      "error_must_be_in_enum": "error_code_enum"
+    },
+    "analytics_write_duplicate": {
+      "_when": "DDB returned ConditionalCheckFailedException — benign idempotency rejection (same request_id replayed).",
+      "required_fields": ["evt", "error", "event_type"],
+      "forbidden_fields": ["reason"],
+      "error_must_equal": "ddb_validation"
+    }
+  },
   "reason_enum": [
     "invalid_session_id_format",
     "invalid_tenant_hash_format",
@@ -75,7 +128,7 @@
     },
     {
       "name": "MESSAGE_SENT_no_first_question",
-      "_doc": "MESSAGE_SENT with empty first_question payload — first_question SET clause is omitted entirely.",
+      "_doc": "MESSAGE_SENT with empty first_question payload — first_question SET clause is omitted entirely. Full expected shape provided so Python implementer cannot diverge.",
       "input": {
         "event_type": "MESSAGE_SENT",
         "session_id": "sess_abc123XYZ",
@@ -88,7 +141,16 @@
       "expected": {
         "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, last_request_id_message_sent = :request_id ADD message_count :one, user_message_count :one",
         "ConditionExpression": "attribute_not_exists(last_request_id_message_sent) OR last_request_id_message_sent <> :request_id",
-        "ExpressionAttributeNames_omit": [":first_question"]
+        "ExpressionAttributeNames": { "#ttl": "ttl" },
+        "ExpressionAttributeValues": {
+          ":ended_at": { "S": "2026-05-04T20:00:00.000Z" },
+          ":session_id": { "S": "sess_abc123XYZ" },
+          ":tenant_id": { "S": "MYR384719" },
+          ":started_at": { "S": "2026-05-04T20:00:00.000Z" },
+          ":ttl": { "N": "1786060800" },
+          ":request_id": { "S": "req-aaaa-1111" },
+          ":one": { "N": "1" }
+        }
       }
     },
     {
@@ -118,7 +180,7 @@
     },
     {
       "name": "MESSAGE_RECEIVED_response_time_out_of_range",
-      "_doc": "response_time_ms outside (0, 60000) — accumulator clauses omitted.",
+      "_doc": "response_time_ms outside (0, 60000) → BOTH total_response_time_ms and response_count accumulator clauses omitted (atomic — denominator and numerator stay consistent). Full expected shape provided.",
       "input": {
         "event_type": "MESSAGE_RECEIVED",
         "session_id": "sess_abc123XYZ",
@@ -129,7 +191,10 @@
         "event_payload": { "response_time_ms": 75000 }
       },
       "expected": {
-        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, last_request_id_message_received = :request_id ADD message_count :one, bot_message_count :one"
+        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, last_request_id_message_received = :request_id ADD message_count :one, bot_message_count :one",
+        "ConditionExpression": "attribute_not_exists(last_request_id_message_received) OR last_request_id_message_received <> :request_id",
+        "ExpressionAttributeNames": { "#ttl": "ttl" },
+        "ExpressionAttributeValues_must_NOT_contain": [":response_time"]
       }
     },
     {

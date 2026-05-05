@@ -18,6 +18,7 @@ const { SQSClient, SendMessageCommand, SendMessageBatchCommand } = require('@aws
 const { enhanceResponse } = require('./response_enhancer');
 const { handleFormMode } = require('./form_handler'); // Migrated to AWS SDK v3
 const { writeSessionSummary } = require('./analytics_writer');
+const { redactPII } = require('./redactPII');
 const {
   buildV4ConversationPrompt,
   classifyTopic,
@@ -341,7 +342,7 @@ const streamingHandler = async (event, responseStream, context) => {
     // Form mode requests don't require user_input - they have form_data instead
     if (!tenantHash || (!userInput && !isFormMode)) {
       const error = !tenantHash ? 'Missing tenant_hash' : 'Missing user_input';
-      write(`data: {"type": "error", "error": "${error}"}\n\n`);
+      write(`data: ${JSON.stringify({ type: 'error', error: String(error) })}\n\n`);
       write('data: [DONE]\n\n');
       streamEnded = true;
       responseStream.end();
@@ -405,7 +406,7 @@ const streamingHandler = async (event, responseStream, context) => {
         return;
       } catch (error) {
         console.error('Form mode error:', error);
-        write(`data: {"type": "error", "error": "Form processing failed: ${error.message}"}\n\n`);
+        write(`data: ${JSON.stringify({ type: 'error', error: `Form processing failed: ${error.message}` })}\n\n`);
         write('data: [DONE]\n\n');
         streamEnded = true;
         responseStream.end();
@@ -438,7 +439,7 @@ const streamingHandler = async (event, responseStream, context) => {
           console.log(`✅ Sent showcase card: ${showcaseCard.id}`);
         } else {
           // Showcase not found - send error
-          write(`data: {"type": "error", "error": "Showcase item not found: ${routingMetadata.target_showcase_id}"}\n\n`);
+          write(`data: ${JSON.stringify({ type: 'error', error: `Showcase item not found: ${routingMetadata.target_showcase_id}` })}\n\n`);
         }
 
         write('data: [DONE]\n\n');
@@ -453,7 +454,7 @@ const streamingHandler = async (event, responseStream, context) => {
         return;
       } catch (error) {
         console.error('Showcase mode error:', error);
-        write(`data: {"type": "error", "error": "Showcase processing failed: ${error.message}"}\n\n`);
+        write(`data: ${JSON.stringify({ type: 'error', error: `Showcase processing failed: ${error.message}` })}\n\n`);
         write('data: [DONE]\n\n');
         streamEnded = true;
         responseStream.end();
@@ -575,16 +576,21 @@ const streamingHandler = async (event, responseStream, context) => {
     write(`: x-total-time-ms=${totalTime}\n`);
     console.log(`✅ Complete - ${tokenCount} tokens in ${totalTime}ms`);
     
-    // Log complete Q&A pair AFTER streaming is done (no impact on user experience)
+    // Log complete Q&A pair AFTER streaming is done (no impact on user experience).
+    // CloudWatch logs are operational, not employee-facing — redact email/phone before
+    // emitting. Employee outreach uses form submissions (full PII) and conversation
+    // history table (untouched by this redaction).
     if (questionBuffer && responseBuffer) {
+      const questionRedacted = redactPII(questionBuffer);
+      const answerRedacted = redactPII(responseBuffer);
       console.log('📝 Q&A Pair Captured:');
       console.log(`  Session: ${sessionId}`);
       console.log(`  Tenant: ${tenantHash.substring(0, 8)}...`);
-      console.log(`  Question: "${questionBuffer.substring(0, 100)}${questionBuffer.length > 100 ? '...' : ''}"`);
-      console.log(`  Answer: "${responseBuffer.substring(0, 200)}${responseBuffer.length > 200 ? '...' : ''}"`);
+      console.log(`  Question: "${questionRedacted.substring(0, 100)}${questionRedacted.length > 100 ? '...' : ''}"`);
+      console.log(`  Answer: "${answerRedacted.substring(0, 200)}${answerRedacted.length > 200 ? '...' : ''}"`);
       console.log(`  Full Q Length: ${questionBuffer.length} chars`);
       console.log(`  Full A Length: ${responseBuffer.length} chars`);
-      
+
       // Log full Q&A in structured format for analytics
       console.log(JSON.stringify({
         type: 'QA_COMPLETE',
@@ -593,8 +599,8 @@ const streamingHandler = async (event, responseStream, context) => {
         tenant_hash: tenantHash,
         tenant_id: config?.tenant_id || null,  // Add tenant_id from config
         conversation_id: body.conversation_id || sessionId,  // Add conversation_id
-        question: questionBuffer,
-        answer: responseBuffer,
+        question: questionRedacted,
+        answer: answerRedacted,
         metrics: {
           first_token_ms: firstTokenTime,
           total_tokens: tokenCount,
@@ -751,7 +757,7 @@ const streamingHandler = async (event, responseStream, context) => {
 
   } catch (error) {
     console.error('❌ Stream error:', error);
-    write(`data: {"type": "error", "error": "${error.message}"}\n\n`);
+    write(`data: ${JSON.stringify({ type: 'error', error: String(error.message) })}\n\n`);
   } finally {
     // Clean up
     if (heartbeatInterval) {
@@ -986,8 +992,12 @@ const bufferedHandler = async (event, context) => {
     
     console.log(`✅ Complete - ${tokenCount} tokens in ${totalTime}ms`);
     
-    // Log complete Q&A pair for analytics
+    // Log complete Q&A pair for analytics. CloudWatch logs are operational —
+    // redact email/phone before emitting (employee outreach uses form
+    // submissions + conversation history, both untouched by this).
     if (questionBuffer && responseBuffer) {
+      const questionRedacted = redactPII(questionBuffer);
+      const answerRedacted = redactPII(responseBuffer);
       console.log(JSON.stringify({
         type: 'QA_COMPLETE',
         timestamp: new Date().toISOString(),
@@ -995,8 +1005,8 @@ const bufferedHandler = async (event, context) => {
         tenant_hash: tenantHash,
         tenant_id: config?.tenant_id || null,  // Add tenant_id from config
         conversation_id: body.conversation_id || sessionId,  // Add conversation_id
-        question: questionBuffer,
-        answer: responseBuffer,
+        question: questionRedacted,
+        answer: answerRedacted,
         metrics: {
           first_token_ms: firstTokenTime,
           total_tokens: tokenCount,

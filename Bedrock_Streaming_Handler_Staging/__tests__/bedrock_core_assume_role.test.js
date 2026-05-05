@@ -185,4 +185,95 @@ describe('shared/bedrock-core — KB_RETRIEVER_ROLE_ARN assume-role branch', () 
 
     consoleErrorSpy.mockRestore();
   });
+
+  // ── Review B3: kb_creds_init_failed structured signal on every retrieveKB call after init failure ──
+
+  test('when init failed, retrieveKB emits kb_creds_init_failed signal on every call', async () => {
+    const TEST_ROLE_ARN = 'arn:aws:iam::999999999999:role/fallback-role';
+    const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    console.log.mockClear();
+    let bedrockCore;
+
+    jest.isolateModules(() => {
+      process.env.KB_RETRIEVER_ROLE_ARN = TEST_ROLE_ARN;
+
+      jest.doMock('@aws-sdk/client-bedrock-agent-runtime', () => {
+        const MockClient = jest.fn(function () {});
+        MockClient.prototype.send = jest.fn().mockResolvedValue({ retrievalResults: [] });
+        return {
+          BedrockAgentRuntimeClient: MockClient,
+          RetrieveCommand: jest.fn(function (p) { this.input = p; }),
+        };
+      });
+      jest.doMock('@aws-sdk/credential-providers', () => {
+        throw new Error('Cannot find module @aws-sdk/credential-providers');
+      });
+      jest.doMock('@aws-sdk/client-s3', () => ({
+        S3Client: jest.fn(function () {}),
+        GetObjectCommand: jest.fn(),
+      }));
+      jest.doMock('@aws-sdk/client-dynamodb', () => ({
+        DynamoDBClient: jest.fn(function () {}),
+        QueryCommand: jest.fn(),
+      }));
+
+      bedrockCore = require('../../shared/bedrock-core');
+    });
+
+    // Two retrieveKB calls — both must emit the structured signal
+    await bedrockCore.retrieveKB('first query', { aws: { knowledge_base_id: 'KB-TEST-1' } });
+    await bedrockCore.retrieveKB('second query', { aws: { knowledge_base_id: 'KB-TEST-2' } });
+
+    const signals = console.log.mock.calls
+      .map((c) => c[0])
+      .filter((s) => typeof s === 'string' && s.includes('kb_creds_init_failed'));
+
+    expect(signals.length).toBe(2);
+    const first = JSON.parse(signals[0]);
+    expect(first.evt).toBe('kb_creds_init_failed');
+    expect(first.kb_id).toBe('KB-TEST-1');
+    expect(first.role_arn).toBe(TEST_ROLE_ARN);
+
+    consoleErrorSpy.mockRestore();
+  });
+
+  test('when init succeeded, retrieveKB does NOT emit kb_creds_init_failed signal', async () => {
+    const TEST_ROLE_ARN = 'arn:aws:iam::999999999999:role/working-role';
+    console.log.mockClear();
+    let bedrockCore;
+
+    jest.isolateModules(() => {
+      process.env.KB_RETRIEVER_ROLE_ARN = TEST_ROLE_ARN;
+
+      jest.doMock('@aws-sdk/client-bedrock-agent-runtime', () => {
+        const MockClient = jest.fn(function () {});
+        MockClient.prototype.send = jest.fn().mockResolvedValue({ retrievalResults: [] });
+        return {
+          BedrockAgentRuntimeClient: MockClient,
+          RetrieveCommand: jest.fn(function (p) { this.input = p; }),
+        };
+      });
+      jest.doMock('@aws-sdk/credential-providers', () => ({
+        fromTemporaryCredentials: jest.fn().mockReturnValue({}),
+      }));
+      jest.doMock('@aws-sdk/client-s3', () => ({
+        S3Client: jest.fn(function () {}),
+        GetObjectCommand: jest.fn(),
+      }));
+      jest.doMock('@aws-sdk/client-dynamodb', () => ({
+        DynamoDBClient: jest.fn(function () {}),
+        QueryCommand: jest.fn(),
+      }));
+
+      bedrockCore = require('../../shared/bedrock-core');
+    });
+
+    await bedrockCore.retrieveKB('a query', { aws: { knowledge_base_id: 'KB-OK' } });
+
+    const signals = console.log.mock.calls
+      .map((c) => c[0])
+      .filter((s) => typeof s === 'string' && s.includes('kb_creds_init_failed'));
+
+    expect(signals.length).toBe(0);
+  });
 });

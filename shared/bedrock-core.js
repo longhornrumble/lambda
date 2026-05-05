@@ -20,18 +20,25 @@ const crypto = require('crypto');
 
 // Initialize AWS clients
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-// Cross-account KB access: when KB_RETRIEVER_ROLE_ARN is set (staging account
-// reaching prod-account KBs), assume that role for Bedrock-Agent-Runtime
-// calls. fromTemporaryCredentials caches and auto-refreshes via STS, so the
-// AssumeRole call only happens on first use + before credential expiry.
-// Unset env var → SDK default credential chain (legacy / prod-account behavior).
-// Lazy-require keeps prod-account consumers from needing the credential-providers dep.
+/**
+ * Cross-account KB access: when KB_RETRIEVER_ROLE_ARN is set (staging account
+ * reaching prod-account KBs), assume that role for Bedrock-Agent-Runtime calls.
+ * fromTemporaryCredentials caches and auto-refreshes via STS, so AssumeRole
+ * fires only on first use + before credential expiry. Unset env var → SDK
+ * default credential chain (legacy / prod-account behavior).
+ *
+ * Lazy-require keeps prod-account consumers from needing credential-providers.
+ *
+ * MODULE-LOAD-TIME CAPTURE: this block runs once when bedrock-core is required.
+ * The bedrockAgent singleton retains whatever credentials it got at load.
+ * Tests that toggle KB_RETRIEVER_ROLE_ARN MUST use jest.isolateModules to force
+ * a fresh require — otherwise the singleton from a prior test contaminates the
+ * next one. See __tests__/bedrock_core_assume_role.test.js for the pattern.
+ */
 const KB_RETRIEVER_ROLE_ARN = process.env.KB_RETRIEVER_ROLE_ARN;
 const bedrockAgentClientConfig = { region: AWS_REGION };
+let kbCredsInitFailed = false;
 if (KB_RETRIEVER_ROLE_ARN) {
-  // try/catch lets esbuild treat this as a runtime require — only consumers
-  // that actually set KB_RETRIEVER_ROLE_ARN need credential-providers
-  // installed at runtime. Currently: only Bedrock_Streaming_Handler_Staging.
   try {
     const { fromTemporaryCredentials } = require('@aws-sdk/credential-providers');
     bedrockAgentClientConfig.credentials = fromTemporaryCredentials({
@@ -42,6 +49,12 @@ if (KB_RETRIEVER_ROLE_ARN) {
       },
     });
   } catch (e) {
+    // Silent fallback to default creds → cross-account KB Retrieve fails with
+    // AccessDenied → retrieveKB() catches and returns ''  → chat answer ships
+    // with NO KB grounding. This is fail-open for chat. Set a sticky flag so
+    // every subsequent retrieveKB() call emits a structured signal that a
+    // CloudWatch metric filter can alert on.
+    kbCredsInitFailed = true;
     console.error('KB_RETRIEVER_ROLE_ARN is set but @aws-sdk/credential-providers is not installed; falling back to default credentials. Bedrock Retrieve will fail with cross-account KB.', e.message);
   }
 }
@@ -248,6 +261,17 @@ async function retrieveKB(userInput, config) {
   const kbId = config?.aws?.knowledge_base_id;
   console.log(`🔍 KB Retrieval - KB ID: ${kbId || 'NOT SET'}`);
   console.log(`🔍 User input: "${userInput.substring(0, 50)}..."`);
+
+  // Sticky alert signal: KB cross-account creds failed at module load.
+  // Emitted on EVERY retrieve so a CloudWatch metric filter on
+  // `kb_creds_init_failed` will fire reliably (not just at cold start).
+  if (kbCredsInitFailed) {
+    console.log(JSON.stringify({
+      evt: 'kb_creds_init_failed',
+      kb_id: kbId || null,
+      role_arn: KB_RETRIEVER_ROLE_ARN || null,
+    }));
+  }
 
   if (!kbId) {
     console.log('⚠️ No KB ID found in config - returning empty context');
