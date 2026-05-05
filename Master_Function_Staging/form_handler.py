@@ -473,6 +473,10 @@ class FormHandler:
             responses = form_data.get('responses', {})
             session_id = form_data.get('session_id')
             conversation_id = form_data.get('conversation_id')
+            # Issue #5 PR A2: lambda_function.handle_form_submission injects these
+            # so _store_submission can fire FORM_COMPLETED analytics with attribution.
+            tenant_hash = form_data.get('_tenant_hash')
+            request_id = form_data.get('_request_id')
 
             logger.info(f"Processing form submission: {form_type} for tenant: {self.tenant_id}")
 
@@ -489,7 +493,9 @@ class FormHandler:
                 responses=responses,
                 session_id=session_id,
                 conversation_id=conversation_id,
-                form_config=form_config
+                form_config=form_config,
+                tenant_hash=tenant_hash,
+                request_id=request_id,
             )
 
             # Determine priority
@@ -540,7 +546,8 @@ class FormHandler:
 
     def _store_submission(self, form_type: str, responses: Dict[str, Any],
                          session_id: str, conversation_id: str,
-                         form_config: Dict[str, Any] = None) -> str:
+                         form_config: Dict[str, Any] = None,
+                         tenant_hash: str = None, request_id: str = None) -> str:
         """Store form submission in DynamoDB"""
         submission_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
@@ -572,6 +579,26 @@ class FormHandler:
                 }
             )
             logger.info(f"Stored submission: {submission_id} with form_title: {form_title}")
+
+            # Issue #5 PR A2: server-side FORM_COMPLETED analytics write.
+            # Awaited (blocking). Writer logs its own errors and never raises.
+            # Skipped silently if any of the required IDs are absent — keeps
+            # backward compat with callers that haven't been updated yet.
+            if session_id and tenant_hash and request_id:
+                try:
+                    from analytics_writer import write_session_summary
+                    write_session_summary({
+                        'event_type': 'FORM_COMPLETED',
+                        'session_id': session_id,
+                        'tenant_hash': tenant_hash,
+                        'tenant_id': self.tenant_id or '',
+                        'client_timestamp': timestamp,
+                        'request_id': request_id,
+                        'event_payload': {'form_id': form_type},
+                    })
+                except Exception as analytics_err:  # noqa: BLE001
+                    logger.warning(f"Analytics write failed (non-fatal): {analytics_err}")
+
             return submission_id
 
         except ClientError as e:
