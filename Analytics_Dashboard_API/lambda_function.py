@@ -3537,13 +3537,19 @@ def handle_recent_conversations(tenant_id: str, params: Dict[str, str]) -> Dict[
     conversations = []
     for session in paginated_sessions:
         question = session.get('first_question', '')
+        # Issue #5 PR C: avg_response_time_ms isn't stored — the session row
+        # holds the running total + count so we average here. Old behavior
+        # (`session.get('avg_response_time_ms', 0)`) always returned 0.
+        total_ms = session.get('total_response_time_ms', 0)
+        count = session.get('response_count', 0)
+        avg_ms = (total_ms / count) if count > 0 else 0
         conversations.append({
             'session_id': session.get('session_id', ''),
             'started_at': session.get('started_at', ''),
             'topic': categorize_question(question),
             'first_question': question or '',
             'first_answer': '',  # Not stored in session summary - would need session events lookup
-            'response_time_seconds': round(session.get('avg_response_time_ms', 0) / 1000, 1),
+            'response_time_seconds': round(avg_ms / 1000, 1),
             'message_count': session.get('message_count', 0),
             'outcome': session.get('outcome')
         })
