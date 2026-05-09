@@ -1,11 +1,13 @@
 name: Deploy Lambda — Production
 
 # Manual promotion to production. Run this AFTER verifying the same
-# code on staging. Same packaging logic as deploy-staging — just targets
-# the prod function instead.
+# code on staging.
 #
-# By default deploys main HEAD. To deploy a specific commit, override
-# the `git_ref` input.
+# Prod model: code lives on $LATEST; publish-version on every deploy creates
+# an immutable audit-trail snapshot (no aliases reference it). Rollback =
+# redeploy a previous commit via this workflow with `git_ref` override.
+#
+# See feedback_uniform_env_rules.md.
 
 on:
   workflow_dispatch:
@@ -70,17 +72,17 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Verify staging is healthy before promoting
+      - name: Show staging $LATEST for context
         if: matrix.lambda.source_dir == github.event.inputs.lambda
         run: |
           set -euo pipefail
-          STAGING_LIVE=$(aws lambda get-alias \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --name live --query FunctionVersion --output text)
           STAGING_SHA=$(aws lambda get-function-configuration \
             --function-name ${{ matrix.lambda.staging_function }} \
-            --qualifier "$STAGING_LIVE" --query CodeSha256 --output text)
-          echo "Staging live = v$STAGING_LIVE (sha256: $STAGING_SHA)"
+            --query CodeSha256 --output text)
+          STAGING_LM=$(aws lambda get-function-configuration \
+            --function-name ${{ matrix.lambda.staging_function }} \
+            --query LastModified --output text)
+          echo "Staging \$LATEST — sha256: $STAGING_SHA, last modified: $STAGING_LM"
 
       - name: Package function
         if: matrix.lambda.source_dir == github.event.inputs.lambda
@@ -90,24 +92,21 @@ jobs:
           zip -q -r9 /tmp/deploy.zip ${{ matrix.lambda.include_globs }}
           echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
 
-      - name: Confirm prod-bound code matches what's live in staging
+      - name: Confirm prod-bound code matches what's running on staging
         if: matrix.lambda.source_dir == github.event.inputs.lambda
         run: |
           set -euo pipefail
-          # Compute the would-be CodeSha256 for our package and compare to staging.
+          # Compute the would-be CodeSha256 for our package and compare to staging $LATEST.
           # This protects against promoting code that diverges from what was actually
           # tested in staging (e.g. mid-flight commits to main between deploys).
           LOCAL_SHA=$(openssl dgst -sha256 -binary /tmp/deploy.zip | base64)
-          STAGING_LIVE=$(aws lambda get-alias \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --name live --query FunctionVersion --output text)
           STAGING_SHA=$(aws lambda get-function-configuration \
             --function-name ${{ matrix.lambda.staging_function }} \
-            --qualifier "$STAGING_LIVE" --query CodeSha256 --output text)
+            --query CodeSha256 --output text)
           echo "Local package sha256:   $LOCAL_SHA"
-          echo "Staging live  sha256:   $STAGING_SHA"
+          echo "Staging \$LATEST sha256: $STAGING_SHA"
           if [ "$LOCAL_SHA" != "$STAGING_SHA" ]; then
-            echo "::warning::Local package SHA differs from staging live. Deploying anyway because git_ref was explicit, but this means main has moved past what's running in staging. Verify intent."
+            echo "::warning::Local package SHA differs from staging \$LATEST. Deploying anyway because git_ref was explicit, but this means main has moved past what's running in staging. Verify intent."
           fi
 
       - name: Update function code
@@ -122,7 +121,7 @@ jobs:
           aws lambda wait function-updated \
             --function-name ${{ matrix.lambda.prod_function }}
 
-      - name: Publish version
+      - name: Publish version (audit trail)
         if: matrix.lambda.source_dir == github.event.inputs.lambda
         id: publish
         run: |
@@ -142,36 +141,13 @@ jobs:
           echo "note=$NOTE" >> "$GITHUB_OUTPUT"
           echo "Published v$NEW_VERSION: $NOTE"
 
-      - name: Roll alias prev → previous live
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
-        run: |
-          set -euo pipefail
-          CURRENT_LIVE=$(aws lambda get-alias \
-            --function-name ${{ matrix.lambda.prod_function }} \
-            --name live --query FunctionVersion --output text)
-          aws lambda update-alias \
-            --function-name ${{ matrix.lambda.prod_function }} \
-            --name prev \
-            --function-version "$CURRENT_LIVE"
-          echo "prev now → v$CURRENT_LIVE (rollback target)"
-
-      - name: Flip alias live → new version
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
-        run: |
-          set -euo pipefail
-          aws lambda update-alias \
-            --function-name ${{ matrix.lambda.prod_function }} \
-            --name live \
-            --function-version ${{ steps.publish.outputs.new_version }}
-          echo "live now → v${{ steps.publish.outputs.new_version }}"
-
       - name: Smoke test
         if: matrix.lambda.source_dir == github.event.inputs.lambda
         run: |
           set -euo pipefail
-          URL=$(aws lambda list-function-url-configs \
+          URL=$(aws lambda get-function-url-config \
             --function-name ${{ matrix.lambda.prod_function }} \
-            --query 'FunctionUrlConfigs[0].FunctionUrl' --output text)
+            --query 'FunctionUrl' --output text)
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${URL%/}${{ matrix.lambda.smoke_path }}")
           echo "Smoke: GET ${URL%/}${{ matrix.lambda.smoke_path }} → $STATUS"
           if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
@@ -184,8 +160,8 @@ jobs:
         run: |
           echo "### Promoted ${{ matrix.lambda.prod_function }} to production" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **New prod version:** v${{ steps.publish.outputs.new_version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Code:** \$LATEST (snapshot v${{ steps.publish.outputs.new_version }} for audit)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Note:** ${{ steps.publish.outputs.note }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Smoke:** passed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Rollback: \`aws lambda update-alias --function-name ${{ matrix.lambda.prod_function }} --name live --function-version \$(aws lambda get-alias --function-name ${{ matrix.lambda.prod_function }} --name prev --query FunctionVersion --output text)\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rollback: re-run this workflow with \`git_ref\` set to a previous commit (e.g. \`gh workflow run deploy-production.yml -f lambda=${{ matrix.lambda.prod_function }} -f git_ref=<prev-sha>\`)" >> "$GITHUB_STEP_SUMMARY"

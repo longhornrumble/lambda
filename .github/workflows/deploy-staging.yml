@@ -1,12 +1,11 @@
 name: Deploy Lambda — Staging
 
 # Auto-deploy each touched Lambda's code to its `*_Staging` counterpart on
-# merge to main. Publishes a numbered version (with commit message as the
-# description), rolls `prev` forward to the previously-live version, and flips
-# `live` to the newly-published version.
+# merge to main. Code goes to $LATEST. No version publish, no aliases — staging
+# uses AWS-native versioning only (rollback = redeploy previous commit).
 #
-# Note: until each function's URL is rebound from $LATEST to alias `live`,
-# the alias flip is informational only — traffic still hits $LATEST.
+# See feedback_uniform_env_rules.md: per-environment conventions apply uniformly.
+# Staging is $LATEST-only.
 
 on:
   push:
@@ -100,50 +99,12 @@ jobs:
           aws lambda wait function-updated \
             --function-name ${{ matrix.lambda.staging_function }}
 
-      - name: Publish version
-        id: publish
-        run: |
-          set -euo pipefail
-          COMMIT_SHA=${{ github.sha }}
-          COMMIT_MSG=$(git log -1 --pretty=%s "$COMMIT_SHA")
-          # Compose version note (truncate to Lambda's 256-char description limit)
-          NOTE="${COMMIT_MSG} (${COMMIT_SHA:0:7})"
-          NOTE=${NOTE:0:256}
-          NEW_VERSION=$(aws lambda publish-version \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --description "$NOTE" \
-            --query Version --output text)
-          echo "new_version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
-          echo "note=$NOTE" >> "$GITHUB_OUTPUT"
-          echo "Published v$NEW_VERSION: $NOTE"
-
-      - name: Roll alias prev → previous live
-        run: |
-          set -euo pipefail
-          CURRENT_LIVE=$(aws lambda get-alias \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --name live --query FunctionVersion --output text)
-          aws lambda update-alias \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --name prev \
-            --function-version "$CURRENT_LIVE"
-          echo "prev now → v$CURRENT_LIVE (rollback target)"
-
-      - name: Flip alias live → new version
-        run: |
-          set -euo pipefail
-          aws lambda update-alias \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --name live \
-            --function-version ${{ steps.publish.outputs.new_version }}
-          echo "live now → v${{ steps.publish.outputs.new_version }}"
-
       - name: Smoke test
         run: |
           set -euo pipefail
-          URL=$(aws lambda list-function-url-configs \
+          URL=$(aws lambda get-function-url-config \
             --function-name ${{ matrix.lambda.staging_function }} \
-            --query 'FunctionUrlConfigs[0].FunctionUrl' --output text)
+            --query 'FunctionUrl' --output text)
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${URL%/}${{ matrix.lambda.smoke_path }}")
           echo "Smoke: GET ${URL%/}${{ matrix.lambda.smoke_path }} → $STATUS"
           if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
@@ -153,10 +114,10 @@ jobs:
 
       - name: Summary
         run: |
+          COMMIT_SHA=${{ github.sha }}
           echo "### Deployed ${{ matrix.lambda.staging_function }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **New version:** v${{ steps.publish.outputs.new_version }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Note:** ${{ steps.publish.outputs.note }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Code:** \$LATEST (commit ${COMMIT_SHA:0:7})" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Smoke:** passed" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Rollback: \`aws lambda update-alias --function-name ${{ matrix.lambda.staging_function }} --name live --function-version \$(aws lambda get-alias --function-name ${{ matrix.lambda.staging_function }} --name prev --query FunctionVersion --output text)\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Rollback: re-run this workflow on a previous commit (\`gh workflow run deploy-staging.yml\` from a reverted branch)" >> "$GITHUB_STEP_SUMMARY"
