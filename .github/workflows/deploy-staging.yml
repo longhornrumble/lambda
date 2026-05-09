@@ -102,9 +102,12 @@ jobs:
       - name: Smoke test
         run: |
           set -euo pipefail
-          URL=$(aws lambda get-function-url-config \
+          # Deterministic: filter for the unaliased ($LATEST) URL config.
+          # Aliased entries have a Qualifier field; the $LATEST entry does not.
+          # Tolerates transitional state where alias URLs still exist.
+          URL=$(aws lambda list-function-url-configs \
             --function-name ${{ matrix.lambda.staging_function }} \
-            --query 'FunctionUrl' --output text)
+            --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${URL%/}${{ matrix.lambda.smoke_path }}")
           echo "Smoke: GET ${URL%/}${{ matrix.lambda.smoke_path }} → $STATUS"
           if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
