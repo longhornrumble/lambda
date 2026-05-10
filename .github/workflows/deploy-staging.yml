@@ -68,8 +68,8 @@ jobs:
           - source_dir: Analytics_Dashboard_API
             # No `_Staging` suffix per uniform-env-rules in the staging account
             # (525409062831). Account boundary IS the env separation. The
-            # legacy prod-account `Analytics_Dashboard_API_Staging` Lambda is
-            # dormant and slated for deletion in Phase 4.5.
+            # legacy prod-account `Analytics_Dashboard_API_Staging` Lambda was
+            # decommissioned 2026-05-10 (Phase 4.5).
             staging_function: Analytics_Dashboard_API
             handler: lambda_function.lambda_handler
             # Files included in the deployment zip (anything not listed is excluded).
