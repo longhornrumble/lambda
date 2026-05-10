@@ -49,6 +49,12 @@ jobs:
     needs: detect-changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # GitHub Environment scopes AWS_DEPLOY_ROLE_ARN to the staging-account role
+    # (525409062831:role/GitHubActionsDeployRole). The role's trust policy
+    # requires sub `repo:longhornrumble/*:environment:staging`, so this
+    # assignment is what unlocks OIDC into the staging account from a `main`
+    # push. See project memory: project_aws_native_versioning_staging_twin.
+    environment: staging
     permissions:
       id-token: write
       contents: read
@@ -60,7 +66,11 @@ jobs:
       matrix:
         lambda:
           - source_dir: Analytics_Dashboard_API
-            staging_function: Analytics_Dashboard_API_Staging
+            # No `_Staging` suffix per uniform-env-rules in the staging account
+            # (525409062831). Account boundary IS the env separation. The
+            # legacy prod-account `Analytics_Dashboard_API_Staging` Lambda is
+            # dormant and slated for deletion in Phase 4.5.
+            staging_function: Analytics_Dashboard_API
             handler: lambda_function.lambda_handler
             # Files included in the deployment zip (anything not listed is excluded).
             # Keep this surgical — exclude tests, migration scripts, build helpers.
