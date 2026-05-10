@@ -88,12 +88,32 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      # Pin the build-side Python to the Lambda runtime so any compiled
+      # wheels we install (cryptography in particular) match the
+      # interpreter at runtime.
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Package function
         id: package
         working-directory: ${{ matrix.lambda.source_dir }}
         run: |
           set -euo pipefail
-          zip -q -r9 /tmp/deploy.zip ${{ matrix.lambda.include_globs }}
+          BUILD=/tmp/build
+          rm -rf "$BUILD" && mkdir "$BUILD"
+          # Source files first
+          cp -r ${{ matrix.lambda.include_globs }} "$BUILD/"
+          # Bundled deps (no Lambda Layer dependency — Phase 4.1
+          # architectural choice). Each lambda dir owns its
+          # requirements-layer.txt; if present, its contents land in
+          # the zip alongside source.
+          if [ -f requirements-layer.txt ]; then
+            pip install --quiet --target "$BUILD" -r requirements-layer.txt
+          fi
+          cd "$BUILD"
+          zip -q -r9 /tmp/deploy.zip .
           echo "size=$(stat -c%s /tmp/deploy.zip)" >> "$GITHUB_OUTPUT"
           echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
 
