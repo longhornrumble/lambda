@@ -660,6 +660,12 @@ def _fetch_clerk_user(user_id: str) -> Dict[str, Any]:
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             user_data = json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode('utf-8', errors='replace')[:500]
+        except Exception:
+            body = ''
+        raise ValueError(f'Failed to fetch user from Clerk API: HTTP {e.code} — body: {body}')
     except Exception as e:
         raise ValueError(f'Failed to fetch user from Clerk API: {e}')
 
@@ -1326,7 +1332,10 @@ def handle_features(tenant_id: str) -> Dict[str, Any]:
 
 
 # S3 configuration for tenant list
-S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'myrecruiter-picasso')
+# Default mirrors the module-top definition at line 93 — never fall back to
+# the prod bucket name, even if the env var is unset (defense-in-depth on
+# top of the staging-account IAM Deny on prod-bucket writes).
+S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
 MAPPINGS_PREFIX = 'mappings'
 TENANTS_PREFIX = 'tenants'
 
@@ -5029,8 +5038,37 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
 # Settings — Notification Recipients & Templates (Phase 2b/2c)
 # =============================================================================
 
-# Sender identity for all outbound SES emails from this API.
-SES_SENDER = 'notify@myrecruiter.ai'
+# Sender identity for all outbound SES emails from this API. Env-var driven
+# so staging can route through a verified staging identity (e.g.,
+# notify@staging.myrecruiter.ai) without changing code.
+SES_SENDER = os.environ.get('SES_SENDER_ADDRESS', 'notify@myrecruiter.ai')
+
+# Comma-separated allowlist of recipient email domains for test-send
+# endpoints. Empty / unset = no restriction (prod default). Staging sets
+# this to e.g. "myrecruiter.ai,staging.myrecruiter.ai" so the staging
+# portal can't accidentally deliver test emails to real customer addresses.
+_TEST_SEND_ALLOWED_DOMAINS = tuple(
+    d.strip().lower()
+    for d in os.environ.get('TEST_SEND_ALLOWED_DOMAINS', '').split(',')
+    if d.strip()
+)
+
+
+def _test_send_recipient_allowed(email: str) -> bool:
+    """
+    Check whether an email's domain is permitted by TEST_SEND_ALLOWED_DOMAINS.
+
+    Returns True when:
+      - the env var is unset / empty (no restriction — current prod behavior), OR
+      - the email's domain is exactly one of the allowed entries.
+
+    Returns False only when the env var is configured AND the email's domain
+    isn't in the list. Callers translate False into HTTP 400.
+    """
+    if not _TEST_SEND_ALLOWED_DOMAINS:
+        return True
+    domain = email.rsplit('@', 1)[-1].lower()
+    return domain in _TEST_SEND_ALLOWED_DOMAINS
 
 # Sample values injected when rendering preview or test-send templates.
 SAMPLE_DATA: Dict[str, str] = {
@@ -5490,6 +5528,8 @@ def handle_notification_recipients_test_send(
         return cors_response(400, {'error': 'A valid form_id is required'})
     if len(email) > 254:
         return cors_response(400, {'error': 'Email address too long'})
+    if not _test_send_recipient_allowed(email):
+        return cors_response(400, {'error': 'domain_not_in_allowlist'})
 
     config = get_tenant_config(tenant_id)
     if not config:
@@ -5732,6 +5772,8 @@ def handle_notification_template_test_send(
 
     if not user_email or user_email == 'unknown' or '@' not in user_email:
         return cors_response(400, {'error': 'Authenticated user email is missing or invalid'})
+    if not _test_send_recipient_allowed(user_email):
+        return cors_response(400, {'error': 'domain_not_in_allowlist'})
 
     body = body or {}
     template_type = body.get('template_type', 'internal')
