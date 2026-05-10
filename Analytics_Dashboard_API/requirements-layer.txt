@@ -1,1 +1,2 @@
-PyJWT[cryptography]>=2.8.0,<3.0.0
+PyJWT>=2.8.0,<3.0.0
+cryptography>=3.4.0
