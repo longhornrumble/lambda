@@ -53,16 +53,22 @@ ERROR_ENUM = frozenset({
 
 SUPPORTED_EVENT_TYPES = frozenset({'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'FORM_COMPLETED'})
 
-# Cold-start assertion (Phase 1 C1 fix). If SESSION_SUMMARIES_TABLE is unset, every
-# write_session_summary call will silently no-op (DynamoDB rejects TableName=None as
-# ValidationException; _classify_error maps it to 'ddb_validation' and returns False).
-# Surface the gap loudly on first import instead of leaving it invisible in metrics.
+# Cold-start assertion (Phase 1 C1 fix; phase-audit B9 fix). If
+# SESSION_SUMMARIES_TABLE is unset, every write_session_summary call will silently
+# no-op (DynamoDB rejects TableName=None as ValidationException; _classify_error
+# maps it to 'ddb_validation' and returns False). Emit as JSON to stdout so
+# CloudWatch Logs Insights queries on the `evt` key find it — matches the _log()
+# pattern used by the rest of this module. Using logger.critical here would split
+# the misconfiguration signal off into stderr where the Insights query
+# `filter evt = "analytics_write_misconfiguration"` would miss it.
 _SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE')
 if not _SESSION_SUMMARIES_TABLE:
-    logger.critical(
-        'SESSION_SUMMARIES_TABLE env var is not set; analytics_writer.write_session_summary '
-        'will silently no-op every call until this is fixed.'
-    )
+    print(json.dumps({
+        'evt': 'analytics_write_misconfiguration',
+        'reason': 'missing_env_var',
+        'env_var': 'SESSION_SUMMARIES_TABLE',
+        'consequence': 'write_session_summary_will_silently_no_op',
+    }))
 
 
 def _log(state, **fields):

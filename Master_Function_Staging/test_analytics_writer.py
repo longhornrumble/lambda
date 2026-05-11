@@ -313,3 +313,47 @@ def test_log_shape_duplicate_error_equals_ddb_validation(base_input, mock_ddb_op
     for f in shape['forbidden_fields']:
         assert f not in parsed
     assert parsed['error'] == shape['error_must_equal']
+
+
+# ---------------------------------------------------------------------------
+# Cold-start assertion tests (phase-audit B10)
+#
+# These tests reload the module with and without SESSION_SUMMARIES_TABLE to
+# exercise the cold-start emission path. Without these tests, the C1 fix's
+# failure-mode branch had zero coverage and a rename would silently regress
+# the only signal that surfaces a missing env var.
+# ---------------------------------------------------------------------------
+
+def _reload_analytics_writer():
+    import importlib
+    import analytics_writer
+    importlib.reload(analytics_writer)
+    return analytics_writer
+
+
+def test_cold_start_missing_env_var_emits_misconfiguration(monkeypatch, capsys):
+    """When SESSION_SUMMARIES_TABLE is unset at module import, emit a
+    structured JSON line on stdout so CloudWatch Insights queries on
+    `evt = analytics_write_misconfiguration` find it."""
+    monkeypatch.delenv('SESSION_SUMMARIES_TABLE', raising=False)
+    _reload_analytics_writer()
+    captured = capsys.readouterr().out
+    line = next(
+        (ln for ln in captured.splitlines() if 'analytics_write_misconfiguration' in ln),
+        None,
+    )
+    assert line is not None, (
+        f"Expected analytics_write_misconfiguration emission on stdout, got: {captured!r}"
+    )
+    parsed = json.loads(line)
+    assert parsed['evt'] == 'analytics_write_misconfiguration'
+    assert parsed['reason'] == 'missing_env_var'
+    assert parsed['env_var'] == 'SESSION_SUMMARIES_TABLE'
+
+
+def test_cold_start_env_var_present_no_misconfiguration(monkeypatch, capsys):
+    """When SESSION_SUMMARIES_TABLE IS set, the cold-start path is silent."""
+    monkeypatch.setenv('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries-staging')
+    _reload_analytics_writer()
+    captured = capsys.readouterr().out
+    assert 'analytics_write_misconfiguration' not in captured
