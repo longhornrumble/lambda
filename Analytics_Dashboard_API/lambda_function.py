@@ -4258,6 +4258,15 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
 
         # Add pagination cursor if provided
         if cursor:
+            # Audit B4: a cursor submitted for a date range that crosses the TTL
+            # boundary would cause the archive merge to re-scan the full archive
+            # on top of the cursor-resumed DDB query, emitting duplicates.
+            # Reject explicitly with a 400 so the caller knows to re-issue.
+            if _date_range_extends_past_ttl(date_range):
+                return cors_response(400, {
+                    'error': 'cursor not supported for date ranges crossing the 90d TTL boundary',
+                    'reason': 'archive merge re-scans the full archive on each call; cursor would emit duplicates. Re-issue without cursor.',
+                })
             try:
                 cursor_data = json.loads(base64.urlsafe_b64decode(cursor).decode('utf-8'))
                 query_params['ExclusiveStartKey'] = cursor_data
@@ -4366,12 +4375,18 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
         # Audit B4: when archive merge fires, the archive helper has no cursor
         # state — issuing a next_cursor would cause every subsequent page to
         # re-scan the full archive and emit duplicates. Suppress pagination on
-        # archive-extending queries; the caller gets one capped page. Phase 6
-        # will introduce dual-cursor pagination if prod volume warrants it.
+        # archive-extending queries; the caller gets one page. Phase 6 dual-cursor
+        # work tracked in project_mfs_cleanup_phase2_post_audit_2026-05-11.
         next_cursor = None
         if not archive_merged and 'LastEvaluatedKey' in response and (has_more_after_filter or not outcome_filter):
             cursor_json = json.dumps(response['LastEvaluatedKey'])
             next_cursor = base64.urlsafe_b64encode(cursor_json.encode('utf-8')).decode('utf-8')
+
+        # Audit B4 follow-up: explicit truncation signal so the caller knows
+        # this page is capped and there could be more data they're not seeing.
+        # has_more_after_filter is True iff the merged-then-filtered set was
+        # larger than `limit` (i.e. the sessions[:limit] above dropped rows).
+        result_truncated = archive_merged and has_more_after_filter
 
         return cors_response(200, {
             'tenant_id': tenant_id,
@@ -4381,7 +4396,9 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
                 'limit': limit,
                 'count': len(sessions),
                 'next_cursor': next_cursor,
-                'has_more': next_cursor is not None
+                'has_more': next_cursor is not None,
+                'result_truncated': result_truncated,
+                'archive_merged': archive_merged,
             },
             'filters': {
                 'outcome': outcome_filter
