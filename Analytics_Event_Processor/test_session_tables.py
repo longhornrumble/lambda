@@ -365,9 +365,12 @@ class TestWriteEventsToDynamoDB:
     @patch('lambda_function.update_session_summary')
     @patch('lambda_function.write_session_event')
     def test_write_events_to_dynamodb_multiple_events(self, mock_write, mock_update):
-        """Should write all events and update all summaries."""
+        """Should write all events to picasso-session-events. update_session_summary
+        is no longer invoked from write_events_to_dynamodb as of 2026-05-11 (Phase 1 C3 fix);
+        direct writers in Master_Function_Staging/analytics_writer.py +
+        Bedrock_Streaming_Handler_Staging/analytics_writer.js cover session-summary writes.
+        """
         mock_write.return_value = True
-        mock_update.return_value = True
 
         events = [
             {'session_id': 'sess_1', 'tenant_hash': 'th1', 'event_type': 'E1'},
@@ -378,7 +381,8 @@ class TestWriteEventsToDynamoDB:
         write_events_to_dynamodb(events)
 
         assert mock_write.call_count == 3
-        assert mock_update.call_count == 3
+        # update_session_summary deliberately NOT called post-2026-05-11 Phase 1 C3 fix
+        mock_update.assert_not_called()
 
     @patch('lambda_function.update_session_summary')
     @patch('lambda_function.write_session_event')
@@ -392,10 +396,11 @@ class TestWriteEventsToDynamoDB:
     @patch('lambda_function.update_session_summary')
     @patch('lambda_function.write_session_event')
     def test_write_events_partial_failure(self, mock_write, mock_update):
-        """Should continue processing even if some writes fail."""
+        """Should continue processing even if some writes fail.
+        update_session_summary not invoked post-2026-05-11 Phase 1 C3 fix.
+        """
         # First write fails, second and third succeed
         mock_write.side_effect = [False, True, True]
-        mock_update.return_value = True
 
         events = [
             {'session_id': 'sess_1', 'tenant_hash': 'th1', 'event_type': 'E1'},
@@ -408,7 +413,8 @@ class TestWriteEventsToDynamoDB:
 
         # All events should be attempted
         assert mock_write.call_count == 3
-        assert mock_update.call_count == 3
+        # update_session_summary deliberately NOT called post-2026-05-11 Phase 1 C3 fix
+        mock_update.assert_not_called()
 
 
 class TestConcurrentWrites:

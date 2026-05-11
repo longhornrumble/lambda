@@ -53,6 +53,17 @@ ERROR_ENUM = frozenset({
 
 SUPPORTED_EVENT_TYPES = frozenset({'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'FORM_COMPLETED'})
 
+# Cold-start assertion (Phase 1 C1 fix). If SESSION_SUMMARIES_TABLE is unset, every
+# write_session_summary call will silently no-op (DynamoDB rejects TableName=None as
+# ValidationException; _classify_error maps it to 'ddb_validation' and returns False).
+# Surface the gap loudly on first import instead of leaving it invisible in metrics.
+_SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE')
+if not _SESSION_SUMMARIES_TABLE:
+    logger.critical(
+        'SESSION_SUMMARIES_TABLE env var is not set; analytics_writer.write_session_summary '
+        'will silently no-op every call until this is fixed.'
+    )
+
 
 def _log(state, **fields):
     """Emit one structured log line. Reason/error are enum members; raw user input
@@ -204,7 +215,7 @@ def build_update_params(input_data):
 
     return {
         'params': {
-            'TableName': os.environ.get('SESSION_SUMMARIES_TABLE'),
+            'TableName': _SESSION_SUMMARIES_TABLE,
             'Key': {
                 'pk': {'S': 'TENANT#{}'.format(tenant_hash)},
                 'sk': {'S': 'SESSION#{}'.format(session_id)},

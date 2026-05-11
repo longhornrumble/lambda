@@ -601,15 +601,19 @@ def write_events_to_dynamodb(events):
         return
 
     events_written = 0
-    summaries_updated = 0
 
+    # Note: update_session_summary() write to picasso-session-summaries was removed
+    # 2026-05-11. The UpdateExpression used invalid `if_not_exists(X, :zero) + :one`
+    # syntax (DynamoDB requires `ADD X :one` for atomic increments), so every call
+    # was failing with ValidationException. The direct writers
+    # (Master_Function_Staging/analytics_writer.py + Bedrock_Streaming_Handler_Staging/
+    # analytics_writer.js) cover the same fields with correct idempotency guards via
+    # `last_request_id_<event>` ConditionExpression. The SQS path remains the canonical
+    # writer for picasso-session-events (per-event records); summaries are written
+    # directly by the chat-path Lambdas. The update_session_summary function below is
+    # kept for reference but no longer invoked.
     for event in events:
-        # Write to picasso-session-events
         if write_session_event(event):
             events_written += 1
 
-        # Update picasso-session-summaries (atomic)
-        if update_session_summary(event):
-            summaries_updated += 1
-
-    logger.info(f"DynamoDB writes: {events_written}/{len(events)} events, {summaries_updated}/{len(events)} summaries")
+    logger.info(f"DynamoDB writes: {events_written}/{len(events)} events to picasso-session-events")

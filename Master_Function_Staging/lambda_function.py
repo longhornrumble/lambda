@@ -1810,19 +1810,6 @@ def clear_cache(tenant_hash: str, event: Dict[str, Any] = None) -> Dict[str, Any
     
     return add_cors_headers(response, event)
 
-def handle_options() -> Dict[str, Any]:
-    """
-    Handle CORS preflight requests
-    """
-    logger.info("OPTIONS preflight request")
-    
-    response = {
-        'statusCode': 200,
-        'body': json.dumps({'message': 'CORS preflight successful'})
-    }
-    
-    return add_cors_headers(response, event)
-
 def handle_cache_warming(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
     """
     Warm the cache for a specific tenant by pre-caching action cards and quick help questions
