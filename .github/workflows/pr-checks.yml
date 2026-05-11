@@ -43,6 +43,7 @@ jobs:
       analytics_dashboard_api:   ${{ steps.filter.outputs.analytics_dashboard_api }}
       analytics_event_processor: ${{ steps.filter.outputs.analytics_event_processor }}
       ses_event_handler:         ${{ steps.filter.outputs.ses_event_handler }}
+      session_archiver:          ${{ steps.filter.outputs.session_archiver }}
       # Node.js Lambda using node:test runner (no Jest)
       applier:        ${{ steps.filter.outputs.applier }}
       notification_hub: ${{ steps.filter.outputs.notification_hub }}
@@ -76,6 +77,8 @@ jobs:
               - 'Analytics_Event_Processor/**'
             ses_event_handler:
               - 'ses_event_handler/**'
+            session_archiver:
+              - 'picasso_session_archiver/**'
             applier:
               - 'kb_proposal_applier/**'
             notification_hub:
@@ -216,7 +219,8 @@ jobs:
       needs.detect-changes.outputs.master == 'true' ||
       needs.detect-changes.outputs.analytics_dashboard_api == 'true' ||
       needs.detect-changes.outputs.analytics_event_processor == 'true' ||
-      needs.detect-changes.outputs.ses_event_handler == 'true'
+      needs.detect-changes.outputs.ses_event_handler == 'true' ||
+      needs.detect-changes.outputs.session_archiver == 'true'
 
     strategy:
       fail-fast: false
@@ -240,6 +244,10 @@ jobs:
             has_requirements: false
           - lambda: ses_event_handler
             changed: ${{ needs.detect-changes.outputs.ses_event_handler }}
+            # boto3 from Lambda runtime; no requirements.txt.
+            has_requirements: false
+          - lambda: picasso_session_archiver
+            changed: ${{ needs.detect-changes.outputs.session_archiver }}
             # boto3 from Lambda runtime; no requirements.txt.
             has_requirements: false
 

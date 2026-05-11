@@ -1,0 +1,55 @@
+# picasso-session-archiver
+
+Tier 3 archival for `picasso-session-summaries-{env}`. Triggered by DynamoDB
+Streams REMOVE events; writes the `OldImage` to S3 as JSON.
+
+## Architecture
+
+```
+picasso-session-summaries-{env}  (90-day TTL)
+  └─[DDB Streams: OLD_IMAGE]─►  picasso-session-archiver Lambda
+                                  └─►  s3://picasso-archive-{env}/sessions/year=Y/month=M/day=D/{session_id}.json
+```
+
+The archive bucket has a 365-day lifecycle on the `sessions/` prefix.
+
+## Filtering
+
+Archives **every** REMOVE event, regardless of `userIdentity`. We do NOT filter
+to TTL-only deletes because Phase 2 verification uses direct `delete-item` to
+simulate TTL expiry without waiting 48h. Manual deletes outside tests are rare
+in this table; archiving them is harmless. Re-evaluate before Phase 6 (prod
+mirror).
+
+## Runtime
+
+- Runtime: `python3.11` (matches lambda repo CI)
+- Memory: 256 MB (small JSON serialization workload)
+- Timeout: 30 s
+- Env vars:
+  - `ARCHIVE_BUCKET` — destination S3 bucket name (e.g. `picasso-archive-staging`)
+
+## IAM (minimal)
+
+- `dynamodb:DescribeStream`, `GetRecords`, `GetShardIterator`, `ListStreams`
+  on the stream ARN
+- `s3:PutObject` on `arn:aws:s3:::{ARCHIVE_BUCKET}/sessions/*`
+- AWSLambdaBasicExecutionRole for CloudWatch Logs
+
+## Event Source Mapping
+
+- StartingPosition: **LATEST** (never TRIM_HORIZON — would reprocess all
+  existing rows as deletes the first time it runs)
+- BatchSize: 100, MaximumBatchingWindowInSeconds: 5
+
+## Idempotency
+
+S3 keys are deterministic from `(archive UTC date, session_id)`. Re-processing
+the same record overwrites the same key with identical content.
+
+## Tests
+
+```bash
+cd Lambdas/lambda/picasso_session_archiver
+python -m pytest test_archiver.py -v
+```
