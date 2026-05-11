@@ -33,6 +33,7 @@ def archiver(monkeypatch):
 
 def _ttl_remove_record(session_id="sess_test_123", extra=None, sequence_number=None):
     image = {
+        "pk": {"S": "TENANT#my87674d777bf9"},
         "session_id": {"S": session_id},
         "tenant_id": {"S": "MYR384719"},
         "started_at": {"S": "2026-01-15T10:30:00Z"},
@@ -71,7 +72,7 @@ def test_ttl_remove_is_archived(archiver):
     assert s3.put_object.call_count == 1
     call = s3.put_object.call_args.kwargs
     assert call["Bucket"] == "picasso-archive-staging-test"
-    assert call["Key"].startswith("sessions/year=")
+    assert call["Key"].startswith("sessions/tenant=my87674d777bf9/year=")
     assert call["Key"].endswith("sess_ttl_001.json")
     assert call["ContentType"] == "application/json"
     body = json.loads(call["Body"].decode("utf-8"))
@@ -188,18 +189,45 @@ def test_empty_batch(archiver):
     assert s3.put_object.call_count == 0
 
 
-def test_partitioning_is_utc_date(archiver):
-    """Key format: sessions/year=YYYY/month=MM/day=DD/{sid}.json — UTC-based."""
+def test_partitioning_is_utc_date_and_tenant(archiver):
+    """B5: key format is sessions/tenant={hash}/year=YYYY/month=MM/day=DD/{sid}.json.
+    UTC-based date partitions; tenant_hash from the DDB row's pk."""
     mod, s3 = archiver
     res = mod.lambda_handler({"Records": [_ttl_remove_record("sess_date")]}, None)
     assert res["archived"] == 1
     key = s3.put_object.call_args.kwargs["Key"]
     parts = key.split("/")
     assert parts[0] == "sessions"
-    assert parts[1].startswith("year=") and len(parts[1]) == len("year=YYYY")
-    assert parts[2].startswith("month=") and len(parts[2]) == len("month=MM")
-    assert parts[3].startswith("day=") and len(parts[3]) == len("day=DD")
-    assert parts[4].endswith(".json")
+    assert parts[1] == "tenant=my87674d777bf9"
+    assert parts[2].startswith("year=") and len(parts[2]) == len("year=YYYY")
+    assert parts[3].startswith("month=") and len(parts[3]) == len("month=MM")
+    assert parts[4].startswith("day=") and len(parts[4]) == len("day=DD")
+    assert parts[5].endswith(".json")
+
+
+def test_archived_key_with_missing_pk_uses_unknown_tenant(archiver):
+    """B5 fallback: a DDB row that somehow lacks pk goes to tenant=unknown
+    rather than crashing. ADA never queries that prefix, so the row is
+    effectively orphaned — better than leaking it into another tenant's prefix."""
+    mod, s3 = archiver
+    rec = _ttl_remove_record("sess_no_pk")
+    del rec["dynamodb"]["OldImage"]["pk"]
+    res = mod.lambda_handler({"Records": [rec]}, None)
+    assert res["archived"] == 1
+    key = s3.put_object.call_args.kwargs["Key"]
+    assert "/tenant=unknown/" in key
+
+
+def test_archived_key_with_malformed_pk_uses_unknown_tenant(archiver):
+    """B5 fallback: pk that doesn't start with TENANT# goes to tenant=unknown
+    rather than producing a malformed key path."""
+    mod, s3 = archiver
+    rec = _ttl_remove_record("sess_bad_pk")
+    rec["dynamodb"]["OldImage"]["pk"] = {"S": "INVALID#prefix"}
+    res = mod.lambda_handler({"Records": [rec]}, None)
+    assert res["archived"] == 1
+    key = s3.put_object.call_args.kwargs["Key"]
+    assert "/tenant=unknown/" in key
 
 
 # ---------------------------------------------------------------------------
