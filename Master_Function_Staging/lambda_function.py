@@ -1939,57 +1939,6 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             return clear_cache(tenant_hash, event)
         elif action == 'warm_cache':
             return handle_cache_warming(event, tenant_hash)
-        elif action == 'test_import':
-            # Test import debugging
-            import_results = []
-            try:
-                import boto3
-                import_results.append("✅ boto3 imported")
-            except Exception as e:
-                import_results.append(f"❌ boto3: {e}")
-            
-            try:
-                import jwt
-                import_results.append("✅ jwt imported")
-            except Exception as e:
-                import_results.append(f"❌ jwt: {e}")
-            
-            try:
-                import aws_client_manager
-                import_results.append("✅ aws_client_manager imported")
-            except Exception as e:
-                import_results.append(f"❌ aws_client_manager: {e}")
-            
-            try:
-                import audit_logger
-                import_results.append("✅ audit_logger imported")
-            except Exception as e:
-                import_results.append(f"❌ audit_logger: {e}")
-            
-            try:
-                import token_blacklist
-                import_results.append("✅ token_blacklist imported")
-            except Exception as e:
-                import_results.append(f"❌ token_blacklist: {e}")
-            
-            try:
-                import conversation_handler
-                import_results.append("✅ conversation_handler imported")
-            except Exception as e:
-                import_results.append(f"❌ conversation_handler: {e}")
-                import traceback
-                import_results.append(f"Traceback: {traceback.format_exc()}")
-            
-            import sys
-            import_results.append(f"Python: {sys.version}")
-            
-            response = {
-                'statusCode': 200,
-                'body': json.dumps({
-                    'import_test_results': import_results
-                })
-            }
-            return add_cors_headers(response, event)
         elif not action:
             # No action specified, default to health check
             return health_check(event)
