@@ -308,6 +308,10 @@ class TestHandleSessionsList:
         assert result['statusCode'] == 200
         assert body['pagination']['has_more'] is True
         assert body['pagination']['next_cursor'] is not None
+        # Third-audit row H: mutation-resistance. Live-only query (range=30d
+        # by default, well within TTL) must not claim archive_merged.
+        assert body['pagination']['archive_merged'] is False
+        assert body['pagination']['result_truncated'] is False
 
     @patch('lambda_function.dynamodb')
     def test_sessions_list_with_cursor(self, mock_dynamodb):
@@ -1064,6 +1068,29 @@ class TestArchiveProbe:
             assert result['statusCode'] == 404
         finally:
             self._reset_probe()
+
+    def test_probe_returns_404_when_environment_unset_with_flag_on(self):
+        """Third-audit row A: absent ENVIRONMENT must fail closed. A prod
+        Lambda that forgets to set ENVIRONMENT must not pass the gate just
+        because someone set the soft flag."""
+        try:
+            os.environ.pop('ENVIRONMENT', None)
+            os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'true'
+            result = handle_archive_probe()
+            assert result['statusCode'] == 404
+        finally:
+            self._reset_probe()
+
+    def test_probe_returns_404_for_environment_case_and_short_variants(self):
+        """Third-audit row H: gate is exact-match whitelist on lowercase
+        'staging' / 'dev'. Any casing variant or short form must fail closed."""
+        for env_value in ('Staging', 'STAGING', 'prod', 'PROD', 'Production', 'PRODUCTION', ''):
+            try:
+                self._enable_probe(environment=env_value)
+                result = handle_archive_probe()
+                assert result['statusCode'] == 404, f"ENVIRONMENT={env_value!r} should fail closed"
+            finally:
+                self._reset_probe()
 
     @patch('lambda_function.s3')
     def test_probe_returns_count_when_both_gates_pass(self, mock_s3):

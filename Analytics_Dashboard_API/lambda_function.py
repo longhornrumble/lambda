@@ -304,9 +304,10 @@ def lambda_handler(event, context):
     # Env-gated so it returns 404 unless STAGING_HEALTH_PROBE_ENABLED=true is
     # explicitly set on the Lambda. Used to verify the Lambda execution role
     # can actually LIST + GET archive objects in S3 via real HTTP. Returns
-    # archives_found (count) + bucket_head_check (IAM grant status) for the
-    # MYR test tenant only — never exposes real-tenant data.
-    if path.endswith('/__internal/archive-probe') and method == 'GET':
+    # archives_found (count) + iam_path (ok/failed) for the MYR test tenant
+    # only — never exposes real-tenant data. Audit follow-up: exact-match the
+    # path so /<anything>/__internal/archive-probe does NOT reach the handler.
+    if path.rstrip('/') == '/__internal/archive-probe' and method == 'GET':
         return handle_archive_probe()
 
     # Authenticate request
@@ -2183,11 +2184,11 @@ STAGING_PROBE_TENANT_HASH = 'my87674d777bf9'
 
 
 def handle_archive_probe() -> Dict[str, Any]:
-    # Defense in depth #1: structural prod block. ENVIRONMENT must be staging
-    # or dev. The env-flag below is a soft control; this is the hard one.
-    # If somehow promoted to prod and STAGING_HEALTH_PROBE_ENABLED is also
-    # mistakenly set, this gate fails-closed.
-    if os.environ.get('ENVIRONMENT', 'staging') not in ('staging', 'dev'):
+    # Defense in depth #1: structural prod block. ENVIRONMENT must be set to
+    # staging or dev. No default — an absent ENVIRONMENT fails CLOSED so a
+    # prod Lambda missing the env var cannot accidentally pass the gate.
+    # The env-flag below is a soft control on top.
+    if os.environ.get('ENVIRONMENT') not in ('staging', 'dev'):
         return cors_response(404, {'error': 'Not Found'})
 
     # Defense in depth #2: explicit opt-in via env var.
