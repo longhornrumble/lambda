@@ -1,8 +1,10 @@
 """
 Unit tests for DynamoDB Session Tables functionality.
 
-Tests the write_session_event(), update_session_summary(), and write_events_to_dynamodb()
-functions added for User Journey Analytics Phase 1.
+Tests the write_session_event() and write_events_to_dynamodb() functions.
+update_session_summary() was deleted 2026-05-11 (phase audit B7) — its
+UpdateExpression used invalid DynamoDB syntax and the call site was already
+removed in PR #57.
 """
 
 import pytest
@@ -15,7 +17,6 @@ from botocore.exceptions import ClientError
 from lambda_function import (
     calculate_ttl,
     write_session_event,
-    update_session_summary,
     write_events_to_dynamodb
 )
 
@@ -141,235 +142,14 @@ class TestWriteSessionEvent:
         assert result is False
 
 
-class TestUpdateSessionSummary:
-    """Tests for update_session_summary() function."""
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_basic(self, mock_dynamodb):
-        """Should update session summary with basic event."""
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'tenant_id': 'FOS123',
-            'event_type': 'WIDGET_OPENED',
-            'client_timestamp': '2025-12-26T10:00:00Z'
-        }
-
-        result = update_session_summary(event)
-
-        assert result is True
-        mock_dynamodb.update_item.assert_called_once()
-
-        # Verify key structure
-        call_args = mock_dynamodb.update_item.call_args
-        key = call_args[1]['Key']
-        assert key['pk']['S'] == 'TENANT#fo85e6a06dcdf4'
-        assert 'SESSION#' in key['sk']['S']
-        assert 'sess_123' in key['sk']['S']
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_message_sent(self, mock_dynamodb):
-        """MESSAGE_SENT should increment user_message_count and message_count."""
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'MESSAGE_SENT',
-            'client_timestamp': '2025-12-26T10:00:00Z',
-            'event_payload': {'content_preview': 'What are your volunteer opportunities?'}
-        }
-
-        result = update_session_summary(event)
-
-        assert result is True
-        call_args = mock_dynamodb.update_item.call_args
-        update_expr = call_args[1]['UpdateExpression']
-        expr_values = call_args[1]['ExpressionAttributeValues']
-        assert 'user_message_count' in update_expr
-        assert 'message_count' in update_expr
-        assert 'first_question' in update_expr
-        # Counter bindings must be present for counter branches
-        assert ':one' in expr_values
-        assert ':zero' in expr_values
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_message_received(self, mock_dynamodb):
-        """MESSAGE_RECEIVED should increment bot_message_count and message_count."""
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'MESSAGE_RECEIVED',
-            'client_timestamp': '2025-12-26T10:00:00Z'
-        }
-
-        result = update_session_summary(event)
-
-        assert result is True
-        call_args = mock_dynamodb.update_item.call_args
-        update_expr = call_args[1]['UpdateExpression']
-        expr_values = call_args[1]['ExpressionAttributeValues']
-        assert 'bot_message_count' in update_expr
-        assert 'message_count' in update_expr
-        # Counter bindings must be present for counter branches
-        assert ':one' in expr_values
-        assert ':zero' in expr_values
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_form_completed(self, mock_dynamodb):
-        """FORM_COMPLETED should set outcome to form_completed."""
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'FORM_COMPLETED',
-            'client_timestamp': '2025-12-26T10:00:00Z',
-            'event_payload': {'form_id': 'volunteer_signup'}
-        }
-
-        result = update_session_summary(event)
-
-        assert result is True
-        call_args = mock_dynamodb.update_item.call_args
-        expr_values = call_args[1]['ExpressionAttributeValues']
-        assert ':outcome' in expr_values
-        assert expr_values[':outcome']['S'] == 'form_completed'
-        assert ':form_id' in expr_values
-        # Regression guard: non-counter branches must NOT bind unused :one/:zero
-        # (DynamoDB rejects unused ExpressionAttributeValues with ValidationException)
-        assert ':one' not in expr_values
-        assert ':zero' not in expr_values
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_link_clicked(self, mock_dynamodb):
-        """LINK_CLICKED should set outcome only if not already set."""
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'LINK_CLICKED',
-            'client_timestamp': '2025-12-26T10:00:00Z'
-        }
-
-        result = update_session_summary(event)
-
-        assert result is True
-        call_args = mock_dynamodb.update_item.call_args
-        update_expr = call_args[1]['UpdateExpression']
-        expr_values = call_args[1]['ExpressionAttributeValues']
-        # Should use if_not_exists for weaker outcome
-        assert 'if_not_exists' in update_expr
-        # Regression guard: no unused counter bindings
-        assert ':one' not in expr_values
-        assert ':zero' not in expr_values
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_cta_clicked(self, mock_dynamodb):
-        """CTA_CLICKED should set outcome via if_not_exists and not bind unused counters."""
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'CTA_CLICKED',
-            'client_timestamp': '2025-12-26T10:00:00Z'
-        }
-
-        result = update_session_summary(event)
-
-        assert result is True
-        call_args = mock_dynamodb.update_item.call_args
-        expr_values = call_args[1]['ExpressionAttributeValues']
-        assert ':outcome' in expr_values
-        assert expr_values[':outcome']['S'] == 'cta_clicked'
-        assert ':one' not in expr_values
-        assert ':zero' not in expr_values
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_session_end(self, mock_dynamodb):
-        """SESSION_END should set default 'conversation' outcome and not bind unused counters."""
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'SESSION_END',
-            'client_timestamp': '2025-12-26T10:00:00Z'
-        }
-
-        result = update_session_summary(event)
-
-        assert result is True
-        call_args = mock_dynamodb.update_item.call_args
-        expr_values = call_args[1]['ExpressionAttributeValues']
-        assert ':outcome' in expr_values
-        assert expr_values[':outcome']['S'] == 'conversation'
-        assert ':one' not in expr_values
-        assert ':zero' not in expr_values
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_no_unused_bindings(self, mock_dynamodb):
-        """Generic invariant: every :placeholder bound in ExpressionAttributeValues
-        must appear in the UpdateExpression. Mirrors DynamoDB's server-side validator
-        and would have caught the original ValidationException bug."""
-        mock_dynamodb.update_item.return_value = {}
-
-        for event_type in ['WIDGET_OPENED', 'MESSAGE_SENT', 'MESSAGE_RECEIVED',
-                           'FORM_COMPLETED', 'LINK_CLICKED', 'CTA_CLICKED', 'SESSION_END']:
-            mock_dynamodb.update_item.reset_mock()
-            update_session_summary({
-                'session_id': 'sess_123',
-                'tenant_hash': 'fo85e6a06dcdf4',
-                'event_type': event_type,
-                'client_timestamp': '2025-12-26T10:00:00Z',
-                'event_payload': {'form_id': 'f1'} if event_type == 'FORM_COMPLETED' else {}
-            })
-            call_args = mock_dynamodb.update_item.call_args
-            update_expr = call_args[1]['UpdateExpression']
-            expr_values = call_args[1]['ExpressionAttributeValues']
-            for placeholder in expr_values:
-                assert placeholder in update_expr, (
-                    f"{event_type}: bound {placeholder} but it is not used in "
-                    f"UpdateExpression — DynamoDB will reject with ValidationException"
-                )
-
-    @patch('lambda_function.dynamodb')
-    def test_update_session_summary_dynamodb_error(self, mock_dynamodb):
-        """Should return False on DynamoDB error."""
-        mock_dynamodb.update_item.side_effect = ClientError(
-            {'Error': {'Code': 'InternalError', 'Message': 'Test error'}},
-            'UpdateItem'
-        )
-
-        event = {
-            'session_id': 'sess_123',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'WIDGET_OPENED',
-            'client_timestamp': '2025-12-26T10:00:00Z'
-        }
-
-        result = update_session_summary(event)
-
-        assert result is False
-
-
 class TestWriteEventsToDynamoDB:
     """Tests for write_events_to_dynamodb() orchestration function."""
 
-    @patch('lambda_function.update_session_summary')
     @patch('lambda_function.write_session_event')
-    def test_write_events_to_dynamodb_multiple_events(self, mock_write, mock_update):
-        """Should write all events to picasso-session-events. update_session_summary
-        is no longer invoked from write_events_to_dynamodb as of 2026-05-11 (Phase 1 C3 fix);
-        direct writers in Master_Function_Staging/analytics_writer.py +
-        Bedrock_Streaming_Handler_Staging/analytics_writer.js cover session-summary writes.
-        """
+    def test_write_events_to_dynamodb_multiple_events(self, mock_write):
+        """Should write all events to picasso-session-events. Session summaries are
+        written by chat-path Lambdas, not by this orchestrator (update_session_summary
+        deleted 2026-05-11 phase audit B7)."""
         mock_write.return_value = True
 
         events = [
@@ -381,25 +161,17 @@ class TestWriteEventsToDynamoDB:
         write_events_to_dynamodb(events)
 
         assert mock_write.call_count == 3
-        # update_session_summary deliberately NOT called post-2026-05-11 Phase 1 C3 fix
-        mock_update.assert_not_called()
 
-    @patch('lambda_function.update_session_summary')
     @patch('lambda_function.write_session_event')
-    def test_write_events_to_dynamodb_empty_list(self, mock_write, mock_update):
+    def test_write_events_to_dynamodb_empty_list(self, mock_write):
         """Should handle empty event list gracefully."""
         write_events_to_dynamodb([])
 
         mock_write.assert_not_called()
-        mock_update.assert_not_called()
 
-    @patch('lambda_function.update_session_summary')
     @patch('lambda_function.write_session_event')
-    def test_write_events_partial_failure(self, mock_write, mock_update):
-        """Should continue processing even if some writes fail.
-        update_session_summary not invoked post-2026-05-11 Phase 1 C3 fix.
-        """
-        # First write fails, second and third succeed
+    def test_write_events_partial_failure(self, mock_write):
+        """Should continue processing even if some writes fail."""
         mock_write.side_effect = [False, True, True]
 
         events = [
@@ -413,76 +185,6 @@ class TestWriteEventsToDynamoDB:
 
         # All events should be attempted
         assert mock_write.call_count == 3
-        # update_session_summary deliberately NOT called post-2026-05-11 Phase 1 C3 fix
-        mock_update.assert_not_called()
-
-
-class TestConcurrentWrites:
-    """Tests for atomic update behavior under concurrent writes."""
-
-    @patch('lambda_function.dynamodb')
-    def test_concurrent_message_sent_uses_atomic_increment(self, mock_dynamodb):
-        """
-        Multiple MESSAGE_SENT events for same session should use atomic ADD.
-        This verifies the UpdateExpression uses ADD for counters, not SET.
-        """
-        mock_dynamodb.update_item.return_value = {}
-
-        event = {
-            'session_id': 'sess_concurrent',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'MESSAGE_SENT',
-            'client_timestamp': '2025-12-26T10:00:00Z',
-            'event_payload': {'content_preview': 'Test message'}
-        }
-
-        update_session_summary(event)
-
-        call_args = mock_dynamodb.update_item.call_args
-        update_expr = call_args[1]['UpdateExpression']
-
-        # Verify atomic increment pattern (not SET x = x + 1)
-        assert 'if_not_exists(user_message_count' in update_expr
-        assert 'if_not_exists(message_count' in update_expr
-        # The pattern is: SET field = if_not_exists(field, :zero) + :one
-        # This is atomic because DynamoDB executes SET atomically
-
-    @patch('lambda_function.dynamodb')
-    def test_form_completed_overwrites_link_clicked(self, mock_dynamodb):
-        """
-        FORM_COMPLETED should always set outcome (strong outcome).
-        LINK_CLICKED should only set if outcome not already set (weak outcome).
-        """
-        mock_dynamodb.update_item.return_value = {}
-
-        # Form completed - strong outcome, uses SET directly
-        form_event = {
-            'session_id': 'sess_outcome',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'FORM_COMPLETED',
-            'client_timestamp': '2025-12-26T10:00:00Z',
-            'event_payload': {'form_id': 'test_form'}
-        }
-        update_session_summary(form_event)
-        form_call = mock_dynamodb.update_item.call_args
-        form_update = form_call[1]['UpdateExpression']
-
-        # Link clicked - weak outcome, uses if_not_exists
-        mock_dynamodb.reset_mock()
-        link_event = {
-            'session_id': 'sess_outcome',
-            'tenant_hash': 'fo85e6a06dcdf4',
-            'event_type': 'LINK_CLICKED',
-            'client_timestamp': '2025-12-26T10:00:00Z'
-        }
-        update_session_summary(link_event)
-        link_call = mock_dynamodb.update_item.call_args
-        link_update = link_call[1]['UpdateExpression']
-
-        # Form should use direct SET for outcome
-        assert '#outcome = :outcome' in form_update
-        # Link should use if_not_exists for outcome
-        assert 'if_not_exists(#outcome, :outcome)' in link_update
 
 
 if __name__ == '__main__':

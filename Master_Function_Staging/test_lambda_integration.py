@@ -239,7 +239,12 @@ class TestLambdaFormSubmissionIntegration(unittest.TestCase):
             self.assertIn('Failed to process form submission', body['message'])
 
     def test_options_request_handling(self):
-        """Test CORS preflight OPTIONS request handling"""
+        """Test CORS preflight OPTIONS request handling.
+
+        After the C2 fix (PR #57 — duplicate handle_options removed), OPTIONS
+        preflight returns 200. The deleted duplicate handle_options() raised
+        TypeError that was caught by the generic handler and returned 500.
+        """
         options_event = {
             'httpMethod': 'OPTIONS',
             'queryStringParameters': {
@@ -255,10 +260,7 @@ class TestLambdaFormSubmissionIntegration(unittest.TestCase):
 
         response = lambda_handler(options_event, self.mock_context)
 
-        # Production bug: lambda_function.py defines handle_options() twice (lines 163 and 1707).
-        # The second definition (no args) shadows the first; lambda_handler calls handle_options(event)
-        # which raises TypeError → caught by generic handler → returns 500.
-        self.assertEqual(response['statusCode'], 500)
+        self.assertEqual(response['statusCode'], 200)
 
     @mock_dynamodb
     @mock_ses
