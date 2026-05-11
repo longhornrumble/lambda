@@ -37,7 +37,7 @@ def _ttl_remove_record(session_id="sess_test_123", extra=None, sequence_number=N
         "tenant_id": {"S": "MYR384719"},
         "started_at": {"S": "2026-01-15T10:30:00Z"},
         "ttl": {"N": "1736947800"},
-        "messages_count": {"N": "12"},
+        "message_count": {"N": "12"},
     }
     if extra:
         image.update(extra)

@@ -2084,8 +2084,9 @@ def _fetch_archived_sessions(tenant_hash: str, date_range: Dict[str, str], limit
     the requested date range extends past the DDB 90-day TTL boundary.
 
     Filters:
-      - tenant: match pk == "TENANT#{tenant_hash}" OR the JSON tenant_id field
-        (the second is for forward compat — current archiver writes both).
+      - tenant: match pk == "TENANT#{tenant_hash}". The archiver writes only `pk`;
+        no standalone `tenant_hash` attribute exists on archived items (verified
+        2026-05-11 audit B3).
       - started_at: in [start_date_iso, end_date_iso + 1d)
       - limit: hard cap on returned sessions (defaults to 1000 to match DDB caller)
 
@@ -2129,8 +2130,11 @@ def _fetch_archived_sessions(tenant_hash: str, date_range: Dict[str, str], limit
                     logger.warning(f"_fetch_archived_sessions: skipping {key}: {type(e).__name__}: {e}")
                     continue
 
-                # Tenant filter
-                if item.get('pk') != expected_pk and item.get('tenant_hash') != tenant_hash:
+                # Tenant filter — real archiver output has only `pk`, not a standalone
+                # `tenant_hash` field (analytics_writer.py writes tenant_hash into the
+                # DDB Key.pk, not as a separate attribute). Verified via captured S3
+                # objects in TestArchivedRealFixture (audit B3, 2026-05-11).
+                if item.get('pk') != expected_pk:
                     continue
 
                 # started_at filter
