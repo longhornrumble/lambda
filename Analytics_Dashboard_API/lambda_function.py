@@ -84,6 +84,12 @@ FORM_SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_
 SESSION_EVENTS_TABLE = os.environ.get('SESSION_EVENTS_TABLE', 'picasso-session-events')
 SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries')
 
+# Tier-3 archive bucket — session-summaries rows that aged past the 90-day DDB TTL
+# are archived here by picasso-session-archiver. ADA reads this bucket as a
+# fallback when the requested date range extends past the TTL boundary. Default
+# follows the environment naming convention; override per-env via the Lambda env.
+ARCHIVE_BUCKET = os.environ.get('ARCHIVE_BUCKET', f'picasso-archive-{ENVIRONMENT}')
+
 # DynamoDB Notification Tables (Phase 2a)
 # IAM: Lambda execution role needs dynamodb:Query on both tables and the ByMessageId GSI.
 NOTIFICATION_EVENTS_TABLE = os.environ.get('NOTIFICATION_EVENTS_TABLE', 'picasso-notification-events')
@@ -2025,6 +2031,145 @@ def validate_feature_access(tenant_id: str, required_feature: str, user_role: Op
 
 
 # =============================================================================
+# S3 Archive Read Path (Tier-3)
+# =============================================================================
+
+# DDB session-summaries are TTL-deleted at 90 days. The archiver Lambda writes
+# the OldImage to s3://picasso-archive-{env}/sessions/year=Y/month=M/day=D/{sid}.json
+# at archive-write time. ADA reads from S3 when a date-range request reaches
+# back past the TTL boundary.
+
+ARCHIVE_TTL_DAYS = 90
+
+
+def _archived_item_to_session_shape(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an archived session JSON (raw DDB shape) into the same shape
+    fetch_session_summaries returns from DDB. Lets callers merge S3 + DDB
+    results without caring about source."""
+    started_at = item.get('started_at', '') or ''
+    ended_at = item.get('ended_at', '') or started_at
+
+    duration_seconds = 0
+    if started_at and ended_at:
+        try:
+            start_dt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+            end_dt = datetime.fromisoformat(ended_at.replace('Z', '+00:00'))
+            duration_seconds = int((end_dt - start_dt).total_seconds())
+        except (ValueError, TypeError):
+            pass
+
+    raw_outcome = item.get('outcome', 'conversation') or 'conversation'
+    outcome = 'conversation' if raw_outcome == 'browsing' else raw_outcome
+
+    return {
+        'session_id': item.get('session_id') or '',
+        'started_at': started_at,
+        'ended_at': ended_at,
+        'duration_seconds': duration_seconds,
+        'outcome': outcome,
+        'message_count': int(item.get('message_count') or 0),
+        'user_message_count': int(item.get('user_message_count') or 0),
+        'bot_message_count': int(item.get('bot_message_count') or 0),
+        'first_question': item.get('first_question', '') or '',
+        'form_id': item.get('form_id', '') or '',
+        'total_response_time_ms': int(item.get('total_response_time_ms') or 0),
+        'response_count': int(item.get('response_count') or 0),
+    }
+
+
+def _fetch_archived_sessions(tenant_hash: str, date_range: Dict[str, str], limit: int = 1000) -> List[Dict[str, Any]]:
+    """Read archived sessions from S3 matching the tenant + date range.
+
+    Used by fetch_session_summaries + handle_sessions_list as a fallback when
+    the requested date range extends past the DDB 90-day TTL boundary.
+
+    Filters:
+      - tenant: match pk == "TENANT#{tenant_hash}" OR the JSON tenant_id field
+        (the second is for forward compat — current archiver writes both).
+      - started_at: in [start_date_iso, end_date_iso + 1d)
+      - limit: hard cap on returned sessions (defaults to 1000 to match DDB caller)
+
+    Returns the same shape as fetch_session_summaries (session dicts).
+
+    Implementation note: scans the entire sessions/ prefix and filters in
+    Python. At staging volume (<10 objects) this is fine. For prod scale this
+    will need tighter prefix bounds — revisit before Phase 6 prod mirror.
+    """
+    start_date_iso = date_range['start_date_iso']
+    end_date_iso = date_range.get('end_date_iso')
+
+    try:
+        start_dt = datetime.strptime(start_date_iso, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        logger.warning(f"_fetch_archived_sessions: invalid start_date_iso={start_date_iso!r}")
+        return []
+
+    if end_date_iso:
+        try:
+            end_dt = datetime.strptime(end_date_iso, '%Y-%m-%d').replace(tzinfo=timezone.utc) + timedelta(days=1)
+        except (ValueError, TypeError):
+            end_dt = datetime.now(timezone.utc)
+    else:
+        end_dt = datetime.now(timezone.utc)
+
+    expected_pk = f'TENANT#{tenant_hash}'
+    sessions: List[Dict[str, Any]] = []
+
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=ARCHIVE_BUCKET, Prefix='sessions/'):
+            for obj in page.get('Contents', []) or []:
+                if len(sessions) >= limit:
+                    break
+                key = obj['Key']
+                try:
+                    resp = s3.get_object(Bucket=ARCHIVE_BUCKET, Key=key)
+                    item = json.loads(resp['Body'].read())
+                except (ClientError, json.JSONDecodeError, KeyError) as e:
+                    logger.warning(f"_fetch_archived_sessions: skipping {key}: {type(e).__name__}: {e}")
+                    continue
+
+                # Tenant filter
+                if item.get('pk') != expected_pk and item.get('tenant_hash') != tenant_hash:
+                    continue
+
+                # started_at filter
+                started_at = item.get('started_at') or ''
+                if not started_at:
+                    continue
+                try:
+                    sdt = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+                except (ValueError, TypeError):
+                    continue
+                if not (start_dt <= sdt < end_dt):
+                    continue
+
+                sessions.append(_archived_item_to_session_shape(item))
+            if len(sessions) >= limit:
+                break
+    except ClientError as e:
+        logger.error(f"_fetch_archived_sessions: list/get failed on {ARCHIVE_BUCKET}: {e}")
+        return []
+
+    logger.info(f"_fetch_archived_sessions: {len(sessions)} archived sessions matched for tenant_hash={tenant_hash}")
+    return sessions
+
+
+def _date_range_extends_past_ttl(date_range: Dict[str, str]) -> bool:
+    """True iff the date range's start is older than ARCHIVE_TTL_DAYS days ago,
+    meaning some sessions may have already aged out of DDB into S3."""
+    start_date_iso = date_range.get('start_date_iso')
+    if not start_date_iso:
+        return False
+    try:
+        start_dt = datetime.strptime(start_date_iso, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=ARCHIVE_TTL_DAYS)
+    return start_dt < cutoff
+
+
+# =============================================================================
 # DynamoDB Session Summaries Query Functions (Hot Path)
 # =============================================================================
 
@@ -2129,6 +2274,17 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
                 break
 
         logger.info(f"Fetched {len(sessions)} sessions from DynamoDB for tenant {tenant_hash}")
+
+        # Tier-3 fallback: merge archived sessions when the date range extends
+        # past the DDB TTL boundary. Dedupe by session_id (DDB wins on overlap).
+        if _date_range_extends_past_ttl(date_range) and len(sessions) < limit:
+            ddb_session_ids = {s['session_id'] for s in sessions if s.get('session_id')}
+            archived = _fetch_archived_sessions(tenant_hash, date_range, limit=limit - len(sessions))
+            for arc in archived:
+                if arc.get('session_id') and arc['session_id'] not in ddb_session_ids:
+                    sessions.append(arc)
+            logger.info(f"Merged {len(archived)} archived sessions; total {len(sessions)}")
+
         return sessions
 
     except ClientError as e:
@@ -4091,6 +4247,35 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
                 'form_id': form_id if form_id else None,
                 'event_count': 0  # Will be set by enrichment
             })
+
+        # Tier-3 merge: include archived sessions when range extends past TTL.
+        # Dedupe by session_id (DDB wins on overlap). Shape archived rows into
+        # the same dict shape handle_sessions_list emits, then re-sort the merged
+        # list by started_at desc so enrichment + pagination see a single stream.
+        if _date_range_extends_past_ttl(date_range) and len(sessions) < fetch_limit:
+            ddb_session_ids = {s['session_id'] for s in sessions if s.get('session_id')}
+            archived = _fetch_archived_sessions(tenant_hash, date_range, limit=fetch_limit - len(sessions))
+            for arc in archived:
+                arc_sid = arc.get('session_id')
+                if not arc_sid or arc_sid in ddb_session_ids:
+                    continue
+                arc_first_q = arc.get('first_question') or ''
+                arc_form_id = arc.get('form_id') or None
+                sessions.append({
+                    'session_id': arc_sid,
+                    'started_at': arc.get('started_at', ''),
+                    'ended_at': arc.get('ended_at', ''),
+                    'duration_seconds': arc.get('duration_seconds', 0),
+                    'outcome': arc.get('outcome', 'conversation'),
+                    'message_count': arc.get('message_count', 0),
+                    'user_message_count': arc.get('user_message_count', 0),
+                    'bot_message_count': arc.get('bot_message_count', 0),
+                    'first_question': arc_first_q[:100],
+                    'form_id': arc_form_id,
+                    'event_count': 0,
+                })
+            sessions.sort(key=lambda s: s.get('started_at', ''), reverse=True)
+            logger.info(f"handle_sessions_list: merged {len(archived)} archived sessions; total {len(sessions)}")
 
         # Enrich sessions with accurate outcomes and event counts from events table
         if sessions:
