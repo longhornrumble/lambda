@@ -4256,7 +4256,9 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
         # Dedupe by session_id (DDB wins on overlap). Shape archived rows into
         # the same dict shape handle_sessions_list emits, then re-sort the merged
         # list by started_at desc so enrichment + pagination see a single stream.
+        archive_merged = False
         if _date_range_extends_past_ttl(date_range) and len(sessions) < fetch_limit:
+            archive_merged = True
             ddb_session_ids = {s['session_id'] for s in sessions if s.get('session_id')}
             archived = _fetch_archived_sessions(tenant_hash, date_range, limit=fetch_limit - len(sessions))
             for arc in archived:
@@ -4300,9 +4302,14 @@ def handle_sessions_list(tenant_id: str, params: Dict[str, str]) -> Dict[str, An
         has_more_after_filter = len(sessions) > limit
         sessions = sessions[:limit]
 
-        # Build next page cursor
+        # Build next page cursor.
+        # Audit B4: when archive merge fires, the archive helper has no cursor
+        # state — issuing a next_cursor would cause every subsequent page to
+        # re-scan the full archive and emit duplicates. Suppress pagination on
+        # archive-extending queries; the caller gets one capped page. Phase 6
+        # will introduce dual-cursor pagination if prod volume warrants it.
         next_cursor = None
-        if 'LastEvaluatedKey' in response and (has_more_after_filter or not outcome_filter):
+        if not archive_merged and 'LastEvaluatedKey' in response and (has_more_after_filter or not outcome_filter):
             cursor_json = json.dumps(response['LastEvaluatedKey'])
             next_cursor = base64.urlsafe_b64encode(cursor_json.encode('utf-8')).decode('utf-8')
 
