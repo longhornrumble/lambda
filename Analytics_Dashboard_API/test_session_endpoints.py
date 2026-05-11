@@ -750,22 +750,55 @@ class TestArchivedRealFixture:
         mock_s3.get_object.return_value = {'Body': body}
 
     @patch('lambda_function.s3')
-    def test_real_archiver_output_minimal_passes_tenant_filter(self, mock_s3):
-        """B3 verification: real archiver output has NO `tenant_hash` field —
-        only `pk`. The filter must pass via `pk` match alone."""
+    def test_minimal_archive_without_started_at_is_dropped(self, mock_s3):
+        """Documents a known gap: archived rows lacking `started_at` are dropped
+        at the date filter (lambda_function.py:2138 `if not started_at: continue`)
+        BEFORE the tenant filter runs. A session deleted before MFS wrote
+        started_at is therefore unrecoverable via the archive read path.
+
+        Renamed 2026-05-11 (audit B3 closure): prior name claimed the test
+        verified the tenant filter, but the row never reaches the tenant filter
+        — it exits at the started_at guard first."""
         self._wire_one(mock_s3, self.REAL_ARCHIVER_OUTPUT_MINIMAL)
         result = lambda_function._fetch_archived_sessions(
             'my87674d777bf9',
             {'start_date_iso': '2020-01-01', 'end_date_iso': '2030-12-31'},
         )
-        # Item has no started_at → filter drops it (correct — no date to filter on)
-        # This is itself a finding: minimal archiver output is unrecoverable.
-        # Documenting via this test.
-        assert result == [], (
-            "Expected minimal-shape row to drop because started_at is absent — "
-            "this is a known gap: a session deleted before MFS wrote started_at "
-            "cannot be archived in a queryable way."
+        assert result == []
+
+    @patch('lambda_function.s3')
+    def test_pk_only_tenant_filter_accepts_matching_real_archive(self, mock_s3):
+        """B3 verification (the real test): real archiver output has no `tenant_hash`
+        attribute, only `pk`. The pk-only filter (audit B3 closure) must accept rows
+        whose pk matches expected_pk, and reject rows whose pk does not match."""
+        matching = dict(self.REAL_ARCHIVER_OUTPUT_FULL)  # pk = TENANT#my87674d777bf9
+        non_matching = dict(self.REAL_ARCHIVER_OUTPUT_FULL)
+        non_matching['pk'] = 'TENANT#some_other_tenant'
+        non_matching['session_id'] = 'other_tenant_sess'
+        non_matching['sk'] = 'SESSION#other_tenant_sess'
+
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{
+            'Contents': [
+                {'Key': 'sessions/year=2026/month=05/day=11/match.json'},
+                {'Key': 'sessions/year=2026/month=05/day=11/other.json'},
+            ]
+        }]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        def fake_get_object(Bucket, Key):
+            body = MagicMock()
+            body.read.return_value = json.dumps(matching if 'match' in Key else non_matching).encode('utf-8')
+            return {'Body': body}
+
+        mock_s3.get_object.side_effect = fake_get_object
+
+        result = lambda_function._fetch_archived_sessions(
+            'my87674d777bf9',
+            {'start_date_iso': '2026-05-01', 'end_date_iso': '2026-05-31'},
         )
+        assert len(result) == 1
+        assert result[0]['session_id'] == 'archive_verify_1778513282'
 
     @patch('lambda_function.s3')
     def test_real_archiver_output_full_passes_filter_and_shapes_correctly(self, mock_s3):
