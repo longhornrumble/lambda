@@ -329,6 +329,67 @@ class TestHandleSessionsList:
         assert result['statusCode'] == 400
         assert 'cursor' in body['error'].lower()
 
+    @patch('lambda_function.enrich_sessions_with_events', return_value={})
+    @patch('lambda_function.get_tenant_hash', return_value='hash_abc123')
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_sessions_list_no_cursor_when_archive_merged(
+        self, mock_dynamodb, mock_s3, mock_get_tenant_hash, mock_enrich
+    ):
+        """B4: when the date range extends past the 90d TTL boundary and the
+        archive merge fires, next_cursor must be None — even if DDB returns
+        a LastEvaluatedKey. Issuing a cursor would cause subsequent pages to
+        re-scan the full archive and emit duplicates."""
+        # DDB returns one live row PLUS a LastEvaluatedKey (would normally trigger pagination).
+        mock_dynamodb.query.return_value = {
+            'Items': [{
+                'pk': {'S': 'TENANT#hash_abc123'},
+                'sk': {'S': 'SESSION#live_sid'},
+                'started_at': {'S': '2026-04-01T10:00:00Z'},
+                'message_count': {'N': '3'},
+            }],
+            'LastEvaluatedKey': {
+                'pk': {'S': 'TENANT#hash_abc123'},
+                'sk': {'S': 'SESSION#live_sid'},
+            },
+        }
+        # Wire S3 with one archived row from 2024 (well past 90d TTL).
+        archived = {
+            'pk': 'TENANT#hash_abc123',
+            'sk': 'SESSION#archived_sid',
+            'session_id': 'archived_sid',
+            'tenant_id': 'FOS123',
+            'started_at': '2024-06-01T10:00:00Z',
+            'ended_at': '2024-06-01T10:05:00Z',
+            'message_count': 2,
+        }
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {'Contents': [{'Key': 'sessions/year=2024/month=06/day=01/archived.json'}]}
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+        body_mock = MagicMock()
+        body_mock.read.return_value = json.dumps(archived).encode('utf-8')
+        mock_s3.get_object.return_value = {'Body': body_mock}
+
+        # Custom range starting in 2024 forces _date_range_extends_past_ttl=True.
+        result = handle_sessions_list('FOS123', {
+            'range': 'custom',
+            'start_date': '2024-01-01',
+            'end_date': '2024-12-31',
+            'limit': '25',
+        })
+        body = json.loads(result['body'])
+
+        assert result['statusCode'] == 200
+        # Both live and archived rows merged into the response.
+        session_ids = {s['session_id'] for s in body['sessions']}
+        assert 'live_sid' in session_ids
+        assert 'archived_sid' in session_ids
+        # The actual fix: no cursor handed back when archive merge fired.
+        assert body['pagination']['next_cursor'] is None
+        assert body['pagination']['has_more'] is False
+
     @patch('lambda_function.dynamodb')
     def test_sessions_list_limit_bounds(self, mock_dynamodb):
         """Should enforce limit bounds (1-100)."""
