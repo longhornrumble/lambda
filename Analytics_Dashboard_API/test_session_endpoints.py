@@ -415,5 +415,266 @@ class TestRecentConversationsResponseTime:
         assert body['conversations'][0]['response_time_seconds'] == 0
 
 
+# ---------------------------------------------------------------------------
+# Phase 2.8 — Tier-3 S3 archive read path
+# ---------------------------------------------------------------------------
+
+class TestS3ArchiveReadPath:
+    """Tests for _fetch_archived_sessions + the Tier-3 merge in
+    fetch_session_summaries / handle_sessions_list."""
+
+    def _wire_archive_objects(self, mock_s3, objects):
+        """Set up mock_s3 to serve list_objects_v2 + get_object for archive items.
+
+        `objects` is a list of (key, body_dict) tuples.
+        """
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {'Contents': [{'Key': k} for k, _ in objects]}
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        body_by_key = {k: b for k, b in objects}
+
+        def fake_get_object(Bucket, Key):
+            body = MagicMock()
+            body.read.return_value = json.dumps(body_by_key[Key]).encode('utf-8')
+            return {'Body': body}
+
+        mock_s3.get_object.side_effect = fake_get_object
+
+    def _archived_item(self, session_id, started_at, tenant_hash='hash_abc123', tenant_id='TEST123', **extra):
+        item = {
+            'pk': f'TENANT#{tenant_hash}',
+            'sk': f'SESSION#{session_id}',
+            'session_id': session_id,
+            'tenant_id': tenant_id,
+            'started_at': started_at,
+            'ended_at': started_at,
+            'message_count': 2,
+            'user_message_count': 1,
+            'bot_message_count': 1,
+            'first_question': 'archived test',
+        }
+        item.update(extra)
+        return item
+
+    @patch('lambda_function.s3')
+    def test_archive_helper_filters_by_tenant_pk(self, mock_s3):
+        """_fetch_archived_sessions should return only sessions whose pk matches the tenant hash."""
+        self._wire_archive_objects(mock_s3, [
+            ('sessions/year=2024/month=06/day=01/match.json',
+             self._archived_item('match_sid', '2024-06-01T12:00:00Z', tenant_hash='hash_abc123')),
+            ('sessions/year=2024/month=06/day=01/other_tenant.json',
+             self._archived_item('other_sid', '2024-06-01T12:00:00Z', tenant_hash='other_hash')),
+        ])
+        result = lambda_function._fetch_archived_sessions(
+            'hash_abc123',
+            {'start_date_iso': '2024-05-01', 'end_date_iso': '2024-06-30'},
+        )
+        assert len(result) == 1
+        assert result[0]['session_id'] == 'match_sid'
+
+    @patch('lambda_function.s3')
+    def test_archive_helper_filters_by_started_at_range(self, mock_s3):
+        """Archive scan must filter by started_at, not by S3 key date (key is archive-write date)."""
+        self._wire_archive_objects(mock_s3, [
+            # Both keys are written on the SAME archive date but the session
+            # started_at values straddle the range boundary.
+            ('sessions/year=2026/month=05/day=11/in_range.json',
+             self._archived_item('in_range', '2024-06-15T10:00:00Z')),
+            ('sessions/year=2026/month=05/day=11/out_of_range.json',
+             self._archived_item('out_of_range', '2023-01-01T10:00:00Z')),
+        ])
+        result = lambda_function._fetch_archived_sessions(
+            'hash_abc123',
+            {'start_date_iso': '2024-06-01', 'end_date_iso': '2024-06-30'},
+        )
+        assert {s['session_id'] for s in result} == {'in_range'}
+
+    @patch('lambda_function.s3')
+    def test_archive_helper_returns_correct_shape(self, mock_s3):
+        """Returned dicts must match fetch_session_summaries shape so callers can merge."""
+        self._wire_archive_objects(mock_s3, [
+            ('sessions/year=2024/month=06/day=01/sess.json',
+             self._archived_item(
+                 'sess_shape', '2024-06-01T10:00:00Z',
+                 ended_at='2024-06-01T10:05:00Z',
+                 outcome='form_completed', form_id='volunteer_form',
+                 total_response_time_ms=1500, response_count=3,
+             )),
+        ])
+        result = lambda_function._fetch_archived_sessions(
+            'hash_abc123',
+            {'start_date_iso': '2024-05-01', 'end_date_iso': '2024-06-30'},
+        )
+        assert len(result) == 1
+        s = result[0]
+        assert s['session_id'] == 'sess_shape'
+        assert s['outcome'] == 'form_completed'
+        assert s['form_id'] == 'volunteer_form'
+        assert s['duration_seconds'] == 300
+        assert s['total_response_time_ms'] == 1500
+        assert s['response_count'] == 3
+
+    @patch('lambda_function.s3')
+    def test_archive_helper_normalizes_legacy_browsing_outcome(self, mock_s3):
+        """Per existing DDB reader: 'browsing' outcome maps to 'conversation'."""
+        self._wire_archive_objects(mock_s3, [
+            ('sessions/year=2024/month=06/day=01/sess.json',
+             self._archived_item('sess_legacy_outcome', '2024-06-01T10:00:00Z', outcome='browsing')),
+        ])
+        result = lambda_function._fetch_archived_sessions(
+            'hash_abc123',
+            {'start_date_iso': '2024-05-01', 'end_date_iso': '2024-06-30'},
+        )
+        assert result[0]['outcome'] == 'conversation'
+
+    @patch('lambda_function.s3')
+    def test_archive_helper_skips_malformed_json(self, mock_s3):
+        """Malformed JSON in S3 should not break the scan — log + skip."""
+        good_item = self._archived_item('good', '2024-06-01T10:00:00Z')
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{
+            'Contents': [
+                {'Key': 'sessions/year=2024/month=06/day=01/bad.json'},
+                {'Key': 'sessions/year=2024/month=06/day=01/good.json'},
+            ]
+        }]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        def fake_get_object(Bucket, Key):
+            body = MagicMock()
+            if 'bad' in Key:
+                body.read.return_value = b'{this is not json'
+            else:
+                body.read.return_value = json.dumps(good_item).encode('utf-8')
+            return {'Body': body}
+
+        mock_s3.get_object.side_effect = fake_get_object
+        result = lambda_function._fetch_archived_sessions(
+            'hash_abc123',
+            {'start_date_iso': '2024-05-01', 'end_date_iso': '2024-06-30'},
+        )
+        assert [s['session_id'] for s in result] == ['good']
+
+    @patch('lambda_function.s3')
+    def test_archive_helper_returns_empty_on_list_failure(self, mock_s3):
+        """An S3 ClientError on list_objects should degrade gracefully to [],
+        not crash the calling endpoint."""
+        from botocore.exceptions import ClientError
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied'}}, 'ListObjectsV2'
+        )
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        result = lambda_function._fetch_archived_sessions(
+            'hash_abc123',
+            {'start_date_iso': '2020-01-01', 'end_date_iso': '2020-12-31'},
+        )
+        assert result == []
+
+    def test_date_range_cutoff_triggers_archive(self):
+        """_date_range_extends_past_ttl returns True iff start_date is older
+        than ARCHIVE_TTL_DAYS (90) days ago."""
+        from datetime import timedelta as td
+        from datetime import datetime as dt
+        from datetime import timezone as tz
+        old = (dt.now(tz.utc) - td(days=95)).strftime('%Y-%m-%d')
+        recent = (dt.now(tz.utc) - td(days=30)).strftime('%Y-%m-%d')
+        assert lambda_function._date_range_extends_past_ttl({'start_date_iso': old}) is True
+        assert lambda_function._date_range_extends_past_ttl({'start_date_iso': recent}) is False
+        assert lambda_function._date_range_extends_past_ttl({}) is False
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_fetch_session_summaries_merges_archive_when_range_old(self, mock_ddb, mock_s3):
+        """When the date range extends past 90d, fetch_session_summaries should
+        include archived sessions alongside DDB rows. Dedupe by session_id."""
+        # DDB returns one recent session
+        mock_ddb.query.return_value = {
+            'Items': [{
+                'sk': {'S': 'SESSION#recent_sid'},
+                'started_at': {'S': '2026-05-01T10:00:00Z'},
+                'ended_at': {'S': '2026-05-01T10:05:00Z'},
+                'outcome': {'S': 'conversation'},
+                'message_count': {'N': '2'},
+                'user_message_count': {'N': '1'},
+                'bot_message_count': {'N': '1'},
+                'first_question': {'S': 'recent'},
+                'total_response_time_ms': {'N': '500'},
+                'response_count': {'N': '1'},
+            }],
+        }
+        # S3 returns one older archived session
+        old_item = self._archived_item('archived_sid', '2024-06-01T10:00:00Z')
+        self._wire_archive_objects(mock_s3, [
+            ('sessions/year=2024/month=09/day=01/archived.json', old_item),
+        ])
+
+        # Range starts >90 days ago → archive merge triggers
+        date_range = {'start_date_iso': '2024-01-01', 'end_date_iso': '2026-05-31'}
+        result = lambda_function.fetch_session_summaries('hash_abc123', date_range, limit=100)
+
+        sids = {s['session_id'] for s in result}
+        assert 'recent_sid' in sids
+        assert 'archived_sid' in sids
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_fetch_session_summaries_skips_archive_when_range_recent(self, mock_ddb, mock_s3):
+        """When the date range is fully within the 90d TTL window, archive must
+        NOT be hit (saves S3 list/get calls)."""
+        from datetime import timedelta as td
+        from datetime import datetime as dt
+        from datetime import timezone as tz
+        mock_ddb.query.return_value = {'Items': []}
+
+        recent = (dt.now(tz.utc) - td(days=30)).strftime('%Y-%m-%d')
+        result = lambda_function.fetch_session_summaries(
+            'hash_abc123',
+            {'start_date_iso': recent, 'end_date_iso': recent},
+            limit=100,
+        )
+        assert result == []
+        # Archive helper should not have invoked S3 list/get
+        mock_s3.get_paginator.assert_not_called()
+        mock_s3.get_object.assert_not_called()
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_fetch_session_summaries_dedupes_overlap(self, mock_ddb, mock_s3):
+        """If DDB and S3 both have the same session_id (overlap at the 90d boundary),
+        DDB wins — the archive entry is dropped from the merge."""
+        mock_ddb.query.return_value = {
+            'Items': [{
+                'sk': {'S': 'SESSION#dup_sid'},
+                'started_at': {'S': '2025-12-01T10:00:00Z'},
+                'ended_at': {'S': '2025-12-01T10:05:00Z'},
+                'outcome': {'S': 'form_completed'},  # DDB version says form
+                'message_count': {'N': '5'},
+                'user_message_count': {'N': '3'},
+                'bot_message_count': {'N': '2'},
+                'first_question': {'S': 'ddb'},
+                'total_response_time_ms': {'N': '0'},
+                'response_count': {'N': '0'},
+            }],
+        }
+        dup_item = self._archived_item('dup_sid', '2025-12-01T10:00:00Z', outcome='conversation')
+        self._wire_archive_objects(mock_s3, [
+            ('sessions/year=2025/month=12/day=01/dup.json', dup_item),
+        ])
+
+        date_range = {'start_date_iso': '2024-01-01', 'end_date_iso': '2025-12-31'}
+        result = lambda_function.fetch_session_summaries('hash_abc123', date_range, limit=100)
+
+        matching = [s for s in result if s['session_id'] == 'dup_sid']
+        assert len(matching) == 1
+        # DDB version wins
+        assert matching[0]['outcome'] == 'form_completed'
+        assert matching[0]['message_count'] == 5
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
