@@ -31,7 +31,15 @@ from boto3.dynamodb.types import TypeDeserializer
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-ARCHIVE_BUCKET = os.environ["ARCHIVE_BUCKET"]
+# Cold-start assertion: ARCHIVE_BUCKET must be set or every invocation
+# fails to write. Log loudly at module load (mirrors the pattern used in
+# Master_Function_Staging/analytics_writer.py for SESSION_SUMMARIES_TABLE).
+ARCHIVE_BUCKET = os.environ.get("ARCHIVE_BUCKET")
+if not ARCHIVE_BUCKET:
+    logger.critical(
+        "archiver_misconfiguration: ARCHIVE_BUCKET env var not set; "
+        "every REMOVE event will fail to archive"
+    )
 
 s3 = boto3.client("s3")
 _deser = TypeDeserializer()

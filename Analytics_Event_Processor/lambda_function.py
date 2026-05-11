@@ -464,132 +464,6 @@ def write_session_event(event):
         return False
 
 
-def update_session_summary(event):
-    """
-    Atomic update to picasso-session-summaries table.
-
-    Key Structure:
-    - PK: TENANT#{tenant_hash}
-    - SK: SESSION#{started_at}#{session_id}
-
-    Uses atomic UPDATE operations with ADD and if_not_exists to prevent race conditions
-    when multiple events for the same session arrive in parallel.
-    """
-    session_id = event.get('session_id')
-    tenant_hash = event.get('tenant_hash')
-    timestamp = event.get('client_timestamp') or event.get('server_timestamp') or datetime.utcnow().isoformat() + 'Z'
-    event_type = event.get('event_type', 'UNKNOWN')
-
-    if not session_id or not tenant_hash:
-        logger.warning(f"Skipping session summary update: missing session_id or tenant_hash")
-        return False
-
-    # Build the update expression based on event type
-    # Note: 'ttl' is a reserved keyword in DynamoDB, must use expression attribute name
-    update_parts = [
-        "SET ended_at = :ended_at",
-        "session_id = if_not_exists(session_id, :session_id)",
-        "tenant_id = if_not_exists(tenant_id, :tenant_id)",
-        "started_at = if_not_exists(started_at, :started_at)",
-        "#ttl = :ttl"
-    ]
-
-    expression_values = {
-        ':ended_at': {'S': timestamp},
-        ':session_id': {'S': session_id},
-        ':tenant_id': {'S': event.get('tenant_id', '')},
-        ':started_at': {'S': timestamp},
-        ':ttl': {'N': str(calculate_ttl())},
-    }
-
-    expression_names = {'#ttl': 'ttl'}
-
-    # Increment message counts based on event type
-    if event_type == 'MESSAGE_SENT':
-        expression_values[':one'] = {'N': '1'}
-        expression_values[':zero'] = {'N': '0'}
-        update_parts.append("user_message_count = if_not_exists(user_message_count, :zero) + :one")
-        update_parts.append("message_count = if_not_exists(message_count, :zero) + :one")
-
-        # Capture first question if this is a user message
-        payload = event.get('event_payload', {})
-        if payload.get('content_preview'):
-            update_parts.append("first_question = if_not_exists(first_question, :first_question)")
-            expression_values[':first_question'] = {'S': payload['content_preview'][:200]}
-
-    elif event_type == 'MESSAGE_RECEIVED':
-        expression_values[':one'] = {'N': '1'}
-        expression_values[':zero'] = {'N': '0'}
-        update_parts.append("bot_message_count = if_not_exists(bot_message_count, :zero) + :one")
-        update_parts.append("message_count = if_not_exists(message_count, :zero) + :one")
-
-        # Use response_time_ms from event payload (sent by frontend)
-        # This is the time from user message to first character displayed
-        payload = event.get('event_payload', {})
-        response_time_ms = payload.get('response_time_ms', 0)
-        if response_time_ms and 0 < response_time_ms < 60000:  # Sanity check: 0-60 seconds
-            # Add to running totals for averaging
-            update_parts.append("total_response_time_ms = if_not_exists(total_response_time_ms, :zero) + :response_time")
-            update_parts.append("response_count = if_not_exists(response_count, :zero) + :one")
-            expression_values[':response_time'] = {'N': str(int(response_time_ms))}
-            logger.info(f"Response time from payload: {response_time_ms}ms for session {session_id}")
-
-    elif event_type == 'FORM_COMPLETED':
-        # Form completion is a strong outcome - always set
-        update_parts.append("#outcome = :outcome")
-        expression_names['#outcome'] = 'outcome'
-        expression_values[':outcome'] = {'S': 'form_completed'}
-
-        # Capture form_id
-        payload = event.get('event_payload', {})
-        if payload.get('form_id'):
-            update_parts.append("form_id = :form_id")
-            expression_values[':form_id'] = {'S': payload['form_id']}
-
-    elif event_type == 'LINK_CLICKED':
-        # Link click is a weaker outcome - only set if not already set
-        update_parts.append("#outcome = if_not_exists(#outcome, :outcome)")
-        expression_names['#outcome'] = 'outcome'
-        expression_values[':outcome'] = {'S': 'link_clicked'}
-
-    elif event_type == 'CTA_CLICKED':
-        # CTA click is also a meaningful outcome
-        update_parts.append("#outcome = if_not_exists(#outcome, :outcome)")
-        expression_names['#outcome'] = 'outcome'
-        expression_values[':outcome'] = {'S': 'cta_clicked'}
-
-    elif event_type == 'SESSION_END':
-        # Session ended - set default outcome if no conversion occurred
-        # This ensures all sessions have an explicit outcome for filtering
-        update_parts.append("#outcome = if_not_exists(#outcome, :outcome)")
-        expression_names['#outcome'] = 'outcome'
-        expression_values[':outcome'] = {'S': 'conversation'}
-
-    # Build final update expression
-    update_expression = ', '.join(update_parts)
-
-    try:
-        update_params = {
-            'TableName': SESSION_SUMMARIES_TABLE,
-            'Key': {
-                'pk': {'S': f"TENANT#{tenant_hash}"},
-                'sk': {'S': f"SESSION#{session_id}"}  # Use session_id only - not timestamp
-            },
-            'UpdateExpression': update_expression,
-            'ExpressionAttributeValues': expression_values
-        }
-
-        if expression_names:
-            update_params['ExpressionAttributeNames'] = expression_names
-
-        dynamodb.update_item(**update_params)
-        return True
-
-    except ClientError as e:
-        logger.error(f"Error updating session summary: {e}")
-        return False
-
-
 def write_events_to_dynamodb(events):
     """
     Orchestrate writes to both session tables.
@@ -602,16 +476,16 @@ def write_events_to_dynamodb(events):
 
     events_written = 0
 
-    # Note: update_session_summary() write to picasso-session-summaries was removed
-    # 2026-05-11. The UpdateExpression used invalid `if_not_exists(X, :zero) + :one`
-    # syntax (DynamoDB requires `ADD X :one` for atomic increments), so every call
-    # was failing with ValidationException. The direct writers
+    # The update_session_summary() function was removed entirely 2026-05-11 (phase audit B7).
+    # It used invalid `if_not_exists(X, :zero) + :one` syntax (DDB requires `ADD X :one`)
+    # so every call failed with ValidationException; the call site was removed in PR #57
+    # and the dead definition was deleted in phase-1.5 hardening to eliminate the
+    # revert-vector that would re-enable unredacted-PII writes.
+    # Session summaries are now written exclusively by the chat-path Lambdas
     # (Master_Function_Staging/analytics_writer.py + Bedrock_Streaming_Handler_Staging/
-    # analytics_writer.js) cover the same fields with correct idempotency guards via
-    # `last_request_id_<event>` ConditionExpression. The SQS path remains the canonical
-    # writer for picasso-session-events (per-event records); summaries are written
-    # directly by the chat-path Lambdas. The update_session_summary function below is
-    # kept for reference but no longer invoked.
+    # analytics_writer.js) with correct idempotency via last_request_id_<event>
+    # ConditionExpression. The SQS path remains the canonical writer for
+    # picasso-session-events (per-event records).
     for event in events:
         if write_session_event(event):
             events_written += 1
