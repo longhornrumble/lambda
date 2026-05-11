@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import boto3
-from boto3.dynamodb.types import TypeDeserializer
+from boto3.dynamodb.types import Binary, TypeDeserializer
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -54,6 +54,9 @@ def _json_default(obj):
         return float(obj) if obj % 1 else int(obj)
     if isinstance(obj, set):
         return list(obj)
+    if isinstance(obj, Binary):
+        # boto3 wraps DDB Binary attributes; .value is the raw bytes.
+        return obj.value.decode("utf-8", errors="replace")
     if isinstance(obj, (bytes, bytearray)):
         return obj.decode("utf-8", errors="replace")
     return str(obj)
@@ -69,10 +72,21 @@ def _make_key(item):
 
 
 def lambda_handler(event, context):
+    """Phase-audit B3/B4 fix: per-record try/except + ReportBatchItemFailures.
+
+    On a record-level failure we capture its SequenceNumber in batchItemFailures
+    instead of raising — that way the ESM (configured with
+    FunctionResponseTypes=["ReportBatchItemFailures"]) only retries the failed
+    record, not the whole 100-record batch. Combined with a finite
+    MaximumRetryAttempts + DLQ this gives bounded retry semantics; without it
+    a single poison record (e.g. unknown DDB type → TypeError) could stall the
+    shard indefinitely on the previous infinite-retry setting.
+    """
     records = event.get("Records") or []
     archived = 0
     skipped_non_remove = 0
     skipped_no_old_image = 0
+    batch_item_failures = []
 
     for record in records:
         if record.get("eventName") != "REMOVE":
@@ -88,33 +102,55 @@ def lambda_handler(event, context):
             skipped_no_old_image += 1
             continue
 
-        item = _deserialize_image(old_image)
-        key = _make_key(item)
-        body = json.dumps(item, default=_json_default).encode("utf-8")
+        sequence_number = (record.get("dynamodb") or {}).get("SequenceNumber")
 
-        s3.put_object(
-            Bucket=ARCHIVE_BUCKET,
-            Key=key,
-            Body=body,
-            ContentType="application/json",
-        )
-        archived += 1
-        logger.info(
-            "Archived session_id=%s to s3://%s/%s (bytes=%d)",
-            item.get("session_id") or item.get("sessionId") or "unknown",
-            ARCHIVE_BUCKET,
-            key,
-            len(body),
-        )
+        try:
+            item = _deserialize_image(old_image)
+            key = _make_key(item)
+            body = json.dumps(item, default=_json_default).encode("utf-8")
+
+            s3.put_object(
+                Bucket=ARCHIVE_BUCKET,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+            )
+            archived += 1
+            logger.info(
+                "Archived session_id=%s to s3://%s/%s (bytes=%d)",
+                item.get("session_id") or item.get("sessionId") or "unknown",
+                ARCHIVE_BUCKET,
+                key,
+                len(body),
+            )
+        except Exception as exc:
+            # Per-record failure — log + report via batchItemFailures so the ESM
+            # retries just this record, not the whole batch.
+            logger.exception(
+                "archive_failed eventID=%s SequenceNumber=%s error=%s",
+                record.get("eventID"),
+                sequence_number,
+                type(exc).__name__,
+            )
+            if sequence_number:
+                batch_item_failures.append({"itemIdentifier": sequence_number})
+            # If we lack a SequenceNumber, we can't report partial failure for
+            # this record — re-raise so the entire batch retries (last-resort
+            # safety net; should not happen for real DDB Streams events).
+            else:
+                raise
 
     logger.info(
-        "Batch summary: archived=%d skipped_non_remove=%d skipped_no_old_image=%d total=%d",
+        "Batch summary: archived=%d skipped_non_remove=%d skipped_no_old_image=%d failed=%d total=%d",
         archived,
         skipped_non_remove,
         skipped_no_old_image,
+        len(batch_item_failures),
         len(records),
     )
     return {
+        "batchItemFailures": batch_item_failures,
+        # Diagnostic fields ignored by the ESM but useful in CloudWatch:
         "archived": archived,
         "skipped_non_remove": skipped_non_remove,
         "skipped_no_old_image": skipped_no_old_image,

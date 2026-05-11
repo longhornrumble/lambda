@@ -41,11 +41,28 @@ mirror).
 - StartingPosition: **LATEST** (never TRIM_HORIZON — would reprocess all
   existing rows as deletes the first time it runs)
 - BatchSize: 100, MaximumBatchingWindowInSeconds: 5
+- MaximumRetryAttempts: 3 (phase-audit B2 — was -1 infinite)
+- FunctionResponseTypes: `["ReportBatchItemFailures"]` (phase-audit B4 —
+  failed records reported via `batchItemFailures` so only the failed record
+  retries, not the whole batch)
+- OnFailure: SQS DLQ `picasso-session-archiver-dlq` (14-day retention) —
+  records that exhaust the retry budget land here for investigation
+
+## CloudWatch alarm
+
+`picasso-session-archiver-iterator-age` fires when `Maximum(IteratorAge) >
+60000ms` for 5 consecutive 1-minute periods. Catches shard backlog before
+records start expiring (DDB Streams retain 24h).
 
 ## Idempotency
 
 S3 keys are deterministic from `(archive UTC date, session_id)`. Re-processing
 the same record overwrites the same key with identical content.
+
+**Known caveat**: if the same `session_id` REMOVE event fires twice across
+UTC midnight (e.g. ESM retry spanning midnight), two archive records with
+different date partitions can exist for the same session. Acceptable at
+current staging scale; revisit before Phase 6 prod mirror.
 
 ## Tests
 
