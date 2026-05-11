@@ -2096,7 +2096,7 @@ def _fetch_archived_sessions(tenant_hash: str, date_range: Dict[str, str], limit
     Python. At staging volume (<10 objects) this is fine. For prod scale this
     will need tighter prefix bounds — revisit before Phase 6 prod mirror.
     """
-    start_date_iso = date_range['start_date_iso']
+    start_date_iso = date_range.get('start_date_iso')
     end_date_iso = date_range.get('end_date_iso')
 
     try:

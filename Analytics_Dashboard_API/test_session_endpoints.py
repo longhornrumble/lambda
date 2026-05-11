@@ -849,6 +849,14 @@ class TestArchivedRealFixture:
         # last_request_id_* fields are silently ignored by _archived_item_to_session_shape —
         # that's correct, they're idempotency keys not user-facing data.
 
+    @patch('lambda_function.s3')
+    def test_archive_helper_missing_start_date_iso_returns_empty(self, mock_s3):
+        """B7: caller passing a date_range dict without 'start_date_iso' must not
+        KeyError. The helper should degrade to [] (same as invalid start_date_iso)."""
+        result = lambda_function._fetch_archived_sessions('hash_abc123', {})
+        assert result == []
+        mock_s3.get_paginator.assert_not_called()
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
