@@ -944,71 +944,84 @@ class TestArchiveProbe:
     """B1 audit: env-gated staging-only probe to verify the deployed Lambda's
     IAM role can LIST + GET S3 archive objects via the real HTTP path."""
 
+    def _enable_probe(self, environment='staging'):
+        os.environ['ENVIRONMENT'] = environment
+        os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'true'
+
+    def _reset_probe(self):
+        os.environ.pop('ENVIRONMENT', None)
+        os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+
     def test_probe_returns_404_when_flag_off(self):
         """Default-deny: no env var means the route doesn't exist as far as
         the caller can tell. Production-promoted code must not expose this."""
-        os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+        self._reset_probe()
         result = handle_archive_probe()
         assert result['statusCode'] == 404
 
     def test_probe_returns_404_when_flag_explicitly_false(self):
         """Any value other than 'true' must keep the probe off."""
+        self._reset_probe()
         os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'false'
         try:
             result = handle_archive_probe()
             assert result['statusCode'] == 404
         finally:
-            os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+            self._reset_probe()
+
+    def test_probe_returns_404_when_environment_is_prod_even_with_flag_on(self):
+        """Audit follow-up #4: ENVIRONMENT gate is the structural defense.
+        Even with the soft env-flag mistakenly set, prod must fail-closed."""
+        try:
+            self._enable_probe(environment='production')
+            result = handle_archive_probe()
+            assert result['statusCode'] == 404
+        finally:
+            self._reset_probe()
 
     @patch('lambda_function.s3')
-    def test_probe_returns_count_and_iam_status_when_flag_on(self, mock_s3):
-        """Flag on + IAM grants ok + empty bucket: returns archives_found=0
-        and bucket_head_check='ok'. The 200-with-counts signals IAM works."""
-        # head_bucket succeeds
-        mock_s3.head_bucket.return_value = {}
-        # Paginator returns one empty page
+    def test_probe_returns_count_when_both_gates_pass(self, mock_s3):
+        """ENVIRONMENT=staging + flag on + empty bucket: returns archives_found=0
+        and iam_path='ok'. The 200-response itself is the signal that the IAM
+        path completed without raising."""
         mock_paginator = MagicMock()
         mock_paginator.paginate.return_value = [{'Contents': []}]
         mock_s3.get_paginator.return_value = mock_paginator
 
-        os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'true'
         try:
+            self._enable_probe()
             result = handle_archive_probe()
             body = json.loads(result['body'])
         finally:
-            os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+            self._reset_probe()
 
         assert result['statusCode'] == 200
         assert body['archives_found'] == 0
-        assert body['tenant_hash_used'] == 'my87674d777bf9'
-        assert body['bucket_head_check'] == 'ok'
-        # The paginator must be scoped to the test tenant's prefix (B5 invariant).
+        assert body['iam_path'] == 'ok'
+        # B5 invariant: paginator must be scoped to the test tenant's prefix.
         kwargs = mock_paginator.paginate.call_args.kwargs
         assert kwargs.get('Prefix') == 'sessions/tenant=my87674d777bf9/'
+        # Audit follow-up #9: response must not leak bucket name or tenant hash.
+        assert 'archive_bucket' not in body
+        assert 'tenant_hash_used' not in body
 
     @patch('lambda_function.s3')
-    def test_probe_reports_iam_denial_in_bucket_head_check(self, mock_s3):
-        """If head_bucket raises AccessDenied, the probe still returns 200
-        but bucket_head_check carries the IAM error code."""
-        from botocore.exceptions import ClientError
-        mock_s3.head_bucket.side_effect = ClientError(
-            {'Error': {'Code': 'AccessDenied', 'Message': 'denied'}},
-            'HeadBucket',
-        )
-        # Paginator can still return empty so the function completes.
-        mock_paginator = MagicMock()
-        mock_paginator.paginate.return_value = [{'Contents': []}]
-        mock_s3.get_paginator.return_value = mock_paginator
+    def test_probe_surfaces_unexpected_exception_in_iam_path_field(self, mock_s3):
+        """Audit follow-up #17: any unexpected exception in _fetch_archived_sessions
+        must be reported via iam_path, not propagated as a 500."""
+        # Simulate a non-ClientError exception that bypasses the inner try/except.
+        mock_s3.get_paginator.side_effect = RuntimeError("simulated unexpected failure")
 
-        os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'true'
         try:
+            self._enable_probe()
             result = handle_archive_probe()
             body = json.loads(result['body'])
         finally:
-            os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+            self._reset_probe()
 
         assert result['statusCode'] == 200
-        assert body['bucket_head_check'].startswith('failed: AccessDenied')
+        assert body['archives_found'] == 0
+        assert body['iam_path'].startswith('failed: RuntimeError')
 
 
 if __name__ == '__main__':
