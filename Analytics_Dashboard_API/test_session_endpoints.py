@@ -331,6 +331,22 @@ class TestHandleSessionsList:
         assert result['statusCode'] == 400
         assert 'cursor' in body['error'].lower()
 
+    def test_sessions_list_rejects_cursor_when_range_crosses_ttl(self):
+        """B4 stale-cursor scenario: a cursor submitted for a date range that
+        crosses the 90d TTL boundary would cause archive re-scan + duplicates.
+        Must return 400 with a clear reason — caller re-issues without cursor."""
+        cursor = base64.urlsafe_b64encode(json.dumps({'pk': {'S': 'TENANT#x'}}).encode()).decode()
+        result = handle_sessions_list('FOS123', {
+            'cursor': cursor,
+            'range': 'custom',
+            'start_date': '2024-01-01',
+            'end_date': '2024-12-31',
+        })
+        body = json.loads(result['body'])
+        assert result['statusCode'] == 400
+        assert 'cursor' in body['error'].lower()
+        assert 'ttl' in body['error'].lower() or 'archive' in body.get('reason', '').lower()
+
     @patch('lambda_function.enrich_sessions_with_events', return_value={})
     @patch('lambda_function.get_tenant_hash', return_value='hash_abc123')
     @patch('lambda_function.s3')
@@ -389,6 +405,76 @@ class TestHandleSessionsList:
         assert 'live_sid' in session_ids
         assert 'archived_sid' in session_ids
         # The actual fix: no cursor handed back when archive merge fired.
+        assert body['pagination']['next_cursor'] is None
+        assert body['pagination']['has_more'] is False
+        # Audit follow-up: archive_merged signal is surfaced so the consumer
+        # knows pagination was suppressed deliberately.
+        assert body['pagination']['archive_merged'] is True
+        # result_truncated is False here because merged set fit within limit
+        # (only 2 sessions total: 1 live + 1 archived, limit=25).
+        assert body['pagination']['result_truncated'] is False
+
+    @patch('lambda_function.enrich_sessions_with_events', return_value={})
+    @patch('lambda_function.get_tenant_hash', return_value='hash_abc123')
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_sessions_list_result_truncated_when_merged_set_exceeds_limit(
+        self, mock_dynamodb, mock_s3, mock_get_tenant_hash, mock_enrich
+    ):
+        """B4 follow-up: when archive_merged is True AND the merged result set
+        is larger than `limit`, `result_truncated: true` tells the caller they
+        haven't seen everything. Without this signal, capping is invisible."""
+        # DDB returns 0 rows (so the archive merge condition fires:
+        # _date_range_extends_past_ttl AND len(sessions) < fetch_limit).
+        # Archive returns 2 rows; limit=1; merged set is truncated to 1.
+        # Use outcome filter to push fetch_limit to 3x limit, so the archive
+        # merge call gets limit=3 (rather than the bare-limit=1 case where
+        # archive returns at most 1 row and no truncation occurs).
+        mock_dynamodb.query.return_value = {'Items': []}
+
+        archived_rows = [
+            {
+                'pk': 'TENANT#hash_abc123',
+                'sk': f'SESSION#archived_{i}',
+                'session_id': f'archived_{i}',
+                'tenant_id': 'FOS123',
+                'started_at': f'2024-06-{15 - i}T10:00:00Z',
+                'ended_at': f'2024-06-{15 - i}T10:05:00Z',
+                'message_count': 2,
+            }
+            for i in range(3)
+        ]
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{
+            'Contents': [
+                {'Key': f'sessions/tenant=hash_abc123/year=2024/month=06/day=1{i}/archived_{i}.json'}
+                for i in range(3)
+            ]
+        }]
+        mock_s3.get_paginator.return_value = mock_paginator
+        bodies_by_key = {
+            f'sessions/tenant=hash_abc123/year=2024/month=06/day=1{i}/archived_{i}.json': row
+            for i, row in enumerate(archived_rows)
+        }
+        def fake_get_object(Bucket, Key):
+            body = MagicMock()
+            body.read.return_value = json.dumps(bodies_by_key[Key]).encode('utf-8')
+            return {'Body': body}
+        mock_s3.get_object.side_effect = fake_get_object
+
+        result = handle_sessions_list('FOS123', {
+            'range': 'custom',
+            'start_date': '2024-01-01',
+            'end_date': '2024-12-31',
+            'limit': '1',
+            'outcome': 'conversation',  # 3x fetch_limit → 3 archive rows
+        })
+        body = json.loads(result['body'])
+
+        assert result['statusCode'] == 200
+        assert body['pagination']['count'] == 1
+        assert body['pagination']['archive_merged'] is True
+        assert body['pagination']['result_truncated'] is True
         assert body['pagination']['next_cursor'] is None
         assert body['pagination']['has_more'] is False
 
