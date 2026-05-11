@@ -287,13 +287,17 @@ def lambda_handler(event, context):
         return cors_response(200, {})
 
     # /webhooks/clerk — PRE-AUTH: Clerk webhook events (user.created, etc.)
-    # Verified via Svix signature, not JWT.
-    if path.endswith('/webhooks/clerk') and method == 'POST':
+    # Verified via Svix signature, not JWT. Exact-match per audit row B:
+    # endswith would match /<anything>/webhooks/clerk subpaths, even though
+    # Svix verifies the body, the routing should be exact to keep the
+    # pre-auth surface tight.
+    if path.rstrip('/') == '/webhooks/clerk' and method == 'POST':
         return handle_clerk_webhook(event)
 
     # /auth/clerk — PRE-AUTH: exchange Clerk session token for internal Picasso JWT.
     # Must be checked BEFORE authenticate_request since no internal JWT exists yet.
-    if path.endswith('/auth/clerk') and method == 'POST':
+    # Exact-match per audit row B.
+    if path.rstrip('/') == '/auth/clerk' and method == 'POST':
         try:
             body = json.loads(event.get('body', '{}') or '{}')
         except json.JSONDecodeError:
@@ -2188,30 +2192,45 @@ def handle_archive_probe() -> Dict[str, Any]:
     # staging or dev. No default — an absent ENVIRONMENT fails CLOSED so a
     # prod Lambda missing the env var cannot accidentally pass the gate.
     # The env-flag below is a soft control on top.
-    if os.environ.get('ENVIRONMENT') not in ('staging', 'dev'):
+    env = os.environ.get('ENVIRONMENT')
+    if env not in ('staging', 'dev'):
         return cors_response(404, {'error': 'Not Found'})
 
     # Defense in depth #2: explicit opt-in via env var.
     if os.environ.get('STAGING_HEALTH_PROBE_ENABLED') != 'true':
         return cors_response(404, {'error': 'Not Found'})
 
-    # Full LIST + GET code path on the test tenant prefix. _fetch_archived_sessions
-    # swallows ClientError → returns []. The 200-response itself is the signal
-    # that the IAM path completed without raising; archives_found shows what
-    # was actually readable.
-    #
-    # Wrapped in broad except so any unexpected exception is surfaced in the
-    # probe response rather than propagating as 500 — the whole point of the
-    # probe is to diagnose, not to crash.
-    try:
-        results = _fetch_archived_sessions(
-            STAGING_PROBE_TENANT_HASH,
-            {'start_date_iso': '2024-01-01', 'end_date_iso': '2026-12-31'},
-            limit=10,
-        )
+    # Defense in depth #3: ARCHIVE_BUCKET must match the gated ENVIRONMENT.
+    # Without this, a prod Lambda with mistaken ENVIRONMENT=staging would
+    # silently query the staging bucket cross-account; _fetch_archived_sessions
+    # swallows the resulting ClientError and the probe would report ok with
+    # 0 results. Audit row #1: probe must not lie about IAM status.
+    expected_bucket = f'picasso-archive-{env}'
+    if ARCHIVE_BUCKET != expected_bucket:
         return cors_response(200, {
-            'archives_found': len(results),
+            'archives_found': 0,
+            'iam_path': f'misconfigured: ARCHIVE_BUCKET={ARCHIVE_BUCKET!r} does not match expected {expected_bucket!r}',
+        })
+
+    # Test the actual IAM grants directly via list_objects_v2 with the
+    # tenant-scoped prefix. NOT via _fetch_archived_sessions (which swallows
+    # ClientError and would mask AccessDenied as "ok"). Audit row #1.
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        pages = list(paginator.paginate(
+            Bucket=ARCHIVE_BUCKET,
+            Prefix=f'sessions/tenant={STAGING_PROBE_TENANT_HASH}/',
+            PaginationConfig={'MaxItems': 10},
+        ))
+        count = sum(len(p.get('Contents', []) or []) for p in pages)
+        return cors_response(200, {
+            'archives_found': count,
             'iam_path': 'ok',
+        })
+    except ClientError as e:
+        return cors_response(200, {
+            'archives_found': 0,
+            'iam_path': f'failed: {e.response.get("Error", {}).get("Code", "Unknown")}',
         })
     except Exception as e:
         return cors_response(200, {
