@@ -521,6 +521,25 @@ class TestS3ArchiveReadPath:
         return item
 
     @patch('lambda_function.s3')
+    def test_archive_helper_scopes_listing_to_tenant_prefix(self, mock_s3):
+        """B5: the S3 LIST must be scoped to sessions/tenant={hash}/ — the in-loop
+        pk filter is defense in depth, but the structural guarantee against
+        cross-tenant exposure lives in the Prefix argument to paginate()."""
+        # Wire an empty page so the function returns quickly.
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{'Contents': []}]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        lambda_function._fetch_archived_sessions(
+            'hash_abc123',
+            {'start_date_iso': '2020-01-01', 'end_date_iso': '2020-12-31'},
+        )
+
+        mock_paginator.paginate.assert_called_once()
+        kwargs = mock_paginator.paginate.call_args.kwargs
+        assert kwargs.get('Prefix') == 'sessions/tenant=hash_abc123/'
+
+    @patch('lambda_function.s3')
     def test_archive_helper_filters_by_tenant_pk(self, mock_s3):
         """_fetch_archived_sessions should return only sessions whose pk matches the tenant hash."""
         self._wire_archive_objects(mock_s3, [

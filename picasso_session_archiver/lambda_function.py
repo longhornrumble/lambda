@@ -63,11 +63,18 @@ def _json_default(obj):
 
 
 def _make_key(item):
+    # Audit B5: tenant-partition the S3 key so cross-tenant LIST exposure
+    # requires a deliberate change. pk on the DDB row is the canonical
+    # source for tenant_hash (analytics_writer.py writes it as TENANT#{hash}).
+    # Items missing pk fall through to tenant=unknown — a quarantine prefix
+    # the ADA reader never queries, so the row is effectively orphaned.
     now = datetime.now(timezone.utc)
+    pk = item.get("pk") or ""
+    tenant_hash = pk[len("TENANT#"):] if pk.startswith("TENANT#") else "unknown"
     session_id = item.get("session_id") or item.get("sessionId") or "unknown"
     return (
-        f"sessions/year={now.year:04d}/month={now.month:02d}/day={now.day:02d}/"
-        f"{session_id}.json"
+        f"sessions/tenant={tenant_hash}/year={now.year:04d}/"
+        f"month={now.month:02d}/day={now.day:02d}/{session_id}.json"
     )
 
 

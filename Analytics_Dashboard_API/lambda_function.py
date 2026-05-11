@@ -2116,9 +2116,15 @@ def _fetch_archived_sessions(tenant_hash: str, date_range: Dict[str, str], limit
     expected_pk = f'TENANT#{tenant_hash}'
     sessions: List[Dict[str, Any]] = []
 
+    # Audit B5: scope the LIST to the tenant's prefix so cross-tenant
+    # exposure requires a deliberate change. Archiver _make_key writes to
+    # sessions/tenant={tenant_hash}/year=... The in-loop pk check below is
+    # kept as defense in depth.
+    tenant_prefix = f'sessions/tenant={tenant_hash}/'
+
     try:
         paginator = s3.get_paginator('list_objects_v2')
-        for page in paginator.paginate(Bucket=ARCHIVE_BUCKET, Prefix='sessions/'):
+        for page in paginator.paginate(Bucket=ARCHIVE_BUCKET, Prefix=tenant_prefix):
             for obj in page.get('Contents', []) or []:
                 if len(sessions) >= limit:
                     break
