@@ -300,6 +300,15 @@ def lambda_handler(event, context):
             return cors_response(400, {'error': 'Invalid JSON body'})
         return handle_clerk_auth(body)
 
+    # /__internal/archive-probe — PRE-AUTH: B1 audit verification endpoint.
+    # Env-gated so it returns 404 unless STAGING_HEALTH_PROBE_ENABLED=true is
+    # explicitly set on the Lambda. Used to verify the Lambda execution role
+    # can actually LIST + GET archive objects in S3 via real HTTP. Returns
+    # archives_found (count) + bucket_head_check (IAM grant status) for the
+    # MYR test tenant only — never exposes real-tenant data.
+    if path.endswith('/__internal/archive-probe') and method == 'GET':
+        return handle_archive_probe()
+
     # Authenticate request
     auth_result = authenticate_request(event)
     if not auth_result['success']:
@@ -2163,6 +2172,43 @@ def _fetch_archived_sessions(tenant_hash: str, date_range: Dict[str, str], limit
 
     logger.info(f"_fetch_archived_sessions: {len(sessions)} archived sessions matched for tenant_hash={tenant_hash}")
     return sessions
+
+
+# B1 audit: env-gated archive probe for verifying the deployed Lambda's IAM
+# role can actually LIST + GET archive objects. Returns 404 unless
+# STAGING_HEALTH_PROBE_ENABLED=true is explicitly set on the function. Used
+# only against the MYR test tenant (my87674d777bf9 per reference_test_tenant.md);
+# never exposes real-tenant data.
+STAGING_PROBE_TENANT_HASH = 'my87674d777bf9'
+
+
+def handle_archive_probe() -> Dict[str, Any]:
+    if os.environ.get('STAGING_HEALTH_PROBE_ENABLED') != 'true':
+        return cors_response(404, {'error': 'Not Found'})
+
+    # IAM check #1: can the role even reach the bucket?
+    try:
+        s3.head_bucket(Bucket=ARCHIVE_BUCKET)
+        bucket_head_check = 'ok'
+    except ClientError as e:
+        bucket_head_check = f"failed: {e.response.get('Error', {}).get('Code', 'Unknown')}"
+
+    # IAM check #2 + #3: full LIST + GET code path on the test tenant prefix.
+    # _fetch_archived_sessions swallows ClientError → returns []. The count is
+    # 0 in either "IAM denied" or "no archived data" case, which is why the
+    # head_bucket check above is the IAM signal.
+    results = _fetch_archived_sessions(
+        STAGING_PROBE_TENANT_HASH,
+        {'start_date_iso': '2024-01-01', 'end_date_iso': '2026-12-31'},
+        limit=10,
+    )
+
+    return cors_response(200, {
+        'archives_found': len(results),
+        'tenant_hash_used': STAGING_PROBE_TENANT_HASH,
+        'bucket_head_check': bucket_head_check,
+        'archive_bucket': ARCHIVE_BUCKET,
+    })
 
 
 def _date_range_extends_past_ttl(date_range: Dict[str, str]) -> bool:

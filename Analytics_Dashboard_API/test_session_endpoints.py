@@ -12,6 +12,7 @@ import time
 from unittest.mock import patch, MagicMock
 from datetime import datetime
 
+import os
 import lambda_function
 # Import functions under test
 from lambda_function import (
@@ -19,6 +20,7 @@ from lambda_function import (
     handle_session_detail,
     handle_sessions_list,
     handle_recent_conversations,
+    handle_archive_probe,
     cors_response,
 )
 
@@ -936,6 +938,77 @@ class TestArchivedRealFixture:
         result = lambda_function._fetch_archived_sessions('hash_abc123', {})
         assert result == []
         mock_s3.get_paginator.assert_not_called()
+
+
+class TestArchiveProbe:
+    """B1 audit: env-gated staging-only probe to verify the deployed Lambda's
+    IAM role can LIST + GET S3 archive objects via the real HTTP path."""
+
+    def test_probe_returns_404_when_flag_off(self):
+        """Default-deny: no env var means the route doesn't exist as far as
+        the caller can tell. Production-promoted code must not expose this."""
+        os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+        result = handle_archive_probe()
+        assert result['statusCode'] == 404
+
+    def test_probe_returns_404_when_flag_explicitly_false(self):
+        """Any value other than 'true' must keep the probe off."""
+        os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'false'
+        try:
+            result = handle_archive_probe()
+            assert result['statusCode'] == 404
+        finally:
+            os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+
+    @patch('lambda_function.s3')
+    def test_probe_returns_count_and_iam_status_when_flag_on(self, mock_s3):
+        """Flag on + IAM grants ok + empty bucket: returns archives_found=0
+        and bucket_head_check='ok'. The 200-with-counts signals IAM works."""
+        # head_bucket succeeds
+        mock_s3.head_bucket.return_value = {}
+        # Paginator returns one empty page
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{'Contents': []}]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'true'
+        try:
+            result = handle_archive_probe()
+            body = json.loads(result['body'])
+        finally:
+            os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+
+        assert result['statusCode'] == 200
+        assert body['archives_found'] == 0
+        assert body['tenant_hash_used'] == 'my87674d777bf9'
+        assert body['bucket_head_check'] == 'ok'
+        # The paginator must be scoped to the test tenant's prefix (B5 invariant).
+        kwargs = mock_paginator.paginate.call_args.kwargs
+        assert kwargs.get('Prefix') == 'sessions/tenant=my87674d777bf9/'
+
+    @patch('lambda_function.s3')
+    def test_probe_reports_iam_denial_in_bucket_head_check(self, mock_s3):
+        """If head_bucket raises AccessDenied, the probe still returns 200
+        but bucket_head_check carries the IAM error code."""
+        from botocore.exceptions import ClientError
+        mock_s3.head_bucket.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied', 'Message': 'denied'}},
+            'HeadBucket',
+        )
+        # Paginator can still return empty so the function completes.
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [{'Contents': []}]
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        os.environ['STAGING_HEALTH_PROBE_ENABLED'] = 'true'
+        try:
+            result = handle_archive_probe()
+            body = json.loads(result['body'])
+        finally:
+            os.environ.pop('STAGING_HEALTH_PROBE_ENABLED', None)
+
+        assert result['statusCode'] == 200
+        assert body['bucket_head_check'].startswith('failed: AccessDenied')
 
 
 if __name__ == '__main__':
