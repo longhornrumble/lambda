@@ -80,12 +80,10 @@ jobs:
             # Files included in the deployment zip (anything not listed is excluded).
             # Keep this surgical — exclude tests, migration scripts, build helpers.
             include_globs: 'lambda_function.py tenant_registry_ops.py'
-            # env_vars is managed OUT-OF-BAND for this Lambda. DO NOT populate
-            # without first enumerating ALL of ADA's currently-set vars — the
-            # update-function-configuration step REPLACES the entire env map
-            # below, so a single-var setting here would wipe the other 16+.
-            # See audit row #6 (project_mfs_cleanup_phase2_post_audit_*).
-            # Future direction: move to JSON-file-per-Lambda for full CI-as-source.
+            # env_vars are managed out-of-band for this Lambda today. The step
+            # below MERGES matrix env_vars with existing live env vars (matrix
+            # wins on conflict) so populating this list adds/overrides without
+            # wiping out-of-band vars. Safe to extend incrementally.
             env_vars: ''
             # Smoke via Function URL HTTP probe; auth-gated endpoints return 401.
             smoke_path: /forms/summary
@@ -99,12 +97,10 @@ jobs:
             staging_function: picasso-session-archiver
             handler: lambda_function.lambda_handler
             include_globs: 'lambda_function.py'
-            # CI is the source of truth for this Lambda's env vars: archiver
-            # has only ARCHIVE_BUCKET set, and update-function-configuration
-            # REPLACES the entire env map every deploy. Adding a var out-of-band
-            # will be silently wiped on next deploy. To add a permanent env var:
-            # extend this list (comma-separated, no spaces, no special chars in
-            # values — values with embedded commas need the JSON-file approach).
+            # CI is the source of truth for the keys listed here. The step
+            # MERGES with existing live env vars (matrix wins on conflict).
+            # Other vars set out-of-band are preserved. Values with embedded
+            # commas need the JSON-file approach (not yet implemented).
             env_vars: 'ARCHIVE_BUCKET=picasso-archive-staging'
             smoke_path: ''
             smoke_expect_status: ''
@@ -152,20 +148,54 @@ jobs:
 
       - name: Update function configuration (env vars)
         if: matrix.lambda.env_vars != ''
+        env:
+          MATRIX_ENV_VARS: ${{ matrix.lambda.env_vars }}
+          FN_NAME: ${{ matrix.lambda.staging_function }}
         run: |
           set -euo pipefail
-          # ⚠️ DESTRUCTIVE: update-function-configuration REPLACES the entire
-          # Variables map. Any var on the Lambda not enumerated in matrix.env_vars
-          # will be DROPPED. This step only runs for Lambdas where env_vars is
-          # populated — Lambdas with env_vars: '' are skipped (their env is
-          # managed out-of-band; populating env_vars without enumerating ALL
-          # current vars would wipe them).
+          # MERGE matrix env_vars with existing live env vars. Matrix entries
+          # take precedence on key conflicts; existing out-of-band vars are
+          # preserved. Fix for fourth-audit row #8: previous version REPLACED
+          # the entire Variables map, which wiped any var not enumerated here.
+          # Limitation: matrix value cannot contain commas (need JSON-file
+          # approach for that).
+
+          # 1. Snapshot current env vars (null-safe: empty if none set)
+          aws lambda get-function-configuration \
+            --function-name "$FN_NAME" \
+            --query 'Environment.Variables' --output json > /tmp/current_env.json
+          if [ "$(cat /tmp/current_env.json)" = "null" ]; then
+            echo '{}' > /tmp/current_env.json
+          fi
+
+          # 2. Convert matrix KEY=val,KEY=val into JSON via python (jq -R . is
+          #    surprisingly awkward for this; python is clearer)
+          python3 - <<'PY'
+          import json, os
+          raw = os.environ['MATRIX_ENV_VARS']
+          pairs = {}
+          for kv in raw.split(','):
+              if not kv:
+                  continue
+              k, _, v = kv.partition('=')
+              pairs[k.strip()] = v.strip()
+          with open('/tmp/matrix_env.json', 'w') as f:
+              json.dump(pairs, f)
+          PY
+
+          # 3. Merge (matrix wins on conflict)
+          jq -s '.[0] * .[1] | {Variables: .}' /tmp/current_env.json /tmp/matrix_env.json > /tmp/env.json
+          echo "Merged env vars (keys):"
+          jq -r '.Variables | keys[]' /tmp/env.json | sort
+          echo "---"
+
+          # 4. Apply
           aws lambda update-function-configuration \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --environment "Variables={${{ matrix.lambda.env_vars }}}" \
-            --query '{State:State, LastUpdateStatus:LastUpdateStatus}'
+            --function-name "$FN_NAME" \
+            --environment file:///tmp/env.json \
+            --query '{State:State,LastUpdateStatus:LastUpdateStatus}'
           aws lambda wait function-updated \
-            --function-name ${{ matrix.lambda.staging_function }}
+            --function-name "$FN_NAME"
 
       - name: Update function code
         id: update
