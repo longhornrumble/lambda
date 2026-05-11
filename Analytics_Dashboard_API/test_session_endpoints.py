@@ -1096,7 +1096,7 @@ class TestArchiveProbe:
     def test_probe_returns_count_when_both_gates_pass(self, mock_s3):
         """ENVIRONMENT=staging + flag on + empty bucket: returns archives_found=0
         and iam_path='ok'. The 200-response itself is the signal that the IAM
-        path completed without raising."""
+        LIST call completed without raising."""
         mock_paginator = MagicMock()
         mock_paginator.paginate.return_value = [{'Contents': []}]
         mock_s3.get_paginator.return_value = mock_paginator
@@ -1119,10 +1119,58 @@ class TestArchiveProbe:
         assert 'tenant_hash_used' not in body
 
     @patch('lambda_function.s3')
+    def test_probe_reports_misconfigured_when_archive_bucket_mismatches_env(self, mock_s3):
+        """Fourth-audit row #1: if ARCHIVE_BUCKET doesn't match the gate-allowed
+        ENVIRONMENT (e.g. prod Lambda accidentally has ENVIRONMENT=staging but
+        ARCHIVE_BUCKET set to picasso-archive-prod), the probe must surface
+        the mismatch in iam_path rather than silently lying with 'ok'."""
+        import lambda_function as lf
+        original_bucket = lf.ARCHIVE_BUCKET
+        try:
+            self._enable_probe(environment='staging')
+            # Module-level ARCHIVE_BUCKET set to a value that doesn't match env.
+            lf.ARCHIVE_BUCKET = 'picasso-archive-production'
+            result = handle_archive_probe()
+            body = json.loads(result['body'])
+        finally:
+            lf.ARCHIVE_BUCKET = original_bucket
+            self._reset_probe()
+
+        assert result['statusCode'] == 200
+        assert body['archives_found'] == 0
+        assert body['iam_path'].startswith('misconfigured:')
+        # Must NOT have hit S3 — the misconfig gate fires first.
+        mock_s3.get_paginator.assert_not_called()
+
+    @patch('lambda_function.s3')
+    def test_probe_reports_iam_failure_when_list_raises_access_denied(self, mock_s3):
+        """Fourth-audit row #1: probe must NOT swallow ClientError silently.
+        Direct LIST call (not via _fetch_archived_sessions) so AccessDenied
+        surfaces in iam_path. Previously the probe relied on the inner helper
+        which swallowed and reported 'ok' on denial."""
+        from botocore.exceptions import ClientError
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied', 'Message': 'denied'}},
+            'ListObjectsV2',
+        )
+        mock_s3.get_paginator.return_value = mock_paginator
+
+        try:
+            self._enable_probe()
+            result = handle_archive_probe()
+            body = json.loads(result['body'])
+        finally:
+            self._reset_probe()
+
+        assert result['statusCode'] == 200
+        assert body['archives_found'] == 0
+        assert body['iam_path'] == 'failed: AccessDenied'
+
+    @patch('lambda_function.s3')
     def test_probe_surfaces_unexpected_exception_in_iam_path_field(self, mock_s3):
-        """Audit follow-up #17: any unexpected exception in _fetch_archived_sessions
-        must be reported via iam_path, not propagated as a 500."""
-        # Simulate a non-ClientError exception that bypasses the inner try/except.
+        """Audit follow-up #17: any unexpected exception is reported via
+        iam_path, not propagated as a 500."""
         mock_s3.get_paginator.side_effect = RuntimeError("simulated unexpected failure")
 
         try:
@@ -1134,7 +1182,7 @@ class TestArchiveProbe:
 
         assert result['statusCode'] == 200
         assert body['archives_found'] == 0
-        assert body['iam_path'].startswith('failed: RuntimeError')
+        assert body['iam_path'] == 'failed: RuntimeError'
 
 
 if __name__ == '__main__':
