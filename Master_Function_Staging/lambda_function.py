@@ -174,25 +174,32 @@ def validate_cors_origin(request_headers, tenant_hash, config_data):
 def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Add CORS headers to response. This is the ONLY place CORS headers are added.
+
+    Phase-audit B6 (2026-05-11): default no longer falls back to '*'. When the
+    request has no Origin header (direct invocation, test harness, or missing
+    event), we use the first entry from the allowlist — never wildcard. The
+    streaming-handler responses now route through this function instead of
+    constructing their own headers (which previously hardcoded '*').
     """
     if 'headers' not in response:
         response['headers'] = {}
-    
-    # Determine the allowed origin based on the request
-    # For now, use wildcard to ensure it works, then we can tighten security later
-    allowed_origin = '*'
-    
+
+    # Safe default — never wildcard. If no Origin header is present, fall back
+    # to the canonical chat origin. Browsers will refuse the actual cross-origin
+    # request if their origin doesn't match, which is the desired CORS posture.
+    allowed_origin = _CORS_ALLOWED_ORIGINS_DEFAULT[0]
+
     # Check for origin header in various formats (Lambda can provide headers in different cases)
     if event and 'headers' in event:
         headers = event.get('headers', {})
         origin = None
-        
+
         # Try different header key variations
         for key in ['origin', 'Origin', 'ORIGIN']:
             if key in headers:
                 origin = headers[key]
                 break
-        
+
         if origin:
             # Use the shared allowlist defined above (single source of truth with
             # validate_cors_origin). Includes staging.chat.myrecruiter.ai as of
@@ -205,18 +212,16 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
                 allowed_origin = origin
                 logger.info(f"CORS: Allowing specific origin {origin}")
             else:
-                # SECURITY: Don't fall back to wildcard - use first allowed origin instead
                 logger.warning(f"CORS: Origin {origin} not in allowed list, using default origin (not wildcard)")
+                # allowed_origin already set to allowed_origins[0] above; explicit reassign for clarity
                 allowed_origin = allowed_origins[0] if allowed_origins else 'https://chat.myrecruiter.ai'
-    
+
     # Add CORS headers - this is the single source of truth
     response['headers']['Access-Control-Allow-Origin'] = allowed_origin
     response['headers']['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, DELETE'
     response['headers']['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-    
-    # Only set credentials if we're using a specific origin (not wildcard)
-    if allowed_origin != '*':
-        response['headers']['Access-Control-Allow-Credentials'] = 'true'
+    # Always set credentials true — we never use wildcard now, so this is safe.
+    response['headers']['Access-Control-Allow-Credentials'] = 'true'
     
     # Set content type if not already set
     if 'Content-Type' not in response['headers']:
@@ -548,23 +553,22 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
                 })
                 yield f'data: {error_data}\n\ndata: [DONE]\n\n'
         
-        # Create streaming response using Lambda's StreamingBody
-        return {
+        # Create streaming response using Lambda's StreamingBody. CORS headers
+        # come from add_cors_headers (single source of truth — phase-audit B6).
+        response = {
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
             },
             'body': StreamingBody(stream_generator())
         }
-        
+        return add_cors_headers(response, event)
+
     except Exception as e:
         logger.error(f"Error in streaming chat: {str(e)}", exc_info=True)
-        
+
         # Return error as SSE format
         error_data = json.dumps({
             "type": "error",
@@ -572,19 +576,17 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
             "session_id": session_id if 'session_id' in locals() else 'unknown'
         })
         error_sse = f'data: {error_data}\n\ndata: [DONE]\n\n'
-        
-        return {
+
+        response = {
             'statusCode': 500,
             'headers': {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
             },
             'body': error_sse
         }
+        return add_cors_headers(response, event)
 
 def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
     """
@@ -724,26 +726,25 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         # Combine all SSE chunks
         sse_body = ''.join(sse_chunks)
         
-        # Create SSE response with proper headers
+        # Create SSE response with proper headers. CORS comes from
+        # add_cors_headers (single source of truth — phase-audit B6).
         response = {
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
             },
             'body': sse_body
         }
-        
+        response = add_cors_headers(response, event)
+
         logger.info(f"Fallback streaming response sent for tenant: {tenant_hash[:8]}... with {len(sse_chunks)-1} chunks")
         return response
-        
+
     except Exception as e:
         logger.error(f"Error in fallback streaming chat: {str(e)}", exc_info=True)
-        
+
         # Return error as SSE format
         error_data = json.dumps({
             "type": "error",
@@ -751,21 +752,18 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
             "session_id": session_id if 'session_id' in locals() else 'unknown'
         })
         error_sse = f'data: {error_data}\n\ndata: [DONE]\n\n'
-        
+
         response = {
             'statusCode': 500,
             'headers': {
                 'Content-Type': 'text/event-stream',
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, Authorization'
             },
             'body': error_sse
         }
-        
-        return response
+
+        return add_cors_headers(response, event)
 
 def get_conversation_branch(metadata: Dict[str, Any], tenant_config: Dict[str, Any]) -> Optional[str]:
     """
