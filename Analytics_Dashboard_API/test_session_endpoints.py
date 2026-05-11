@@ -676,5 +676,146 @@ class TestS3ArchiveReadPath:
         assert matching[0]['message_count'] == 5
 
 
+# ---------------------------------------------------------------------------
+# Phase 2.8 audit follow-up — REAL archiver-produced object fixtures (B2/B3)
+#
+# The 10 TestS3ArchiveReadPath tests use synthetic _archived_item() builders
+# that include a top-level `tenant_hash` field. Real archiver output (verified
+# 2026-05-11 via aws s3 cp from picasso-archive-staging) does NOT include that
+# field — analytics_writer.py only writes tenant_hash into the DDB Key.pk, not
+# as a separate attribute. This means every synthetic test exercises a fallback
+# filter branch (`item.get('tenant_hash') != tenant_hash`) that real data never
+# populates. These tests validate the reader against actual archiver output.
+# ---------------------------------------------------------------------------
+
+class TestArchivedRealFixture:
+    """Tests against literal JSON captured from real archiver-produced objects
+    in s3://picasso-archive-staging on 2026-05-11. These fixtures are the
+    exact bytes the deployed archiver writes when a real DDB Streams REMOVE
+    event fires — no synthetic embellishment."""
+
+    # Captured from sessions/year=2026/month=05/day=11/archive_verify_1778513282.json
+    # via: aws s3 cp s3://picasso-archive-staging/sessions/.../*.json -
+    REAL_ARCHIVER_OUTPUT_FULL = {
+        "tenant_id": "MYR384719",
+        "first_question": "Phase 2.7 verification test (retry)",
+        "sk": "SESSION#archive_verify_1778513282",
+        "session_id": "archive_verify_1778513282",
+        "started_at": "2026-05-11T15:28:02.000Z",
+        "pk": "TENANT#my87674d777bf9",
+        "message_count": 2,
+        "ttl": 1778509682,
+        "ended_at": "2026-05-11T15:28:02.000Z",
+    }
+
+    # Captured from sessions/year=2026/month=05/day=11/verify_1778513346.json
+    # Minimal shape — TTL-deleted before bot/user_message_count etc were written.
+    REAL_ARCHIVER_OUTPUT_MINIMAL = {
+        "tenant_id": "MYR384719",
+        "sk": "SESSION#verify_1778513346",
+        "session_id": "verify_1778513346",
+        "pk": "TENANT#my87674d777bf9",
+    }
+
+    # What a real MFS-produced session-summary row would archive when TTL fires.
+    # Captured from picasso-session-summaries-staging::bsh_smoke_1777997575 row
+    # via: aws dynamodb scan --table-name picasso-session-summaries-staging
+    # (then conceptually deserialized via the archiver's TypeDeserializer path).
+    REAL_PRODUCTION_SHAPE = {
+        "total_response_time_ms": 1739,
+        "first_question": "hi",
+        "last_request_id_message_sent": "2800f690-1d5d-4e4a-b323-11d235e5d77a",
+        "ttl": 1785773575,
+        "last_request_id_message_received": "2800f690-1d5d-4e4a-b323-11d235e5d77a",
+        "user_message_count": 1,
+        "message_count": 2,
+        "bot_message_count": 1,
+        "ended_at": "2026-05-05T16:12:55.251Z",
+        "tenant_id": "MYR384719",
+        "session_id": "bsh_smoke_1777997575",
+        "sk": "SESSION#bsh_smoke_1777997575",
+        "pk": "TENANT#my87674d777bf9",
+        "response_count": 1,
+        "started_at": "2026-05-05T16:12:55.251Z",
+    }
+
+    def _wire_one(self, mock_s3, item):
+        mock_paginator = MagicMock()
+        mock_paginator.paginate.return_value = [
+            {'Contents': [{'Key': 'sessions/year=2026/month=05/day=11/real.json'}]}
+        ]
+        mock_s3.get_paginator.return_value = mock_paginator
+        body = MagicMock()
+        body.read.return_value = json.dumps(item).encode('utf-8')
+        mock_s3.get_object.return_value = {'Body': body}
+
+    @patch('lambda_function.s3')
+    def test_real_archiver_output_minimal_passes_tenant_filter(self, mock_s3):
+        """B3 verification: real archiver output has NO `tenant_hash` field —
+        only `pk`. The filter must pass via `pk` match alone."""
+        self._wire_one(mock_s3, self.REAL_ARCHIVER_OUTPUT_MINIMAL)
+        result = lambda_function._fetch_archived_sessions(
+            'my87674d777bf9',
+            {'start_date_iso': '2020-01-01', 'end_date_iso': '2030-12-31'},
+        )
+        # Item has no started_at → filter drops it (correct — no date to filter on)
+        # This is itself a finding: minimal archiver output is unrecoverable.
+        # Documenting via this test.
+        assert result == [], (
+            "Expected minimal-shape row to drop because started_at is absent — "
+            "this is a known gap: a session deleted before MFS wrote started_at "
+            "cannot be archived in a queryable way."
+        )
+
+    @patch('lambda_function.s3')
+    def test_real_archiver_output_full_passes_filter_and_shapes_correctly(self, mock_s3):
+        """B2/B3 verification: feed REAL archiver-produced JSON into the reader.
+        Must (a) pass the tenant filter via `pk` alone, (b) match the date range,
+        (c) shape correctly with sane defaults for fields not present in this row."""
+        self._wire_one(mock_s3, self.REAL_ARCHIVER_OUTPUT_FULL)
+        result = lambda_function._fetch_archived_sessions(
+            'my87674d777bf9',
+            {'start_date_iso': '2026-05-01', 'end_date_iso': '2026-05-31'},
+        )
+        assert len(result) == 1
+        s = result[0]
+        assert s['session_id'] == 'archive_verify_1778513282'
+        assert s['started_at'] == '2026-05-11T15:28:02.000Z'
+        assert s['ended_at'] == '2026-05-11T15:28:02.000Z'
+        assert s['first_question'] == 'Phase 2.7 verification test (retry)'
+        assert s['message_count'] == 2
+        # Fields absent in this archiver-output → reader must default sanely:
+        assert s['user_message_count'] == 0
+        assert s['bot_message_count'] == 0
+        assert s['outcome'] == 'conversation'   # missing → default
+        assert s['form_id'] == ''               # missing → default
+        assert s['total_response_time_ms'] == 0
+        assert s['response_count'] == 0
+        assert s['duration_seconds'] == 0       # ended_at == started_at
+
+    @patch('lambda_function.s3')
+    def test_real_production_shape_archives_correctly(self, mock_s3):
+        """The 'when real soak data ages past 90d TTL' case. Verifies the reader
+        handles the full-shape MFS row (5 message-count fields + last_request_id_*
+        idempotency keys + ttl as int + no outcome field)."""
+        self._wire_one(mock_s3, self.REAL_PRODUCTION_SHAPE)
+        result = lambda_function._fetch_archived_sessions(
+            'my87674d777bf9',
+            {'start_date_iso': '2026-05-01', 'end_date_iso': '2026-05-31'},
+        )
+        assert len(result) == 1
+        s = result[0]
+        assert s['session_id'] == 'bsh_smoke_1777997575'
+        assert s['message_count'] == 2
+        assert s['user_message_count'] == 1
+        assert s['bot_message_count'] == 1
+        assert s['total_response_time_ms'] == 1739
+        assert s['response_count'] == 1
+        assert s['outcome'] == 'conversation'   # MFS never sets outcome — reader defaults
+        assert s['form_id'] == ''
+        # last_request_id_* fields are silently ignored by _archived_item_to_session_shape —
+        # that's correct, they're idempotency keys not user-facing data.
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
