@@ -838,14 +838,12 @@ class TestEndToEndIntegration(unittest.TestCase):
 
         response = lambda_handler(event, {})
 
-        # PRODUCTION BUG: lambda_function.py defines handle_options() twice.
-        # Line 163: def handle_options(event: Dict[str, Any] = None)
-        # Line 1707: def handle_options() -> Dict[str, Any]:   ← shadows first, takes no args
-        # lambda_handler calls handle_options(event) → TypeError → 500 instead of 200.
-        # Test documents the actual (broken) behavior until the duplicate is removed.
-        self.assertEqual(response['statusCode'], 500)
+        # Phase 1 C2 fix (2026-05-11) removed the duplicate handle_options() at
+        # the old line 1813 that shadowed the correct definition. OPTIONS now
+        # returns 200 with CORS headers via the line-227 definition.
+        self.assertEqual(response['statusCode'], 200)
 
-        logger.info("Test ran: CORS headers test (OPTIONS returns 500 due to duplicate handle_options production bug)")
+        logger.info("Test passed: OPTIONS returns 200 with CORS headers (duplicate handle_options removed)")
 
     def test_routing_branch_validation(self):
         """
