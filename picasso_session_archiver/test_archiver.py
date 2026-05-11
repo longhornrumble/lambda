@@ -279,6 +279,22 @@ def test_record_without_sequence_number_raises_last_resort(archiver):
         mod.lambda_handler({"Records": [rec]}, None)
 
 
+def test_record_with_empty_string_sequence_number_reports_via_batch_item_failures(archiver):
+    """B8: empty-string SequenceNumber is distinct from None — the value is
+    present, just falsy. Truthiness check would re-raise (escalating the entire
+    batch); `is not None` correctly reports the failure for ESM retry."""
+    from botocore.exceptions import ClientError
+    mod, s3 = archiver
+    s3.put_object.side_effect = ClientError({"Error": {"Code": "ThrottlingException"}}, "PutObject")
+
+    rec = _ttl_remove_record("sess_empty_seq")
+    rec["dynamodb"]["SequenceNumber"] = ""
+
+    res = mod.lambda_handler({"Records": [rec]}, None)
+    assert res["batchItemFailures"] == [{"itemIdentifier": ""}]
+    assert res["archived"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Coverage gaps from audit defer-list (R12, R13, R14)
 # ---------------------------------------------------------------------------

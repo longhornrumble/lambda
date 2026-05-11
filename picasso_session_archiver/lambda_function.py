@@ -132,7 +132,7 @@ def lambda_handler(event, context):
                 sequence_number,
                 type(exc).__name__,
             )
-            if sequence_number:
+            if sequence_number is not None:
                 batch_item_failures.append({"itemIdentifier": sequence_number})
             # If we lack a SequenceNumber, we can't report partial failure for
             # this record — re-raise so the entire batch retries (last-resort
