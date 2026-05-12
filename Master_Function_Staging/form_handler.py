@@ -5,6 +5,7 @@ Handles notifications, storage, and fulfillment
 """
 
 import json
+import os
 import time
 import uuid
 import logging
@@ -31,11 +32,13 @@ lambda_client = boto3.client('lambda')
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# DynamoDB tables
-SUBMISSIONS_TABLE = 'picasso_form_submissions'
-SMS_USAGE_TABLE = 'picasso_sms_usage'
-AUDIT_TABLE = 'picasso_audit_logs'
-NOTIFICATION_SENDS_TABLE = 'picasso-notification-sends'
+# DynamoDB tables — env-var-driven so staging routes to staging-suffixed
+# tables without code change. Defaults match the prod-account legacy names
+# (no suffix, underscored) so prod behavior is unchanged when env vars unset.
+SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_submissions')
+SMS_USAGE_TABLE = os.environ.get('SMS_USAGE_TABLE', 'picasso_sms_usage')
+AUDIT_TABLE = os.environ.get('FORM_AUDIT_TABLE', 'picasso_audit_logs')
+NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-notification-sends')
 
 notification_sends_table = dynamodb.Table(NOTIFICATION_SENDS_TABLE)
 
