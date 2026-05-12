@@ -2,12 +2,10 @@
 Analytics Dashboard API Lambda
 
 Provides REST API endpoints for querying analytics data.
-**HOT PATH**: Reads pre-computed aggregates from DynamoDB for sub-100ms responses.
-**COLD PATH**: Falls back to Athena for real-time queries if DynamoDB cache is stale.
+Reads pre-computed aggregates from DynamoDB for sub-100ms responses.
 
 Architecture:
 - DynamoDB Table: picasso-dashboard-aggregates (pre-computed by Analytics_Aggregator Lambda)
-- Athena: Fallback for fresh queries, historical data >90 days
 - Pre-computed aggregates refreshed hourly by EventBridge-triggered Aggregator
 
 Endpoints:
@@ -34,8 +32,6 @@ Authentication:
 - Token contains tenant_id for data isolation
 
 Environment Variables:
-- ATHENA_DATABASE: Athena database name (default: picasso_analytics)
-- ATHENA_OUTPUT_LOCATION: S3 location for query results
 - JWT_SECRET_KEY_NAME: Secrets Manager key name for JWT secret
 - AGGREGATES_TABLE: DynamoDB table for pre-computed aggregates (default: picasso-dashboard-aggregates)
 - USE_DYNAMO_CACHE: Enable DynamoDB hot path (default: true)
@@ -2264,7 +2260,7 @@ def fetch_session_summaries(tenant_hash: str, date_range: Dict[str, str], limit:
     This queries the picasso-session-summaries table directly for hot data (<90 days).
     Returns raw session data for aggregation.
 
-    Performance: ~50-200ms for most tenants (vs 5-60s for Athena)
+    Performance: ~50-200ms for most tenants
 
     Args:
         tenant_hash: Tenant hash (e.g., 'fo85e6a06dcdf4')
@@ -2487,10 +2483,9 @@ def fetch_form_events_from_dynamo(tenant_hash: str, date_range: Dict[str, str], 
 
 def fetch_form_summary_from_dynamo(tenant_hash: str, date_range: Dict[str, str], form_id: str = None) -> Dict[str, Any]:
     """
-    Calculate form summary metrics from DynamoDB session events.
-
-    Replaces Athena query for /forms/summary endpoint.
-    Performance: ~100-500ms (vs 5-30s for Athena)
+    Calculate form summary metrics from DynamoDB session events for the
+    /forms/summary endpoint.
+    Performance: ~100-500ms
 
     Args:
         tenant_hash: Tenant hash
@@ -2721,10 +2716,9 @@ def fetch_form_bottlenecks_from_dynamo(tenant_hash: str, date_range: Dict[str, s
 
 def fetch_form_top_performers_from_dynamo(tenant_hash: str, date_range: Dict[str, str], limit: int = 5, sort_by: str = 'conversion_rate') -> Dict[str, Any]:
     """
-    Calculate form performance rankings from DynamoDB session events.
-
-    Replaces Athena query for /forms/top-performers endpoint.
-    Performance: ~100-500ms (vs 5-30s for Athena)
+    Calculate form performance rankings from DynamoDB session events for
+    the /forms/top-performers endpoint.
+    Performance: ~100-500ms
 
     Args:
         tenant_hash: Tenant hash
@@ -2843,7 +2837,7 @@ def handle_form_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any
     - form_id: Filter by specific form (optional)
 
     Data source: picasso-session-events table via tenant-date-index GSI
-    Performance: ~100-500ms (vs 5-30s for Athena)
+    Performance: ~100-500ms
     """
     # Validate premium feature access
     access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
@@ -2869,7 +2863,7 @@ def handle_form_summary(tenant_id: str, params: Dict[str, str]) -> Dict[str, Any
     logger.info(f"Querying DynamoDB for forms_summary: tenant={tenant_hash}, range={range_str}, form_id={form_id}")
 
     try:
-        # Query DynamoDB directly (no Athena fallback)
+        # Query DynamoDB directly
         metrics = fetch_form_summary_from_dynamo(tenant_hash, date_range, form_id)
 
         return cors_response(200, {
@@ -2911,7 +2905,7 @@ def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     - limit: Number of results (default 5, max 20)
 
     Data source: picasso-session-events table via tenant-date-index GSI
-    Performance: ~100-500ms (vs 5-30s for Athena)
+    Performance: ~100-500ms
     """
     # Validate premium feature access
     access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
@@ -2938,7 +2932,7 @@ def handle_form_bottlenecks(tenant_id: str, params: Dict[str, str]) -> Dict[str,
     logger.info(f"Querying DynamoDB for forms_bottlenecks: tenant={tenant_hash}, range={range_str}, form_id={form_id}")
 
     try:
-        # Query DynamoDB directly (no Athena fallback)
+        # Query DynamoDB directly
         result = fetch_form_bottlenecks_from_dynamo(tenant_hash, date_range, form_id, limit)
 
         return cors_response(200, {
@@ -3371,7 +3365,7 @@ def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[s
     - sort_by: Sort field (conversion_rate, completions, avg_time) - default conversion_rate
 
     Data source: picasso-session-events table via tenant-date-index GSI
-    Performance: ~100-500ms (vs 5-30s for Athena)
+    Performance: ~100-500ms
     """
     # Validate premium feature access
     access_error = validate_feature_access(tenant_id, 'dashboard_forms', _request_user_role)
@@ -3399,7 +3393,7 @@ def handle_form_top_performers(tenant_id: str, params: Dict[str, str]) -> Dict[s
     logger.info(f"Querying DynamoDB for forms_top_performers: tenant={tenant_hash}, range={range_str}, sort_by={sort_by}")
 
     try:
-        # Query DynamoDB directly (no Athena fallback)
+        # Query DynamoDB directly
         result = fetch_form_top_performers_from_dynamo(tenant_hash, date_range, limit, sort_by)
 
         return cors_response(200, {
