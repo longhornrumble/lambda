@@ -1024,77 +1024,27 @@ def _get_jwt_signing_key():
 
 def _options_response(event=None):
     """
-    Handle OPTIONS requests for CORS preflight
+    Handle OPTIONS requests for CORS preflight.
+    Delegates to lambda_function.handle_options so the central allowlist
+    (_CORS_ALLOWED_ORIGINS_DEFAULT) is the single source of truth.
     """
-    # Get origin from request headers
-    origin = "*"
-    if event and 'headers' in event:
-        headers = event.get('headers', {})
-        request_origin = headers.get('origin') or headers.get('Origin')
-        
-        if request_origin:
-            allowed_origins = [
-                'http://localhost:8000',
-                'http://localhost:8080', 
-                'http://localhost:5173',
-                'http://localhost:3000',
-                'https://chat.myrecruiter.ai',
-                'https://picassocode.s3.amazonaws.com',
-                'https://picassostaging.s3.amazonaws.com'
-            ]
-            if request_origin in allowed_origins or request_origin.startswith('http://localhost:'):
-                origin = request_origin
-    
-    return {
-        "statusCode": 200,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": origin,
-            "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Authorization, X-Requested-With",
-            "Access-Control-Max-Age": "86400"
-        },
-        "body": ""
-    }
+    from lambda_function import handle_options
+    return handle_options(event)
 
 def _success_response(data, request_headers=None, tenant_hash=None):
     """
-    Create successful response with secure tenant-specific CORS headers
-    Security: Implements tenant-specific CORS validation
+    Create successful response. CORS headers are added by the central
+    add_cors_headers() helper in lambda_function, which holds the single
+    source of truth for the allowlist.
     """
-    headers = {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Headers": "Content-Type,Authorization",
-        "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS"
-    }
-    
-    # Check origin and set appropriate CORS headers
-    origin = None
-    if request_headers:
-        origin = request_headers.get('origin') or request_headers.get('Origin')
-    
-    allowed_origin = "*"  # Default fallback
-    if origin:
-        allowed_origins = [
-            'http://localhost:8000',
-            'http://localhost:8080', 
-            'http://localhost:5173',
-            'http://localhost:3000',
-            'https://chat.myrecruiter.ai',
-            'https://picassocode.s3.amazonaws.com',
-            'https://picassostaging.s3.amazonaws.com'
-        ]
-        if origin in allowed_origins or origin.startswith('http://localhost:'):
-            allowed_origin = origin
-    
-    headers["Access-Control-Allow-Origin"] = allowed_origin
-    headers["Access-Control-Allow-Headers"] = "Content-Type,Authorization,X-Authorization"
-    
-    return {
+    from lambda_function import add_cors_headers
+    response = {
         "statusCode": 200,
-        "headers": headers,
+        "headers": {"Content-Type": "application/json"},
         "body": json.dumps(data, separators=(',', ':'))
     }
+    event = {"headers": request_headers} if request_headers else None
+    return add_cors_headers(response, event)
 
 def _error_response(error_type, message, status_code, extra_data=None, request_headers=None, tenant_hash=None):
     """
@@ -1141,38 +1091,14 @@ def _error_response(error_type, message, status_code, extra_data=None, request_h
         else:
             error_data.update(extra_data)
     
-    # Apply secure CORS validation
-    headers = {
-        "Content-Type": "application/json",
-        "Access-Control-Allow-Headers": "Content-Type,Authorization",
-        "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS"
-    }
-    
-    # Determine the allowed origin based on the request
-    allowed_origin = '*'  # Default fallback
-    if request_headers:
-        origin = request_headers.get('origin') or request_headers.get('Origin')
-        if origin:
-            # Allow specific trusted origins
-            allowed_origins = [
-                'http://localhost:8000',
-                'http://localhost:5173',
-                'http://localhost:3000',
-                'https://chat.myrecruiter.ai',
-                'https://picassocode.s3.amazonaws.com',
-                'https://picassostaging.s3.amazonaws.com'
-            ]
-            if origin in allowed_origins or origin.startswith('http://localhost:'):
-                allowed_origin = origin
-                headers["Access-Control-Allow-Credentials"] = "true"
-                logger.info(f"[{tenant_hash[:8] if tenant_hash else 'unknown'}...] CORS: Error response allowing origin {origin}")
-            else:
-                logger.warning(f"[{tenant_hash[:8] if tenant_hash else 'unknown'}...] CORS: Origin {origin} not in allowed list for error response")
-    
-    headers["Access-Control-Allow-Origin"] = allowed_origin
-    
-    return {
+    # CORS headers are added by the central add_cors_headers() helper in
+    # lambda_function, which holds the single source of truth for the
+    # allowlist.
+    from lambda_function import add_cors_headers
+    response = {
         "statusCode": status_code,
-        "headers": headers,
+        "headers": {"Content-Type": "application/json"},
         "body": json.dumps(error_data, separators=(',', ':'))
     }
+    event = {"headers": request_headers} if request_headers else None
+    return add_cors_headers(response, event)
