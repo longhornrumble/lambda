@@ -163,11 +163,12 @@ jobs:
               PyJWT-2.10.1.dist-info
               notification_templates.json
               analytics_writer_contract.json
-            # MFS env vars are managed out-of-band (S3 buckets, DDB tables,
-            # JWT key name, Bedrock config). Adding any here would merge,
-            # not replace, but the CI-source-of-truth call is a Phase 4.5
-            # decision — not within scope of bringing MFS to CI deploys.
-            env_vars: ''
+            # Most MFS env vars stay out-of-band today; the merge-not-replace
+            # step at line ~156 preserves them. CI manages the single key
+            # listed below per Phase 4 EC-P4-2 — BEDROCK_MODEL_ID is now the
+            # single source of truth for the Bedrock default model. Code
+            # fails loud (KeyError) if this var is missing on the function.
+            env_vars: 'BEDROCK_MODEL_ID=global.anthropic.claude-haiku-4-5-20251001-v1:0'
             # action=health_check returns 200 unauthenticated; default route
             # (no action) also dispatches to health_check. Use the explicit
             # form for clarity in CI logs.

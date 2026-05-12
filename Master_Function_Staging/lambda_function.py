@@ -449,9 +449,12 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
             region_name=os.environ.get('AWS_REGION', 'us-east-1')
         )
         
-        # Get model ID from config or use default
-        model_id = config.get("model_id", "anthropic.claude-3-haiku-20240307-v1:0") if config else "anthropic.claude-3-haiku-20240307-v1:0"
-        
+        # Model ID resolution: tenant config wins; fall back to the Lambda
+        # default (env var BEDROCK_MODEL_ID, single source of truth across MFS
+        # + BSH per Phase 4 EC-P4-2). KeyError on missing env var is the
+        # intentional fail-loud signal — Lambda deploy must set this var.
+        model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
+
         # Prepare the message for Claude with enhanced prompt
         messages = [
             {
@@ -459,7 +462,7 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
                 "content": enhanced_prompt  # Use the KB-enhanced prompt instead of raw input
             }
         ]
-        
+
         # Bedrock request body for Claude 3 Haiku
         bedrock_body = {
             "anthropic_version": "bedrock-2023-05-31",
@@ -469,7 +472,7 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
         }
 
         logger.info("Invoking Bedrock with streaming...")
-        
+
         def stream_generator():
             """Generator function to yield streaming chunks"""
             try:
@@ -629,8 +632,10 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
             region_name=os.environ.get('AWS_REGION', 'us-east-1')
         )
         
-        # Get model ID from config or use default
-        model_id = config.get("model_id", "anthropic.claude-3-haiku-20240307-v1:0") if config else "anthropic.claude-3-haiku-20240307-v1:0"
+        # Model ID resolution: tenant config wins; fall back to Lambda default
+        # (env var BEDROCK_MODEL_ID per Phase 4 EC-P4-2). KeyError fail-loud
+        # if env var missing.
+        model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
         
         # Prepare the message for Claude with enhanced prompt
         messages = [
