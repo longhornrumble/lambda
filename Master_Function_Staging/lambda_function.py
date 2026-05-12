@@ -768,8 +768,12 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
         logger.info(f"Session context extracted: completed_forms={session_context.get('completed_forms', [])}")
 
         # ACTION CHIPS EXPLICIT ROUTING (PRD FR-3, FR-5)
-        # Extract metadata from request for 3-tier routing hierarchy
-        request_metadata = body.get('metadata', {})
+        # Extract metadata from request for 3-tier routing hierarchy.
+        # Wire-shape parity with BSH: widget sends body.routing_metadata
+        # (both HTTPChatProvider and StreamingChatProvider). Fall back to
+        # body.metadata for backward compatibility with older callers and
+        # synthetic tests.
+        request_metadata = body.get('routing_metadata') or body.get('metadata') or {}
         logger.info(f"[Routing] Extracted metadata: action_chip_triggered={request_metadata.get('action_chip_triggered')}, "
                    f"cta_triggered={request_metadata.get('cta_triggered')}, "
                    f"target_branch={request_metadata.get('target_branch')}")
