@@ -48,7 +48,6 @@ try:
     from aws_client_manager import (
         protected_dynamodb_operation,
         protected_secrets_operation,
-        timeout_handler,
         CircuitBreakerError,
         aws_client_manager,
         graceful_degradation
@@ -190,9 +189,6 @@ def handle_save_conversation(event):
     POST Operation: Save conversation state with delta updates
     Security: Compare-and-swap, DLP scrubbing, payload validation
     """
-    logger.info(f"🔴 SAVE HANDLER CALLED at {datetime.utcnow().isoformat()}")
-    logger.info(f"🔴 SAVE EVENT: {json.dumps(event, default=str)[:500]}")
-
     try:
         # 1. Validate and parse state token
         token_data = _validate_state_token(event)
