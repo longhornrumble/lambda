@@ -240,7 +240,10 @@ def call_claude_with_prompt(prompt, config):
     """
     Call Claude with response caching for identical prompts
     """
-    model_id = config.get("model_id", "anthropic.claude-3-haiku-20240307-v1:0")  # Use Haiku for faster responses
+    # Tenant config wins; fall back to Lambda default (env var
+    # BEDROCK_MODEL_ID per Phase 4 EC-P4-2 — single source of truth).
+    # KeyError fail-loud on missing env var.
+    model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
     
     # For initial conversations, use a simpler cache key (without full history)
     # This allows caching of common first questions

@@ -301,7 +301,10 @@ CURRENT USER QUESTION: {user_input}
 Please provide a helpful response:""".strip()
 
 def call_claude_with_prompt(prompt, config):
-    model_id = config.get("model_id", "us.anthropic.claude-3-5-haiku-20241022-v1:0")
+    # Tenant config wins; fall back to Lambda default (env var
+    # BEDROCK_MODEL_ID per Phase 4 EC-P4-2 — single source of truth).
+    # KeyError fail-loud on missing env var.
+    model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
     logger.info(f"🧠 Calling Claude model {model_id} with constructed prompt")
     
     try:

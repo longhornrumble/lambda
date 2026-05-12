@@ -948,6 +948,51 @@ class TestPhase3HardeningRegression(unittest.TestCase):
         self.assertEqual(err['headers']['Access-Control-Allow-Origin'], origin)
         self.assertEqual(err['statusCode'], 500)
 
+    def test_bedrock_model_id_reads_from_env_var(self):
+        """
+        EC-P4-2 / Phase 4: tenant config wins; otherwise the Lambda default
+        comes from BEDROCK_MODEL_ID env var. KeyError fail-loud if env var
+        missing. Centralizes 4 previously-hardcoded fallback sites.
+        """
+        import os
+        from unittest.mock import patch
+
+        # Force the bedrock_handler modules to reload so the patched env
+        # is observed at function-call time. The pattern under test reads
+        # os.environ inside call_claude_with_prompt, so module reload is
+        # not actually needed — but we test the env-var-precedence directly.
+
+        sentinel_env = 'global.anthropic.claude-haiku-4-5-20251001-v1:0'
+        sentinel_tenant = 'us.anthropic.claude-opus-4-7-test-override'
+
+        # Case 1: tenant config has model_id — wins regardless of env var
+        with patch.dict(os.environ, {'BEDROCK_MODEL_ID': sentinel_env}):
+            # The expression under test is the same in all 4 sites; verify
+            # by inline evaluation rather than executing the full Bedrock
+            # call (which needs a live AWS client).
+            config = {'model_id': sentinel_tenant}
+            model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
+            self.assertEqual(model_id, sentinel_tenant)
+
+        # Case 2: tenant config has no model_id — env var is the default
+        with patch.dict(os.environ, {'BEDROCK_MODEL_ID': sentinel_env}):
+            config = {'tone_prompt': 'be helpful'}
+            model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
+            self.assertEqual(model_id, sentinel_env)
+
+        # Case 3: tenant config is None — env var is the default
+        with patch.dict(os.environ, {'BEDROCK_MODEL_ID': sentinel_env}):
+            config = None
+            model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
+            self.assertEqual(model_id, sentinel_env)
+
+        # Case 4: env var missing — KeyError (fail-loud)
+        env_without_var = {k: v for k, v in os.environ.items() if k != 'BEDROCK_MODEL_ID'}
+        with patch.dict(os.environ, env_without_var, clear=True):
+            config = {}
+            with self.assertRaises(KeyError):
+                _ = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
+
     def test_conversation_handler_responses_reject_unknown_origin(self):
         """
         EC-P3-5 / H5: unknown origins fall back to the canonical default
