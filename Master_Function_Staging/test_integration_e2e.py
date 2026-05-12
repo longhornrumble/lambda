@@ -917,6 +917,58 @@ class TestPhase3HardeningRegression(unittest.TestCase):
         self.assertNotIn('chat_title', body)
         self.assertNotIn('branding', body)
 
+    def test_conversation_handler_responses_honor_staging_origin(self):
+        """
+        EC-P3-5 / H5: conversation_handler.{_options,_success,_error}_response
+        must accept https://staging.chat.myrecruiter.ai as a valid Origin.
+        Pre-refactor these helpers had their own divergent allowlists that
+        omitted staging.chat. Post-refactor they delegate to
+        lambda_function.add_cors_headers / handle_options, which holds the
+        single source of truth and includes the staging origin.
+        """
+        from conversation_handler import (
+            _options_response,
+            _success_response,
+            _error_response,
+        )
+
+        origin = 'https://staging.chat.myrecruiter.ai'
+        request_headers = {'Origin': origin}
+
+        opt = _options_response({'headers': request_headers})
+        self.assertEqual(opt['headers']['Access-Control-Allow-Origin'], origin)
+
+        ok = _success_response({'ok': True}, request_headers=request_headers)
+        self.assertEqual(ok['headers']['Access-Control-Allow-Origin'], origin)
+        self.assertEqual(json.loads(ok['body']), {'ok': True})
+
+        err = _error_response('SYSTEM_ERROR', 'boom', 500,
+                              request_headers=request_headers,
+                              tenant_hash='aa12345678')
+        self.assertEqual(err['headers']['Access-Control-Allow-Origin'], origin)
+        self.assertEqual(err['statusCode'], 500)
+
+    def test_conversation_handler_responses_reject_unknown_origin(self):
+        """
+        EC-P3-5 / H5: unknown origins fall back to the canonical default
+        (not '*'). add_cors_headers picks _CORS_ALLOWED_ORIGINS_DEFAULT[0]
+        as the safe default — browsers reject the cross-origin request,
+        which is the desired posture.
+        """
+        from conversation_handler import _success_response, _error_response
+
+        bad_origin = 'https://evil.example.com'
+        request_headers = {'Origin': bad_origin}
+
+        ok = _success_response({'ok': True}, request_headers=request_headers)
+        self.assertNotEqual(ok['headers']['Access-Control-Allow-Origin'], bad_origin)
+        self.assertNotEqual(ok['headers']['Access-Control-Allow-Origin'], '*')
+
+        err = _error_response('SYSTEM_ERROR', 'boom', 500,
+                              request_headers=request_headers)
+        self.assertNotEqual(err['headers']['Access-Control-Allow-Origin'], bad_origin)
+        self.assertNotEqual(err['headers']['Access-Control-Allow-Origin'], '*')
+
 
 def run_test_suite():
     """Run the complete test suite and generate report"""
