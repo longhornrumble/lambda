@@ -672,10 +672,18 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
     try:
         # Try to use the real intent router
         from intent_router import route_intent
-        
+
         # Parse request body
         body = json.loads(event.get('body', '{}')) if event.get('body') else {}
-        
+
+        # Forms-fallback wire-up: widget HTTP path POSTs form submissions to
+        # ?action=chat with body {form_mode: true, action: 'submit_form', ...}
+        # when BSH streaming is unavailable. Route those to the existing form
+        # submission handler so MFS can serve forms as fallback.
+        if body.get('form_mode') is True:
+            logger.info("form_mode=True in chat body — routing to handle_form_submission")
+            return handle_form_submission(event, tenant_hash, request_id)
+
         # Extract Authorization header for state token (conversation memory)
         headers = event.get('headers', {})
         auth_header = headers.get('Authorization', headers.get('authorization', ''))
