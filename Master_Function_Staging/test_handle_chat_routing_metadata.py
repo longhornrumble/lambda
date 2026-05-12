@@ -92,6 +92,28 @@ class TestHandleChatRoutingMetadata(unittest.TestCase):
         })
         self.assertEqual(captured, {})
 
+    def test_empty_routing_metadata_suppresses_legacy_metadata_fallback(self):
+        """Explicit `routing_metadata: {}` must NOT fall back to legacy metadata.
+
+        Key presence — not truthiness — gates the fallback. A widget that sends
+        an empty routing_metadata is signaling "no routing context", and the
+        legacy metadata key must not override that intent.
+        """
+        captured = self._call_handle_chat_capture_routing({
+            'user_input': 'hello',
+            'routing_metadata': {},
+            'metadata': {'target_branch': 'should_not_leak'},
+        })
+        self.assertEqual(captured, {})
+
+    def test_null_routing_metadata_resolves_to_empty_dict(self):
+        """Defensive: explicit `routing_metadata: null` resolves to {}, not None."""
+        captured = self._call_handle_chat_capture_routing({
+            'user_input': 'hello',
+            'routing_metadata': None,
+        })
+        self.assertEqual(captured, {})
+
 
 if __name__ == '__main__':
     unittest.main()
