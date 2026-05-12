@@ -772,8 +772,12 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
         # Wire-shape parity with BSH: widget sends body.routing_metadata
         # (both HTTPChatProvider and StreamingChatProvider). Fall back to
         # body.metadata for backward compatibility with older callers and
-        # synthetic tests.
-        request_metadata = body.get('routing_metadata') or body.get('metadata') or {}
+        # synthetic tests. Key presence — not truthiness — gates the fallback,
+        # so an explicit empty routing_metadata suppresses legacy metadata.
+        if 'routing_metadata' in body:
+            request_metadata = body['routing_metadata'] or {}
+        else:
+            request_metadata = body.get('metadata') or {}
         logger.info(f"[Routing] Extracted metadata: action_chip_triggered={request_metadata.get('action_chip_triggered')}, "
                    f"cta_triggered={request_metadata.get('cta_triggered')}, "
                    f"target_branch={request_metadata.get('target_branch')}")
