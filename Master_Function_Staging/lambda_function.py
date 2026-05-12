@@ -50,6 +50,106 @@ def get_jwt_signing_key() -> Optional[str]:
         logger.critical("SECURITY CRITICAL: No JWT signing key available - authentication will fail")
         return None
 
+
+# Lambda Function URLs are public AWS endpoints with no built-in WAF binding.
+# Without an out-of-band auth signal, an attacker who learns the Function URL
+# can bypass CloudFront (and any WAF rules attached there) entirely. This
+# header is the out-of-band signal: CloudFront injects it on every origin
+# request via the distribution's "Custom Headers" feature; the Function URL
+# refuses any request that lacks (or mismatches) the secret.
+#
+# Rollout is feature-flagged via REQUIRE_CF_ORIGIN_HEADER. Default is off so
+# this PR can ship and deploy without coupling to the CF config change. See
+# the PR body for the activation runbook (provision secret → configure CF →
+# flip flag).
+_CF_ORIGIN_HEADER_NAME = 'x-picasso-cf-origin'
+# Sentinel distinct from None so the cache can record a known-failed lookup
+# and avoid hammering Secrets Manager on every invocation during an outage.
+_CF_ORIGIN_SECRET_UNAVAILABLE = object()
+_cf_origin_secret_cache: Any = None
+
+
+def get_cf_origin_secret() -> Optional[str]:
+    """Read the CF origin secret from Secrets Manager. Cached per Lambda instance.
+
+    Returns the secret string, or None if unavailable. Caller decides how to
+    handle unavailability — under REQUIRE_CF_ORIGIN_HEADER='true' we fail
+    closed (treat as missing-header → 403).
+
+    Caching: both success AND failure are cached for the lifetime of the
+    Lambda instance. Caching failure prevents O(RPS) Secrets Manager calls
+    during a SM outage when the feature flag is on (every request would
+    otherwise re-attempt the lookup). To force a refresh after rotation,
+    publish a new Lambda version.
+    """
+    global _cf_origin_secret_cache
+    if _cf_origin_secret_cache is _CF_ORIGIN_SECRET_UNAVAILABLE:
+        return None
+    if _cf_origin_secret_cache is not None:
+        return _cf_origin_secret_cache
+
+    try:
+        import boto3
+        client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+        secret_name = os.environ.get('CF_ORIGIN_SECRET_NAME', 'picasso/mfs/cf-origin-secret')
+        response = client.get_secret_value(SecretId=secret_name)
+        secret_string = response.get('SecretString', '')
+        try:
+            data = json.loads(secret_string)
+            candidate = data.get('secret', secret_string)
+        except json.JSONDecodeError:
+            candidate = secret_string
+
+        # Empty-string secret would compare equal to an empty header — explicit
+        # fail-closed rather than treating "" as a valid shared secret.
+        if not candidate:
+            logger.error("SECURITY: CF origin secret is empty; treating as unavailable")
+            _cf_origin_secret_cache = _CF_ORIGIN_SECRET_UNAVAILABLE
+            return None
+
+        _cf_origin_secret_cache = candidate
+        return _cf_origin_secret_cache
+    except Exception as e:
+        logger.error(f"SECURITY: failed to retrieve CF origin secret: {e}")
+        _cf_origin_secret_cache = _CF_ORIGIN_SECRET_UNAVAILABLE
+        return None
+
+
+def validate_cf_origin_header(event: Dict[str, Any]) -> tuple:
+    """Validate the CloudFront-injected origin secret header on the request.
+
+    Returns (is_valid, reason). When REQUIRE_CF_ORIGIN_HEADER is unset or
+    'false', validation is skipped and returns (True, None) regardless of
+    header state — this is the default during rollout.
+
+    When enabled, the request must carry the header with a value that
+    matches the Secrets Manager secret via constant-time compare. Missing,
+    mismatched, or unavailable-secret all fail-closed (return False).
+    """
+    if os.environ.get('REQUIRE_CF_ORIGIN_HEADER', 'false').lower() != 'true':
+        return True, None
+
+    headers = event.get('headers') or {}
+    received: Optional[str] = None
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == _CF_ORIGIN_HEADER_NAME:
+            received = value
+            break
+
+    if not received:
+        return False, "missing CF origin header"
+
+    expected = get_cf_origin_secret()
+    if not expected:
+        return False, "CF origin secret unavailable (failing closed)"
+
+    import hmac
+    if not hmac.compare_digest(str(received), str(expected)):
+        return False, "CF origin header mismatch"
+
+    return True, None
+
+
 def sanitize_user_input(user_input: str, max_length: int = 4000) -> str:
     """
     Sanitize and validate user input before sending to Bedrock.
@@ -1588,6 +1688,21 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         if http_method == 'OPTIONS':
             logger.info("OPTIONS request - returning CORS headers immediately")
             return handle_options(event)
+
+        # CF origin header validation — guards against direct Function URL
+        # access that bypasses CloudFront (and its WAF). Feature-flagged via
+        # REQUIRE_CF_ORIGIN_HEADER env var; default skip during rollout.
+        is_valid_origin, origin_reason = validate_cf_origin_header(event)
+        if not is_valid_origin:
+            logger.warning(f"SECURITY: rejected request with invalid CF origin header — {origin_reason}")
+            response = {
+                'statusCode': 403,
+                'body': json.dumps({
+                    'error': 'Forbidden',
+                    'message': 'Request must originate from CloudFront',
+                })
+            }
+            return add_cors_headers(response, event)
 
         # Parse query parameters
         query_params = event.get('queryStringParameters', {}) or {}
