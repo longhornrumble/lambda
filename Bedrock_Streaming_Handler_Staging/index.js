@@ -30,9 +30,16 @@ const {
 } = require('./prompt_v4');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 
-// Default model configuration - single source of truth
-// Upgraded to Haiku 4.5 for better instruction following (2025-11-26)
-const DEFAULT_MODEL_ID = 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
+// Default model configuration - single source of truth, sourced from
+// BEDROCK_MODEL_ID env var per Phase 4 EC-P4-2 (single point of update
+// across MFS Python + BSH Node.js, matches CLAUDE.md required-env-var
+// contract). Fail-loud at module load if missing — Lambda cold-start
+// errors are observable in CloudWatch immediately, no silent fallback
+// to a stale model.
+const DEFAULT_MODEL_ID = process.env.BEDROCK_MODEL_ID;
+if (!DEFAULT_MODEL_ID) {
+  throw new Error('BEDROCK_MODEL_ID environment variable is required');
+}
 const DEFAULT_MAX_TOKENS = 1000;
 const DEFAULT_TEMPERATURE = 0; // Set to 0 for maximum factual accuracy
 const DEFAULT_TONE = 'You are a helpful assistant.';

@@ -472,7 +472,9 @@ async function classifyTopic(userMessage, conversationHistory, config, bedrockCl
     const knownNames = topicDefinitions.map(d => d.name);
 
     const { InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
-    const modelId = config.model_id || config.aws?.model_id || 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
+    // BEDROCK_MODEL_ID env var per Phase 4 EC-P4-2 (single source of
+    // truth). Validated at module load in index.js; safe to read here.
+    const modelId = config.model_id || config.aws?.model_id || process.env.BEDROCK_MODEL_ID;
 
     const command = new InvokeModelCommand({
       modelId,
@@ -937,7 +939,9 @@ Return ONLY a raw JSON array of action IDs. No explanation, no markdown, no code
     console.log(`[V4 ActionSelector] Prompt: ${prompt.length} chars, ${vocabulary.split('\n').length} CTAs`);
 
     const { InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
-    const modelId = config.model_id || config.aws?.model_id || 'global.anthropic.claude-haiku-4-5-20251001-v1:0';
+    // BEDROCK_MODEL_ID env var per Phase 4 EC-P4-2 (single source of
+    // truth). Validated at module load in index.js; safe to read here.
+    const modelId = config.model_id || config.aws?.model_id || process.env.BEDROCK_MODEL_ID;
 
     const command = new InvokeModelCommand({
       modelId,
