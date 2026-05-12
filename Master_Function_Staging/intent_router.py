@@ -1,6 +1,6 @@
 import json
 import logging
-from session_utils import extract_session_data, build_session_attributes
+from session_utils import extract_session_data
 
 from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt, call_claude_with_prompt, get_cache_status, warm_cache_for_tenant
 

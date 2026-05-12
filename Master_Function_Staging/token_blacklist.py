@@ -22,19 +22,15 @@ logger.setLevel(logging.INFO)
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 BLACKLIST_TABLE_NAME = os.environ.get('BLACKLIST_TABLE_NAME', f'picasso-token-blacklist-{ENVIRONMENT}')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
-JWT_SECRET_KEY_NAME = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
 
 # Performance and Security Settings
 BLACKLIST_CACHE_TTL = 300  # 5 minutes cache for frequently checked tokens
 MAX_BATCH_SIZE = 25  # DynamoDB batch write limit
-RATE_LIMIT_REVOCATIONS = 50  # Max revocations per tenant per hour
 
 # Import AWS client manager for timeout protection
 try:
     from aws_client_manager import (
         protected_dynamodb_operation,
-        protected_secrets_operation,
-        timeout_handler,
         CircuitBreakerError,
         aws_client_manager
     )
@@ -44,8 +40,12 @@ except ImportError as e:
     logger.warning(f"⚠️ AWS client manager not available, using legacy clients: {e}")
     # Fallback to legacy clients without timeout protection
     dynamodb = boto3.client('dynamodb', region_name=AWS_REGION)
-    secrets_client = boto3.client('secretsmanager', region_name=AWS_REGION)
     AWS_CLIENT_MANAGER_AVAILABLE = False
+
+# NOTE: add_token_to_blacklist, revoke_tenant_tokens, and
+# cleanup_expired_blacklist_entries below have no production callers today.
+# They are planned admin token-revocation API surfaces — preserve as-is.
+# is_token_blacklisted IS live (called from conversation_handler.py).
 
 # In-memory cache for frequently checked blacklisted tokens (security optimization)
 blacklist_cache = {}

@@ -27,8 +27,6 @@ MAX_RETENTION_DAYS = 365
 
 # Performance targets
 AUDIT_TIMEOUT_MS = 10
-QUERY_TIMEOUT_MS = 500
-STATE_CLEAR_TIMEOUT_MS = 200
 
 # PII Detection Patterns - Comprehensive but lean
 PII_PATTERNS = {
@@ -287,19 +285,7 @@ class AuditLogger:
         return self._log_audit_event(tenant_id, 'TENANT_INFERENCE_FAILED', session_id, context)
     
     # Security Events
-    
-    def log_cross_tenant_attempt(self, tenant_id: str, session_id: str = None,
-                                attempted_tenant: str = None, source_ip: str = None,
-                                request_id: str = None) -> bool:
-        """Log cross-tenant access attempt"""
-        context = {
-            'attempted_tenant_hash': hashlib.sha256(f"{attempted_tenant}".encode()).hexdigest()[:8] if attempted_tenant else None,
-            'source_ip_hash': hashlib.sha256(f"{source_ip}_{ENVIRONMENT}".encode()).hexdigest()[:8] if source_ip else None,
-            'request_id': request_id,
-            'operation': 'cross_tenant_security_violation'
-        }
-        return self._log_audit_event(tenant_id, 'SECURITY_CROSS_TENANT_ATTEMPT', session_id, context, AuditSeverity.CRITICAL)
-    
+
     def log_rate_limit_triggered(self, tenant_id: str = "unknown", session_id: str = None,
                                 source_ip: str = None, limit_type: str = None,
                                 current_count: int = None, threshold: int = None) -> bool:
@@ -312,19 +298,7 @@ class AuditLogger:
             'operation': 'rate_limit_triggered'
         }
         return self._log_audit_event(tenant_id, 'SECURITY_RATE_LIMIT_TRIGGERED', session_id, context, AuditSeverity.HIGH)
-    
-    def log_invalid_jwt_flood(self, tenant_id: str = "unknown", session_id: str = None,
-                             source_ip: str = None, failure_count: int = None,
-                             time_window_minutes: int = None) -> bool:
-        """Log JWT flood attack detection"""
-        context = {
-            'source_ip_hash': hashlib.sha256(f"{source_ip}_{ENVIRONMENT}".encode()).hexdigest()[:8] if source_ip else None,
-            'failure_count': failure_count,
-            'time_window_minutes': time_window_minutes,
-            'operation': 'jwt_flood_detected'
-        }
-        return self._log_audit_event(tenant_id, 'SECURITY_INVALID_JWT_FLOOD', session_id, context, AuditSeverity.CRITICAL)
-    
+
     def log_unauthorized_access(self, tenant_id: str = "unknown", session_id: str = None,
                                resource: str = None, action: str = None, source_ip: str = None,
                                reason: str = None) -> bool:
@@ -337,33 +311,7 @@ class AuditLogger:
             'operation': 'unauthorized_access_denied'
         }
         return self._log_audit_event(tenant_id, 'SECURITY_UNAUTHORIZED_ACCESS', session_id, context, AuditSeverity.HIGH)
-    
-    # Handoff Events
-    
-    def log_handoff_to_secure_form(self, tenant_id: str, session_id: str = None,
-                                  form_type: str = None, handoff_reason: str = None,
-                                  security_level: str = None) -> bool:
-        """Log handoff to secure form"""
-        context = {
-            'form_type': form_type,
-            'handoff_reason': handoff_reason,  # pii_detected, security_upgrade, compliance_required
-            'security_level': security_level,
-            'operation': 'secure_form_handoff'
-        }
-        return self._log_audit_event(tenant_id, 'HANDOFF_TO_SECURE_FORM', session_id, context, AuditSeverity.MEDIUM)
-    
-    def log_handoff_completed(self, tenant_id: str, session_id: str = None,
-                             form_type: str = None, completion_status: str = None,
-                             duration_seconds: int = None) -> bool:
-        """Log handoff completion"""
-        context = {
-            'form_type': form_type,
-            'completion_status': completion_status,  # success, abandoned, timeout
-            'duration_seconds': duration_seconds,
-            'operation': 'secure_form_completed'
-        }
-        return self._log_audit_event(tenant_id, 'HANDOFF_COMPLETED', session_id, context, AuditSeverity.LOW)
-    
+
     # Performance and Metrics
     
     def _track_performance_metric(self, metric_name: str, value: float) -> None:
@@ -526,22 +474,3 @@ def log_tenant_inferred(tenant_id: str, session_id: str = None, inference_method
     """Quick logging for tenant inference success"""
     return audit_logger.log_tenant_inferred(tenant_id, session_id, inference_method, matched_value)
 
-def log_security_event(event_type: str, tenant_id: str = "unknown", **kwargs) -> bool:
-    """Quick logging for security events"""
-    method_map = {
-        'cross_tenant': audit_logger.log_cross_tenant_attempt,
-        'rate_limit': audit_logger.log_rate_limit_triggered,
-        'jwt_flood': audit_logger.log_invalid_jwt_flood,
-        'unauthorized': audit_logger.log_unauthorized_access
-    }
-    
-    method = method_map.get(event_type)
-    if method:
-        return method(tenant_id, **kwargs)
-    
-    logger.warning(f"Unknown security event type: {event_type}")
-    return False
-
-def get_audit_logger() -> AuditLogger:
-    """Get the global audit logger instance"""
-    return audit_logger
