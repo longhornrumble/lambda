@@ -144,17 +144,9 @@ jobs:
               analytics_writer.py
               audit_logger.py
               aws_client_manager.py
-              backfill_tenant_registry.py
-              bedrock_handler.py
               bedrock_handler_optimized.py
               contact_extractor.py
               conversation_handler.py
-              create_audit_table.py
-              create_blacklist_table.py
-              create_conversation_tables.py
-              create_employee_registry_table.py
-              create_employee_registry_table_v2.py
-              create_tenant_registry_table.py
               form_cta_enhancer.py
               form_handler.py
               intent_router.py
@@ -162,7 +154,6 @@ jobs:
               redact_pii.py
               response_formatter.py
               session_utils.py
-              state_clear_handler.py
               template_renderer.py
               tenant_config_loader.py
               tenant_inference.py

@@ -121,10 +121,10 @@ def validate_cors_origin(request_headers, tenant_hash, config_data):
     """
     Validate the request's Origin header against the allowlist.
 
-    Restored 2026-05-02: response_formatter.py and state_clear_handler.py import
-    this name from lambda_function but it had been undefined, causing an
-    ImportError on every error-response code path and dropping CORS headers.
-    Implementation mirrors add_cors_headers() origin logic for consistency.
+    Restored 2026-05-02: response_formatter.py imports this name from
+    lambda_function but it had been undefined, causing an ImportError on every
+    error-response code path and dropping CORS headers. Implementation mirrors
+    add_cors_headers() origin logic for consistency.
 
     Args:
         request_headers: dict of HTTP request headers (case-insensitive lookup).
@@ -383,12 +383,7 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
         # Retrieve Knowledge Base chunks and build enhanced prompt
         enhanced_prompt = user_input  # Default to raw input if KB fails
         try:
-            # Try optimized handler (cached) first; fall back to non-cached.
-            # Mirrors intent_router.py's import pattern. EC-P4-3 closure.
-            try:
-                from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt
-            except ImportError:
-                from bedrock_handler import retrieve_kb_chunks, build_prompt
+            from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt
 
             # Get tenant tone
             tone = config.get("tone_prompt", "You are a helpful assistant.") if config else "You are a helpful assistant."
@@ -572,12 +567,7 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         # Retrieve Knowledge Base chunks and build enhanced prompt
         enhanced_prompt = user_input  # Default to raw input if KB fails
         try:
-            # Try optimized handler (cached) first; fall back to non-cached.
-            # Mirrors intent_router.py's import pattern. EC-P4-3 closure.
-            try:
-                from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt
-            except ImportError:
-                from bedrock_handler import retrieve_kb_chunks, build_prompt
+            from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt
 
             # Get tenant tone
             tone = config.get("tone_prompt", "You are a helpful assistant.") if config else "You are a helpful assistant."

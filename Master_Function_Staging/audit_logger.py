@@ -338,42 +338,6 @@ class AuditLogger:
         }
         return self._log_audit_event(tenant_id, 'SECURITY_UNAUTHORIZED_ACCESS', session_id, context, AuditSeverity.HIGH)
     
-    # State Management Events
-    
-    def log_state_clear_requested(self, tenant_id: str, session_id: str = None,
-                                 clear_type: str = None, requester_ip: str = None) -> bool:
-        """Log state clear operation request"""
-        context = {
-            'clear_type': clear_type,  # full, partial, cache_only
-            'requester_ip_hash': hashlib.sha256(f"{requester_ip}_{ENVIRONMENT}".encode()).hexdigest()[:8] if requester_ip else None,
-            'operation': 'state_clear_initiated'
-        }
-        return self._log_audit_event(tenant_id, 'STATE_CLEAR_REQUESTED', session_id, context, AuditSeverity.MEDIUM)
-    
-    def log_state_clear_completed(self, tenant_id: str, session_id: str = None,
-                                 clear_type: str = None, items_cleared: int = None,
-                                 duration_ms: float = None) -> bool:
-        """Log successful state clear completion"""
-        context = {
-            'clear_type': clear_type,
-            'items_cleared': items_cleared,
-            'duration_ms': round(duration_ms, 2) if duration_ms else None,
-            'operation': 'state_clear_completed'
-        }
-        return self._log_audit_event(tenant_id, 'STATE_CLEAR_COMPLETED', session_id, context, AuditSeverity.MEDIUM)
-    
-    def log_state_clear_failed(self, tenant_id: str, session_id: str = None,
-                              clear_type: str = None, error_type: str = None,
-                              partial_success: bool = False) -> bool:
-        """Log state clear operation failure"""
-        context = {
-            'clear_type': clear_type,
-            'error_type': error_type,
-            'partial_success': partial_success,
-            'operation': 'state_clear_failed'
-        }
-        return self._log_audit_event(tenant_id, 'STATE_CLEAR_FAILED', session_id, context, AuditSeverity.HIGH)
-    
     # Handoff Events
     
     def log_handoff_to_secure_form(self, tenant_id: str, session_id: str = None,
