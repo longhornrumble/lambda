@@ -9,8 +9,11 @@ import os
 import time
 import uuid
 import logging
+import ipaddress
+import socket
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
+from urllib.parse import urlparse
 import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
@@ -41,6 +44,62 @@ AUDIT_TABLE = os.environ.get('FORM_AUDIT_TABLE', 'picasso_audit_logs')
 NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-notification-sends')
 
 notification_sends_table = dynamodb.Table(NOTIFICATION_SENDS_TABLE)
+
+
+def _validate_webhook_url(url: Optional[str]) -> Tuple[bool, Optional[str]]:
+    """Validate a webhook URL to prevent SSRF.
+
+    Webhook URLs are read from tenant config (S3). Without validation, a
+    malicious or compromised tenant config could point the Lambda at internal
+    services (RFC1918), the host loopback, the EC2/IMDS link-local
+    (169.254.169.254), or non-HTTP schemes — letting an attacker pivot from
+    config-write to internal-network reach.
+
+    Returns (is_valid, reason). On invalid: caller logs reason and skips POST.
+
+    Allowed: https scheme + hostname that resolves entirely to public IPs.
+    Rejected: non-https, missing hostname, hostnames that resolve to any
+    private/loopback/link-local/multicast/reserved/unspecified IP.
+
+    Static-resolution-time check; does not defend against DNS rebinding
+    between validation and connect. The threat model here is malicious
+    tenant config, not fast-flux DNS.
+    """
+    if not url or not isinstance(url, str):
+        return False, "webhook url must be a non-empty string"
+
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        return False, f"webhook url parse failed: {e}"
+
+    if parsed.scheme != 'https':
+        return False, f"webhook url scheme must be https, got '{parsed.scheme}'"
+
+    if not parsed.hostname:
+        return False, "webhook url missing hostname"
+
+    try:
+        infos = socket.getaddrinfo(
+            parsed.hostname,
+            parsed.port or 443,
+            proto=socket.IPPROTO_TCP,
+        )
+    except (socket.gaierror, OSError) as e:
+        return False, f"webhook hostname resolution failed: {e}"
+
+    for info in infos:
+        ip_str = info[4][0]
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False, f"webhook resolved IP malformed: {ip_str}"
+
+        if (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_multicast or ip.is_reserved or ip.is_unspecified):
+            return False, f"webhook hostname resolves to disallowed IP range: {ip_str}"
+
+    return True, None
 
 
 def normalize_label(label: str) -> str:
@@ -810,6 +869,13 @@ class FormHandler:
 
         url = webhook_config.get('url')
         headers = webhook_config.get('headers', {})
+
+        # SSRF defense: validate URL before issuing the request. See
+        # _validate_webhook_url docstring for threat model.
+        is_valid, reason = _validate_webhook_url(url)
+        if not is_valid:
+            logger.error(f"SECURITY: webhook URL rejected — {reason}")
+            return sent
 
         # Add content type if not specified
         if 'Content-Type' not in headers:
