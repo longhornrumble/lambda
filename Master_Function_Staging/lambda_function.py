@@ -1715,7 +1715,11 @@ def handle_generate_stream_token(event: Dict[str, Any], tenant_hash: str) -> Dic
             'tenant_hash': tenant_hash,
             'tenant_id': tenant_id,
             'expires_in': 3600,
-            'streaming_endpoint': os.environ.get('STREAMING_ENDPOINT', 'https://xqc4wnxwia2nytjkbw6xasjd6q0jckgb.lambda-url.us-east-1.on.aws/'),
+            # STREAMING_ENDPOINT env var is required (Phase 4 EC-P4-4).
+            # KeyError fail-loud if missing — prevents silently routing to
+            # the prior prod-account BSH URL that was previously hardcoded
+            # as the fallback (cross-account leakage risk).
+            'streaming_endpoint': os.environ['STREAMING_ENDPOINT'],
             'purpose': 'stream',
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
