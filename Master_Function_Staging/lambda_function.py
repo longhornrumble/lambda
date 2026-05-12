@@ -5,14 +5,6 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 from urllib.parse import parse_qs
 
-# Try to import Lambda streaming support
-try:
-    from awslambdaric import StreamingBody
-    STREAMING_AVAILABLE = True
-except ImportError:
-    # StreamingBody not available - will use fallback
-    STREAMING_AVAILABLE = False
-
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -84,24 +76,6 @@ def sanitize_user_input(user_input: str, max_length: int = 4000) -> str:
             logger.warning(f"SECURITY: Potential prompt injection detected: {pattern}")
 
     return sanitized.strip()
-
-def sanitize_log_data(data: str, max_length: int = 100) -> str:
-    """
-    Sanitize data before logging to prevent PII leakage.
-    Redacts email addresses and phone numbers.
-    """
-    import re
-    if not data or not isinstance(data, str):
-        return "[empty]"
-
-    # Redact email patterns
-    sanitized = re.sub(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', '[EMAIL]', data)
-
-    # Redact phone patterns
-    sanitized = re.sub(r'(\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}', '[PHONE]', sanitized)
-
-    # Truncate
-    return sanitized[:max_length] + "..." if len(sanitized) > max_length else sanitized
 
 # Single source of truth for tenant-agnostic CORS allowlist. Used by both
 # add_cors_headers() and validate_cors_origin(). When a tenant config is
@@ -322,201 +296,15 @@ def get_config_for_tenant(tenant_hash: str, event: Dict[str, Any] = None) -> Dic
 
 def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None):
     """
-    Handle streaming chat requests using Lambda response streaming with SSE format
-    Uses awslambdaric.StreamingBody to properly stream responses
-    Supports both GET (EventSource) and POST requests
-    NOW WITH KNOWLEDGE BASE INTEGRATION
+    Entry point for ?action=chat&streaming=true. Delegates to the batch fallback
+    because Master_Function_Staging is NOT deployed with InvokeMode=RESPONSE_STREAM
+    (the standard Python 3.13 Lambda runtime does not export
+    awslambdaric.StreamingBody). The yield-based streaming code path was removed
+    in Phase 4.5b; restore it only if/when the Lambda is reconfigured for
+    response streaming.
     """
     logger.info(f"Streaming chat request for tenant: {tenant_hash[:8] if tenant_hash else 'unknown'}...")
-    
-    try:
-        # Check if streaming is available
-        if not STREAMING_AVAILABLE:
-            logger.warning("StreamingBody not available - falling back to batch response")
-            return handle_streaming_chat_fallback(event, tenant_hash)
-        
-        # Check if this is a GET request (from EventSource) or POST
-        http_method = event.get('httpMethod', event.get('requestContext', {}).get('http', {}).get('method', 'GET'))
-        
-        if http_method == 'GET':
-            # EventSource uses GET with query parameters
-            query_params = event.get('queryStringParameters', {}) or {}
-            user_input = sanitize_user_input(query_params.get('user_input', 'Hello'))
-            session_id = query_params.get('session_id', 'default_session')
-            conversation_context = None  # GET requests don't have conversation context
-            logger.info(f"GET streaming request with query params - input: {sanitize_log_data(user_input)}")
-        else:
-            # POST request with body
-            body = json.loads(event.get('body', '{}')) if event.get('body') else {}
-            user_input = sanitize_user_input(body.get('user_input', 'Hello'))
-            session_id = body.get('session_id', 'default_session')
-            
-            # Extract conversation context from POST body
-            request_context = body.get('conversation_context', {})
-            messages_from_context = request_context.get('recentMessages', request_context.get('messages', []))
-            conversation_context = None
-            if request_context and messages_from_context:
-                conversation_context = {
-                    'messages': messages_from_context,
-                    'recentMessages': messages_from_context,
-                    'session_id': body.get('session_id'),
-                    'conversation_id': body.get('conversation_id'),
-                    'turn': body.get('turn', 0)
-                }
-                logger.info(f"POST streaming request with {len(messages_from_context)} conversation messages")
-            else:
-                logger.info(f"POST streaming request with body - input: {sanitize_log_data(user_input)}")
-
-        # Load tenant configuration for Knowledge Base access
-        config = None
-        try:
-            from tenant_config_loader import get_config_for_tenant_by_hash
-            config = get_config_for_tenant_by_hash(tenant_hash)
-            logger.info(f"[{tenant_hash[:8]}...] ✅ Config loaded for streaming with KB")
-        except Exception as e:
-            logger.warning(f"[{tenant_hash[:8]}...] ⚠️ Could not load config: {e}")
-        
-        if not config:
-            logger.error(f"[{tenant_hash[:8]}...] ❌ No config found - cannot access Knowledge Base")
-            # Fall back to direct Claude call without KB
-        
-        # Retrieve Knowledge Base chunks and build enhanced prompt
-        enhanced_prompt = user_input  # Default to raw input if KB fails
-        try:
-            from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt
-
-            # Get tenant tone
-            tone = config.get("tone_prompt", "You are a helpful assistant.") if config else "You are a helpful assistant."
-
-            # Retrieve relevant chunks from Knowledge Base
-            if config:
-                kb_context, sources = retrieve_kb_chunks(user_input, config)
-                logger.info(f"[{tenant_hash[:8]}...] 📚 Retrieved KB context for streaming")
-                
-                # Build the enhanced prompt with KB context
-                enhanced_prompt = build_prompt(user_input, kb_context, tone, conversation_context)
-                logger.info(f"[{tenant_hash[:8]}...] 🧩 Built enhanced prompt with KB context")
-            else:
-                logger.warning(f"[{tenant_hash[:8]}...] ⚠️ No config - using direct prompt without KB")
-                
-        except Exception as e:
-            logger.error(f"[{tenant_hash[:8]}...] ❌ KB retrieval failed for streaming: {e}")
-            # Continue with raw user input if KB fails
-        
-        # Initialize Bedrock client
-        import boto3
-        bedrock_client = boto3.client(
-            'bedrock-runtime',
-            region_name=os.environ.get('AWS_REGION', 'us-east-1')
-        )
-        
-        # Model ID resolution: tenant config wins; fall back to the Lambda
-        # default (env var BEDROCK_MODEL_ID, single source of truth across MFS
-        # + BSH per Phase 4 EC-P4-2). KeyError on missing env var is the
-        # intentional fail-loud signal — Lambda deploy must set this var.
-        model_id = (config or {}).get("model_id") or os.environ['BEDROCK_MODEL_ID']
-
-        # Prepare the message for Claude with enhanced prompt
-        messages = [
-            {
-                "role": "user",
-                "content": enhanced_prompt  # Use the KB-enhanced prompt instead of raw input
-            }
-        ]
-
-        # Bedrock request body for Claude 3 Haiku
-        bedrock_body = {
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": 1000,
-            "messages": messages,
-            "temperature": 0.7,
-        }
-
-        logger.info("Invoking Bedrock with streaming...")
-
-        def stream_generator():
-            """Generator function to yield streaming chunks"""
-            try:
-                # Call Bedrock with streaming using the model from config
-                response = bedrock_client.invoke_model_with_response_stream(
-                    modelId=model_id,  # Use the model ID from config
-                    body=json.dumps(bedrock_body),
-                    contentType="application/json"
-                )
-                
-                # Process the event stream
-                for event in response['body']:
-                    if 'chunk' in event:
-                        chunk = event['chunk']
-                        if 'bytes' in chunk:
-                            chunk_data = json.loads(chunk['bytes'].decode('utf-8'))
-                            
-                            if chunk_data.get('type') == 'content_block_delta':
-                                # Extract the text content from the delta
-                                delta = chunk_data.get('delta', {})
-                                if delta.get('type') == 'text_delta':
-                                    text_content = delta.get('text', '')
-                                    if text_content:
-                                        # Format as SSE data and yield immediately
-                                        sse_data = json.dumps({
-                                            "type": "text",
-                                            "content": text_content,
-                                            "session_id": session_id
-                                        })
-                                        yield f'data: {sse_data}\n\n'
-                            
-                            elif chunk_data.get('type') == 'message_stop':
-                                # End of message
-                                logger.info("Bedrock streaming completed")
-                                break
-                
-                # Send final [DONE] marker
-                yield 'data: [DONE]\n\n'
-                
-            except Exception as e:
-                logger.error(f"Error in stream generator: {str(e)}", exc_info=True)
-                # Send error as SSE format
-                error_data = json.dumps({
-                    "type": "error",
-                    "content": f"Streaming error: {str(e)}",
-                    "session_id": session_id
-                })
-                yield f'data: {error_data}\n\ndata: [DONE]\n\n'
-        
-        # Create streaming response using Lambda's StreamingBody. CORS headers
-        # come from add_cors_headers (single source of truth — phase-audit B6).
-        response = {
-            'statusCode': 200,
-            'headers': {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-            },
-            'body': StreamingBody(stream_generator())
-        }
-        return add_cors_headers(response, event)
-
-    except Exception as e:
-        logger.error(f"Error in streaming chat: {str(e)}", exc_info=True)
-
-        # Return error as SSE format
-        error_data = json.dumps({
-            "type": "error",
-            "content": f"Streaming error: {str(e)}",
-            "session_id": session_id if 'session_id' in locals() else 'unknown'
-        })
-        error_sse = f'data: {error_data}\n\ndata: [DONE]\n\n'
-
-        response = {
-            'statusCode': 500,
-            'headers': {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-            },
-            'body': error_sse
-        }
-        return add_cors_headers(response, event)
+    return handle_streaming_chat_fallback(event, tenant_hash)
 
 def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
     """
@@ -896,7 +684,7 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
         
         if auth_header and auth_header.startswith('Bearer '):
             state_token = auth_header.replace('Bearer ', '').strip()
-            logger.info(f"State token found in Authorization header: {state_token[:20]}...")
+            logger.info("State token found in Authorization header")
             
             # Try to decode as JWT first, then fall back to base64
             try:
@@ -1013,7 +801,8 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
                         user_message=body.get('user_input', ''),
                         tenant_hash=tenant_hash,
                         conversation_history=conversation_history,
-                        session_context=session_context
+                        session_context=session_context,
+                        tenant_config=tenant_config,  # Phase 4.5b SF-2: skip redundant S3 fetch
                     )
 
                     if enhanced_response:
@@ -1063,10 +852,6 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
 
             # Re-serialize the enhanced body back into response_data
             response_data['body'] = json.dumps(response_body)
-            logger.info(f"[DEBUG] response_body keys after enhancement: {list(response_body.keys())}")
-            logger.info(f"[DEBUG] response_body has ctaButtons: {'ctaButtons' in response_body}")
-            if 'ctaButtons' in response_body:
-                logger.info(f"[DEBUG] ctaButtons count: {len(response_body['ctaButtons'])}")
         except Exception as enhance_error:
             logger.warning(f"CTA enhancement failed, continuing with unenhanced response: {enhance_error}")
 
@@ -1404,9 +1189,6 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
         # If we found existing conversation, return it (ADDITIVE PATH)
         if existing_conversation:
             try:
-                import time
-                import jwt
-                
                 existing_turn = int(existing_conversation.get('turn', {}).get('N', 0))
                 
                 # Try to use existing state token or generate new one
@@ -1783,8 +1565,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 
         # Parse query parameters
         query_params = event.get('queryStringParameters', {}) or {}
-        multi_value_params = event.get('multiValueQueryStringParameters', {}) or {}
-        
+
         # If no queryStringParameters, try to parse from rawQueryString (Lambda Function URL format)
         if not query_params and event.get('rawQueryString'):
             parsed = parse_qs(event.get('rawQueryString', ''))

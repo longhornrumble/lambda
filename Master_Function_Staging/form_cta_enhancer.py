@@ -372,7 +372,8 @@ def enhance_response_with_form_cta(
     user_message: str,
     tenant_hash: str,
     conversation_history: List[Dict[str, str]] = None,
-    session_context: Dict[str, Any] = None  # PHASE 1B: NEW parameter
+    session_context: Dict[str, Any] = None,  # PHASE 1B: NEW parameter
+    tenant_config: Dict[str, Any] = None     # Phase 4.5b SF-2: pre-loaded config to skip redundant S3 fetch
 ) -> Dict[str, Any]:
     """
     Enhance the HTTP response with form CTAs when appropriate
@@ -382,6 +383,11 @@ def enhance_response_with_form_cta(
     - Tracks completed_forms to prevent duplicate CTAs
     - Loads conversation_branches and cta_definitions from config
     - Filters CTAs based on user's form completion history
+
+    Phase 4.5b SF-2: Pass tenant_config when the caller has already loaded it
+    (eg. lambda_function.handle_chat at line ~786) to eliminate a redundant S3
+    fetch on the chat hot path. Falls back to load_tenant_config(tenant_hash)
+    when tenant_config is None for backward compatibility.
     """
 
     try:
@@ -399,7 +405,7 @@ def enhance_response_with_form_cta(
             logger.info(f"[Phase 1B] 🔄 Suspended form detected: {suspended_forms[0]}")
 
             # Load config to check if current message would trigger a DIFFERENT form
-            config = load_tenant_config(tenant_hash)
+            config = tenant_config or load_tenant_config(tenant_hash)
             conversational_forms = config.get('conversational_forms', {})
 
             # Check if user's message would trigger a different form
