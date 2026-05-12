@@ -977,8 +977,14 @@ def run_test_suite():
     logger.info("Action Chips Explicit Routing PRD - Test Suites 4 & 5")
     logger.info("="*80)
 
-    # Create test suite
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestEndToEndIntegration)
+    # Create test suite. Both integration class and Phase 3 hardening
+    # regressions must load when invoked via `python test_integration_e2e.py`
+    # (test-engineer audit row #10: TestPhase3HardeningRegression was
+    # silently skipped on direct invocation pre-fix).
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite()
+    suite.addTests(loader.loadTestsFromTestCase(TestEndToEndIntegration))
+    suite.addTests(loader.loadTestsFromTestCase(TestPhase3HardeningRegression))
 
     # Run tests with verbose output
     runner = unittest.TextTestRunner(verbosity=2)
