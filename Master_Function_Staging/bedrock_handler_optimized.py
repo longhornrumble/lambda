@@ -9,8 +9,6 @@ from typing import Dict, Tuple, List, Any
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-BUBBLE_API_KEY = os.environ.get("BUBBLE_API_KEY")
-
 # Synchronous InvokeModel client — default creds, same account.
 bedrock = boto3.client("bedrock-runtime")
 
