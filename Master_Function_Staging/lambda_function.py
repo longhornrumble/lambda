@@ -63,7 +63,10 @@ def get_jwt_signing_key() -> Optional[str]:
 # the PR body for the activation runbook (provision secret → configure CF →
 # flip flag).
 _CF_ORIGIN_HEADER_NAME = 'x-picasso-cf-origin'
-_cf_origin_secret_cache: Optional[str] = None
+# Sentinel distinct from None so the cache can record a known-failed lookup
+# and avoid hammering Secrets Manager on every invocation during an outage.
+_CF_ORIGIN_SECRET_UNAVAILABLE = object()
+_cf_origin_secret_cache: Any = None
 
 
 def get_cf_origin_secret() -> Optional[str]:
@@ -72,8 +75,16 @@ def get_cf_origin_secret() -> Optional[str]:
     Returns the secret string, or None if unavailable. Caller decides how to
     handle unavailability — under REQUIRE_CF_ORIGIN_HEADER='true' we fail
     closed (treat as missing-header → 403).
+
+    Caching: both success AND failure are cached for the lifetime of the
+    Lambda instance. Caching failure prevents O(RPS) Secrets Manager calls
+    during a SM outage when the feature flag is on (every request would
+    otherwise re-attempt the lookup). To force a refresh after rotation,
+    publish a new Lambda version.
     """
     global _cf_origin_secret_cache
+    if _cf_origin_secret_cache is _CF_ORIGIN_SECRET_UNAVAILABLE:
+        return None
     if _cf_origin_secret_cache is not None:
         return _cf_origin_secret_cache
 
@@ -85,12 +96,22 @@ def get_cf_origin_secret() -> Optional[str]:
         secret_string = response.get('SecretString', '')
         try:
             data = json.loads(secret_string)
-            _cf_origin_secret_cache = data.get('secret', secret_string)
+            candidate = data.get('secret', secret_string)
         except json.JSONDecodeError:
-            _cf_origin_secret_cache = secret_string
+            candidate = secret_string
+
+        # Empty-string secret would compare equal to an empty header — explicit
+        # fail-closed rather than treating "" as a valid shared secret.
+        if not candidate:
+            logger.error("SECURITY: CF origin secret is empty; treating as unavailable")
+            _cf_origin_secret_cache = _CF_ORIGIN_SECRET_UNAVAILABLE
+            return None
+
+        _cf_origin_secret_cache = candidate
         return _cf_origin_secret_cache
     except Exception as e:
         logger.error(f"SECURITY: failed to retrieve CF origin secret: {e}")
+        _cf_origin_secret_cache = _CF_ORIGIN_SECRET_UNAVAILABLE
         return None
 
 

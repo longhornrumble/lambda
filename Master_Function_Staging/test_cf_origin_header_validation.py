@@ -139,12 +139,55 @@ class TestGetCfOriginSecret(unittest.TestCase):
             first = get_cf_origin_secret()
             second = get_cf_origin_secret()
         self.assertEqual(first, second)
-        # boto3.client itself called twice in lazy import, but get_secret_value
-        # called only once due to module-level cache.
+        # get_secret_value called once on first call; second call returns
+        # cached value without re-calling Secrets Manager.
         self.assertEqual(
             mock_client.return_value.get_secret_value.call_count,
             1,
         )
+
+    def test_caches_failure_to_avoid_secrets_manager_hammering(self):
+        """SM outage + flag-on = O(RPS) calls without this cache.
+
+        Audit blocker #6: failure path must be cached, not retried per-call,
+        or every request during an outage hits Secrets Manager.
+        """
+        from lambda_function import get_cf_origin_secret
+        with patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.side_effect = Exception('AccessDenied')
+            first = get_cf_origin_secret()
+            second = get_cf_origin_secret()
+            third = get_cf_origin_secret()
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertIsNone(third)
+        # Despite 3 calls to get_cf_origin_secret, SM was hit exactly once.
+        self.assertEqual(
+            mock_client.return_value.get_secret_value.call_count,
+            1,
+        )
+
+    def test_empty_string_secret_treated_as_unavailable(self):
+        """Audit blocker #16: empty-string secret would compare equal to an
+        empty header via hmac.compare_digest. Must fail-closed, not match.
+        """
+        from lambda_function import get_cf_origin_secret
+        with patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.return_value = {
+                'SecretString': '',
+            }
+            secret = get_cf_origin_secret()
+        self.assertIsNone(secret)
+
+    def test_empty_json_secret_key_treated_as_unavailable(self):
+        """Same defense: SM contains JSON with empty `secret` field."""
+        from lambda_function import get_cf_origin_secret
+        with patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.return_value = {
+                'SecretString': json.dumps({'secret': ''}),
+            }
+            secret = get_cf_origin_secret()
+        self.assertIsNone(secret)
 
 
 class TestLambdaHandlerCfOriginEnforcement(unittest.TestCase):
