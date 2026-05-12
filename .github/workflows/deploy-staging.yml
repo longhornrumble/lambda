@@ -173,11 +173,15 @@ jobs:
               notification_templates.json
               analytics_writer_contract.json
             # Most MFS env vars stay out-of-band today; the merge-not-replace
-            # step at line ~156 preserves them. CI manages the single key
-            # listed below per Phase 4 EC-P4-2 — BEDROCK_MODEL_ID is now the
-            # single source of truth for the Bedrock default model. Code
-            # fails loud (KeyError) if this var is missing on the function.
-            env_vars: 'BEDROCK_MODEL_ID=global.anthropic.claude-haiku-4-5-20251001-v1:0'
+            # step at line ~156 preserves them. CI manages the keys listed
+            # below per Phase 4. Both are fail-loud reads in code (KeyError
+            # if missing on the function):
+            #   - BEDROCK_MODEL_ID: Bedrock default model (EC-P4-2)
+            #   - STREAMING_ENDPOINT: BSH Function URL for handle_stream_token
+            #     (EC-P4-4). Was previously out-of-band with a hardcoded
+            #     prod-account URL fallback. Phase 4 audit row #4 flagged the
+            #     out-of-band gap; this brings it under CI source-of-truth.
+            env_vars: 'BEDROCK_MODEL_ID=global.anthropic.claude-haiku-4-5-20251001-v1:0,STREAMING_ENDPOINT=https://chm3ioesaxyrgsaeo3v763dmw40qaswu.lambda-url.us-east-1.on.aws/'
             # action=health_check returns 200 unauthenticated; default route
             # (no action) also dispatches to health_check. Use the explicit
             # form for clarity in CI logs.

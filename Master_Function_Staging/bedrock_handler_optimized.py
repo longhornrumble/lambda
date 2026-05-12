@@ -76,10 +76,6 @@ def is_cache_valid(cache_entry: Dict) -> bool:
         return False
     return time.time() - cache_entry.get('timestamp', 0) < CACHE_TTL
 
-def fetch_tenant_tone(tenant_id):
-    logger.info(f"[{tenant_id}] ✅ Using stub - no API call made")
-    return "You are a helpful and friendly assistant."
-
 def retrieve_kb_chunks(user_input, config):
     """
     Retrieve KB chunks with caching for common queries
