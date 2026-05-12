@@ -7,8 +7,6 @@ import boto3
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-BUBBLE_API_KEY = os.environ.get("BUBBLE_API_KEY")
-
 # Synchronous InvokeModel client — default creds, same account.
 bedrock = boto3.client("bedrock-runtime")
 
@@ -330,49 +328,3 @@ def call_claude_with_prompt(prompt, config):
         logger.error(f"❌ Claude invocation failed: {str(e)}", exc_info=True)
         return "I apologize, but I'm having trouble processing your request right now. Please try again later or contact support for assistance."
 
-def lambda_handler(event, context):
-    try:
-        # Log the raw event for debugging
-        logger.info(f"Raw event received: {json.dumps(event)[:500]}")
-        
-        # Handle Function URL wrapper
-        if 'body' in event and isinstance(event.get('body'), str):
-            logger.info("Detected Function URL event wrapper, parsing body")
-            event = json.loads(event['body'])
-        
-        user_input = event.get('user_input', '')
-        tenant_id = event.get('tenant_id', '')
-        config = event.get('config', {})
-        
-        if not user_input:
-            return {
-                'statusCode': 400,
-                'body': json.dumps({'error': 'No user input provided'})
-            }
-        
-        # Fetch tenant tone
-        tenant_tone = fetch_tenant_tone(tenant_id)
-        
-        # Retrieve knowledge base chunks
-        query_results, sources = retrieve_kb_chunks(user_input, config)
-        
-        # Build prompt (no conversation context in direct lambda handler calls)
-        prompt = build_prompt(user_input, query_results, tenant_tone)
-        
-        # Call Claude
-        response = call_claude_with_prompt(prompt, config)
-        
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'response': response,
-                'sources_used': len(sources) if sources else 0
-            })
-        }
-        
-    except Exception as e:
-        logger.error(f"❌ Lambda handler failed: {str(e)}", exc_info=True)
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': 'Internal server error'})
-        }
