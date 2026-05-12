@@ -366,46 +366,7 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
                 logger.info(f"POST streaming request with {len(messages_from_context)} conversation messages")
             else:
                 logger.info(f"POST streaming request with body - input: {sanitize_log_data(user_input)}")
-                
-                # SURGERY 3: Fetch conversation context from DynamoDB for streaming
-                conversation_id = body.get('conversation_id')
-                session_id = body.get('session_id')
-                
-                if conversation_id or session_id:
-                    logger.info(f"Surgery 3 (Streaming): Fetching conversation context from DynamoDB")
-                    logger.info(f"  conversation_id: {conversation_id}")
-                    logger.info(f"  session_id: {session_id}")
-                    
-                    try:
-                        # Try to import conversation_handler
-                        from conversation_handler import _get_conversation_from_db
-                        
-                        # Fetch conversation from DynamoDB
-                        conv_data = _get_conversation_from_db(
-                            conversation_id or session_id,
-                            tenant_hash
-                        )
-                        
-                        if conv_data and ('messages' in conv_data or 'lastMessages' in conv_data):
-                            # Get last 10 messages for context (check both field names)
-                            recent_messages = (conv_data.get('messages') or conv_data.get('lastMessages', []))[-10:]
-                            conversation_context = {
-                                'messages': recent_messages,
-                                'recentMessages': recent_messages,
-                                'session_id': session_id,
-                                'conversation_id': conversation_id or session_id,
-                                'turn': conv_data.get('turn', 0)
-                            }
-                            logger.info(f"Surgery 3 (Streaming): Retrieved {len(recent_messages)} messages from DynamoDB")
-                            logger.info(f"  Turn count: {conversation_context['turn']}")
-                        else:
-                            logger.info("Surgery 3 (Streaming): No existing conversation found in DynamoDB")
-                            
-                    except ImportError as e:
-                        logger.warning(f"Surgery 3 (Streaming): conversation_handler not available: {e}")
-                    except Exception as e:
-                        logger.error(f"Surgery 3 (Streaming): Error fetching conversation: {e}")
-        
+
         # Load tenant configuration for Knowledge Base access
         config = None
         try:
@@ -967,52 +928,6 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
                 logger.warning("Base64 token fallback has been removed for security — only signed JWTs are accepted")
         else:
             logger.info("No Authorization header found - starting new conversation")
-        
-        # SURGERY 2: Fetch conversation context from DynamoDB if not provided
-        # Check for both 'messages' and 'recentMessages' as client sends 'recentMessages'
-        has_messages = (conversation_context and 
-                       (conversation_context.get('messages') or 
-                        conversation_context.get('recentMessages')))
-        
-        if not has_messages:
-            conversation_id = body.get('conversation_id')
-            session_id = body.get('session_id')
-            
-            if conversation_id or session_id:
-                logger.info(f"Surgery 2: Fetching conversation context from DynamoDB")
-                logger.info(f"  conversation_id: {conversation_id}")
-                logger.info(f"  session_id: {session_id}")
-                
-                try:
-                    # Try to import conversation_handler
-                    from conversation_handler import _get_conversation_from_db
-                    
-                    # Fetch conversation from DynamoDB
-                    conv_data = _get_conversation_from_db(
-                        conversation_id or session_id,
-                        tenant_hash
-                    )
-                    
-                    if conv_data and ('messages' in conv_data or 'lastMessages' in conv_data):
-                        # Get last 10 messages for context (check both field names)
-                        recent_messages = (conv_data.get('messages') or conv_data.get('lastMessages', []))[-10:]
-                        conversation_context = {
-                            'session_id': session_id,
-                            'conversation_id': conversation_id or session_id,
-                            'messages': recent_messages,
-                            'recentMessages': recent_messages,
-                            'previous_messages': recent_messages,
-                            'turn': conv_data.get('turn', 0)
-                        }
-                        logger.info(f"Surgery 2: Retrieved {len(recent_messages)} messages from DynamoDB")
-                        logger.info(f"  Turn count: {conversation_context['turn']}")
-                    else:
-                        logger.info("Surgery 2: No existing conversation found in DynamoDB")
-                        
-                except ImportError as e:
-                    logger.warning(f"Surgery 2: conversation_handler not available: {e}")
-                except Exception as e:
-                    logger.error(f"Surgery 2: Error fetching conversation: {e}")
         
         # Prepare the event for intent router - it expects Lambda event structure
         chat_event = {
