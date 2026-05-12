@@ -114,6 +114,38 @@ class TestHandleChatRoutingMetadata(unittest.TestCase):
         })
         self.assertEqual(captured, {})
 
+    def test_list_routing_metadata_falls_back_to_empty_dict(self):
+        """Audit follow-up: non-dict types must NOT survive — `.get()` would crash."""
+        captured = self._call_handle_chat_capture_routing({
+            'user_input': 'hello',
+            'routing_metadata': ['action_chip_triggered', True],
+        })
+        self.assertEqual(captured, {})
+
+    def test_string_routing_metadata_falls_back_to_empty_dict(self):
+        """Audit follow-up: bare strings (e.g. malformed widget body) must not crash."""
+        captured = self._call_handle_chat_capture_routing({
+            'user_input': 'hello',
+            'routing_metadata': 'target_branch=contact',
+        })
+        self.assertEqual(captured, {})
+
+    def test_int_routing_metadata_falls_back_to_empty_dict(self):
+        """Audit follow-up: int / numeric non-dict types must not crash."""
+        captured = self._call_handle_chat_capture_routing({
+            'user_input': 'hello',
+            'routing_metadata': 42,
+        })
+        self.assertEqual(captured, {})
+
+    def test_non_dict_legacy_metadata_falls_back_to_empty_dict(self):
+        """Audit follow-up: same type guard applies when key is `metadata`."""
+        captured = self._call_handle_chat_capture_routing({
+            'user_input': 'hello',
+            'metadata': ['stale', 'shape'],
+        })
+        self.assertEqual(captured, {})
+
 
 if __name__ == '__main__':
     unittest.main()

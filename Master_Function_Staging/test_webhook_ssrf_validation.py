@@ -112,6 +112,22 @@ class TestValidateWebhookURL(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn('disallowed', reason)
 
+    def test_rejects_ipv4_mapped_ipv6_imds(self):
+        """Audit follow-up: IPv4-mapped IPv6 notation for the IMDS address
+        (`::ffff:169.254.169.254`) must be blocked. ipaddress.ip_address
+        on this string reports is_reserved=True (the IPv4-mapped subspace
+        falls inside the reserved IANA block ::ffff:0:0/96), so the existing
+        rejection logic catches it — but no test exercised this path."""
+        ok, reason = _validate_webhook_url('https://[::ffff:169.254.169.254]/latest/meta-data/')
+        self.assertFalse(ok)
+        self.assertIn('disallowed', reason)
+
+    def test_rejects_ipv4_mapped_ipv6_rfc1918(self):
+        """Same coverage for IPv4-mapped IPv6 pointing at RFC1918."""
+        ok, reason = _validate_webhook_url('https://[::ffff:10.0.0.1]/hook')
+        self.assertFalse(ok)
+        self.assertIn('disallowed', reason)
+
     def test_rejects_when_any_resolution_returns_private_ip(self):
         # Defense-in-depth: a hostname that resolves to multiple IPs where
         # any one is in a disallowed range must be rejected. This blocks
@@ -173,6 +189,48 @@ class TestSendWebhookNotificationsSSRFBlock(unittest.TestCase):
 
         mock_post.assert_called_once()
         self.assertEqual(sent, ['webhook:200'])
+
+    def test_send_passes_allow_redirects_false(self):
+        """Audit follow-up: a public webhook server returning 302 → IMDS would
+        bypass the static-URL validator if requests.post follows redirects.
+        The send path must pass allow_redirects=False so the redirect target
+        is never fetched."""
+        handler = self._make_handler()
+        webhook_config = {'url': 'https://example.com/hook', 'headers': {}}
+
+        with patch('form_handler.socket.getaddrinfo') as mock_resolve, \
+             patch('requests.post') as mock_post:
+            mock_resolve.return_value = [(2, 1, 6, '', ('93.184.216.34', 443))]
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_post.return_value = mock_response
+
+            handler._send_webhook_notifications(webhook_config, {'field': 'value'})
+
+        # The call must include allow_redirects=False explicitly.
+        _, kwargs = mock_post.call_args
+        self.assertEqual(kwargs.get('allow_redirects'), False)
+
+    def test_send_treats_3xx_as_security_event(self):
+        """Audit follow-up: a 302 response (which we no longer follow) must
+        NOT be reported as a successful send. The validator can't recurse
+        into the redirect target; treating 3xx as success would let an
+        attacker confirm IMDS reachability via timing or response code."""
+        handler = self._make_handler()
+        webhook_config = {'url': 'https://example.com/hook', 'headers': {}}
+
+        with patch('form_handler.socket.getaddrinfo') as mock_resolve, \
+             patch('requests.post') as mock_post:
+            mock_resolve.return_value = [(2, 1, 6, '', ('93.184.216.34', 443))]
+            mock_response = MagicMock()
+            mock_response.status_code = 302
+            mock_response.headers = {'Location': 'http://169.254.169.254/'}
+            mock_post.return_value = mock_response
+
+            sent = handler._send_webhook_notifications(webhook_config, {'field': 'value'})
+
+        # 302 must not be recorded as "webhook:302".
+        self.assertEqual(sent, [])
 
 
 if __name__ == '__main__':
