@@ -1887,21 +1887,11 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         # Extract HTTP method first thing
         http_method = event.get('httpMethod', event.get('requestContext', {}).get('http', {}).get('method', 'GET'))
 
-        # Log query string to catch save operations
-        query_string = event.get('rawQueryString', '')
-        if 'save' in query_string.lower():
-            logger.info(f"🔴 SAVE OPERATION DETECTED: query={query_string}")
-            logger.info(f"🔴 SAVE REQUEST HEADERS: {json.dumps(event.get('headers', {}), default=str)[:500]}")
-            logger.info(f"🔴 SAVE REQUEST BODY: {event.get('body', 'NO BODY')[:500]}")
-
         # Handle OPTIONS requests immediately for CORS preflight
         if http_method == 'OPTIONS':
             logger.info("OPTIONS request - returning CORS headers immediately")
             return handle_options(event)
 
-        # Log the incoming request for debugging
-        logger.info(f"Received {http_method} event: {json.dumps(event, default=str)[:500]}")
-        
         # Parse query parameters
         query_params = event.get('queryStringParameters', {}) or {}
         multi_value_params = event.get('multiValueQueryStringParameters', {}) or {}
