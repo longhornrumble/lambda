@@ -20,6 +20,7 @@ on:
         options:
           - Analytics_Dashboard_API
           - picasso-session-archiver
+          - Master_Function_Staging
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -37,6 +38,7 @@ jobs:
     outputs:
       analytics_dashboard_api: ${{ steps.filter.outputs.analytics_dashboard_api }}
       picasso_session_archiver: ${{ steps.filter.outputs.picasso_session_archiver }}
+      master_function_staging: ${{ steps.filter.outputs.master_function_staging }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -47,6 +49,8 @@ jobs:
               - 'Analytics_Dashboard_API/**'
             picasso_session_archiver:
               - 'picasso_session_archiver/**'
+            master_function_staging:
+              - 'Master_Function_Staging/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -65,7 +69,8 @@ jobs:
     if: |
       github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.analytics_dashboard_api == 'true' ||
-      needs.detect-changes.outputs.picasso_session_archiver == 'true'
+      needs.detect-changes.outputs.picasso_session_archiver == 'true' ||
+      needs.detect-changes.outputs.master_function_staging == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +112,33 @@ jobs:
             # Empty Records list exercises cold-start + handler entry with no
             # archive side effects. Expected response: archived=0, no failures.
             smoke_invoke_event: '{"Records":[]}'
+          - source_dir: Master_Function_Staging
+            # In staging account, Lambda keeps its `_Staging` suffix because
+            # the matching prod-account Lambda is `Master_Function` (no
+            # suffix). Different account boundary IS the env separation,
+            # but the function NAMES remain distinct because the prod-side
+            # name was claimed first historically. Cf. ADA, where staging
+            # and prod both renamed to the suffix-less form on Phase 4.5.
+            staging_function: Master_Function_Staging
+            handler: lambda_function.lambda_handler
+            # MFS historically bundled its entire source dir (76 git-tracked
+            # files: 27 runtime .py + jwt/ + PyJWT-2.10.1.dist-info/ +
+            # config JSON). A surgical include list would be 30+ entries
+            # for trivial size savings. Match legacy "zip everything" via
+            # `*` glob; CI checkout excludes pyc/__pycache__/build artifacts
+            # via .gitignore.
+            include_globs: '*'
+            # MFS env vars are managed out-of-band (S3 buckets, DDB tables,
+            # JWT key name, Bedrock config). Adding any here would merge,
+            # not replace, but the CI-source-of-truth call is a Phase 4.5
+            # decision — not within scope of bringing MFS to CI deploys.
+            env_vars: ''
+            # action=health_check returns 200 unauthenticated; default route
+            # (no action) also dispatches to health_check. Use the explicit
+            # form for clarity in CI logs.
+            smoke_path: '/?action=health_check'
+            smoke_expect_status: '200'
+            smoke_invoke_event: ''
 
     steps:
       - uses: actions/checkout@v4
