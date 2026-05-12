@@ -100,10 +100,12 @@ def get_cf_origin_secret() -> Optional[str]:
         except json.JSONDecodeError:
             candidate = secret_string
 
-        # Empty-string secret would compare equal to an empty header — explicit
-        # fail-closed rather than treating "" as a valid shared secret.
-        if not candidate:
-            logger.error("SECURITY: CF origin secret is empty; treating as unavailable")
+        # Empty or whitespace-only secret would compare equal to a same-shaped
+        # header value — explicit fail-closed. `not candidate` catches "", but
+        # whitespace is truthy in Python ("   " evaluates True), so the strip
+        # check is needed to catch misconfigured secrets like "  \n".
+        if not candidate or not str(candidate).strip():
+            logger.error("SECURITY: CF origin secret is empty or whitespace-only; treating as unavailable")
             _cf_origin_secret_cache = _CF_ORIGIN_SECRET_UNAVAILABLE
             return None
 

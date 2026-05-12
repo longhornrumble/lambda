@@ -189,6 +189,23 @@ class TestGetCfOriginSecret(unittest.TestCase):
             secret = get_cf_origin_secret()
         self.assertIsNone(secret)
 
+    def test_whitespace_only_secret_treated_as_unavailable(self):
+        """Cycle-3 audit follow-up: `not "   "` is False in Python (whitespace
+        is truthy), so the prior empty-check would let a whitespace-only
+        secret through. A misconfigured secret of spaces, tabs, or newlines
+        must fail-closed, not compare-equal to a matching-whitespace header."""
+        import lambda_function
+        from lambda_function import get_cf_origin_secret
+        for ws_value in ['   ', '\t', '\n', ' \r\n ', '\t\t  ']:
+            # Reset cache between iterations so each ws_value re-enters SM.
+            lambda_function._cf_origin_secret_cache = None
+            with patch('boto3.client') as mock_client:
+                mock_client.return_value.get_secret_value.return_value = {
+                    'SecretString': ws_value,
+                }
+                secret = get_cf_origin_secret()
+            self.assertIsNone(secret, f"whitespace value {ws_value!r} must be rejected")
+
 
 class TestLambdaHandlerCfOriginEnforcement(unittest.TestCase):
     """Integration: the handler returns 403 when origin validation fails."""
