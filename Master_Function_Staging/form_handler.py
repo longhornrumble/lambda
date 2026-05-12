@@ -882,14 +882,26 @@ class FormHandler:
             headers['Content-Type'] = 'application/json'
 
         try:
+            # SSRF defense in depth: validate URL was static; now also refuse
+            # to follow redirects so a public webhook server cannot 302 the
+            # Lambda to 169.254.169.254 / RFC1918 / loopback. Without this,
+            # requests.post follows redirects by default, fully bypassing the
+            # validator. Treat any 3xx as a security event and abort.
             response = requests.post(
                 url=url,
                 headers=headers,
                 json=form_data,
-                timeout=10
+                timeout=10,
+                allow_redirects=False,
             )
 
-            if response.status_code < 300:
+            if 300 <= response.status_code < 400:
+                logger.error(
+                    f"SECURITY: webhook returned redirect ({response.status_code}) to "
+                    f"{response.headers.get('Location', '<no Location header>')}; "
+                    f"refusing to follow (potential SSRF redirect chain)"
+                )
+            elif response.status_code < 300:
                 sent.append(f"webhook:{response.status_code}")
                 logger.info(f"Webhook sent to {url}: {response.status_code}")
             else:

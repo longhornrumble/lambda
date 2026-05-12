@@ -874,10 +874,13 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
         # body.metadata for backward compatibility with older callers and
         # synthetic tests. Key presence — not truthiness — gates the fallback,
         # so an explicit empty routing_metadata suppresses legacy metadata.
+        # Type guard: only dicts are valid; a list/str/int would survive the
+        # `or {}` check but blow up on `.get()` downstream.
         if 'routing_metadata' in body:
-            request_metadata = body['routing_metadata'] or {}
+            candidate = body['routing_metadata']
         else:
-            request_metadata = body.get('metadata') or {}
+            candidate = body.get('metadata')
+        request_metadata = candidate if isinstance(candidate, dict) else {}
         logger.info(f"[Routing] Extracted metadata: action_chip_triggered={request_metadata.get('action_chip_triggered')}, "
                    f"cta_triggered={request_metadata.get('cta_triggered')}, "
                    f"target_branch={request_metadata.get('target_branch')}")
