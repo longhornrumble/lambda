@@ -680,7 +680,17 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
         # ?action=chat with body {form_mode: true, action: 'submit_form', ...}
         # when BSH streaming is unavailable. Route those to the existing form
         # submission handler so MFS can serve forms as fallback.
+        #
+        # Widget body uses form_id/form_data; MFS FormHandler reads
+        # form_type/responses. Translate widget shape → FormHandler shape so
+        # widget-originated submissions process correctly. Preserve any
+        # FormHandler-shape fields already present (don't overwrite).
         if body.get('form_mode') is True:
+            if 'form_id' in body and 'form_type' not in body:
+                body['form_type'] = body['form_id']
+            if 'form_data' in body and 'responses' not in body:
+                body['responses'] = body['form_data'] or {}
+            event = {**event, 'body': json.dumps(body)}
             logger.info("form_mode=True in chat body — routing to handle_form_submission")
             return handle_form_submission(event, tenant_hash, request_id)
 
