@@ -300,47 +300,13 @@ def get_config_for_tenant(tenant_hash: str, event: Dict[str, Any] = None) -> Dic
             }
         
     except ImportError:
-        logger.warning("tenant_config_loader not available, returning mock config")
-        # Fall back to mock config if module not available
-        config_data = {
-            'tenant_hash': tenant_hash,
-            'chat_title': 'Chat Assistant',
-            'welcome_message': 'Hello! How can I help you today?',
-            'branding': {
-                'primary_color': '#3b82f6',
-                'font_family': 'Inter, sans-serif',
-                'chat_title': 'Chat',
-                'border_radius': '12px'
-            },
-            'features': {
-                'uploads': False,
-                'photo_uploads': False,
-                'callout': True,
-                'streaming_enabled': False,
-                'quick_help': True,
-                'action_chips': True
-            },
-            'quick_help': {
-                'enabled': True,
-                'items': [
-                    {'label': 'How can I get help?', 'value': 'How can I get help?'},
-                    {'label': 'What services do you offer?', 'value': 'What services do you offer?'}
-                ]
-            },
-            'action_chips': {
-                'enabled': True,
-                'chips': ['Yes', 'No', 'Tell me more']
-            },
-            'metadata': {
-                'source': 'lambda-mock',
-                'environment': os.environ.get('ENVIRONMENT', 'staging'),
-                'version': os.environ.get('VERSION', '1.0.0')
-            }
-        }
-        
+        logger.error("tenant_config_loader module unavailable — cannot serve tenant config")
         response = {
-            'statusCode': 200,
-            'body': json.dumps(config_data)
+            'statusCode': 503,
+            'body': json.dumps({
+                'error': 'Service Unavailable',
+                'message': 'Tenant configuration service is not available'
+            })
         }
     except Exception as e:
         logger.error(f"Error loading config: {str(e)}")

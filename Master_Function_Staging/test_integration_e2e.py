@@ -886,6 +886,38 @@ class TestEndToEndIntegration(unittest.TestCase):
         logger.info("✅ Test passed: Branch validation working correctly")
 
 
+class TestPhase3HardeningRegression(unittest.TestCase):
+    """
+    Regression tests for Phase 3 security hardening (MFS cleanup plan).
+
+    Each test pins behavior that a previous code path got wrong. Keep these
+    tests narrow — they exist to prevent regression of the named EC, not to
+    expand into a general config-flow harness.
+    """
+
+    def test_get_config_returns_503_on_import_error(self):
+        """
+        EC-P3-3 / H4: when tenant_config_loader cannot be imported, the
+        config endpoint must return HTTP 503, NOT 200 with unbranded
+        mock data.
+        """
+        import sys
+        from lambda_function import get_config_for_tenant
+
+        with patch.dict(sys.modules, {'tenant_config_loader': None}):
+            response = get_config_for_tenant(
+                'aa12345678',
+                {'queryStringParameters': {'action': 'get_config', 't': 'aa12345678'}}
+            )
+
+        self.assertEqual(response['statusCode'], 503)
+        body = json.loads(response['body'])
+        self.assertEqual(body['error'], 'Service Unavailable')
+        # Negative assertion: the old mock payload must NOT leak through
+        self.assertNotIn('chat_title', body)
+        self.assertNotIn('branding', body)
+
+
 def run_test_suite():
     """Run the complete test suite and generate report"""
     logger.info("\n" + "="*80)
