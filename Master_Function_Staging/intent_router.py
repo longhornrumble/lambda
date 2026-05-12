@@ -4,10 +4,10 @@ from session_utils import extract_session_data, build_session_attributes
 
 # Try to use optimized handler, fall back to original if not available
 try:
-    from bedrock_handler_optimized import fetch_tenant_tone, retrieve_kb_chunks, build_prompt, call_claude_with_prompt, get_cache_status, warm_cache_for_tenant
+    from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt, call_claude_with_prompt, get_cache_status, warm_cache_for_tenant
     logging.info("✅ Using optimized bedrock handler with caching")
 except ImportError:
-    from bedrock_handler import fetch_tenant_tone, retrieve_kb_chunks, build_prompt, call_claude_with_prompt
+    from bedrock_handler import retrieve_kb_chunks, build_prompt, call_claude_with_prompt
     get_cache_status = None
     warm_cache_for_tenant = None
     logging.info("⚠️ Using standard bedrock handler without caching")

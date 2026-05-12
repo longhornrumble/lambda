@@ -58,11 +58,7 @@ def _get_bedrock_agent_client():
         print(json.dumps({"evt": "analytics_kb_creds_init_failed", "error": str(e)}))
         raise
 
-def fetch_tenant_tone(tenant_id):
-    logger.info(f"[{tenant_id}] ✅ Using stub - no API call made")
-    return "You are a helpful and friendly assistant."
-
-def retrieve_kb_chunks(user_input, config):  
+def retrieve_kb_chunks(user_input, config):
     try:
         kb_id = config.get("aws", {}).get("knowledge_base_id")
         

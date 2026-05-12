@@ -383,11 +383,16 @@ def handle_streaming_chat(event: Dict[str, Any], tenant_hash: str, request_id: s
         # Retrieve Knowledge Base chunks and build enhanced prompt
         enhanced_prompt = user_input  # Default to raw input if KB fails
         try:
-            from bedrock_handler import retrieve_kb_chunks, build_prompt
-            
+            # Try optimized handler (cached) first; fall back to non-cached.
+            # Mirrors intent_router.py's import pattern. EC-P4-3 closure.
+            try:
+                from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt
+            except ImportError:
+                from bedrock_handler import retrieve_kb_chunks, build_prompt
+
             # Get tenant tone
             tone = config.get("tone_prompt", "You are a helpful assistant.") if config else "You are a helpful assistant."
-            
+
             # Retrieve relevant chunks from Knowledge Base
             if config:
                 kb_context, sources = retrieve_kb_chunks(user_input, config)
@@ -567,11 +572,16 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         # Retrieve Knowledge Base chunks and build enhanced prompt
         enhanced_prompt = user_input  # Default to raw input if KB fails
         try:
-            from bedrock_handler import retrieve_kb_chunks, build_prompt
-            
+            # Try optimized handler (cached) first; fall back to non-cached.
+            # Mirrors intent_router.py's import pattern. EC-P4-3 closure.
+            try:
+                from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt
+            except ImportError:
+                from bedrock_handler import retrieve_kb_chunks, build_prompt
+
             # Get tenant tone
             tone = config.get("tone_prompt", "You are a helpful assistant.") if config else "You are a helpful assistant."
-            
+
             # Retrieve relevant chunks from Knowledge Base
             if config:
                 kb_context, sources = retrieve_kb_chunks(user_input, config)
@@ -1771,7 +1781,6 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     Main Lambda handler with centralized routing and CORS
     """
     try:
-        # IMMEDIATE LOGGING - Log every single request that comes in
         logger.info(f"🚀 LAMBDA INVOKED at {datetime.utcnow().isoformat()}")
 
         # Extract HTTP method first thing
