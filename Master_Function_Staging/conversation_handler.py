@@ -420,7 +420,7 @@ def _validate_state_token(event):
         
         # Decode and validate JWT
         try:
-            payload = jwt.decode(token, signing_key, algorithms=['HS256'])
+            payload = jwt.decode(token, signing_key, algorithms=['HS256'], options={"require": ["iss", "iat", "exp"]}, issuer="myrecruiter-chat")
         except jwt.ExpiredSignatureError:
             raise ConversationError("TOKEN_EXPIRED", "State token has expired", 401)
         except jwt.InvalidTokenError as e:

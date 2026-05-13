@@ -832,7 +832,7 @@ def handle_chat(event: Dict[str, Any], tenant_hash: str, request_id: str = None)
                     raise ValueError("No JWT signing key available")
 
                 # Decode JWT token
-                token_data = jwt.decode(state_token, jwt_signing_key, algorithms=['HS256'])
+                token_data = jwt.decode(state_token, jwt_signing_key, algorithms=['HS256'], options={"require": ["iss", "iat", "exp"]}, issuer="myrecruiter-chat")
                 
                 # Extract conversation context from token AND request body
                 request_context = body.get('conversation_context', {})
