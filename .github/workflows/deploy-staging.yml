@@ -176,7 +176,13 @@ jobs:
             # action=health_check returns 200 unauthenticated; default route
             # (no action) also dispatches to health_check. Use the explicit
             # form for clarity in CI logs.
-            smoke_path: '/?action=health_check'
+            #
+            # CF origin header activation 2026-05-13: direct Function URL hits
+            # without x-picasso-cf-origin now 403. Route the smoke through CF
+            # so the header is injected. CF /Master_Function* routes to MFS;
+            # action=health_check works without tenant.
+            smoke_base_url: 'https://staging.chat.myrecruiter.ai'
+            smoke_path: '/Master_Function?action=health_check'
             smoke_expect_status: '200'
             smoke_invoke_event: ''
           - source_dir: Bedrock_Streaming_Handler_Staging
@@ -331,14 +337,24 @@ jobs:
 
       - name: Smoke test (HTTP)
         if: matrix.lambda.smoke_path != ''
+        env:
+          # Per-matrix override. When set, the smoke routes via this base URL
+          # (typically CloudFront) instead of the Lambda Function URL. Required
+          # for any Lambda gated by REQUIRE_CF_ORIGIN_HEADER (activated for
+          # MFS 2026-05-13); direct Function URL hits now 403.
+          SMOKE_BASE_URL: '${{ matrix.lambda.smoke_base_url }}'
         run: |
           set -euo pipefail
-          # Deterministic: filter for the unaliased ($LATEST) URL config.
-          # Aliased entries have a Qualifier field; the $LATEST entry does not.
-          # Tolerates transitional state where alias URLs still exist.
-          URL=$(aws lambda list-function-url-configs \
-            --function-name ${{ matrix.lambda.staging_function }} \
-            --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
+          if [ -n "$SMOKE_BASE_URL" ]; then
+            URL="$SMOKE_BASE_URL"
+          else
+            # Deterministic: filter for the unaliased ($LATEST) URL config.
+            # Aliased entries have a Qualifier field; the $LATEST entry does not.
+            # Tolerates transitional state where alias URLs still exist.
+            URL=$(aws lambda list-function-url-configs \
+              --function-name ${{ matrix.lambda.staging_function }} \
+              --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
+          fi
           STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${URL%/}${{ matrix.lambda.smoke_path }}")
           echo "Smoke: GET ${URL%/}${{ matrix.lambda.smoke_path }} → $STATUS"
           if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
