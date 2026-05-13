@@ -29,6 +29,7 @@ const {
   sanitizeTonePromptV4,
 } = require('./prompt_v4');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
+const { corsHeaders } = require('./cors-helper');
 
 // Default model configuration - single source of truth, sourced from
 // BEDROCK_MODEL_ID env var per Phase 4 EC-P4-2 (single point of update
@@ -98,7 +99,7 @@ async function handleAnalyticsEvent(event) {
   if (!ANALYTICS_QUEUE_URL) {
     return {
       statusCode: 200,
-      headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' },
+      headers: { 'Content-Type': 'application/json', ...corsHeaders(event) },
       body: JSON.stringify({ status: 'noop', reason: 'analytics_queue_not_configured' }),
     };
   }
@@ -117,7 +118,7 @@ async function handleAnalyticsEvent(event) {
           statusCode: 200,
           headers: {
             'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
+            ...corsHeaders(event)
           },
           body: JSON.stringify({ status: 'success', processed: 0 })
         };
@@ -150,7 +151,7 @@ async function handleAnalyticsEvent(event) {
         statusCode: 200,
         headers: {
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
+          ...corsHeaders(event)
         },
         body: JSON.stringify({ status: 'success', processed: events.length })
       };
@@ -162,7 +163,7 @@ async function handleAnalyticsEvent(event) {
         statusCode: 400,
         headers: {
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
+          ...corsHeaders(event)
         },
         body: JSON.stringify({ error: 'Missing required fields: session_id, event' })
       };
@@ -180,7 +181,7 @@ async function handleAnalyticsEvent(event) {
       statusCode: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
+        ...corsHeaders(event)
       },
       body: JSON.stringify({ status: 'success', processed: 1 })
     };
@@ -191,7 +192,7 @@ async function handleAnalyticsEvent(event) {
       statusCode: 500,
       headers: {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
+        ...corsHeaders(event)
       },
       body: JSON.stringify({ error: error.message })
     };
@@ -218,7 +219,7 @@ async function handlePromptPreview(event) {
         statusCode: 400,
         headers: {
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
+          ...corsHeaders(event)
         },
         body: JSON.stringify({ error: 'Missing tenant_hash' })
       };
@@ -231,7 +232,7 @@ async function handlePromptPreview(event) {
         statusCode: 404,
         headers: {
           'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
+          ...corsHeaders(event)
         },
         body: JSON.stringify({ error: 'Config not found for tenant' })
       };
@@ -252,9 +253,7 @@ async function handlePromptPreview(event) {
       statusCode: 200,
       headers: {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept'
+        ...corsHeaders(event)
       },
       body: JSON.stringify({
         tenant_hash: tenantHash,
@@ -275,7 +274,7 @@ async function handlePromptPreview(event) {
       statusCode: 500,
       headers: {
         'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
+        ...corsHeaders(event)
       },
       body: JSON.stringify({
         error: error.message,
@@ -808,11 +807,7 @@ const bufferedHandler = async (event, context) => {
   if (event.httpMethod === 'OPTIONS' || event.requestContext?.http?.method === 'OPTIONS') {
     return {
       statusCode: 200,
-      headers: {
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept'
-      },
+      headers: corsHeaders(event),
       body: ''
     };
   }
@@ -853,8 +848,8 @@ const bufferedHandler = async (event, context) => {
         headers: {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache, no-transform',
-          'Access-Control-Allow-Origin': '*',
-          'X-Accel-Buffering': 'no'
+          'X-Accel-Buffering': 'no',
+          ...corsHeaders(event)
         },
         body: chunks.join('')
       };
@@ -916,8 +911,8 @@ const bufferedHandler = async (event, context) => {
           headers: {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache, no-transform',
-            'Access-Control-Allow-Origin': '*',
-            'X-Accel-Buffering': 'no'
+            'X-Accel-Buffering': 'no',
+            ...corsHeaders(event)
           },
           body: chunks.join(''),
           isBase64Encoded: false
@@ -932,7 +927,7 @@ const bufferedHandler = async (event, context) => {
           headers: {
             'Content-Type': 'text/event-stream',
             'Cache-Control': 'no-cache, no-transform',
-            'Access-Control-Allow-Origin': '*'
+            ...corsHeaders(event)
           },
           body: chunks.join('')
         };
@@ -1139,15 +1134,13 @@ const bufferedHandler = async (event, context) => {
       headers: {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache, no-transform',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept',
-        'X-Accel-Buffering': 'no'
+        'X-Accel-Buffering': 'no',
+        ...corsHeaders(event)
       },
       body: chunks.join(''),
       isBase64Encoded: false
     };
-    
+
   } catch (error) {
     console.error('Handler error:', error);
     
@@ -1159,7 +1152,7 @@ const bufferedHandler = async (event, context) => {
       headers: {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache, no-transform',
-        'Access-Control-Allow-Origin': '*'
+        ...corsHeaders(event)
       },
       body: chunks.join('')
     };
