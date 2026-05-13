@@ -1689,14 +1689,12 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         # Extract HTTP method first thing
         http_method = event.get('httpMethod', event.get('requestContext', {}).get('http', {}).get('method', 'GET'))
 
-        # Handle OPTIONS requests immediately for CORS preflight
-        if http_method == 'OPTIONS':
-            logger.info("OPTIONS request - returning CORS headers immediately")
-            return handle_options(event)
-
-        # CF origin header validation — guards against direct Function URL
-        # access that bypasses CloudFront (and its WAF). Feature-flagged via
-        # REQUIRE_CF_ORIGIN_HEADER env var; default skip during rollout.
+        # CF origin header validation runs FIRST, before any method branching.
+        # OPTIONS must not bypass this — a direct Function URL OPTIONS without
+        # the header would otherwise leak service existence and allowed CORS
+        # methods to any unauthenticated caller. Validator is a no-op when
+        # REQUIRE_CF_ORIGIN_HEADER is unset/false, so this is safe during
+        # rollout and identical to the prior order for flag-off traffic.
         is_valid_origin, origin_reason = validate_cf_origin_header(event)
         if not is_valid_origin:
             logger.warning(f"SECURITY: rejected request with invalid CF origin header — {origin_reason}")
@@ -1708,6 +1706,11 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 })
             }
             return add_cors_headers(response, event)
+
+        # Handle OPTIONS requests immediately for CORS preflight
+        if http_method == 'OPTIONS':
+            logger.info("OPTIONS request - returning CORS headers immediately")
+            return handle_options(event)
 
         # Parse query parameters
         query_params = event.get('queryStringParameters', {}) or {}
