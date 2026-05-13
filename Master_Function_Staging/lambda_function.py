@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 from datetime import datetime
 from typing import Dict, Any, Optional
 from urllib.parse import parse_qs
@@ -67,6 +68,13 @@ _CF_ORIGIN_HEADER_NAME = 'x-picasso-cf-origin'
 # and avoid hammering Secrets Manager on every invocation during an outage.
 _CF_ORIGIN_SECRET_UNAVAILABLE = object()
 _cf_origin_secret_cache: Any = None
+# Monotonic timestamp of when the cache was last set to UNAVAILABLE. Lets the
+# failure path expire after _CF_ORIGIN_SECRET_FAILURE_TTL_SECONDS so a
+# transient SM brownout doesn't permanently poison a Lambda instance until
+# cold-start. Successful (string) cache values never expire — rotation
+# requires a new Lambda version per get_cf_origin_secret's docstring.
+_cf_origin_secret_cache_at: float = 0.0
+_CF_ORIGIN_SECRET_FAILURE_TTL_SECONDS = 60
 
 
 def get_cf_origin_secret() -> Optional[str]:
@@ -76,15 +84,22 @@ def get_cf_origin_secret() -> Optional[str]:
     handle unavailability — under REQUIRE_CF_ORIGIN_HEADER='true' we fail
     closed (treat as missing-header → 403).
 
-    Caching: both success AND failure are cached for the lifetime of the
-    Lambda instance. Caching failure prevents O(RPS) Secrets Manager calls
-    during a SM outage when the feature flag is on (every request would
-    otherwise re-attempt the lookup). To force a refresh after rotation,
-    publish a new Lambda version.
+    Caching:
+    - Success: cached for the lifetime of the Lambda instance. Rotation
+      requires publishing a new Lambda version (forces cold-start).
+    - Failure: cached for _CF_ORIGIN_SECRET_FAILURE_TTL_SECONDS (60s) so a
+      transient SM brownout doesn't permanently poison the instance. After
+      the TTL, the next call re-attempts SM; if it succeeds we cache the
+      value, otherwise we re-arm the failure window. This prevents O(RPS)
+      SM calls during outages while still recovering automatically.
     """
-    global _cf_origin_secret_cache
+    global _cf_origin_secret_cache, _cf_origin_secret_cache_at
     if _cf_origin_secret_cache is _CF_ORIGIN_SECRET_UNAVAILABLE:
-        return None
+        if time.monotonic() - _cf_origin_secret_cache_at < _CF_ORIGIN_SECRET_FAILURE_TTL_SECONDS:
+            return None
+        # TTL expired — allow a retry by clearing the sentinel and falling
+        # through to the fetch path below.
+        _cf_origin_secret_cache = None
     if _cf_origin_secret_cache is not None:
         return _cf_origin_secret_cache
 
@@ -107,6 +122,7 @@ def get_cf_origin_secret() -> Optional[str]:
         if not candidate or not str(candidate).strip():
             logger.error("SECURITY: CF origin secret is empty or whitespace-only; treating as unavailable")
             _cf_origin_secret_cache = _CF_ORIGIN_SECRET_UNAVAILABLE
+            _cf_origin_secret_cache_at = time.monotonic()
             return None
 
         _cf_origin_secret_cache = candidate
@@ -114,6 +130,7 @@ def get_cf_origin_secret() -> Optional[str]:
     except Exception as e:
         logger.error(f"SECURITY: failed to retrieve CF origin secret: {e}")
         _cf_origin_secret_cache = _CF_ORIGIN_SECRET_UNAVAILABLE
+        _cf_origin_secret_cache_at = time.monotonic()
         return None
 
 

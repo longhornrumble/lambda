@@ -22,6 +22,7 @@ class TestValidateCfOriginHeader(unittest.TestCase):
         # Reset module-level cache between tests so secret reads don't leak.
         import lambda_function
         lambda_function._cf_origin_secret_cache = None
+        lambda_function._cf_origin_secret_cache_at = 0.0
 
     def _event(self, headers=None):
         return {
@@ -104,6 +105,7 @@ class TestGetCfOriginSecret(unittest.TestCase):
     def setUp(self):
         import lambda_function
         lambda_function._cf_origin_secret_cache = None
+        lambda_function._cf_origin_secret_cache_at = 0.0
 
     def test_returns_plain_string_when_not_json(self):
         from lambda_function import get_cf_origin_secret
@@ -199,12 +201,94 @@ class TestGetCfOriginSecret(unittest.TestCase):
         for ws_value in ['   ', '\t', '\n', ' \r\n ', '\t\t  ']:
             # Reset cache between iterations so each ws_value re-enters SM.
             lambda_function._cf_origin_secret_cache = None
+            lambda_function._cf_origin_secret_cache_at = 0.0
             with patch('boto3.client') as mock_client:
                 mock_client.return_value.get_secret_value.return_value = {
                     'SecretString': ws_value,
                 }
                 secret = get_cf_origin_secret()
             self.assertIsNone(secret, f"whitespace value {ws_value!r} must be rejected")
+
+    def test_failure_cache_expires_after_ttl_then_retries(self):
+        """Audit row #10: a transient SM brownout must not poison the cache
+        until cold-start. After _CF_ORIGIN_SECRET_FAILURE_TTL_SECONDS the
+        next call re-attempts SM; success replaces the sentinel with the
+        value, failure re-arms the TTL window.
+        """
+        import lambda_function
+        from lambda_function import get_cf_origin_secret
+
+        # First call: SM fails, cache enters UNAVAILABLE at t=100.
+        with patch('lambda_function.time.monotonic', return_value=100.0), \
+             patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.side_effect = Exception('SM brownout')
+            first = get_cf_origin_secret()
+        self.assertIsNone(first)
+        self.assertIs(lambda_function._cf_origin_secret_cache, lambda_function._CF_ORIGIN_SECRET_UNAVAILABLE)
+
+        # Second call within TTL (t=130, +30s): no SM call; still None.
+        with patch('lambda_function.time.monotonic', return_value=130.0), \
+             patch('boto3.client') as mock_client:
+            second = get_cf_origin_secret()
+            self.assertEqual(mock_client.call_count, 0,
+                             "within TTL the cache must not re-hit SM")
+        self.assertIsNone(second)
+
+        # Third call AFTER TTL (t=200, +100s), SM now healthy → caches value.
+        with patch('lambda_function.time.monotonic', return_value=200.0), \
+             patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.return_value = {
+                'SecretString': 'recovered-value',
+            }
+            third = get_cf_origin_secret()
+        self.assertEqual(third, 'recovered-value')
+
+    def test_failure_cache_rearms_when_sm_still_failing_after_ttl(self):
+        """TTL elapsed but SM still failing → cache stays UNAVAILABLE and
+        the timestamp resets so we don't hit SM every call after TTL."""
+        import lambda_function
+        from lambda_function import get_cf_origin_secret
+
+        # First call: fail at t=100.
+        with patch('lambda_function.time.monotonic', return_value=100.0), \
+             patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.side_effect = Exception('outage')
+            get_cf_origin_secret()
+        first_cache_at = lambda_function._cf_origin_secret_cache_at
+
+        # Second call after TTL (t=200), SM still failing → re-arms.
+        with patch('lambda_function.time.monotonic', return_value=200.0), \
+             patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.side_effect = Exception('still down')
+            second = get_cf_origin_secret()
+            self.assertEqual(mock_client.call_count, 1,
+                             "after TTL we should retry SM exactly once")
+        self.assertIsNone(second)
+        self.assertIs(lambda_function._cf_origin_secret_cache, lambda_function._CF_ORIGIN_SECRET_UNAVAILABLE)
+        self.assertGreater(lambda_function._cf_origin_secret_cache_at, first_cache_at,
+                           "failure timestamp must be re-armed on the retry")
+
+    def test_success_cache_does_not_expire(self):
+        """Successful values are cached for the lifetime of the Lambda
+        instance regardless of how much wall-clock time passes. Rotation
+        requires publishing a new Lambda version."""
+        import lambda_function
+        from lambda_function import get_cf_origin_secret
+
+        with patch('lambda_function.time.monotonic', return_value=100.0), \
+             patch('boto3.client') as mock_client:
+            mock_client.return_value.get_secret_value.return_value = {
+                'SecretString': 'long-lived-value',
+            }
+            first = get_cf_origin_secret()
+        self.assertEqual(first, 'long-lived-value')
+
+        # Hours later — still cached, SM not re-hit.
+        with patch('lambda_function.time.monotonic', return_value=100_000.0), \
+             patch('boto3.client') as mock_client:
+            second = get_cf_origin_secret()
+            self.assertEqual(mock_client.call_count, 0)
+        self.assertEqual(second, 'long-lived-value')
 
 
 class TestLambdaHandlerCfOriginEnforcement(unittest.TestCase):
@@ -213,6 +297,7 @@ class TestLambdaHandlerCfOriginEnforcement(unittest.TestCase):
     def setUp(self):
         import lambda_function
         lambda_function._cf_origin_secret_cache = None
+        lambda_function._cf_origin_secret_cache_at = 0.0
 
     def test_handler_returns_403_when_header_missing_and_flag_on(self):
         from lambda_function import lambda_handler
