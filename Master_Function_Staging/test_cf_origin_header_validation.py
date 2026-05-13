@@ -260,6 +260,57 @@ class TestLambdaHandlerCfOriginEnforcement(unittest.TestCase):
 
         self.assertEqual(response['statusCode'], 200)
 
+    def test_handler_returns_403_on_OPTIONS_when_header_missing_and_flag_on(self):
+        """Audit follow-up 2026-05-13: OPTIONS preflight must not bypass the
+        CF origin check. The handler previously returned a 200 CORS response
+        on direct Function URL OPTIONS before validating the header, leaking
+        service existence + allowed methods. Validator now runs first.
+        """
+        from lambda_function import lambda_handler
+
+        event = {
+            'httpMethod': 'OPTIONS',
+            'headers': {},
+        }
+        with patch.dict(os.environ, {'REQUIRE_CF_ORIGIN_HEADER': 'true'}), \
+             patch('lambda_function.get_cf_origin_secret', return_value='secret-value'):
+            response = lambda_handler(event, None)
+
+        self.assertEqual(response['statusCode'], 403)
+        body = json.loads(response['body'])
+        self.assertEqual(body['error'], 'Forbidden')
+
+    def test_handler_OPTIONS_succeeds_when_header_valid_and_flag_on(self):
+        """Positive case: CF-routed OPTIONS (header present, value matches)
+        still gets a normal CORS preflight 200 response."""
+        from lambda_function import lambda_handler
+
+        event = {
+            'httpMethod': 'OPTIONS',
+            'headers': {'x-picasso-cf-origin': 'secret-value'},
+        }
+        with patch.dict(os.environ, {'REQUIRE_CF_ORIGIN_HEADER': 'true'}), \
+             patch('lambda_function.get_cf_origin_secret', return_value='secret-value'):
+            response = lambda_handler(event, None)
+
+        self.assertEqual(response['statusCode'], 200)
+
+    def test_handler_OPTIONS_passes_through_when_flag_off(self):
+        """Flag-off: OPTIONS without header still gets a normal CORS preflight
+        response — validator is no-op when REQUIRE_CF_ORIGIN_HEADER is unset.
+        Ensures the order-swap didn't regress pre-activation behavior."""
+        from lambda_function import lambda_handler
+
+        event = {
+            'httpMethod': 'OPTIONS',
+            'headers': {},
+        }
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('REQUIRE_CF_ORIGIN_HEADER', None)
+            response = lambda_handler(event, None)
+
+        self.assertEqual(response['statusCode'], 200)
+
 
 if __name__ == '__main__':
     unittest.main()
