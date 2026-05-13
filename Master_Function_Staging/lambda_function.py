@@ -209,6 +209,14 @@ _CORS_ALLOWED_ORIGINS_DEFAULT = [
     'https://picassostaging.s3.amazonaws.com',
 ]
 
+# Used when no Origin header is present OR the origin is not in the allowlist.
+# Phase-D3 audit (2026-05-13) flagged the prior default of `_CORS_ALLOWED_ORIGINS_DEFAULT[0]`
+# (= http://localhost:8000) as a live misconfiguration: combined with
+# `Access-Control-Allow-Credentials: true`, any page running at http://localhost:8000
+# in a victim's browser could read responses. The canonical chat host is the
+# correct fallback regardless of allowlist ordering.
+_CORS_DEFAULT_FALLBACK_ORIGIN = 'https://chat.myrecruiter.ai'
+
 
 def validate_cors_origin(request_headers, tenant_hash, config_data):
     """
@@ -280,7 +288,7 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
     # Safe default — never wildcard. If no Origin header is present, fall back
     # to the canonical chat origin. Browsers will refuse the actual cross-origin
     # request if their origin doesn't match, which is the desired CORS posture.
-    allowed_origin = _CORS_ALLOWED_ORIGINS_DEFAULT[0]
+    allowed_origin = _CORS_DEFAULT_FALLBACK_ORIGIN
 
     # Check for origin header in various formats (Lambda can provide headers in different cases)
     if event and 'headers' in event:
@@ -306,8 +314,7 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
                 logger.info(f"CORS: Allowing specific origin {origin}")
             else:
                 logger.warning(f"CORS: Origin {origin} not in allowed list, using default origin (not wildcard)")
-                # allowed_origin already set to allowed_origins[0] above; explicit reassign for clarity
-                allowed_origin = allowed_origins[0] if allowed_origins else 'https://chat.myrecruiter.ai'
+                allowed_origin = _CORS_DEFAULT_FALLBACK_ORIGIN
 
     # Add CORS headers - this is the single source of truth
     response['headers']['Access-Control-Allow-Origin'] = allowed_origin
