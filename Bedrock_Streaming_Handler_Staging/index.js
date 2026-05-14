@@ -188,6 +188,11 @@ async function handleAnalyticsEvent(event) {
     };
 
   } catch (error) {
+    // Phase C audit F2 closure: never return raw SDK error text to the
+    // browser. AWS SDK errors include the queue ARN + role ARN + denied
+    // IAM action, which an attacker can use to target subsequent attacks.
+    // Log the full error to CloudWatch (still observable for debugging);
+    // return an opaque code to the caller.
     console.error('❌ Analytics handler error:', error);
     return {
       statusCode: 500,
@@ -195,7 +200,7 @@ async function handleAnalyticsEvent(event) {
         'Content-Type': 'application/json',
         ...corsHeaders(event)
       },
-      body: JSON.stringify({ error: error.message })
+      body: JSON.stringify({ error: 'analytics_write_failed' })
     };
   }
 }
