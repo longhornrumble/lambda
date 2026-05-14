@@ -19,6 +19,7 @@ on:
         required: true
         options:
           - Analytics_Dashboard_API
+          - Analytics_Event_Processor
           - picasso-session-archiver
           - Master_Function_Staging
           - Bedrock_Streaming_Handler_Staging
@@ -39,6 +40,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       analytics_dashboard_api: ${{ steps.filter.outputs.analytics_dashboard_api }}
+      analytics_event_processor: ${{ steps.filter.outputs.analytics_event_processor }}
       picasso_session_archiver: ${{ steps.filter.outputs.picasso_session_archiver }}
       master_function_staging: ${{ steps.filter.outputs.master_function_staging }}
       bedrock_streaming_handler_staging: ${{ steps.filter.outputs.bedrock_streaming_handler_staging }}
@@ -50,6 +52,8 @@ jobs:
           filters: |
             analytics_dashboard_api:
               - 'Analytics_Dashboard_API/**'
+            analytics_event_processor:
+              - 'Analytics_Event_Processor/**'
             picasso_session_archiver:
               - 'picasso_session_archiver/**'
             master_function_staging:
@@ -74,6 +78,7 @@ jobs:
     if: |
       github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.analytics_dashboard_api == 'true' ||
+      needs.detect-changes.outputs.analytics_event_processor == 'true' ||
       needs.detect-changes.outputs.picasso_session_archiver == 'true' ||
       needs.detect-changes.outputs.master_function_staging == 'true' ||
       needs.detect-changes.outputs.bedrock_streaming_handler_staging == 'true'
