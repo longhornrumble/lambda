@@ -212,12 +212,17 @@ const streamingHandler = async (event, responseStream, context) => {
   const cfCheck = await validateCfOriginHeader(event);
   if (!cfCheck.valid) {
     console.warn(`SECURITY: streamingHandler rejected request: ${cfCheck.reason}`);
+    // Canonical AWS streaming-mode HTTP-metadata pattern: reassign
+    // responseStream after .from() wraps it, then write body + end()
+    // separately. Using .end(body) on the wrapped stream produced 502 in
+    // the real runtime — observed during PR #6 deploy verification.
     if (typeof awslambda !== 'undefined' && awslambda.HttpResponseStream) {
-      const httpStream = awslambda.HttpResponseStream.from(responseStream, {
+      responseStream = awslambda.HttpResponseStream.from(responseStream, {
         statusCode: 403,
         headers: { 'Content-Type': 'application/json' },
       });
-      httpStream.end(JSON.stringify({ error: 'forbidden' }));
+      responseStream.write(JSON.stringify({ error: 'forbidden' }));
+      responseStream.end();
     } else {
       responseStream.end(JSON.stringify({ error: 'forbidden' }));
     }
