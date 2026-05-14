@@ -80,6 +80,14 @@ async function getCfOriginSecret() {
       let candidate = raw;
       try {
         const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === 'object' && parsed.secret === undefined && parsed.value === undefined) {
+          // JSON object with neither recognized key — fall back to raw JSON
+          // string, but warn loudly so operators see this in CloudWatch.
+          // Without this, a misconfigured rotation (e.g. {"key": "..."})
+          // silently uses the raw JSON as the secret value and produces
+          // hard-to-diagnose 403s.
+          console.warn('SECURITY: CF origin secret is JSON without .secret or .value key; using raw string fallback');
+        }
         candidate = parsed.secret || parsed.value || raw;
       } catch (_) { /* not JSON — use raw */ }
 

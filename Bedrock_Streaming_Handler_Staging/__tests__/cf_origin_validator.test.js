@@ -198,6 +198,23 @@ describe('validateCfOriginHeader / secret JSON-or-raw handling', () => {
     });
     expect(result).toEqual({ valid: true, reason: null });
   });
+
+  test('JSON-shaped secret with neither .secret nor .value key warns and falls back to raw', async () => {
+    const rawJson = JSON.stringify({ unknown_key: SECRET_VALUE });
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: rawJson });
+
+    const warnSpy = jest.spyOn(global.console, 'warn');
+    // Effective secret value is the raw JSON string, so the matching header must
+    // also be the raw JSON string. Mismatched header still rejects.
+    const result = await validateCfOriginHeader({
+      headers: { 'x-picasso-cf-origin': rawJson },
+    });
+    expect(result).toEqual({ valid: true, reason: null });
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/JSON without \.secret or \.value key/),
+    );
+    warnSpy.mockRestore();
+  });
 });
 
 describe('validateCfOriginHeader / lifetime cache (success path)', () => {
