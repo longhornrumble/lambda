@@ -1159,5 +1159,13 @@ const bufferedHandler = async (event, context) => {
   }
 };
 
-// Export the appropriate handler based on streaming support
+// Export the appropriate handler based on streaming support.
+//
+// CORS-path asymmetry: under streamifyResponse, the streamingHandler's
+// returned `{statusCode, headers, body}` has its `headers` field silently
+// dropped by AWS — the Lambda URL CORS config is the active CORS gatekeeper
+// for that path. The 16 `corsHeaders(event)` calls above are live only when
+// this export resolves to `bufferedHandler` (local invocation / non-streaming
+// runtime). Keep `cors-helper.js` AND the Lambda URL CORS config in sync;
+// see cors-helper.js module header.
 exports.handler = streamifyResponse ? streamifyResponse(streamingHandler) : bufferedHandler;
