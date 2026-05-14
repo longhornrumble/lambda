@@ -136,12 +136,22 @@ aws lambda get-function-configuration \
    - Lambda → Configuration → Function URL
    - Create function URL
    - Auth type: NONE (or IAM for additional security)
-   - Configure CORS:
+   - Configure CORS (must mirror `cors-helper.js` `ALLOWED_ORIGINS`; `OPTIONS` is intentionally NOT in `AllowMethods` — AWS Lambda URL API rejects method strings >6 chars, and the URL CORS layer handles preflight automatically regardless):
      ```json
      {
-       "AllowOrigins": ["*"],
-       "AllowMethods": ["POST", "OPTIONS"],
-       "AllowHeaders": ["Content-Type", "Authorization", "Accept"],
+       "AllowCredentials": true,
+       "AllowOrigins": [
+         "http://localhost:3000",
+         "http://localhost:5173",
+         "http://localhost:8000",
+         "https://chat.myrecruiter.ai",
+         "https://staging.chat.myrecruiter.ai",
+         "https://picassocode.s3.amazonaws.com",
+         "https://picassostaging.s3.amazonaws.com"
+       ],
+       "AllowMethods": ["GET", "POST"],
+       "AllowHeaders": ["Content-Type", "Authorization", "X-Requested-With", "Accept"],
+       "ExposeHeaders": [],
        "MaxAge": 86400
      }
      ```
@@ -151,13 +161,10 @@ aws lambda get-function-configuration \
    aws lambda create-function-url-config \
      --function-name Bedrock_Streaming_Handler_Staging \
      --auth-type NONE \
-     --cors '{
-       "AllowOrigins": ["*"],
-       "AllowMethods": ["POST","OPTIONS"],
-       "AllowHeaders": ["Content-Type","Authorization","Accept"],
-       "MaxAge": 86400
-     }'
+     --cors '{"AllowCredentials":true,"AllowOrigins":["http://localhost:3000","http://localhost:5173","http://localhost:8000","https://chat.myrecruiter.ai","https://staging.chat.myrecruiter.ai","https://picassocode.s3.amazonaws.com","https://picassostaging.s3.amazonaws.com"],"AllowMethods":["GET","POST"],"AllowHeaders":["Content-Type","Authorization","X-Requested-With","Accept"],"ExposeHeaders":[],"MaxAge":86400}'
    ```
+
+   For prod (`Bedrock_Streaming_Handler`), drop localhost origins from `AllowOrigins` — a localhost origin from a dev machine should never be admitted by a production resource.
 
 **URL Format**: `https://<url-id>.lambda-url.us-east-1.on.aws/`
 
