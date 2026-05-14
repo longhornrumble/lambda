@@ -38,7 +38,8 @@ afterEach(() => {
 const {
   handleFormMode,
   validateFormField,
-  submitForm
+  submitForm,
+  SmsRateLimitError
 } = require('../form_handler');
 
 // Test fixtures
@@ -356,36 +357,32 @@ describe('Form Handler - Phase 2: SMS Rate Limiting', () => {
     );
   });
 
-  it('should skip SMS when monthly limit reached', async () => {
+  it('should return 429 when monthly limit reached (at cap)', async () => {
     dynamoMock.on(GetCommand).resolves({ Item: { count: 100 } });
 
     const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
 
     expect(snsMock.commandCalls(PublishCommand)).toHaveLength(0);
-    expect(result.fulfillment).toContainEqual(
-      expect.objectContaining({
-        channel: 'sms',
-        status: 'skipped',
-        reason: 'monthly_limit_reached',
-        usage: 100,
-        limit: 100
-      })
-    );
+    // SMS cap exhausted: submitForm now returns a 429 structured error response
+    expect(result.statusCode).toBe(429);
+    expect(result.error).toBeDefined();
+    expect(result.status).toBe('rate_limited');
+    // Counter must NOT be incremented past the cap
+    const updateCalls = dynamoMock.commandCalls(UpdateCommand);
+    expect(updateCalls).toHaveLength(0);
   });
 
-  it('should skip SMS when monthly limit exceeded', async () => {
+  it('should return 429 when monthly limit exceeded (over cap)', async () => {
     dynamoMock.on(GetCommand).resolves({ Item: { count: 150 } });
 
     const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
 
     expect(snsMock.commandCalls(PublishCommand)).toHaveLength(0);
-    expect(result.fulfillment).toContainEqual(
-      expect.objectContaining({
-        channel: 'sms',
-        status: 'skipped',
-        reason: 'monthly_limit_reached'
-      })
-    );
+    expect(result.statusCode).toBe(429);
+    expect(result.error).toBeDefined();
+    // Counter must NOT be incremented past the cap
+    const updateCalls = dynamoMock.commandCalls(UpdateCommand);
+    expect(updateCalls).toHaveLength(0);
   });
 
   it('should increment SMS usage counter after sending', async () => {
@@ -453,6 +450,33 @@ describe('Form Handler - Phase 2: SMS Rate Limiting', () => {
 
     // Restore env var
     process.env.SMS_USAGE_TABLE = 'test-sms-usage';
+  });
+
+  // EC-P1.4: T3 threat mitigation — SMS cap-exhausted path returns 429 structured error
+  it('EC-P1.4: SMS cap-exhausted path returns 429 with structured error body', async () => {
+    // Simulate cap exactly at limit (usage === SMS_MONTHLY_LIMIT)
+    dynamoMock.on(GetCommand).resolves({ Item: { count: 100 } });
+
+    const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+
+    // statusCode must be 429
+    expect(result.statusCode).toBe(429);
+
+    // response body must have an `error` field (no cross-tenant info)
+    expect(result.error).toBeDefined();
+    expect(typeof result.error).toBe('string');
+
+    // Must not leak tenant-specific data in the error message
+    expect(result.error).not.toContain('TEST123');
+
+    // SMS counter must NOT be incremented past the cap
+    expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(0);
+
+    // No SMS Lambda invocation must occur
+    const smsInvocations = lambdaMock.commandCalls(InvokeCommand).filter(call =>
+      call.args[0].input.FunctionName === (process.env.SMS_SENDER_FUNCTION || 'SMS_Sender')
+    );
+    expect(smsInvocations).toHaveLength(0);
   });
 });
 
