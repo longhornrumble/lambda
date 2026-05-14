@@ -200,91 +200,6 @@ async function handleAnalyticsEvent(event) {
 }
 
 /**
- * Preview prompt handler - returns the constructed prompt without calling Bedrock
- * This allows the Config Builder UI to preview how prompts will be built
- */
-async function handlePromptPreview(event) {
-  console.log('🔍 Prompt preview handler invoked');
-
-  try {
-    // Parse request
-    const body = event.body ? JSON.parse(event.body) : event;
-    const tenantHash = body.tenant_hash || '';
-    const userInput = body.user_input || 'Hello, how can you help me?';
-    const conversationHistory = body.conversation_history || [];
-    const kbContext = body.kb_context || 'Sample knowledge base context about our services...';
-
-    if (!tenantHash) {
-      return {
-        statusCode: 400,
-        headers: {
-          'Content-Type': 'application/json',
-          ...corsHeaders(event)
-        },
-        body: JSON.stringify({ error: 'Missing tenant_hash' })
-      };
-    }
-
-    // Load config
-    const config = await loadConfig(tenantHash);
-    if (!config) {
-      return {
-        statusCode: 404,
-        headers: {
-          'Content-Type': 'application/json',
-          ...corsHeaders(event)
-        },
-        body: JSON.stringify({ error: 'Config not found for tenant' })
-      };
-    }
-
-    // Build the prompt using V4 pipeline
-    const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-    const prompt = buildV4ConversationPrompt(
-      userInput,
-      kbContext,
-      tonePrompt,
-      conversationHistory,
-      config
-    );
-
-    // Return preview data
-    return {
-      statusCode: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        ...corsHeaders(event)
-      },
-      body: JSON.stringify({
-        tenant_hash: tenantHash,
-        tenant_id: config.tenant_id,
-        prompt_length: prompt.length,
-        prompt: prompt,
-        metadata: {
-          pipeline: 'v4.1',
-          has_topic_definitions: (config.topic_definitions || []).length > 0,
-          tone_prompt: tonePrompt ? 'custom' : 'default'
-        }
-      }, null, 2)
-    };
-
-  } catch (error) {
-    console.error('❌ Preview error:', error);
-    return {
-      statusCode: 500,
-      headers: {
-        'Content-Type': 'application/json',
-        ...corsHeaders(event)
-      },
-      body: JSON.stringify({
-        error: error.message,
-        stack: error.stack
-      })
-    };
-  }
-}
-
-/**
  * Main streaming handler - uses true streaming if available, falls back to buffered
  */
 const streamingHandler = async (event, responseStream, context) => {
@@ -786,16 +701,10 @@ const streamingHandler = async (event, responseStream, context) => {
 const bufferedHandler = async (event, context) => {
   console.log('📡 Handler invoked');
 
-  // Check for preview endpoint
+  // Route to analytics handler
   const queryParams = event.queryStringParameters || {};
   const body = event.body ? JSON.parse(event.body) : event;
 
-  if (queryParams.action === 'preview' || body.action === 'preview') {
-    console.log('🔍 Routing to preview handler');
-    return await handlePromptPreview(event);
-  }
-
-  // Route to analytics handler
   if (queryParams.action === 'analytics' || body.action === 'analytics') {
     console.log('📊 Routing to analytics handler');
     return await handleAnalyticsEvent(event);
