@@ -722,12 +722,14 @@ const bufferedHandler = async (event, context) => {
 
   // Validate CloudFront-injected origin header before any route dispatch.
   // No-op when REQUIRE_CF_ORIGIN_HEADER is unset/false (default rollout).
+  // Quiet 403: no CORS headers in the reject path, mirroring streamingHandler
+  // and Ticket 1's "no CORS-header leak on rejected requests" precedent.
   const cfCheck = await validateCfOriginHeader(event);
   if (!cfCheck.valid) {
     console.warn(`SECURITY: bufferedHandler rejected request: ${cfCheck.reason}`);
     return {
       statusCode: 403,
-      headers: { 'Content-Type': 'application/json', ...corsHeaders(event) },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ error: 'forbidden' }),
     };
   }

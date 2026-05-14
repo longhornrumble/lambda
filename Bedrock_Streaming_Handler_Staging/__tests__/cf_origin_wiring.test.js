@@ -133,3 +133,47 @@ describe('cf-origin-validator wiring / streamingHandler', () => {
     expect(forbiddenChunk).toBeDefined();
   });
 });
+
+describe('cf-origin-validator wiring / bufferedHandler', () => {
+  let bufferedExports;
+
+  beforeAll(() => {
+    // Force the buffered fallback by clearing awslambda before re-requiring.
+    // The buffered path is exercised in non-streaming Lambda invocations.
+    bufferedExports = require('../index.js');
+  });
+
+  beforeEach(() => {
+    validateCfOriginHeader.mockReset();
+  });
+
+  test('rejects with 403 + quiet body when validator returns invalid (no CORS-header leak)', async () => {
+    validateCfOriginHeader.mockResolvedValue({ valid: false, reason: 'missing CF origin header' });
+
+    // Re-require with awslambda cleared so exports.handler resolves to bufferedHandler
+    jest.resetModules();
+    const prevAwsLambda = global.awslambda;
+    global.awslambda = undefined;
+    jest.mock('../cf-origin-validator', () => ({
+      validateCfOriginHeader: jest.fn().mockResolvedValue({ valid: false, reason: 'missing CF origin header' }),
+    }));
+    const mod = require('../index.js');
+
+    const event = {
+      body: JSON.stringify({ tenant_hash: 'abc', user_input: 'hi' }),
+      headers: { origin: 'https://chat.myrecruiter.ai' },
+    };
+    const result = await mod.handler(event, {});
+
+    global.awslambda = prevAwsLambda;
+
+    expect(result.statusCode).toBe(403);
+    expect(result.headers['Content-Type']).toBe('application/json');
+    // No CORS-header leak on the reject path (matches streamingHandler precedent)
+    expect(result.headers).not.toHaveProperty('Access-Control-Allow-Origin');
+    expect(result.headers).not.toHaveProperty('Access-Control-Allow-Methods');
+    expect(result.headers).not.toHaveProperty('Access-Control-Allow-Headers');
+    expect(result.headers).not.toHaveProperty('Access-Control-Allow-Credentials');
+    expect(JSON.parse(result.body)).toEqual({ error: 'forbidden' });
+  });
+});
