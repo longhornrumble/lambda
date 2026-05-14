@@ -30,6 +30,7 @@ const {
 } = require('./prompt_v4');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 const { corsHeaders } = require('./cors-helper');
+const { validateCfOriginHeader } = require('./cf-origin-validator');
 
 // Default model configuration - single source of truth, sourced from
 // BEDROCK_MODEL_ID env var per Phase 4 EC-P4-2 (single point of update
@@ -204,7 +205,25 @@ async function handleAnalyticsEvent(event) {
  */
 const streamingHandler = async (event, responseStream, context) => {
   console.log('🌊 True streaming handler invoked');
-  
+
+  // Validate CloudFront-injected origin header before any route dispatch.
+  // No-op when REQUIRE_CF_ORIGIN_HEADER is unset/false (default rollout).
+  // See cf-origin-validator.js + project_bsh_tenant_impersonation_*.
+  const cfCheck = await validateCfOriginHeader(event);
+  if (!cfCheck.valid) {
+    console.warn(`SECURITY: streamingHandler rejected request: ${cfCheck.reason}`);
+    if (typeof awslambda !== 'undefined' && awslambda.HttpResponseStream) {
+      const httpStream = awslambda.HttpResponseStream.from(responseStream, {
+        statusCode: 403,
+        headers: { 'Content-Type': 'application/json' },
+      });
+      httpStream.end(JSON.stringify({ error: 'forbidden' }));
+    } else {
+      responseStream.end(JSON.stringify({ error: 'forbidden' }));
+    }
+    return;
+  }
+
   // Handle OPTIONS requests - Function URLs handle CORS automatically when configured
   if (event.httpMethod === 'OPTIONS' || event.requestContext?.http?.method === 'OPTIONS') {
     // Don't write empty string, just end the stream
@@ -700,6 +719,18 @@ const streamingHandler = async (event, responseStream, context) => {
  */
 const bufferedHandler = async (event, context) => {
   console.log('📡 Handler invoked');
+
+  // Validate CloudFront-injected origin header before any route dispatch.
+  // No-op when REQUIRE_CF_ORIGIN_HEADER is unset/false (default rollout).
+  const cfCheck = await validateCfOriginHeader(event);
+  if (!cfCheck.valid) {
+    console.warn(`SECURITY: bufferedHandler rejected request: ${cfCheck.reason}`);
+    return {
+      statusCode: 403,
+      headers: { 'Content-Type': 'application/json', ...corsHeaders(event) },
+      body: JSON.stringify({ error: 'forbidden' }),
+    };
+  }
 
   // Route to analytics handler
   const queryParams = event.queryStringParameters || {};
