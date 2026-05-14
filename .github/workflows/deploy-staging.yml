@@ -120,6 +120,30 @@ jobs:
             # Empty Records list exercises cold-start + handler entry with no
             # archive side effects. Expected response: archived=0, no failures.
             smoke_invoke_event: '{"Records":[]}'
+          - source_dir: Analytics_Event_Processor
+            # BSH staging-twin Phase C: SQS-triggered Lambda that consumes
+            # browser analytics events and writes to S3 + DDB session-events.
+            # No `_Staging` suffix per uniform-env-rules in the staging account
+            # (525409062831) — account boundary is env separation. Prod-side
+            # equivalent is `Picasso_Analytics_Event_Processor` (different name
+            # for historical reasons; do not align).
+            staging_function: Analytics_Event_Processor
+            handler: lambda_function.lambda_handler
+            runtime: python
+            # Stdlib + boto3 only; boto3 is bundled in the Lambda runtime, so
+            # no third-party deps to ship. Single runtime file.
+            include_globs: 'lambda_function.py'
+            # Env vars managed by the Phase C Terraform module
+            # (analytics-events-pipeline-staging). Matrix-side env_vars empty
+            # keeps Terraform as single source of truth; matches the
+            # Analytics_Dashboard_API entry above.
+            env_vars: ''
+            smoke_path: ''
+            smoke_expect_status: ''
+            # Empty Records list exercises cold-start + handler entry with no
+            # SQS-message side effects. Matches the picasso_session_archiver
+            # pattern above.
+            smoke_invoke_event: '{"Records":[]}'
           - source_dir: Master_Function_Staging
             # In staging account, Lambda keeps its `_Staging` suffix because
             # the matching prod-account Lambda is `Master_Function` (no
