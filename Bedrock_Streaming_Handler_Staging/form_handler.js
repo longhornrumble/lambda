@@ -43,6 +43,19 @@ const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent'
 const SMS_MONTHLY_LIMIT = parseInt(process.env.SMS_MONTHLY_LIMIT || '100', 10);
 
 /**
+ * Thrown by routeFulfillment when the tenant's monthly SMS cap is exhausted.
+ * Caught specifically in submitForm to return a 429 structured response.
+ */
+class SmsRateLimitError extends Error {
+  constructor(usage, limit) {
+    super('SMS monthly limit reached');
+    this.name = 'SmsRateLimitError';
+    this.usage = usage;
+    this.limit = limit;
+  }
+}
+
+/**
  * Sanitize text for SMS messages - remove special characters that could cause issues
  * @param {string} text - Raw text
  * @param {number} maxLength - Maximum allowed length (default 50)
@@ -365,6 +378,16 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     };
 
   } catch (error) {
+    if (error instanceof SmsRateLimitError) {
+      console.warn(`⚠️ SMS rate limit response: tenant cap exhausted (${error.usage}/${error.limit})`);
+      return {
+        type: 'form_error',
+        statusCode: 429,
+        status: 'rate_limited',
+        error: 'SMS rate limit reached. No SMS notifications were sent.',
+        retryAfter: 'next calendar month',
+      };
+    }
     console.error('❌ Form submission error:', error);
     return {
       type: 'form_error',
@@ -800,7 +823,7 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
     const usage = await getMonthlySMSUsage(config.tenant_id);
     if (usage >= SMS_MONTHLY_LIMIT) {
       console.warn(`⚠️ SMS monthly limit reached for tenant ${config.tenant_id}: ${usage}/${SMS_MONTHLY_LIMIT}`);
-      results.push({ channel: 'sms', status: 'skipped', reason: 'monthly_limit_reached', usage, limit: SMS_MONTHLY_LIMIT });
+      throw new SmsRateLimitError(usage, SMS_MONTHLY_LIMIT);
     } else {
       // Build SMS body from template or default
       const safeName = `${sanitizeForSMS(formData.first_name, 30)} ${sanitizeForSMS(formData.last_name, 30)}`.trim();
@@ -1694,5 +1717,6 @@ function getFieldPriority(key) {
 module.exports = {
   handleFormMode,
   validateFormField,
-  submitForm
+  submitForm,
+  SmsRateLimitError
 };
