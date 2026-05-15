@@ -31,7 +31,12 @@ const NOTIFICATION_SENDS_TABLE = process.env.NOTIFICATION_SENDS_TABLE || 'picass
 const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent';
 const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || '';
 
-// Module-level cache for Telnyx credentials (persists across warm invocations)
+// Module-level cache for Telnyx credentials (persists across warm invocations).
+// Cross-account isolation: this Lambda runs in two accounts (prod 614056832592
+// and staging 525409062831). Each account's execution role has an explicit
+// IAM Deny on cross-account secrets ARNs (DenyAllProd* in staging, and equivalent
+// in prod), so a misconfigured TELNYX_SECRET_NAME pointing at the other account
+// fails at runtime with AccessDenied rather than silently leaking credentials.
 let cachedCredentials = null;
 
 /**
@@ -219,6 +224,16 @@ export async function handler(event) {
     const webhookUrl = WEBHOOK_BASE_URL
       ? `${WEBHOOK_BASE_URL}?${callbackParams.toString()}`
       : undefined;
+
+    // Validate caller-supplied fromNumber to prevent arbitrary-from spoofing in
+    // audit logs. Telnyx rejects unregistered numbers with 4xx, but we'd still
+    // log "sent" in the audit table before that; better to reject upfront.
+    if (fromNumber && !/^\+\d{10,15}$/.test(fromNumber)) {
+      const error = `Invalid fromNumber format: ${fromNumber}. Must be E.164.`;
+      console.error(`❌ ${error}`);
+      await writeAuditRecord(tenantId, null, event, 'failed', error);
+      return { success: false, error };
+    }
 
     // Use per-org number if provided, otherwise fall back to Secrets Manager default
     const senderNumber = fromNumber || credentials.fromNumber;

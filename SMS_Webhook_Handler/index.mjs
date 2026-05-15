@@ -238,18 +238,24 @@ export async function handler(event) {
       ? Buffer.from(event.body, 'base64').toString('utf-8')
       : event.body || '';
 
-    // Verify Telnyx signature
-    if (TELNYX_PUBLIC_KEY) {
-      const signature = event.headers?.['telnyx-signature-ed25519'] || '';
-      const timestamp = event.headers?.['telnyx-timestamp'] || '';
+    // Verify Telnyx signature. Fail-closed when TELNYX_PUBLIC_KEY is not set —
+    // skipping verification on an empty key would let any internet host POST
+    // fabricated message.received events (STOP/UNSTOP keywords) and mutate
+    // consent_given across all tenants for arbitrary phone numbers via the
+    // phone-lookup GSI. TCPA-state must never be writable by an unauthenticated
+    // caller, even briefly.
+    if (!TELNYX_PUBLIC_KEY) {
+      console.error('SECURITY: TELNYX_PUBLIC_KEY not set — refusing request (fail-closed)');
+      return { statusCode: 500, body: 'Server configuration error' };
+    }
 
-      const isValid = verifyTelnyxSignature(rawBody, signature, timestamp, TELNYX_PUBLIC_KEY);
-      if (!isValid) {
-        console.warn('⚠️ Invalid Telnyx signature — rejecting request');
-        return { statusCode: 403, body: 'Invalid signature' };
-      }
-    } else {
-      console.warn('⚠️ TELNYX_PUBLIC_KEY not set — skipping signature validation');
+    const signature = event.headers?.['telnyx-signature-ed25519'] || '';
+    const timestamp = event.headers?.['telnyx-timestamp'] || '';
+
+    const isValid = verifyTelnyxSignature(rawBody, signature, timestamp, TELNYX_PUBLIC_KEY);
+    if (!isValid) {
+      console.warn('⚠️ Invalid Telnyx signature — rejecting request');
+      return { statusCode: 403, body: 'Invalid signature' };
     }
 
     const body = JSON.parse(rawBody);
