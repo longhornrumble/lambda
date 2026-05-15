@@ -240,10 +240,12 @@ jobs:
             # BSH code fails loud at module load if this is missing (throws
             # in index.js initialization).
             env_vars: 'BEDROCK_MODEL_ID=global.anthropic.claude-haiku-4-5-20251001-v1:0'
-            # BSH responds to any GET by initiating an SSE stream. A bare GET
-            # returns 200 with "data: {\"type\":\"start\"}..." in the body.
-            # The smoke just confirms the function is alive.
-            smoke_path: '/'
+            # Phase D cutover (2026-05-15): direct Function URL hits without
+            # x-picasso-cf-origin now 403. Route smoke through CF (which
+            # injects the header on origin `picasso-streaming-lambda`).
+            # Mirrors the MFS pattern above. Closes Phase C YIELD-2 noise.
+            smoke_base_url: 'https://staging.chat.myrecruiter.ai'
+            smoke_path: '/stream'
             smoke_expect_status: '200'
             smoke_invoke_event: ''
           - source_dir: SMS_Sender
