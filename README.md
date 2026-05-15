@@ -23,10 +23,6 @@ This repository contains all Lambda functions for the MyRecruiter Picasso chat w
   - In-memory caching (5-min TTL)
   - Claude 3.5 Haiku model
 
-### 3. Aggregator_Function
-- **Purpose**: Data aggregation and processing
-- **Runtime**: Python 3.x
-
 ## Deployment
 
 Each function should be deployed independently to AWS Lambda.
