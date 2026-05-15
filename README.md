@@ -23,15 +23,7 @@ This repository contains all Lambda functions for the MyRecruiter Picasso chat w
   - In-memory caching (5-min TTL)
   - Claude 3.5 Haiku model
 
-### 3. Analytics_Function
-- **Purpose**: Analytics and metrics collection
-- **Runtime**: Python 3.x
-- **Features**:
-  - CloudWatch metrics reader
-  - Tenant resolution
-  - Usage analytics
-
-### 4. Aggregator_Function
+### 3. Aggregator_Function
 - **Purpose**: Data aggregation and processing
 - **Runtime**: Python 3.x
 
