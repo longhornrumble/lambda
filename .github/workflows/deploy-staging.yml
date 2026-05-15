@@ -346,13 +346,16 @@ jobs:
         working-directory: ${{ matrix.lambda.source_dir }}
         run: |
           set -euo pipefail
-          # `npm ci` (not --production) — esbuild is a devDependency required
-          # for the build step. The output (dist/index.js) is what ships;
-          # node_modules stays on the CI runner.
+          # Per-Lambda `package.json` controls what `npm run package` actually
+          # does. Two patterns observed in this repo:
+          #   - BSH: esbuild bundle → zip -j deployment.zip dist/index.js (single
+          #     file). Needs devDependencies (esbuild) → `npm ci` (not --production).
+          #   - SMS_Sender + SMS_Webhook_Handler: `npm ci --production && zip -r
+          #     deployment.zip .` (vendored node_modules in the zip). The script
+          #     re-runs `npm ci --production` itself, pruning the dev install.
+          # Either way, `npm ci` here is a no-op-ish pre-step; `npm run package`
+          # is the authoritative bundle.
           npm ci
-          # `npm run package` runs esbuild then `zip -j deployment.zip
-          # dist/index.js` per the Lambda's own package.json. Produces a
-          # single-file zip at the source-dir root.
           npm run package
           cp deployment.zip /tmp/deploy.zip
           echo "size=$(stat -c%s /tmp/deploy.zip)" >> "$GITHUB_OUTPUT"
