@@ -206,7 +206,6 @@ _CORS_ALLOWED_ORIGINS_DEFAULT = [
     'https://chat.myrecruiter.ai',
     'https://staging.chat.myrecruiter.ai',  # Added 2026-05-02 — staging widget origin was missing
     'https://picassocode.s3.amazonaws.com',
-    'https://picassostaging.s3.amazonaws.com',
 ]
 
 # Used when no Origin header is present OR the origin is not in the allowlist.

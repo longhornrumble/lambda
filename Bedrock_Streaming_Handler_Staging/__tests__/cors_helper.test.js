@@ -17,7 +17,6 @@ describe('cors-helper / pickOrigin', () => {
     ['https://chat.myrecruiter.ai'],
     ['https://staging.chat.myrecruiter.ai'],
     ['https://picassocode.s3.amazonaws.com'],
-    ['https://picassostaging.s3.amazonaws.com'],
     ['http://localhost:3000'],
     ['http://localhost:5173'],
     ['http://localhost:8000'],
@@ -136,7 +135,6 @@ describe('cors-helper / ALLOWED_ORIGINS', () => {
       'http://localhost:8000',
       'https://chat.myrecruiter.ai',
       'https://picassocode.s3.amazonaws.com',
-      'https://picassostaging.s3.amazonaws.com',
       'https://staging.chat.myrecruiter.ai',
     ]);
   });
