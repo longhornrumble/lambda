@@ -29,7 +29,6 @@ const ALLOWED_ORIGINS = new Set([
   'https://chat.myrecruiter.ai',
   'https://staging.chat.myrecruiter.ai',
   'https://picassocode.s3.amazonaws.com',
-  'https://picassostaging.s3.amazonaws.com',
 ]);
 
 const DEFAULT_ORIGIN = 'https://chat.myrecruiter.ai';
