@@ -1,0 +1,6 @@
+# Bundled into the deployment zip by deploy-staging.yml's Python package step
+# (it reads requirements-layer.txt, NOT requirements.txt). boto3 is provided by
+# the Lambda runtime; jwt (PyJWT) is the only third-party import in
+# lambda_function.py and MUST ship or the handler ImportErrors at cold start.
+# Pin style mirrors Analytics_Dashboard_API/requirements-layer.txt.
+PyJWT>=2.8.0,<3.0.0
