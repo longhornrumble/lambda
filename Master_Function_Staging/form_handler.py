@@ -619,11 +619,22 @@ class FormHandler:
         labeled_data = build_labeled_form_data(responses, form_config)
         form_title = form_config.get('title', form_type)
 
+        # PII Path A Phase 1: additive opaque subject id (best-effort, never fatal).
+        # Nothing reads it until Phase 2; scheduling keeps keying on submission_id.
+        try:
+            from pii_subject import get_or_create_pii_subject_id
+            pii_subject_id = get_or_create_pii_subject_id(self.tenant_id, responses)
+        except Exception as pii_err:  # noqa: BLE001
+            logger.warning("pii_subject index module unavailable (non-fatal): %s",
+                           type(pii_err).__name__)
+            pii_subject_id = 'psub_' + uuid.uuid4().hex
+
         try:
             table = dynamodb.Table(SUBMISSIONS_TABLE)
             table.put_item(
                 Item={
                     'submission_id': submission_id,
+                    'pii_subject_id': pii_subject_id,
                     'tenant_id': self.tenant_id,
                     'tenant_hash': self.tenant_hash,
                     'form_id': form_type,
