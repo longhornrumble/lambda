@@ -25,6 +25,9 @@ on:
           - Bedrock_Streaming_Handler_Staging
           - SMS_Sender
           - SMS_Webhook_Handler
+          - Meta_Webhook_Handler
+          - Meta_Response_Processor
+          - Meta_OAuth_Handler
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -48,6 +51,9 @@ jobs:
       bedrock_streaming_handler_staging: ${{ steps.filter.outputs.bedrock_streaming_handler_staging }}
       sms_sender: ${{ steps.filter.outputs.sms_sender }}
       sms_webhook_handler: ${{ steps.filter.outputs.sms_webhook_handler }}
+      meta_webhook_handler: ${{ steps.filter.outputs.meta_webhook_handler }}
+      meta_response_processor: ${{ steps.filter.outputs.meta_response_processor }}
+      meta_oauth_handler: ${{ steps.filter.outputs.meta_oauth_handler }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -68,6 +74,12 @@ jobs:
               - 'SMS_Sender/**'
             sms_webhook_handler:
               - 'SMS_Webhook_Handler/**'
+            meta_webhook_handler:
+              - 'Meta_Webhook_Handler/**'
+            meta_response_processor:
+              - 'Meta_Response_Processor/**'
+            meta_oauth_handler:
+              - 'Meta_OAuth_Handler/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -91,7 +103,10 @@ jobs:
       needs.detect-changes.outputs.master_function_staging == 'true' ||
       needs.detect-changes.outputs.bedrock_streaming_handler_staging == 'true' ||
       needs.detect-changes.outputs.sms_sender == 'true' ||
-      needs.detect-changes.outputs.sms_webhook_handler == 'true'
+      needs.detect-changes.outputs.sms_webhook_handler == 'true' ||
+      needs.detect-changes.outputs.meta_webhook_handler == 'true' ||
+      needs.detect-changes.outputs.meta_response_processor == 'true' ||
+      needs.detect-changes.outputs.meta_oauth_handler == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -292,6 +307,55 @@ jobs:
             # Smoke skipped pre-P-0: handler reads TELNYX_PUBLIC_KEY from
             # the secret (placeholder pre-procurement). Real smoke happens
             # via EC-B.10 post-procurement (Telnyx-signed POST to Function URL).
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Meta_Webhook_Handler
+            # Meta Messenger project — Node.js Lambda, esbuild bundle (same
+            # packaging as Bedrock_Streaming_Handler_Staging). Public Function
+            # URL; HMAC-SHA256 verify in handler. Env vars Terraform-managed
+            # (lambda-meta-staging module) — matrix env_vars empty keeps
+            # Terraform the single source of truth.
+            staging_function: Meta_Webhook_Handler
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # Smoke skipped: a GET without a valid hub.verify_token 403s by
+            # design. Real end-to-end validation is Phase C (Meta App
+            # Dashboard webhook challenge + live message).
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Meta_Response_Processor
+            # Meta Messenger project — Node.js Lambda, esbuild bundle.
+            # Async-invoked by Meta_Webhook_Handler (no Function URL). Reuses
+            # shared/bedrock-core for cross-account KB (@aws-sdk/credential-
+            # providers bundled per #127). Env vars Terraform-managed.
+            staging_function: Meta_Response_Processor
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # Smoke skipped: a synthetic invoke would attempt KMS decrypt +
+            # Bedrock + Meta Send API and throw (matches SMS_Sender rationale).
+            # Real validation is Phase C4 (live Messenger message → KB reply).
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Meta_OAuth_Handler
+            # Meta Messenger project — Python Lambda (OAuth connect/callback +
+            # channels mgmt). Public Function URL. PyJWT ships via
+            # requirements-layer.txt (the Python package step reads that file,
+            # NOT requirements.txt). Env vars Terraform-managed.
+            staging_function: Meta_OAuth_Handler
+            handler: lambda_function.lambda_handler
+            runtime: python
+            include_globs: 'lambda_function.py'
+            env_vars: ''
+            # Smoke skipped: routes are signed-state-JWT / Clerk-JWT gated;
+            # a bare probe is non-deterministic. Real validation is Phase C1
+            # (live OAuth connect of the operator test Page).
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
