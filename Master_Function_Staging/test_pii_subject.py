@@ -57,15 +57,16 @@ def test_normalize_email_deterministic(raw, expected):
 @pytest.mark.parametrize(
     "bad",
     [None, "", "   ", "noatsign", "@nolocal.com", "local@", "a@b@gmail.com",
-     "+@example.com"],  # plus-only local -> empty after... (gmail) / kept (non-gmail)
+     "a b@gmail.com", "a\tb@example.com"],  # incl. internal-whitespace (R1)
 )
 def test_normalize_email_invalid_returns_none(bad):
-    # "+@example.com": non-gmail keeps "+", so it is actually VALID now — assert
-    # the real contract rather than a stale expectation.
-    if bad == "+@example.com":
-        assert normalize_email(bad) == "+@example.com"
-    else:
-        assert normalize_email(bad) is None
+    assert normalize_email(bad) is None
+
+
+def test_normalize_email_non_gmail_plus_preserved():
+    # #6 option A: non-Gmail '+' is preserved (not a provider-guaranteed alias).
+    assert normalize_email("+@example.com") == "+@example.com"
+    assert normalize_email("user+tag@example.com") == "user+tag@example.com"
 
 
 def test_normalize_gmail_plus_strip_semantics():
@@ -149,6 +150,17 @@ def test_get_or_create_empty_index_value_not_reused(tmp_path):
     sid = get_or_create_pii_subject_id("T1", {"email": "a@b.com"}, table=tbl)
     assert sid.startswith("psub_") and sid != ""
     assert tbl.get_item.call_count == _MAX_INDEX_ATTEMPTS  # bounded, no infinite loop
+    assert tbl.put_item.call_count == _MAX_INDEX_ATTEMPTS  # every iteration tried a write
+
+
+def test_get_or_create_non_ccf_clienterror_on_first_get_is_non_fatal():
+    """R9: AccessDenied on the very FIRST index read -> best-effort usable id
+    (the operationally-significant IAM-gap failure mode)."""
+    tbl = MagicMock()
+    tbl.get_item.side_effect = ClientError(
+        {"Error": {"Code": "AccessDeniedException"}}, "GetItem")
+    sid = get_or_create_pii_subject_id("T1", {"email": "a@b.com"}, table=tbl)
+    assert sid.startswith("psub_")
 
 
 def test_get_or_create_race_returns_winner():
@@ -252,7 +264,8 @@ def test_read_subject_id_new_shape_returns_value():
 
 
 @pytest.mark.parametrize("bad_record", [None, "str", 123, [], {"pii_subject_id": ""},
-                                        {"pii_subject_id": None}])
+                                        {"pii_subject_id": None},
+                                        {"pii_subject_id": 42}])
 def test_read_subject_id_robust_to_garbage(bad_record):
     # Never raises; empty/None/non-str/non-dict all collapse to None.
     assert read_subject_id(bad_record) is None

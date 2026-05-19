@@ -81,6 +81,8 @@ def normalize_email(email: Any) -> Optional[str]:
     if email is None:
         return None
     e = str(email).strip()
+    if not e or any(ch.isspace() for ch in e):
+        return None  # internal whitespace ⇒ not a usable address (R1)
     if "@" not in e:
         return None
     local, _, domain = e.rpartition("@")

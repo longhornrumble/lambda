@@ -212,6 +212,9 @@ class TestFormHandler(unittest.TestCase):
         # additive field present + opaque-prefixed on every row
         self.assertTrue(item1['pii_subject_id'].startswith('psub_'))
         self.assertTrue(item2['pii_subject_id'].startswith('psub_'))
+        # R9: a stored Phase-1 row is readable via the canonical Phase-2 reader
+        self.assertEqual(pii_subject.read_subject_id(item1), item1['pii_subject_id'])
+        self.assertEqual(pii_subject.read_subject_id(item2), item2['pii_subject_id'])
         # same person -> same subject id (the indexed reuse path actually ran)
         self.assertEqual(item1['pii_subject_id'], item2['pii_subject_id'])
         # the index really holds the entry (non-gmail: lowercased, dots/+ kept)
