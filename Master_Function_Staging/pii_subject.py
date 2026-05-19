@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 import boto3
@@ -23,14 +24,18 @@ from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
-# Account = env: code default targets the staging table; the Lambda env var
-# (PII_SUBJECT_INDEX_TABLE) + IAM grant are wired at the Phase 1->2 boundary.
+# Account=env: the Lambda env var PII_SUBJECT_INDEX_TABLE + the MFS IAM grant are
+# wired in Terraform in Phase 1, atomic with this code (gate blocker B2). The
+# default below is STAGING-ONLY. A prod promotion MUST set this env var — a prod
+# Lambda silently falling back to this staging name would write to the wrong
+# account and orphan every subject. Recorded as a Phase-2/promotion gate item.
 PII_SUBJECT_INDEX_TABLE = os.environ.get(
     "PII_SUBJECT_INDEX_TABLE", "picasso-pii-subject-index-staging"
 )
 
 # Bounded retry for the get -> conditional-put race (gate blocker B1). 3 is ample:
-# each lost race means a winner committed, so attempt 2's consistent read resolves it.
+# each lost race means a winner committed, so the next iteration's strongly-
+# consistent read resolves it.
 _MAX_INDEX_ATTEMPTS = 3
 
 _GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
@@ -54,6 +59,19 @@ def mint_pii_subject_id() -> str:
     return "psub_" + uuid.uuid4().hex
 
 
+def read_subject_id(record: Any) -> Optional[str]:
+    """Canonical forward-compatible reader of ``pii_subject_id`` off a stored
+    record. Pre-Phase-1 rows have no such field and yield ``None`` — never
+    raises. Phase-2+ readers MUST call this rather than bracket-access the
+    field, so old-shape prod rows never crash a reader (CLAUDE.md schema
+    discipline). This is the reader the forward-compat fixture exercises.
+    """
+    if not isinstance(record, dict):
+        return None
+    sid = record.get("pii_subject_id")
+    return sid if isinstance(sid, str) and sid else None
+
+
 def normalize_email(email: Any) -> Optional[str]:
     """Deterministic email normalization (PII Identity Contract §4).
 
@@ -70,10 +88,15 @@ def normalize_email(email: Any) -> Optional[str]:
         return None
     domain = domain.lower()
     local = local.lower()
-    if "+" in local:
-        local = local.split("+", 1)[0]
+    # Only Gmail's dot/plus aliasing is provider-guaranteed to deliver every
+    # variant to one inbox, so only Gmail is safe to collapse. Stripping +tag
+    # for other providers was an unverified assumption that created an
+    # imposter-deletion vector (audit 2026-05-18 #6, option A) — do NOT alter
+    # non-Gmail local parts beyond lowercase/trim.
     if domain in _GMAIL_DOMAINS:
         domain = "gmail.com"
+        if "+" in local:
+            local = local.split("+", 1)[0]
         local = local.replace(".", "")
     if not local:
         return None
@@ -127,9 +150,12 @@ def get_or_create_pii_subject_id(
         for attempt in range(_MAX_INDEX_ATTEMPTS):
             existing = tbl.get_item(
                 Key=key, ConsistentRead=(attempt > 0)
-            ).get("Item")
-            if existing and existing.get("pii_subject_id"):
-                return existing["pii_subject_id"]
+            ).get("Item") or {}
+            existing_sid = existing.get("pii_subject_id")
+            # Require a non-empty string: a corrupted/empty index value must not
+            # be reused (silent divergence) nor spin the loop forever (#7).
+            if isinstance(existing_sid, str) and existing_sid:
+                return existing_sid
             try:
                 tbl.put_item(
                     Item={
@@ -149,24 +175,30 @@ def get_or_create_pii_subject_id(
                     continue  # someone won the race; loop re-reads consistently
                 raise
 
-        # Persistent unresolved race (winner put-then-deleted repeatedly — degenerate).
-        # NOT a silent divergent mint: the row is recorded UNINDEXED, which is exactly
-        # the pre-Phase-1 shape that locked decision #5 (backfill/TTL) already covers.
+        # Unresolved race (and the non-CCF error path below): the submission still
+        # gets a usable id, but it is UNINDEXED. Across multiple submissions this
+        # ORPHANS the row — the next submission mints a fresh indexed id, and the
+        # Phase-2 delete pipeline walks FROM the index, so it would silently miss
+        # this row (incomplete deletion = compliance failure). This is ONLY closed
+        # by the Phase-2 orphan-sweep gate (sweep form-submissions for
+        # pii_subject_id absent from the index — see PII_IDENTITY_CONTRACT §7/§8).
+        # A submission must never fail for this, so we stay best-effort + log loud.
         logger.warning(
             "pii_subject index race unresolved after %d attempts (tenant=%s); "
-            "row recorded UNINDEXED — legacy-equivalent, Phase-2 backfill covers it",
+            "row is UNINDEXED — incomplete-deletion risk, requires Phase-2 "
+            "orphan-sweep gate",
             _MAX_INDEX_ATTEMPTS,
             tenant_id,
         )
         return candidate
     except Exception as err:  # noqa: BLE001 - index access is best-effort, never fatal
         logger.warning(
-            "pii_subject index unavailable (non-fatal): %s", type(err).__name__
+            "pii_subject index unavailable (non-fatal): %s — row is UNINDEXED, "
+            "requires the Phase-2 orphan-sweep gate (incomplete-deletion risk)",
+            type(err).__name__,
         )
         return candidate
 
 
 def _now_iso() -> str:
-    from datetime import datetime, timezone
-
     return datetime.now(timezone.utc).isoformat()
