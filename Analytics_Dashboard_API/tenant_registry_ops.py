@@ -175,8 +175,37 @@ def update_tenant(tenant_id, fields):
 
 # --- Employee Operations ---
 
-def put_employee(tenant_id, employee_id, record):
-    """Write a full employee record."""
+def validate_scheduling_tags(scheduling_tags, vocabulary):
+    """Reject scheduling_tags not present in the tenant's scheduling_tag_vocabulary.
+
+    Pure — no I/O. The caller supplies `vocabulary` (the tenant config's
+    `scheduling.scheduling_tag_vocabulary`); this module never reads tenant
+    config itself. When `vocabulary` is None the caller has not resolved it
+    yet (sub-phase B5 wires the real source) and validation is skipped — the
+    fields still persist so B5 has data to operate on.
+
+    Raises ValueError listing the offending tags.
+    """
+    if not scheduling_tags:
+        return
+    if vocabulary is None:
+        return
+    allowed = set(vocabulary)
+    invalid = [t for t in scheduling_tags if t not in allowed]
+    if invalid:
+        raise ValueError(
+            f"scheduling_tags not in tenant scheduling_tag_vocabulary: {invalid}"
+        )
+
+
+def put_employee(tenant_id, employee_id, record, scheduling_tag_vocabulary=None):
+    """Write a full employee record.
+
+    `scheduling_tag_vocabulary` (optional): when provided and the record
+    carries `scheduling_tags`, the tags are validated against it before the
+    write (raises ValueError on a violation). Callers that have not resolved
+    the vocabulary pass None and the tags persist unvalidated (B5 path).
+    """
     item = {
         'tenantId': {'S': tenant_id},
         'employeeId': {'S': employee_id},
@@ -224,6 +253,20 @@ def put_employee(tenant_id, employee_id, record):
                         nested[nk] = {'S': nv}
                 prefs_map[k] = {'M': nested}
         item['notificationPrefs'] = {'M': prefs_map}
+
+    # scheduling_tags: optional list of strings drawn from the tenant's
+    # scheduling.scheduling_tag_vocabulary. Omit when absent/empty so old
+    # rows stay forward-compatible (readers must tolerate its absence).
+    scheduling_tags = record.get('scheduling_tags')
+    if scheduling_tags:
+        validate_scheduling_tags(scheduling_tags, scheduling_tag_vocabulary)
+        item['scheduling_tags'] = {'L': [{'S': str(t)} for t in scheduling_tags]}
+
+    # calendar_email_override: optional, the email B5's onboarding hook uses
+    # for this coordinator's calendar when it differs from `email`.
+    calendar_email_override = record.get('calendar_email_override')
+    if calendar_email_override:
+        item['calendar_email_override'] = {'S': calendar_email_override}
 
     dynamodb.put_item(TableName=EMPLOYEE_TABLE, Item=item)
     return _unmarshall(item)
