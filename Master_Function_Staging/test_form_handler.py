@@ -16,6 +16,7 @@ import pytest
 
 # Import the module under test
 from form_handler import FormHandler
+import pii_subject  # PII Path A Phase 1 — for index-table integration assertions
 
 
 class TestFormHandler(unittest.TestCase):
@@ -139,7 +140,6 @@ class TestFormHandler(unittest.TestCase):
             AttributeDefinitions=[{'AttributeName': 'submission_id', 'AttributeType': 'S'}],
             BillingMode='PAY_PER_REQUEST'
         )
-
         handler = FormHandler(self.tenant_config)
 
         # Store submission
@@ -159,6 +159,69 @@ class TestFormHandler(unittest.TestCase):
         self.assertEqual(item['form_type'], 'volunteer_signup')
         self.assertEqual(item['responses']['first_name'], 'John')
         self.assertEqual(item['status'], 'pending_fulfillment')
+
+    def test_store_submission_writes_and_indexes_pii_subject_id(self):
+        """SC4 (audit #1): _store_submission writes an ADDITIVE pii_subject_id and
+        a repeat submission from the same email REUSES it (the real indexed path).
+
+        Moto-independent on purpose: the @mock_dynamodb form_handler suite is a
+        PRE-EXISTING harness break (form_handler.py builds its boto3 resource at
+        import, before moto activates — see audit C2). This deterministic mock
+        proves SC4 without depending on that broken harness.
+        """
+        import form_handler as fh
+
+        class _FakeIndex:
+            def __init__(self):
+                self.store = {}
+
+            def get_item(self, Key, ConsistentRead=False):
+                v = self.store.get((Key['tenant_id'], Key['normalized_email']))
+                return {'Item': v} if v else {}
+
+            def put_item(self, Item, ConditionExpression=None):
+                k = (Item['tenant_id'], Item['normalized_email'])
+                if ConditionExpression and k in self.store:
+                    raise ClientError(
+                        {'Error': {'Code': 'ConditionalCheckFailedException'}},
+                        'PutItem')
+                self.store[k] = Item
+
+        fake_index = _FakeIndex()
+        fake_res = MagicMock()
+        fake_res.Table.return_value = fake_index
+        pii_subject._dynamodb = fake_res
+        self.addCleanup(setattr, pii_subject, '_dynamodb', None)
+
+        stored = {}
+        subs_table = MagicMock()
+        subs_table.put_item.side_effect = (
+            lambda Item: stored.__setitem__(Item['submission_id'], Item))
+
+        handler = FormHandler(self.tenant_config)
+        responses = {'first_name': 'John', 'email': 'John.Doe@Example.com'}
+
+        with patch.object(fh, 'dynamodb') as md:
+            md.Table.return_value = subs_table
+            sid1 = handler._store_submission('volunteer_signup', responses,
+                                             'sess_1', 'conv_1')
+            sid2 = handler._store_submission('volunteer_signup', responses,
+                                             'sess_2', 'conv_2')
+
+        item1, item2 = stored[sid1], stored[sid2]
+        # additive field present + opaque-prefixed on every row
+        self.assertTrue(item1['pii_subject_id'].startswith('psub_'))
+        self.assertTrue(item2['pii_subject_id'].startswith('psub_'))
+        # R9: a stored Phase-1 row is readable via the canonical Phase-2 reader
+        self.assertEqual(pii_subject.read_subject_id(item1), item1['pii_subject_id'])
+        self.assertEqual(pii_subject.read_subject_id(item2), item2['pii_subject_id'])
+        # same person -> same subject id (the indexed reuse path actually ran)
+        self.assertEqual(item1['pii_subject_id'], item2['pii_subject_id'])
+        # the index really holds the entry (non-gmail: lowercased, dots/+ kept)
+        self.assertEqual(
+            fake_index.store[('test_tenant_123', 'john.doe@example.com')]
+            ['pii_subject_id'],
+            item1['pii_subject_id'])
 
     @mock_dynamodb
     def test_store_submission_error(self):
