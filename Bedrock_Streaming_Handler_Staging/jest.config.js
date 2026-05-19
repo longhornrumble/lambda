@@ -19,6 +19,7 @@ module.exports = {
     'response_enhancer.js',
     'index.js',
     'clerk_helper.js',
+    'prompt_v4.js',
     '!node_modules/**',
     '!coverage/**',
     '!__tests__/**'
@@ -37,6 +38,21 @@ module.exports = {
       functions: 60,
       lines: 55,
       statements: 55,
+    },
+    // prompt_v4.js: included in coverage (scheduling sub-phase A1 / audit
+    // Row 2) so the intent-label additions are measured + regression-guarded.
+    // A1's added lines (intentLabel start_scheduling/resume_scheduling →
+    // SCHEDULE) are 100% covered by __tests__/prompt_v4_intent_label.test.js;
+    // the rest of the file is legacy prompt-builder code out of sub-phase-A
+    // scope. Path-keyed → Jest excludes it from the global pool, so the
+    // global ratchet still guards the other BSH files. Ratchet set just
+    // below current measured (stmts 31.35 / br 23.5 / fns 31.57 / ln 32.42)
+    // per this config's ratchet convention — raise as coverage improves.
+    './prompt_v4.js': {
+      branches: 22,
+      functions: 30,
+      lines: 31,
+      statements: 30,
     },
   },
   setupFilesAfterEnv: ['<rootDir>/__tests__/setup.js'],
