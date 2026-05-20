@@ -24,24 +24,29 @@ RESPONSE (JSON):
       "status":            "completed" | "partial" | "failed",
       "pii_subject_id":    "<resolved-opaque-id | null>",
       "rows_touched":      {"<surface>": <count>, ...},
+      "exported_rows":     {"<surface>": [<row>, ...], ...},   # access only
       "manual_followups":  ["<human-readable-todo>", ...],
       "audit_row_pks":     ["<dsar_id|event_timestamp>", ...]
     }
 
-WHAT THIS SCAFFOLD DOES (milestone 1 / PR C):
+WHAT THIS LAMBDA DOES TODAY:
     - Cold-start env-guard (refuse to run outside account 525)
     - Input validation (required fields, supported types, dry_run default)
     - Subject resolution: identifier → pii_subject_id via picasso-pii-subject-index-staging
     - Audit writes (request_received + closed events to picasso-pii-dsar-audit-staging)
-    - Per-surface walkers return manual_followup until their attribute schemas are
-      verified against MFS writer code (separate follow-up PR per surface)
+    - form-submissions walker — tenant-scoped Query + FilterExpression on
+      pii_subject_id; access returns rows in exported_rows; delete dry-runs by
+      default; explicit dry_run=false performs DeleteItem per matched row
+    - Remaining surfaces (notification-sends/events, recent-messages,
+      conversation-summaries, audit) return manual_followup until each surface's
+      subject-linking attribute is verified against MFS writer code
 
 WHAT IT DOES NOT YET DO (follow-up PRs):
-    - form-submissions / notification-* / recent-messages / conversation-summaries
-      actual row enumeration + deletion (need MFS writer attribute schemas)
-    - picasso-audit-staging read for access-type DSARs (same — Art 17(3)(b) read-only)
+    - Per-surface walkers for the 5 remaining MFS surfaces (one PR per surface)
+    - picasso-audit-staging read for access-type DSARs (Art 17(3)(b) read-only)
     - Meta channel-mappings PSID-keyed walk (milestone 2 / item 1b)
     - S3 / ARCHIVE_BUCKET walks (milestone 2 / item 1b)
+    - Pre-Phase-1 form-submission backfill walk (deferred per Apply-2)
 
 The Lambda is intentionally deployable and invocable now. Calls succeed end-to-end
 (env-guard → validate → resolve subject → audit-write → response) and produce a
@@ -55,6 +60,7 @@ import re
 from datetime import datetime, timezone
 
 import boto3
+from boto3.dynamodb.conditions import Attr, Key
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -68,16 +74,13 @@ EXPECTED_ACCOUNT = "525409062831"
 # Staging table names — single source of truth (matches infra/modules/* locals).
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
 TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit-staging"
+TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
 
-# Surfaces walked by milestone 1. Each entry's value is the human-readable
-# "implementation deferred" reason returned in manual_followups until the
-# per-surface walker lands.
+# Surfaces still scaffolded with deferred walkers. form-submissions has its
+# walker implemented (`_walk_form_submissions`); the rest return human-readable
+# manual_followup until each surface's subject-linking attribute is verified
+# against the MFS writer code.
 MFS_SCOPED_SURFACES = {
-    "form-submissions": (
-        "Walker pending: form-submissions has no PiiSubjectIdIndex GSI yet "
-        "(Apply-3 deferred per D5). Implementation requires Scan + "
-        "FilterExpression on pii_subject_id; lands in follow-up PR."
-    ),
     "notification-sends": (
         "Walker pending: subject-linking attribute on pk/sk schema not yet "
         "documented; requires reading MFS notification_hub writer code first."
@@ -242,28 +245,146 @@ def _write_audit_event(dsar_id, event_type, status, payload):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Per-surface walkers (scaffold — return manual_followup until verified)
+# Per-surface walkers
 # ───────────────────────────────────────────────────────────────────────────
-def _walk_mfs_surfaces(pii_subject_id, tenant_id, request_type, dry_run):
-    """Returns (rows_touched, manual_followups).
+def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
+    """Walk picasso-form-submissions-staging for one subject under one tenant.
 
-    Per-surface walker implementation is deferred (see MFS_SCOPED_SURFACES).
-    This scaffold returns zero rows_touched + a manual_followup per surface so
-    the response shape matches the contract and the operator gets honest
-    "implementation pending" signal rather than a silent zero.
+    Access pattern: tenant-scoped Query (PK=tenant_id) + FilterExpression on
+    pii_subject_id. The PiiSubjectIdIndex GSI is forward-referenced in IAM but
+    not yet created (Apply-3 deferred per D5). Tenant-scoped Query bounds the
+    read to one partition — far cheaper than a full-table Scan, and matches
+    the v3 §F12 procedure-mitigated reachability pattern.
+
+    request_type:
+      - "access":            return matched rows in `exported_rows`
+      - "delete" + dry_run=True:  count only; no DeleteItem calls
+      - "delete" + dry_run=False: DeleteItem per matched row
+
+    Coverage gap (explicit, documented in manual_followup): only rows that
+    carry the pii_subject_id attribute are matched. Pre-Phase-1 rows
+    (submissions before lambda #130, 2026-05-18) lack the attribute. The
+    durable fix is Apply-2 backfill (deferred); the interim is a manual
+    email-keyed walk on suspected pre-Phase-1 subjects.
     """
-    rows_touched = {surface: 0 for surface in MFS_SCOPED_SURFACES}
-    manual_followups = [
-        f"{surface}: {reason}" for surface, reason in MFS_SCOPED_SURFACES.items()
-    ]
+    table = ddb.Table(TABLE_FORM_SUBMISSIONS)
+
+    matched = []
+    last_evaluated_key = None
+    while True:
+        kwargs = {
+            "KeyConditionExpression": Key("tenant_id").eq(tenant_id),
+            "FilterExpression": Attr("pii_subject_id").eq(pii_subject_id),
+        }
+        if last_evaluated_key:
+            kwargs["ExclusiveStartKey"] = last_evaluated_key
+        try:
+            resp = table.query(**kwargs)
+        except ClientError as exc:
+            logger.error(
+                "form_submissions_query_failed: tenant=%s subject=%s code=%s",
+                tenant_id, pii_subject_id,
+                exc.response.get("Error", {}).get("Code"),
+            )
+            return {"rows_found": 0, "error": "query_failed"}
+        matched.extend(resp.get("Items", []))
+        last_evaluated_key = resp.get("LastEvaluatedKey")
+        if not last_evaluated_key:
+            break
+
+    rows_found = len(matched)
+
+    if request_type == "access":
+        return {
+            "rows_found": rows_found,
+            "action": "exported",
+            "exported_rows": matched,
+        }
+
+    # request_type == "delete"
+    if dry_run:
+        return {"rows_found": rows_found, "action": "dry_run_count"}
+
+    deleted = 0
+    for row in matched:
+        try:
+            table.delete_item(Key={
+                "tenant_id": row["tenant_id"],
+                "submission_id": row["submission_id"],
+            })
+            deleted += 1
+        except ClientError as exc:
+            logger.error(
+                "form_submissions_delete_failed: submission=%s code=%s",
+                row.get("submission_id"),
+                exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
+        "action": "deleted",
+        "rows_deleted": deleted,
+    }
+
+
+def _walk_mfs_surfaces(pii_subject_id, tenant_id, request_type, dry_run):
+    """Dispatch per-surface walkers.
+
+    Returns (rows_touched: Dict[str,int], manual_followups: List[str],
+             exported_rows: Dict[str, List[dict]]).
+
+    form-submissions has a real walker (`_walk_form_submissions`); the surfaces
+    in MFS_SCOPED_SURFACES still return manual_followup until their schemas are
+    verified against MFS writer code.
+    """
+    rows_touched = {"form-submissions": 0}
+    rows_touched.update({s: 0 for s in MFS_SCOPED_SURFACES})
+    manual_followups = []
+    exported_rows = {}
+
     if pii_subject_id is None:
-        manual_followups.insert(
-            0,
+        manual_followups.append(
             "Subject not found in pii-subject-index. If subject has known "
             "interactions, MFS may not have written the index entry — "
-            "investigate via picasso-audit-staging Query on tenant.",
+            "investigate via picasso-audit-staging Query on tenant."
         )
-    return rows_touched, manual_followups
+        # No walker can run without a pii_subject_id; emit followups for all.
+        manual_followups.append(
+            "form-submissions: skipped (no pii_subject_id resolved)"
+        )
+        for surface, reason in MFS_SCOPED_SURFACES.items():
+            manual_followups.append(f"{surface}: {reason}")
+        return rows_touched, manual_followups, exported_rows
+
+    # form-submissions: real walker.
+    fs = _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run)
+    rows_touched["form-submissions"] = fs["rows_found"]
+    if fs.get("error"):
+        manual_followups.append(
+            f"form-submissions: query failed ({fs['error']}); retry advised"
+        )
+    elif fs.get("action") == "exported":
+        exported_rows["form-submissions"] = fs["exported_rows"]
+    elif fs.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"form-submissions: dry_run=true; {fs['rows_found']} row(s) would "
+            f"be deleted; re-invoke with dry_run=false to delete"
+        )
+    # action == "deleted" → successful real delete; no followup needed.
+
+    # Coverage gap noted whenever the walker ran (even with 0 rows): operator
+    # may need to manually walk pre-Phase-1 rows that lack pii_subject_id.
+    manual_followups.append(
+        "form-submissions: walker filters by pii_subject_id (Phase-1 attribute "
+        "from lambda #130). Submissions written before 2026-05-18 do not carry "
+        "this attribute; durable fix = Apply-2 backfill (deferred); interim = "
+        "manual email-keyed walk if a pre-Phase-1 subject is suspected."
+    )
+
+    # Other surfaces: still scaffolded.
+    for surface, reason in MFS_SCOPED_SURFACES.items():
+        manual_followups.append(f"{surface}: {reason}")
+
+    return rows_touched, manual_followups, exported_rows
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -306,16 +427,16 @@ def lambda_handler(event, context):
         dsar_id, inputs["tenant_id"], pii_subject_id is not None,
     )
 
-    rows_touched, manual_followups = _walk_mfs_surfaces(
+    rows_touched, manual_followups, exported_rows = _walk_mfs_surfaces(
         pii_subject_id=pii_subject_id,
         tenant_id=inputs["tenant_id"],
         request_type=inputs["request_type"],
         dry_run=inputs["dry_run"],
     )
 
-    # Status: "partial" because all per-surface walkers are deferred. When
-    # walkers ship, the rule becomes: "completed" if all walks succeeded;
-    # "partial" if any returned a manual_followup; "failed" if any raised.
+    # Status: "partial" while any walker is still deferred OR any walker
+    # returned a manual_followup. When all walkers ship, the rule becomes
+    # "completed" iff len(manual_followups) == 0; "failed" if any walker raised.
     closed_ts = _write_audit_event(
         dsar_id=dsar_id,
         event_type="closed",
@@ -324,6 +445,7 @@ def lambda_handler(event, context):
             "pii_subject_id_found": pii_subject_id is not None,
             "rows_touched": rows_touched,
             "manual_followups_count": len(manual_followups),
+            "exported_surfaces": list(exported_rows.keys()),
         },
     )
 
@@ -332,6 +454,7 @@ def lambda_handler(event, context):
         "status": "partial",
         "pii_subject_id": pii_subject_id,
         "rows_touched": rows_touched,
+        "exported_rows": exported_rows,
         "manual_followups": manual_followups,
         "audit_row_pks": [
             f"{dsar_id}|{received_ts}",
