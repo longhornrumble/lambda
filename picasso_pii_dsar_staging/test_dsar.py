@@ -431,10 +431,52 @@ def test_ns_walker_access_exports_matched_rows_and_captures_message_ids(dsar):
     assert result["action"] == "exported"
     assert len(result["exported_rows"]) == 2
     assert result["message_ids"] == ["m1", "m2"]
-    # FilterExpression must constrain to recipient
+    # Audit fix-now-2 #1 (2026-05-21): walker drops FilterExpression and
+    # post-filters in Python for case-insensitive recipient match
+    # (writers store recipient verbatim — see F-DSAR3).
     args, kwargs = ns_table.query.call_args
-    assert "FilterExpression" in kwargs
+    assert "FilterExpression" not in kwargs
     ns_table.delete_item.assert_not_called()
+
+
+def test_ns_walker_case_insensitive_recipient_match(dsar):
+    """Audit fix-now-2 #1 (2026-05-21): walker matches recipients case-
+    insensitively to bridge the writer-normalization gap (F-DSAR3).
+    Writers store `Person@Example.COM` raw; walker must match when operator
+    submits `person@example.com`."""
+    mod, mock_ddb, _ = dsar
+    ns_table = MagicMock()
+    ns_table.query.return_value = {"Items": [
+        _ns_row("m1", recipient="Person@Example.COM"),     # mixed case
+        _ns_row("m2", recipient="  person@example.com  "),  # whitespace
+        _ns_row("m3", recipient="other@example.com"),       # no match
+    ]}
+    mock_ddb.Table.return_value = ns_table
+    result = mod._walk_notification_sends(
+        tenant_id="TEN123", normalized_email="person@example.com",
+        request_type="access", dry_run=True,
+    )
+    assert result["rows_found"] == 2
+    assert result["message_ids"] == ["m1", "m2"]
+
+
+def test_ns_walker_handles_non_string_recipient_gracefully(dsar):
+    """Rows with missing or non-string recipient must be excluded, not crash."""
+    mod, mock_ddb, _ = dsar
+    ns_table = MagicMock()
+    ns_table.query.return_value = {"Items": [
+        _ns_row("m1", recipient="test@x.co"),
+        {"pk": "TENANT#TEN123", "sk": "x", "message_id": "m2"},  # no recipient
+        {"pk": "TENANT#TEN123", "sk": "y", "recipient": None, "message_id": "m3"},
+        {"pk": "TENANT#TEN123", "sk": "z", "recipient": 42, "message_id": "m4"},
+    ]}
+    mock_ddb.Table.return_value = ns_table
+    result = mod._walk_notification_sends(
+        tenant_id="TEN123", normalized_email="test@x.co",
+        request_type="access", dry_run=True,
+    )
+    assert result["rows_found"] == 1
+    assert result["message_ids"] == ["m1"]
 
 
 def test_ns_walker_delete_dry_run_returns_message_ids_but_no_deletes(dsar):
@@ -648,7 +690,36 @@ def test_ne_walker_paginates_per_message_id(dsar):
     assert ne_table.query.call_count == 3
 
 
-def test_ne_walker_query_error_returns_error_dict(dsar):
+def test_ne_walker_continues_on_per_message_id_failure(dsar):
+    """Audit fix-now-2 #2 (2026-05-21): per-id GSI failure does NOT
+    short-circuit the walker — failed_message_ids records the failure and
+    the walker proceeds to the next message_id. Operator sees a complete
+    progress picture instead of binary 'query_failed'."""
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    ne_table = MagicMock()
+    # Three message_ids: 1st fails, 2nd succeeds, 3rd fails
+    ne_table.query.side_effect = [
+        ClientError({"Error": {"Code": "InternalServerError"}}, "Query"),
+        {"Items": [_ne_row("m2", "delivery")]},
+        ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "Query"),
+    ]
+    mock_ddb.Table.return_value = ne_table
+    result = mod._walk_notification_events(
+        message_ids=["m1", "m2", "m3"], request_type="access", dry_run=True,
+    )
+    # m2's row was captured despite m1 + m3 failures
+    assert result["rows_found"] == 1
+    assert result["action"] == "exported"
+    # Both failed message_ids recorded for operator visibility
+    assert result["failed_message_ids"] == ["m1", "m3"]
+    # All three were attempted
+    assert ne_table.query.call_count == 3
+
+
+def test_ne_walker_all_failures_returns_empty_with_failed_ids(dsar):
+    """Edge case: every message_id fails. Walker still returns the action
+    + an empty rows_found, with all IDs in failed_message_ids."""
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     ne_table = MagicMock()
@@ -656,10 +727,45 @@ def test_ne_walker_query_error_returns_error_dict(dsar):
         {"Error": {"Code": "InternalServerError"}}, "Query")
     mock_ddb.Table.return_value = ne_table
     result = mod._walk_notification_events(
-        message_ids=["m1"], request_type="delete", dry_run=False,
+        message_ids=["m1", "m2"], request_type="delete", dry_run=False,
     )
-    assert result["error"] == "query_failed"
+    assert result["rows_found"] == 0
+    assert result["action"] == "deleted"
+    assert result["rows_deleted"] == 0
+    assert result["failed_message_ids"] == ["m1", "m2"]
     ne_table.delete_item.assert_not_called()
+
+
+def test_ne_walker_truncates_message_ids_beyond_cap(dsar):
+    """Audit fix-now-2 #4 (2026-05-21): MAX_MESSAGE_IDS_PER_INVOCATION
+    caps the chained walk to prevent Lambda-timeout exhaustion on
+    high-volume subjects. Overflow surfaces in truncated_message_id_count."""
+    mod, mock_ddb, _ = dsar
+    ne_table = MagicMock()
+    ne_table.query.return_value = {"Items": []}
+    mock_ddb.Table.return_value = ne_table
+    cap = mod.MAX_MESSAGE_IDS_PER_INVOCATION
+    big_list = [f"m{i}" for i in range(cap + 50)]  # cap + 50 overflow
+    result = mod._walk_notification_events(
+        message_ids=big_list, request_type="access", dry_run=True,
+    )
+    assert result["truncated_message_id_count"] == 50
+    # Walker queried exactly `cap` message_ids, not all (cap + 50)
+    assert ne_table.query.call_count == cap
+
+
+def test_ne_walker_no_truncation_field_when_under_cap(dsar):
+    """When message_ids is under the cap, truncated_message_id_count
+    must NOT appear in the result dict (avoid noise)."""
+    mod, mock_ddb, _ = dsar
+    ne_table = MagicMock()
+    ne_table.query.return_value = {"Items": [_ne_row("m1", "delivery")]}
+    mock_ddb.Table.return_value = ne_table
+    result = mod._walk_notification_events(
+        message_ids=["m1"], request_type="access", dry_run=True,
+    )
+    assert "truncated_message_id_count" not in result
+    assert "failed_message_ids" not in result
 
 
 def test_ne_walker_skips_corrupted_row(dsar):
@@ -934,7 +1040,8 @@ def test_dispatcher_notification_sends_error_marks_walker_errored(dsar):
 
 
 def test_dispatcher_notification_events_error_marks_walker_errored(dsar):
-    """notification-sends succeeds with matches; notification-events GSI errors."""
+    """notification-sends succeeds with matches; notification-events GSI errors
+    on every message_id (continue-on-error behavior per audit fix-now-2 #2)."""
     mod, mock_ddb, _ = dsar
     _stub_dispatch(
         mock_ddb,
@@ -946,9 +1053,34 @@ def test_dispatcher_notification_events_error_marks_walker_errored(dsar):
         normalized_email="test@x.co",
         request_type="delete", dry_run=False,
     )
+    # Walker now uses partial_query_failures error code (continue-on-error)
     assert walker_results["notification-events"]["status"] == "errored"
-    assert walker_results["notification-events"]["error"] == "query_failed"
-    assert any("notification-events: query failed" in f for f in followups)
+    assert walker_results["notification-events"]["error"] == "partial_query_failures"
+    assert walker_results["notification-events"]["failed_message_ids_count"] == 1
+    # Followup mentions per-id failure semantics, not the old "query failed"
+    assert any("message_id(s) failed" in f for f in followups)
+
+
+def test_dispatcher_emits_truncation_followup_when_message_ids_exceed_cap(dsar):
+    """Audit fix-now-2 #4: dispatcher surfaces overflow count to operator."""
+    mod, mock_ddb, _ = dsar
+    cap = mod.MAX_MESSAGE_IDS_PER_INVOCATION
+    # Seed notification-sends with cap+10 rows so chain hits the cap
+    ns_items = [_ns_row(f"m{i}") for i in range(cap + 10)]
+    _stub_dispatch(mock_ddb, ns_items=ns_items, ne_items=[])
+    _rows, followups, _exp, walker_results = mod._walk_mfs_surfaces(
+        pii_subject_id="subj_xyz", tenant_id="TEN123",
+        normalized_email="test@x.co",
+        request_type="access", dry_run=True,
+    )
+    assert any(
+        "capped at" in f and "10 message_id(s) were NOT walked" in f
+        for f in followups
+    )
+    # The truncation taint flips walker status to errored
+    assert walker_results["notification-events"]["status"] == "errored"
+    assert walker_results["notification-events"]["error"] == "message_ids_truncated"
+    assert walker_results["notification-events"]["truncated_count"] == 10
 
 
 def test_dispatcher_emits_staff_recipient_cli_snippet_followup(dsar):
