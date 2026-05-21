@@ -1621,6 +1621,132 @@ def test_dispatcher_recent_messages_truncation_taints_completed_to_errored(dsar)
     assert any("capped at" in f and "recent-messages" in f for f in followups)
 
 
+def test_dispatcher_recent_messages_combined_failures_and_truncation_taint(dsar):
+    """Security advisor fix-now-3 (2026-05-21): when both failed_session_ids
+    and truncated_session_id_count fire on the same invocation, the
+    dispatcher MUST surface BOTH structured signals in walker_results
+    (the original status-gated taint silently dropped truncated_count when
+    partial_query_failures was already set)."""
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    cap = mod.MAX_SESSION_IDS_PER_INVOCATION
+    # Form-submissions produces cap+2 session_ids → truncation fires.
+    # First Query raises ClientError → failed_session_ids fires too.
+    fs_items = [
+        _row(f"sub-{i}", session_id=f"sess-{i}") for i in range(cap + 2)
+    ]
+    rm_table = MagicMock()
+    rm_responses = [
+        ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query"),
+    ] + [{"Items": []} for _ in range(cap - 1)]
+    rm_table.query.side_effect = rm_responses
+    fs_table = MagicMock()
+    fs_table.query.return_value = {"Items": fs_items}
+    subject_table = MagicMock()
+    audit_table = MagicMock()
+    ns_table = MagicMock()
+    ns_table.query.return_value = {"Items": []}
+    ne_table = MagicMock()
+    ne_table.query.return_value = {"Items": []}
+
+    def route(name):
+        return {
+            "picasso-form-submissions-staging": fs_table,
+            "picasso-pii-subject-index-staging": subject_table,
+            "picasso-pii-dsar-audit-staging": audit_table,
+            "picasso-notification-sends-staging": ns_table,
+            "picasso-notification-events-staging": ne_table,
+            "staging-recent-messages": rm_table,
+        }[name]
+    mock_ddb.Table.side_effect = route
+
+    _r, followups, _exp, walker_results = mod._walk_mfs_surfaces(
+        pii_subject_id="subj_xyz", tenant_id="TEN123",
+        normalized_email="test@x.co",
+        request_type="delete", dry_run=True,
+    )
+    rm_result = walker_results["recent-messages"]
+    # First failure (partial_query_failures) preserved as `error` code
+    assert rm_result["status"] == "errored"
+    assert rm_result["error"] == "partial_query_failures"
+    assert rm_result["failed_session_ids_count"] == 1
+    # Truncation count MUST be present even though partial_query_failures
+    # was already set on the walker_result. This is the regression Security
+    # #7 caught — pre-fix, this field was silently dropped.
+    assert rm_result["truncated_count"] == 2
+    # Both followups visible to operator
+    assert any("failed Query" in f for f in followups)
+    assert any("capped at" in f and "recent-messages" in f for f in followups)
+
+
+def test_dispatcher_notification_events_combined_failures_and_truncation_taint(dsar):
+    """Same pattern as recent-messages — fix-now-3 also closes the
+    pre-existing parallel bug in the notification-events truncation taint
+    (introduced in fix-now-2 PR #136)."""
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    cap = mod.MAX_MESSAGE_IDS_PER_INVOCATION
+    # notification-sends produces cap+2 message_ids → events truncation fires.
+    # notification-events first GSI Query fails → failed_message_ids fires too.
+    ns_items = [
+        _ns_row(message_id=f"msg-{i}", recipient="test@x.co")
+        for i in range(cap + 2)
+    ]
+    ne_table = MagicMock()
+    ne_responses = [
+        ClientError({"Error": {"Code": "ProvisionedThroughputExceededException"}}, "Query"),
+    ] + [{"Items": []} for _ in range(cap - 1)]
+    ne_table.query.side_effect = ne_responses
+    ns_table = MagicMock()
+    ns_table.query.return_value = {"Items": ns_items}
+    fs_table = MagicMock()
+    fs_table.query.return_value = {"Items": []}
+    subject_table = MagicMock()
+    audit_table = MagicMock()
+    rm_table = MagicMock()
+    rm_table.query.return_value = {"Items": []}
+
+    def route(name):
+        return {
+            "picasso-form-submissions-staging": fs_table,
+            "picasso-pii-subject-index-staging": subject_table,
+            "picasso-pii-dsar-audit-staging": audit_table,
+            "picasso-notification-sends-staging": ns_table,
+            "picasso-notification-events-staging": ne_table,
+            "staging-recent-messages": rm_table,
+        }[name]
+    mock_ddb.Table.side_effect = route
+
+    _r, _f, _exp, walker_results = mod._walk_mfs_surfaces(
+        pii_subject_id="subj_xyz", tenant_id="TEN123",
+        normalized_email="test@x.co",
+        request_type="delete", dry_run=True,
+    )
+    ne_result = walker_results["notification-events"]
+    assert ne_result["status"] == "errored"
+    assert ne_result["error"] == "partial_query_failures"
+    assert ne_result["truncated_count"] == 2
+
+
+def test_dispatcher_recent_messages_followup_includes_f_dsar1_inheritance(dsar):
+    """pii-data-lifecycle advisor fix-now-3 (2026-05-21): the recent-
+    messages followup MUST explicitly cross-reference F-DSAR1 — pre-
+    Phase-1 subjects' session_ids are unreachable through the upstream
+    walker, so the chained walk inherits that gap. An operator reading
+    CloudWatch should grep `F-DSAR1` and find the inheritance pointer
+    without having to chain implications manually."""
+    mod, mock_ddb, _ = dsar
+    _stub_dispatch(mock_ddb, fs_items=[])
+    _r, followups, _exp, _wr = mod._walk_mfs_surfaces(
+        pii_subject_id="subj_xyz", tenant_id="TEN123",
+        normalized_email="test@x.co",
+        request_type="delete", dry_run=True,
+    )
+    rm_followups = [f for f in followups if "recent-messages" in f.lower()]
+    rm_text = "\n".join(rm_followups)
+    assert "F-DSAR1" in rm_text or "pre-Phase-1" in rm_text
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # End-to-end handler
 # ───────────────────────────────────────────────────────────────────────────

@@ -1289,14 +1289,18 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             f"were NOT walked. Re-invoke with a narrower scope or wait for "
             f"item 6's integration-test batching."
         )
+        # Security advisor fix-now-3 (2026-05-21): taint unconditionally —
+        # truncation is always an error regardless of whether
+        # partial_query_failures was already set on this walker. Previous
+        # status-gated taint silently dropped `truncated_count` from
+        # walker_results when failed_message_ids fired first.
         existing = walker_results.get("notification-events", {})
-        if existing.get("status") == "completed":
-            walker_results["notification-events"] = {
-                **existing,
-                "status": "errored",
-                "error": "message_ids_truncated",
-                "truncated_count": truncated_count,
-            }
+        walker_results["notification-events"] = {
+            **existing,
+            "status": "errored",
+            "error": existing.get("error") or "message_ids_truncated",
+            "truncated_count": truncated_count,
+        }
 
     # recent-messages: chained walk via form-submissions session_ids.
     # Defense-in-depth: if form-submissions errored, the session_ids list
@@ -1379,14 +1383,17 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             f"(Lambda timeout protection). {truncated_session_count} "
             f"session_id(s) were NOT walked. Re-invoke with a narrower scope."
         )
+        # Security advisor fix-now-3 (2026-05-21): taint unconditionally
+        # (see notification-events comment above for rationale). Preserve
+        # the original `error` if one was already set so the operator's
+        # walker_results carries the FIRST failure mode + truncation count.
         existing = walker_results.get("recent-messages", {})
-        if existing.get("status") == "completed":
-            walker_results["recent-messages"] = {
-                **existing,
-                "status": "errored",
-                "error": "session_ids_truncated",
-                "truncated_count": truncated_session_count,
-            }
+        walker_results["recent-messages"] = {
+            **existing,
+            "status": "errored",
+            "error": existing.get("error") or "session_ids_truncated",
+            "truncated_count": truncated_session_count,
+        }
     if exported_truncated:
         manual_followups.append(
             f"recent-messages: exported message payload capped at "
@@ -1394,25 +1401,38 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             f"{exported_truncated} additional row(s) were truncated from "
             f"the export. Re-invoke with a narrower scope to retrieve."
         )
+        # Security advisor fix-now-3: taint unconditionally; preserve
+        # original error code if set. Reuse `truncated_count` key for
+        # whichever truncation fired first (callsite is mutually exclusive
+        # with session_ids_truncated in practice — exported truncation
+        # only fires on access path; session-id truncation fires on all
+        # paths — but the unconditional merge is defensive).
         existing = walker_results.get("recent-messages", {})
-        if existing.get("status") == "completed":
-            walker_results["recent-messages"] = {
-                **existing,
-                "status": "errored",
-                "error": "exported_messages_truncated",
-                "truncated_count": exported_truncated,
-            }
+        walker_results["recent-messages"] = {
+            **existing,
+            "status": "errored",
+            "error": existing.get("error") or "exported_messages_truncated",
+            "exported_messages_truncated_count": exported_truncated,
+        }
     # F-DSAR4 — chat-only-no-form coverage gap. Surfaced any time the
     # walker ran (incl. no_sessions outcomes) so the operator never assumes
-    # zero rows means clean.
+    # zero rows means clean. Also surfaces F-DSAR1 inheritance per advisor
+    # fix-now-3 (pii-data-lifecycle 2026-05-21): pre-Phase-1 form rows
+    # lack pii_subject_id, so their session_ids are unreachable through
+    # this walker via the chained path either — the operator-known
+    # session_id query below is the primary fallback for that case too.
     manual_followups.append(
         "recent-messages: walker reaches only sessions linked via form-"
         "submissions (chained walk). Subjects who chatted without ever "
         "submitting a form have no durable subject linkage on the row; "
         "their messages age out via the 24h TTL (best-effort within 48h "
         "per DynamoDB TTL semantics). Compensating control = TTL; "
-        "structural fix tracked as D5 F-DSAR4. Operator-actionable fallback "
-        "if an out-of-band session_id is known, OR for content-substring "
+        "structural fix tracked as D5 F-DSAR4. **F-DSAR1 inheritance**: "
+        "if a pre-Phase-1 subject is suspected (see form-submissions "
+        "followup above), their session_ids will also be unreachable "
+        "through this walker — the operator-known session_id query "
+        "below is the primary fallback. Operator-actionable fallback if "
+        "an out-of-band session_id is known, OR for content-substring "
         "scan (case-sensitive — false positives likely):\n"
         f"{_recent_messages_chat_only_cli_snippet(normalized_email, tenant_id)}"
     )
