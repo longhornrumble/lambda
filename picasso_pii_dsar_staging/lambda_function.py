@@ -101,6 +101,7 @@ TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit-staging"
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
+TABLE_RECENT_MESSAGES = "staging-recent-messages"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 
 # Bound the chained notification-events GSI walk so a single DSAR cannot
@@ -111,18 +112,28 @@ GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 # narrower scope or wait for item 6's batching.
 MAX_MESSAGE_IDS_PER_INVOCATION = 200
 
+# Bound the chained recent-messages walk symmetrically — same rationale as
+# MAX_MESSAGE_IDS_PER_INVOCATION; one Query per session_id, ~50ms typical,
+# 200 sessions × 50ms = ~10s well under the 60s Lambda timeout.
+MAX_SESSION_IDS_PER_INVOCATION = 200
+
+# Soft cap on the access-export response payload. A chatty subject can
+# accumulate dozens of messages per session × multiple sessions. Lambda's
+# response limit is 6 MB; an unbounded export risks exceeding it. Overflow
+# surfaces in manual_followups; the walker returns the first
+# MAX_EXPORTED_MESSAGES rows.
+MAX_EXPORTED_MESSAGES = 1000
+
 # Surfaces still scaffolded with deferred walkers. form-submissions +
-# notification-sends + notification-events have their walkers implemented;
-# the rest return human-readable manual_followup until each surface's
-# subject-linking attribute is verified against the MFS writer code.
+# notification-sends + notification-events + recent-messages have their
+# walkers implemented; the rest return human-readable manual_followup until
+# each surface's subject-linking attribute is verified against the MFS
+# writer code.
 MFS_SCOPED_SURFACES = {
-    "recent-messages": (
-        "Walker pending: table keyed by sessionId/messageTimestamp; subject "
-        "linkage requires Scan + FilterExpression on a user-id-like attribute "
-        "yet to be verified against MFS writer."
-    ),
     "conversation-summaries": (
-        "Walker pending: same as recent-messages (sessionId-keyed)."
+        "Walker pending: sessionId-keyed (no subject linkage on row); "
+        "chained walk via form-submissions session_ids — pattern mirrors "
+        "recent-messages once verified against writer."
     ),
     "audit-read-only": (
         "Walker pending: picasso-audit-staging is read-only per Art 17(3)(b) "
@@ -328,6 +339,10 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
     (submissions before lambda #130, 2026-05-18) lack the attribute. The
     durable fix is Apply-2 backfill (deferred); the interim is a manual
     email-keyed walk on suspected pre-Phase-1 subjects.
+
+    `session_ids` is collected from matched rows for the chained recent-
+    messages + (future) conversation-summaries walkers. Empty/None values
+    are skipped (mirrors the notification-sends message_ids extraction).
     """
     table = ddb.Table(TABLE_FORM_SUBMISSIONS)
 
@@ -348,24 +363,33 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
                 tenant_id, pii_subject_id,
                 exc.response.get("Error", {}).get("Code"),
             )
-            return {"rows_found": 0, "error": "query_failed"}
+            return {"rows_found": 0, "session_ids": [], "error": "query_failed"}
         matched.extend(resp.get("Items", []))
         last_evaluated_key = resp.get("LastEvaluatedKey")
         if not last_evaluated_key:
             break
 
     rows_found = len(matched)
+    session_ids = [
+        row["session_id"] for row in matched
+        if row.get("session_id")
+    ]
 
     if request_type == "access":
         return {
             "rows_found": rows_found,
+            "session_ids": session_ids,
             "action": "exported",
             "exported_rows": matched,
         }
 
     # request_type == "delete"
     if dry_run:
-        return {"rows_found": rows_found, "action": "dry_run_count"}
+        return {
+            "rows_found": rows_found,
+            "session_ids": session_ids,
+            "action": "dry_run_count",
+        }
 
     deleted = 0
     skipped_corrupted = 0
@@ -399,6 +423,7 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
             )
     return {
         "rows_found": rows_found,
+        "session_ids": session_ids,
         "action": "deleted",
         "rows_deleted": deleted,
         "rows_skipped_corrupted": skipped_corrupted,
@@ -693,6 +718,244 @@ def _walk_notification_events(message_ids, request_type, dry_run):
     }
 
 
+def _project_recent_messages_row(row):
+    """Project a recent-messages row to the minimum subject-meaningful fields.
+
+    Article 15 / data minimization (pii-lifecycle advisor 2026-05-21):
+    `staging-recent-messages` rows include internal join keys (`sessionId`,
+    `messageId`) and lifecycle metadata (`expires_at`) that the subject
+    neither created nor has any operational use for. Returning the full row
+    would over-disclose internal identifiers and could enable session
+    correlation against other rows in the export. This projection limits
+    the export to fields the subject can reason about — what they said
+    (`content`), who said it (`role`), and when (`messageTimestamp`).
+
+    Divergent from form-submissions and notification-sends walkers (which
+    return full rows). The divergence is justified by `content`'s free-text
+    nature — those other surfaces are field-constrained.
+    """
+    return {
+        "role": row.get("role"),
+        "content": row.get("content"),
+        "messageTimestamp": row.get("messageTimestamp"),
+    }
+
+
+def _walk_recent_messages(tenant_id, session_ids, request_type, dry_run):
+    """Walk staging-recent-messages for one subject via chained session_ids.
+
+    Chained walker: input is `session_ids` produced by `_walk_form_submissions`.
+    The recent-messages table has no subject-linking attribute (no email, no
+    pii_subject_id, no userId) — the only available linkage is via
+    form-submissions `session_id`. For each session_id, Query(PK=sessionId).
+
+    `tenant_id` is unused by the query (the table has no tenantId on row)
+    but is a required argument for defense-in-depth — assert non-empty on
+    entry so a future caller drift cannot silently span tenants. The
+    upstream form-submissions walker IS tenant-keyed; this argument keeps
+    the contract explicit.
+
+    Coverage gaps (flagged in dispatcher manual_followups):
+      - Chat-only subjects (never submitted a form) are NOT in
+        form-submissions, so their session_ids are unknown to this walker.
+        Compensating control = 24h TTL on the table; structural fix tracked
+        in D5 F-DSAR4.
+      - Pre-Phase-1 form submissions lack pii_subject_id (F-DSAR1), so
+        their session_ids are also unreachable through the upstream
+        walker — gap inherits.
+
+    request_type:
+      - "access":            return projected rows (role/content/timestamp)
+      - "delete" + dry_run:  count only; no DeleteItem calls
+      - "delete" + real:     DeleteItem per (sessionId, messageTimestamp)
+
+    Returns:
+      {
+        "rows_found":                int,
+        "action":                    "exported" | "dry_run_count" | "deleted" | "no_sessions",
+        "exported_rows":             [<projected>, ...]   # access only
+        "rows_deleted":              int                  # delete-real only
+        "rows_skipped_corrupted":    int                  # delete-real only
+        "failed_session_ids":        [<sid>, ...]         # set on partial errors
+        "truncated_session_id_count":int                  # set when cap hit
+        "exported_messages_truncated_count": int          # set when soft cap hit
+      }
+
+    If `session_ids` is empty, returns `{"action": "no_sessions",
+    "rows_found": 0}` immediately — no Query calls are issued.
+
+    Bounded fan-out: `len(session_ids) > MAX_SESSION_IDS_PER_INVOCATION` is
+    truncated to the cap; overflow surfaces as a manual_followup with the
+    excess count.
+
+    Continue-on-error: per-session_id Query failures are logged + recorded
+    in `failed_session_ids`; the walker continues to the next session_id.
+    Mirrors the notification-events fix-now-2 pattern.
+
+    Logging discipline: per-PII (audit log leakage) — the walker NEVER logs
+    `content`. On errors, logs `sessionId` + `messageTimestamp` only.
+
+    Exported-messages soft cap: at request_type=access, the projected
+    output is capped at MAX_EXPORTED_MESSAGES to keep the Lambda response
+    payload under 6 MB. Overflow surfaces in
+    `exported_messages_truncated_count`.
+    """
+    # Defense-in-depth: tenant_id MUST be non-empty even though the walker
+    # doesn't use it. Upstream form-submissions walker enforces tenant
+    # scoping; if a future caller bypasses that and calls this walker
+    # directly, fail loud.
+    if not tenant_id:
+        raise ValueError(
+            "_walk_recent_messages requires non-empty tenant_id "
+            "(defense-in-depth — table has no tenantId; upstream walker "
+            "must enforce tenant scoping)"
+        )
+
+    if not session_ids:
+        return {"rows_found": 0, "action": "no_sessions"}
+
+    # Bounded fan-out.
+    truncated_session_id_count = 0
+    if len(session_ids) > MAX_SESSION_IDS_PER_INVOCATION:
+        truncated_session_id_count = len(session_ids) - MAX_SESSION_IDS_PER_INVOCATION
+        session_ids = session_ids[:MAX_SESSION_IDS_PER_INVOCATION]
+        logger.warning(
+            "recent_messages_session_ids_truncated: cap=%d overflow=%d",
+            MAX_SESSION_IDS_PER_INVOCATION, truncated_session_id_count,
+        )
+
+    table = ddb.Table(TABLE_RECENT_MESSAGES)
+
+    matched = []
+    failed_session_ids = []
+    for session_id in session_ids:
+        last_evaluated_key = None
+        while True:
+            kwargs = {
+                "KeyConditionExpression": Key("sessionId").eq(session_id),
+            }
+            if last_evaluated_key:
+                kwargs["ExclusiveStartKey"] = last_evaluated_key
+            try:
+                resp = table.query(**kwargs)
+            except ClientError as exc:
+                logger.error(
+                    "recent_messages_query_failed: sessionId=%s code=%s",
+                    session_id, exc.response.get("Error", {}).get("Code"),
+                )
+                # Continue-on-error: record this session_id as failed and
+                # proceed to the next; do not short-circuit the whole walk.
+                # NB: NEVER log `content` from the row.
+                failed_session_ids.append(session_id)
+                break
+            matched.extend(resp.get("Items", []))
+            last_evaluated_key = resp.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                break
+
+    rows_found = len(matched)
+
+    progress_fields = {}
+    if failed_session_ids:
+        progress_fields["failed_session_ids"] = failed_session_ids
+    if truncated_session_id_count:
+        progress_fields["truncated_session_id_count"] = truncated_session_id_count
+
+    if request_type == "access":
+        # Soft cap on exported messages to stay under Lambda 6 MB response.
+        exported_messages_truncated_count = 0
+        export_rows = matched
+        if len(export_rows) > MAX_EXPORTED_MESSAGES:
+            exported_messages_truncated_count = len(export_rows) - MAX_EXPORTED_MESSAGES
+            export_rows = export_rows[:MAX_EXPORTED_MESSAGES]
+            logger.warning(
+                "recent_messages_exported_truncated: cap=%d overflow=%d",
+                MAX_EXPORTED_MESSAGES, exported_messages_truncated_count,
+            )
+        projected = [_project_recent_messages_row(r) for r in export_rows]
+        result = {
+            "rows_found": rows_found,
+            "action": "exported",
+            "exported_rows": projected,
+            **progress_fields,
+        }
+        if exported_messages_truncated_count:
+            result["exported_messages_truncated_count"] = exported_messages_truncated_count
+        return result
+
+    if dry_run:
+        return {
+            "rows_found": rows_found,
+            "action": "dry_run_count",
+            **progress_fields,
+        }
+
+    deleted = 0
+    skipped_corrupted = 0
+    for row in matched:
+        row_session_id = row.get("sessionId")
+        row_timestamp = row.get("messageTimestamp")
+        if row_session_id is None or row_timestamp is None:
+            skipped_corrupted += 1
+            # NB: do NOT log `content`. Log only the key fields we already
+            # know are present (or None).
+            logger.error(
+                "recent_messages_delete_skipped_corrupted: "
+                "sessionId=%s messageTimestamp=%s — row missing PK/SK",
+                row_session_id, row_timestamp,
+            )
+            continue
+        try:
+            table.delete_item(Key={
+                "sessionId": row_session_id,
+                "messageTimestamp": row_timestamp,
+            })
+            deleted += 1
+        except ClientError as exc:
+            logger.error(
+                "recent_messages_delete_failed: sessionId=%s messageTimestamp=%s code=%s",
+                row_session_id, row_timestamp,
+                exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_skipped_corrupted": skipped_corrupted,
+        **progress_fields,
+    }
+
+
+def _recent_messages_chat_only_cli_snippet(normalized_email, tenant_id):
+    """Operator-actionable CLI snippet for the chat-only F-DSAR4 gap.
+
+    Used in the manual_followup block to give the operator a concrete next
+    step when the walker reaches zero session_ids (or the subject is
+    chat-only / pre-Phase-1). The walker cannot enumerate sessions for a
+    subject who never submitted a form — but the operator may have a
+    session_id from out-of-band sources (support transcript, browser
+    history, etc.) and can query directly.
+
+    Includes a content-substring scan as a last-resort path, with explicit
+    caveats about case-sensitivity and false positives.
+    """
+    return (
+        f"  # Operator-known session_id direct query (preferred):\n"
+        f"  aws dynamodb query --table-name staging-recent-messages \\\n"
+        f"    --profile myrecruiter-staging \\\n"
+        f"    --key-condition-expression 'sessionId = :s' \\\n"
+        f"    --expression-attribute-values "
+        f"'{{\":s\":{{\"S\":\"<SESSION_ID-from-out-of-band-source>\"}}}}'\n"
+        f"  # Last-resort content-substring scan (CASE-SENSITIVE; false positives likely):\n"
+        f"  aws dynamodb scan --table-name staging-recent-messages \\\n"
+        f"    --profile myrecruiter-staging \\\n"
+        f"    --filter-expression 'contains(#c, :e)' \\\n"
+        f"    --expression-attribute-names '{{\"#c\":\"content\"}}' \\\n"
+        f"    --expression-attribute-values "
+        f"'{{\":e\":{{\"S\":\"{normalized_email}\"}}}}'"
+    )
+
+
 def _staff_notification_cli_snippet(normalized_email, tenant_id):
     """Operator-actionable CLI snippet for staff-recipient notification inspection.
 
@@ -756,6 +1019,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         "form-submissions": 0,
         "notification-sends": 0,
         "notification-events": 0,
+        "recent-messages": 0,
     }
     rows_touched.update({s: 0 for s in MFS_SCOPED_SURFACES})
     manual_followups = []
@@ -799,6 +1063,11 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "notification-sends to run first)"
         )
         walker_results["notification-events"] = {"status": "skipped_no_subject"}
+        manual_followups.append(
+            "recent-messages: skipped (chained walker requires "
+            "form-submissions to run first)"
+        )
+        walker_results["recent-messages"] = {"status": "skipped_no_subject"}
         for surface, reason in MFS_SCOPED_SURFACES.items():
             manual_followups.append(f"{surface}: {reason}")
             walker_results[surface] = {"status": "deferred", "reason": reason}
@@ -1028,6 +1297,137 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
                 "error": "message_ids_truncated",
                 "truncated_count": truncated_count,
             }
+
+    # recent-messages: chained walk via form-submissions session_ids.
+    # Defense-in-depth: if form-submissions errored, the session_ids list
+    # is empty and the walker correctly short-circuits to no_sessions.
+    captured_session_ids = fs.get("session_ids", []) if fs else []
+    rm = _walk_recent_messages(
+        tenant_id, captured_session_ids, request_type, dry_run,
+    )
+    rows_touched["recent-messages"] = rm["rows_found"]
+    if rm.get("action") == "no_sessions":
+        # Not an error — form-submissions had no rows (or no rows carried
+        # session_id) so there's nothing to chain into. Record as completed.
+        walker_results["recent-messages"] = {
+            "status": "completed",
+            "action": "no_sessions_to_walk",
+            "rows_touched": 0,
+        }
+    elif rm.get("action") == "exported":
+        exported_rows["recent-messages"] = rm["exported_rows"]
+        walker_results["recent-messages"] = {
+            "status": "completed",
+            "action": "exported",
+            "rows_touched": rm["rows_found"],
+        }
+    elif rm.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"recent-messages: dry_run=true; {rm['rows_found']} message "
+            f"row(s) would be deleted (chained from form-submissions "
+            f"session_ids); re-invoke with dry_run=false to delete"
+        )
+        walker_results["recent-messages"] = {
+            "status": "completed",
+            "action": "dry_run_count",
+            "rows_touched": rm["rows_found"],
+        }
+    else:  # action == "deleted"
+        rm_result = {
+            "status": "completed",
+            "action": "deleted",
+            "rows_touched": rm["rows_found"],
+            "rows_deleted": rm.get("rows_deleted", 0),
+            "rows_skipped_corrupted": rm.get("rows_skipped_corrupted", 0),
+        }
+        if rm.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"recent-messages: {rm['rows_skipped_corrupted']} row(s) "
+                f"skipped due to corrupted PK/SK schema — see CloudWatch logs "
+                f"for sessionId+messageTimestamp; manual inspection required."
+            )
+            rm_result["status"] = "errored"
+            rm_result["error"] = "rows_skipped_corrupted"
+        walker_results["recent-messages"] = rm_result
+
+    # F-DSAR4 chat-only gap + F-DSAR1 inheritance + TTL note + Article 15
+    # third-party-disclosure caveat. Surfaced regardless of outcome so the
+    # operator is reminded of the structural limits each time.
+    failed_session_ids = rm.get("failed_session_ids", []) if rm else []
+    truncated_session_count = rm.get("truncated_session_id_count", 0) if rm else 0
+    exported_truncated = rm.get("exported_messages_truncated_count", 0) if rm else 0
+    if failed_session_ids:
+        manual_followups.append(
+            f"recent-messages: {len(failed_session_ids)} session_id(s) "
+            f"failed Query and were skipped (walker continued on remaining "
+            f"sessions). Failed session_ids: {failed_session_ids[:5]}"
+            f"{'...' if len(failed_session_ids) > 5 else ''}. "
+            f"Re-invoke with the same dsar_id (new event_timestamp) to retry, "
+            f"or inspect CloudWatch logs for the specific error codes."
+        )
+        existing = walker_results.get("recent-messages", {})
+        walker_results["recent-messages"] = {
+            **existing,
+            "status": "errored",
+            "error": "partial_query_failures",
+            "failed_session_ids_count": len(failed_session_ids),
+        }
+    if truncated_session_count:
+        manual_followups.append(
+            f"recent-messages: chained walker capped at "
+            f"{MAX_SESSION_IDS_PER_INVOCATION} session_ids per invocation "
+            f"(Lambda timeout protection). {truncated_session_count} "
+            f"session_id(s) were NOT walked. Re-invoke with a narrower scope."
+        )
+        existing = walker_results.get("recent-messages", {})
+        if existing.get("status") == "completed":
+            walker_results["recent-messages"] = {
+                **existing,
+                "status": "errored",
+                "error": "session_ids_truncated",
+                "truncated_count": truncated_session_count,
+            }
+    if exported_truncated:
+        manual_followups.append(
+            f"recent-messages: exported message payload capped at "
+            f"{MAX_EXPORTED_MESSAGES} rows (Lambda 6 MB response limit). "
+            f"{exported_truncated} additional row(s) were truncated from "
+            f"the export. Re-invoke with a narrower scope to retrieve."
+        )
+        existing = walker_results.get("recent-messages", {})
+        if existing.get("status") == "completed":
+            walker_results["recent-messages"] = {
+                **existing,
+                "status": "errored",
+                "error": "exported_messages_truncated",
+                "truncated_count": exported_truncated,
+            }
+    # F-DSAR4 — chat-only-no-form coverage gap. Surfaced any time the
+    # walker ran (incl. no_sessions outcomes) so the operator never assumes
+    # zero rows means clean.
+    manual_followups.append(
+        "recent-messages: walker reaches only sessions linked via form-"
+        "submissions (chained walk). Subjects who chatted without ever "
+        "submitting a form have no durable subject linkage on the row; "
+        "their messages age out via the 24h TTL (best-effort within 48h "
+        "per DynamoDB TTL semantics). Compensating control = TTL; "
+        "structural fix tracked as D5 F-DSAR4. Operator-actionable fallback "
+        "if an out-of-band session_id is known, OR for content-substring "
+        "scan (case-sensitive — false positives likely):\n"
+        f"{_recent_messages_chat_only_cli_snippet(normalized_email, tenant_id)}"
+    )
+    # Article 15 — third-party disclosure caveat for access exports only.
+    if request_type == "access" and rm.get("action") == "exported":
+        manual_followups.append(
+            "recent-messages: access export includes free-text `content` that "
+            "may reference third parties (family members, others mentioned in "
+            "chat). Operator should review prior to delivery to subject; "
+            "consider per-message redaction if any message references a "
+            "non-subject individual. Export is projected to "
+            "{role, content, messageTimestamp} — internal identifiers "
+            "(sessionId, messageId, expires_at) intentionally omitted per "
+            "Art 15 data-minimization (advisor 2026-05-21)."
+        )
 
     # Other surfaces: still scaffolded.
     for surface, reason in MFS_SCOPED_SURFACES.items():
