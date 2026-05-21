@@ -51,10 +51,19 @@ WHAT THIS LAMBDA DOES TODAY:
       pii_subject_id; access returns rows in exported_rows; delete dry-runs by
       default; explicit dry_run=false performs DeleteItem per matched row;
       corrupted rows (missing PK/SK) are logged + skipped, not crashed-on
-    - Remaining surfaces (notification-sends/events, recent-messages,
-      conversation-summaries, audit) return manual_followup + walker_results
-      status=deferred until each surface's subject-linking attribute is
-      verified against MFS writer code
+    - notification-sends walker — tenant-scoped Query (PK=`TENANT#<id>`) +
+      FilterExpression on `recipient == normalized_email`. Catches direct-to-
+      consumer notifications. Staff-recipient rows (notifications ABOUT the
+      consumer to staff) are operator/staff PII under a different controller
+      relationship (D5 G-H + F9) and flagged in manual_followup with an
+      operator-actionable CLI snippet — NOT auto-deleted.
+    - notification-events walker — chained walk via the `message_id`s captured
+      by notification-sends. Queries the ByMessageId GSI per message_id.
+      If notification-sends produces no message_ids (today's common case),
+      records `action=no_messages_to_walk` with rows_touched=0.
+    - Remaining surfaces (recent-messages, conversation-summaries, audit)
+      return manual_followup + walker_results status=deferred until each
+      surface's subject-linking attribute is verified against MFS writer code
 
 WHAT IT DOES NOT YET DO (follow-up PRs):
     - Per-surface walkers for the 5 remaining MFS surfaces (one PR per surface)
@@ -90,19 +99,15 @@ EXPECTED_ACCOUNT = "525409062831"
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
 TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit-staging"
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
+TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
+TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
+GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 
-# Surfaces still scaffolded with deferred walkers. form-submissions has its
-# walker implemented (`_walk_form_submissions`); the rest return human-readable
-# manual_followup until each surface's subject-linking attribute is verified
-# against the MFS writer code.
+# Surfaces still scaffolded with deferred walkers. form-submissions +
+# notification-sends + notification-events have their walkers implemented;
+# the rest return human-readable manual_followup until each surface's
+# subject-linking attribute is verified against the MFS writer code.
 MFS_SCOPED_SURFACES = {
-    "notification-sends": (
-        "Walker pending: subject-linking attribute on pk/sk schema not yet "
-        "documented; requires reading MFS notification_hub writer code first."
-    ),
-    "notification-events": (
-        "Walker pending: same as notification-sends (generic pk/sk schema)."
-    ),
     "recent-messages": (
         "Walker pending: table keyed by sessionId/messageTimestamp; subject "
         "linkage requires Scan + FilterExpression on a user-id-like attribute "
@@ -392,6 +397,251 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
     }
 
 
+def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run):
+    """Walk picasso-notification-sends-staging for direct-to-consumer messages.
+
+    Access pattern: tenant-scoped Query (PK=`TENANT#<tenant_id>`) +
+    FilterExpression on `recipient == normalized_email`. Catches notification
+    rows where the consumer themselves received the message (email-channel
+    auto-replies, confirmations, etc.).
+
+    Does NOT walk by `submission_id` (which would catch staff-recipient
+    notifications about the consumer's submission). Staff-recipient rows are
+    operator/staff PII under a different controller relationship (D5 G-H +
+    F9 + Step 10 v3 §F9 three-part mitigation). The walker flags this gap in
+    the dispatcher's manual_followup with an operator-actionable CLI snippet
+    so the operator has a clear next step when staff-side inspection is
+    required.
+
+    Returns:
+      {
+        "rows_found":    int,
+        "rows_matched":  [<full row>, ...],     # for chained event walk
+        "message_ids":   [<message_id>, ...],   # for chained event walk
+        "action":        "exported" | "dry_run_count" | "deleted" | "error",
+        "exported_rows": [<row>, ...]            # access only
+        "rows_deleted":  int                     # delete-real only
+        "rows_skipped_corrupted": int            # delete-real only
+        "error":         <code>                  # error only
+      }
+
+    Today's expected outcome: 0 rows in most cases — the MFS email path
+    writes notifications addressed to operator/staff `recipients` (config-
+    driven); the consumer's email rarely appears as recipient. Returning 0
+    rows here is a true negative for the consumer-direct delete scope,
+    NOT a coverage failure. The follow-up makes the scope explicit.
+    """
+    table = ddb.Table(TABLE_NOTIFICATION_SENDS)
+    pk_value = f"TENANT#{tenant_id}"
+
+    matched = []
+    last_evaluated_key = None
+    while True:
+        kwargs = {
+            "KeyConditionExpression": Key("pk").eq(pk_value),
+            "FilterExpression": Attr("recipient").eq(normalized_email),
+        }
+        if last_evaluated_key:
+            kwargs["ExclusiveStartKey"] = last_evaluated_key
+        try:
+            resp = table.query(**kwargs)
+        except ClientError as exc:
+            logger.error(
+                "notification_sends_query_failed: tenant=%s code=%s",
+                tenant_id, exc.response.get("Error", {}).get("Code"),
+            )
+            return {
+                "rows_found": 0,
+                "rows_matched": [],
+                "message_ids": [],
+                "error": "query_failed",
+            }
+        matched.extend(resp.get("Items", []))
+        last_evaluated_key = resp.get("LastEvaluatedKey")
+        if not last_evaluated_key:
+            break
+
+    rows_found = len(matched)
+    # message_ids feed _walk_notification_events. Some send rows have empty
+    # message_id (failed-send rows record `message_id: ''`); skip those for
+    # the chained event lookup.
+    message_ids = [
+        row["message_id"] for row in matched
+        if row.get("message_id")
+    ]
+
+    if request_type == "access":
+        return {
+            "rows_found": rows_found,
+            "rows_matched": matched,
+            "message_ids": message_ids,
+            "action": "exported",
+            "exported_rows": matched,
+        }
+
+    # request_type == "delete"
+    if dry_run:
+        return {
+            "rows_found": rows_found,
+            "rows_matched": matched,
+            "message_ids": message_ids,
+            "action": "dry_run_count",
+        }
+
+    deleted = 0
+    skipped_corrupted = 0
+    for row in matched:
+        row_pk = row.get("pk")
+        row_sk = row.get("sk")
+        if row_pk is None or row_sk is None:
+            skipped_corrupted += 1
+            logger.error(
+                "notification_sends_delete_skipped_corrupted: "
+                "pk=%s sk=%s recipient=%s — row missing PK/SK",
+                row_pk, row_sk, row.get("recipient"),
+            )
+            continue
+        try:
+            table.delete_item(Key={"pk": row_pk, "sk": row_sk})
+            deleted += 1
+        except ClientError as exc:
+            logger.error(
+                "notification_sends_delete_failed: sk=%s code=%s",
+                row_sk,
+                exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
+        "rows_matched": matched,
+        "message_ids": message_ids,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_skipped_corrupted": skipped_corrupted,
+    }
+
+
+def _walk_notification_events(message_ids, request_type, dry_run):
+    """Walk picasso-notification-events-staging via ByMessageId GSI.
+
+    Chained walker: input is `message_ids` produced by
+    `_walk_notification_sends`. For each message_id, Query the ByMessageId
+    GSI (hash=message_id, range=event_type_timestamp). GSI projection is ALL,
+    so each returned item carries the base table's PK/SK for DeleteItem.
+
+    Access pattern: NOT tenant-scoped. The GSI is keyed on message_id only,
+    which is acceptable because message_id has cryptographic uniqueness
+    (SES UUIDs, Telnyx message IDs) — different tenants cannot collide.
+
+    Returns:
+      {
+        "rows_found":     int,
+        "action":         "exported" | "dry_run_count" | "deleted" | "error" | "no_messages",
+        "exported_rows":  [<event row>, ...]    # access only
+        "rows_deleted":   int                    # delete-real only
+        "rows_skipped_corrupted": int            # delete-real only
+        "error":          <code>                 # error only
+      }
+
+    If `message_ids` is empty, returns `{"action": "no_messages",
+    "rows_found": 0}` immediately — no GSI queries are issued. This is the
+    common case when the consumer has no direct-recipient notifications.
+    """
+    if not message_ids:
+        return {"rows_found": 0, "action": "no_messages"}
+
+    table = ddb.Table(TABLE_NOTIFICATION_EVENTS)
+
+    matched = []
+    for message_id in message_ids:
+        last_evaluated_key = None
+        while True:
+            kwargs = {
+                "IndexName": GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID,
+                "KeyConditionExpression": Key("message_id").eq(message_id),
+            }
+            if last_evaluated_key:
+                kwargs["ExclusiveStartKey"] = last_evaluated_key
+            try:
+                resp = table.query(**kwargs)
+            except ClientError as exc:
+                logger.error(
+                    "notification_events_query_failed: message_id=%s code=%s",
+                    message_id, exc.response.get("Error", {}).get("Code"),
+                )
+                return {
+                    "rows_found": len(matched),
+                    "error": "query_failed",
+                }
+            matched.extend(resp.get("Items", []))
+            last_evaluated_key = resp.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                break
+
+    rows_found = len(matched)
+
+    if request_type == "access":
+        return {
+            "rows_found": rows_found,
+            "action": "exported",
+            "exported_rows": matched,
+        }
+
+    if dry_run:
+        return {"rows_found": rows_found, "action": "dry_run_count"}
+
+    deleted = 0
+    skipped_corrupted = 0
+    for row in matched:
+        row_pk = row.get("pk")
+        row_sk = row.get("sk")
+        if row_pk is None or row_sk is None:
+            skipped_corrupted += 1
+            logger.error(
+                "notification_events_delete_skipped_corrupted: "
+                "pk=%s sk=%s message_id=%s — row missing PK/SK",
+                row_pk, row_sk, row.get("message_id"),
+            )
+            continue
+        try:
+            table.delete_item(Key={"pk": row_pk, "sk": row_sk})
+            deleted += 1
+        except ClientError as exc:
+            logger.error(
+                "notification_events_delete_failed: sk=%s code=%s",
+                row_sk,
+                exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_skipped_corrupted": skipped_corrupted,
+    }
+
+
+def _staff_notification_cli_snippet(normalized_email, tenant_id):
+    """Operator-actionable CLI snippet for staff-recipient notification inspection.
+
+    Used in the manual_followup block to explain why staff-recipient
+    notifications (where staff were notified ABOUT the consumer) are NOT
+    automatically deleted by this walker. Substitutes the operator's
+    normalized email + tenant so the snippet is copy-pasteable. The pattern
+    matches `_pre_phase1_cli_snippet` (audit fix-now #3 / 2026-05-21).
+
+    Filtering by `submission_id` requires the operator to fan-in from the
+    form-submissions walker output — the snippet uses a placeholder
+    `<SUBMISSION_ID>` rather than synthesizing the list at runtime.
+    """
+    return (
+        f"  aws dynamodb query --table-name picasso-notification-sends-staging \\\n"
+        f"    --profile myrecruiter-staging \\\n"
+        f"    --key-condition-expression 'pk = :pk' \\\n"
+        f"    --filter-expression 'submission_id = :sid' \\\n"
+        f"    --expression-attribute-values "
+        f"'{{\":pk\":{{\"S\":\"TENANT#{tenant_id}\"}},\":sid\":{{\"S\":\"<SUBMISSION_ID-from-form-submissions-walker>\"}}}}'"
+    )
+
+
 def _pre_phase1_cli_snippet(normalized_email, tenant_id):
     """Operator-actionable CLI snippet for manual email-keyed Scan.
 
@@ -428,7 +678,11 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
     in MFS_SCOPED_SURFACES still return `deferred` until their schemas are
     verified against MFS writer code.
     """
-    rows_touched = {"form-submissions": 0}
+    rows_touched = {
+        "form-submissions": 0,
+        "notification-sends": 0,
+        "notification-events": 0,
+    }
     rows_touched.update({s: 0 for s in MFS_SCOPED_SURFACES})
     manual_followups = []
     exported_rows = {}
@@ -452,10 +706,25 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             f"Repeat per surface; row-by-row DeleteItem if matches found."
         )
         # No walker can run without a pii_subject_id; record skipped + deferred.
+        # Note: notification_sends + notification_events walkers depend on
+        # `normalized_email` (recipient match) not `pii_subject_id`, but the
+        # broader DSAR contract treats subject-resolution failure as a halt
+        # signal — we don't process any surface for an unresolved subject so
+        # the operator confronts the resolution failure before any action.
         manual_followups.append(
             "form-submissions: skipped (no pii_subject_id resolved)"
         )
         walker_results["form-submissions"] = {"status": "skipped_no_subject"}
+        manual_followups.append(
+            "notification-sends: skipped (no pii_subject_id resolved — "
+            "DSAR halts on subject-resolution failure)"
+        )
+        walker_results["notification-sends"] = {"status": "skipped_no_subject"}
+        manual_followups.append(
+            "notification-events: skipped (chained walker requires "
+            "notification-sends to run first)"
+        )
+        walker_results["notification-events"] = {"status": "skipped_no_subject"}
         for surface, reason in MFS_SCOPED_SURFACES.items():
             manual_followups.append(f"{surface}: {reason}")
             walker_results[surface] = {"status": "deferred", "reason": reason}
@@ -519,6 +788,133 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         "manual email-keyed walk if a pre-Phase-1 subject is suspected:\n"
         f"{_pre_phase1_cli_snippet(normalized_email, tenant_id)}"
     )
+
+    # notification-sends: tenant-Query + FilterExpression on
+    # recipient==normalized_email. Catches direct-to-consumer notifications.
+    # Captured message_ids feed the chained notification-events walker.
+    ns = _walk_notification_sends(
+        tenant_id, normalized_email, request_type, dry_run,
+    )
+    rows_touched["notification-sends"] = ns["rows_found"]
+    captured_message_ids = ns.get("message_ids", [])
+    if ns.get("error"):
+        manual_followups.append(
+            f"notification-sends: query failed ({ns['error']}); retry advised"
+        )
+        walker_results["notification-sends"] = {
+            "status": "errored",
+            "error": ns["error"],
+            "rows_touched": ns["rows_found"],
+        }
+    elif ns.get("action") == "exported":
+        exported_rows["notification-sends"] = ns["exported_rows"]
+        walker_results["notification-sends"] = {
+            "status": "completed",
+            "action": "exported",
+            "rows_touched": ns["rows_found"],
+        }
+    elif ns.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"notification-sends: dry_run=true; {ns['rows_found']} direct-to-"
+            f"consumer row(s) would be deleted; re-invoke with dry_run=false "
+            f"to delete (notification-events chained walk will follow)"
+        )
+        walker_results["notification-sends"] = {
+            "status": "completed",
+            "action": "dry_run_count",
+            "rows_touched": ns["rows_found"],
+        }
+    else:  # action == "deleted"
+        ns_result = {
+            "status": "completed",
+            "action": "deleted",
+            "rows_touched": ns["rows_found"],
+            "rows_deleted": ns.get("rows_deleted", 0),
+            "rows_skipped_corrupted": ns.get("rows_skipped_corrupted", 0),
+        }
+        if ns.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"notification-sends: {ns['rows_skipped_corrupted']} row(s) "
+                f"skipped due to corrupted PK/SK schema — see CloudWatch logs "
+                f"for pk+sk+recipient; manual inspection required."
+            )
+            ns_result["status"] = "errored"
+            ns_result["error"] = "rows_skipped_corrupted"
+        walker_results["notification-sends"] = ns_result
+
+    # Always note the scope-limit: walker catches consumer-recipient
+    # notifications only. Staff-recipient rows about this consumer's submission
+    # are operator/staff PII (different controller relationship per D5 G-H +
+    # F9) and require manual operator inspection.
+    manual_followups.append(
+        "notification-sends: walker matches `recipient == normalized_email` "
+        "(direct consumer messages only). Staff-recipient rows where staff "
+        "were notified ABOUT this consumer's submission are operator PII "
+        "under a different controller relationship (D5 G-H + F9) and are "
+        "NOT auto-deleted. For each submission_id from the form-submissions "
+        "walker, the operator may inspect with:\n"
+        f"{_staff_notification_cli_snippet(normalized_email, tenant_id)}"
+    )
+
+    # notification-events: chained walk via captured message_ids. If
+    # notification-sends produced zero message_ids, returns no_messages
+    # (the common case today). Errors only on real GSI failure.
+    ne = _walk_notification_events(
+        captured_message_ids, request_type, dry_run,
+    )
+    rows_touched["notification-events"] = ne["rows_found"]
+    if ne.get("error"):
+        manual_followups.append(
+            f"notification-events: query failed ({ne['error']}); retry advised"
+        )
+        walker_results["notification-events"] = {
+            "status": "errored",
+            "error": ne["error"],
+            "rows_touched": ne["rows_found"],
+        }
+    elif ne.get("action") == "no_messages":
+        # Not an error — notification-sends had no consumer-recipient rows
+        # so there's nothing to chain into. Record as completed with 0.
+        walker_results["notification-events"] = {
+            "status": "completed",
+            "action": "no_messages_to_walk",
+            "rows_touched": 0,
+        }
+    elif ne.get("action") == "exported":
+        exported_rows["notification-events"] = ne["exported_rows"]
+        walker_results["notification-events"] = {
+            "status": "completed",
+            "action": "exported",
+            "rows_touched": ne["rows_found"],
+        }
+    elif ne.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"notification-events: dry_run=true; {ne['rows_found']} event "
+            f"row(s) would be deleted (chained from notification-sends "
+            f"message_ids); re-invoke with dry_run=false to delete"
+        )
+        walker_results["notification-events"] = {
+            "status": "completed",
+            "action": "dry_run_count",
+            "rows_touched": ne["rows_found"],
+        }
+    else:  # action == "deleted"
+        ne_result = {
+            "status": "completed",
+            "action": "deleted",
+            "rows_touched": ne["rows_found"],
+            "rows_deleted": ne.get("rows_deleted", 0),
+            "rows_skipped_corrupted": ne.get("rows_skipped_corrupted", 0),
+        }
+        if ne.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"notification-events: {ne['rows_skipped_corrupted']} row(s) "
+                f"skipped due to corrupted PK/SK schema — see CloudWatch logs "
+                f"for pk+sk+message_id; manual inspection required."
+            )
+            ne_result["status"] = "errored"
+            ne_result["error"] = "rows_skipped_corrupted"
+        walker_results["notification-events"] = ne_result
 
     # Other surfaces: still scaffolded.
     for surface, reason in MFS_SCOPED_SURFACES.items():

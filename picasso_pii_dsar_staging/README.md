@@ -15,7 +15,9 @@ MFS-scoped surfaces. Capability-bundle item 1a per
   - `request_type=access` → matched rows in `exported_rows`
   - `request_type=delete` + `dry_run=true` → count only
   - `request_type=delete` + `dry_run=false` → `DeleteItem` per matched row (corrupted rows missing PK/SK are logged + skipped, batch continues)
-- Other 5 surfaces (`notification-sends/events`, `recent-messages`, `conversation-summaries`, `audit-read-only`) return honest `manual_followup` and `walker_results[surface].status = "deferred"`
+- **`notification-sends` walker** — tenant-scoped Query (PK=`TENANT#<tenant_id>`) + FilterExpression on `recipient == normalized_email`. Catches direct-to-consumer messages (auto-replies, confirmations). Captures the matched `message_id`s for the chained `notification-events` walk. **Staff-recipient rows** (notifications ABOUT the consumer to staff) are operator/staff PII under a different controller relationship (D5 G-H + F9 + Step 10 v3 §F9) and **NOT auto-deleted** — flagged in `manual_followup` with a copy-pasteable inspection CLI snippet.
+- **`notification-events` walker** — chained via the `message_id`s from `notification-sends`. Queries `picasso-notification-events-staging` by the `ByMessageId` GSI per message_id. If `notification-sends` yields no message_ids (the common case today), records `action=no_messages_to_walk` / `rows_touched=0` and does NOT issue GSI queries.
+- Other 3 surfaces (`recent-messages`, `conversation-summaries`, `audit-read-only`) return honest `manual_followup` and `walker_results[surface].status = "deferred"`
 
 ## Status semantics
 
@@ -34,11 +36,12 @@ The walker filters by `pii_subject_id`, which only exists on submissions written
 
 ## What's deferred (follow-up PRs)
 
-- Per-surface walkers for the 5 remaining MFS surfaces (notification-sends/events, recent-messages, conversation-summaries, audit-read-only). Each waits on schema verification against MFS writer code.
+- Per-surface walkers for the 3 remaining MFS surfaces (recent-messages, conversation-summaries, audit-read-only). Each waits on schema verification against MFS writer code (same gating pattern as notification-sends/events landed via this PR).
 - Milestone 2 (item 1b): Meta channel-mappings PSID walk, S3 fan-out, ARCHIVE_BUCKET walk
 - Capability-bundle item 3: EventBridge SLA alarm Lambda
 - Capability-bundle item 6: integration tests against deployed Lambda + staging DDB
 - Apply-2 backfill of `pii_subject_id` onto pre-Phase-1 form-submission rows
+- Staff-recipient notification walk (operator/staff PII under different controller relationship per D5 G-H + F9; current scope is consumer-direct only). Resolution depends on counsel Q1/Q2 + F9 three-part mitigation per Step 10 v3 §F9.
 
 ## Contract
 
