@@ -103,6 +103,14 @@ TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 
+# Bound the chained notification-events GSI walk so a single DSAR cannot
+# exhaust the 60s Lambda timeout (Security advisor Finding 3, 2026-05-21).
+# 200 message_ids × ~50ms avg GSI Query = ~10s, well under the timeout
+# budget after the form-submissions walk + audit writes. Overflow surfaces
+# as a manual_followup with the excess count; operator can re-invoke with
+# narrower scope or wait for item 6's batching.
+MAX_MESSAGE_IDS_PER_INVOCATION = 200
+
 # Surfaces still scaffolded with deferred walkers. form-submissions +
 # notification-sends + notification-events have their walkers implemented;
 # the rest return human-readable manual_followup until each surface's
@@ -430,17 +438,28 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
     driven); the consumer's email rarely appears as recipient. Returning 0
     rows here is a true negative for the consumer-direct delete scope,
     NOT a coverage failure. The follow-up makes the scope explicit.
+
+    Normalization symmetry (D5 row F-DSAR3, 2026-05-21 advisor audit):
+    Writers (`form_handler.py:802`, `SMS_Sender/index.mjs:127`) store
+    `recipient` verbatim without lowercasing or stripping. The walker
+    therefore CANNOT use a DynamoDB FilterExpression on `recipient` —
+    `Attr.eq` is case-sensitive and would miss `Person@Example.COM`
+    when the operator submits `person@example.com`. Instead, the walker
+    queries by tenant PK only and applies a case-insensitive Python
+    post-filter using the same `.strip().lower()` normalization that
+    produced `normalized_email`. RCU cost is unchanged (DynamoDB
+    FilterExpression evaluates after RCU consumption); the only added
+    cost is bandwidth + Lambda Python compare time, which is negligible
+    at tenant scale (~hundreds to low-thousands of rows). Durable fix is
+    writer-side normalization — tracked in F-DSAR3.
     """
     table = ddb.Table(TABLE_NOTIFICATION_SENDS)
     pk_value = f"TENANT#{tenant_id}"
 
-    matched = []
+    all_tenant_rows = []
     last_evaluated_key = None
     while True:
-        kwargs = {
-            "KeyConditionExpression": Key("pk").eq(pk_value),
-            "FilterExpression": Attr("recipient").eq(normalized_email),
-        }
+        kwargs = {"KeyConditionExpression": Key("pk").eq(pk_value)}
         if last_evaluated_key:
             kwargs["ExclusiveStartKey"] = last_evaluated_key
         try:
@@ -456,11 +475,18 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
                 "message_ids": [],
                 "error": "query_failed",
             }
-        matched.extend(resp.get("Items", []))
+        all_tenant_rows.extend(resp.get("Items", []))
         last_evaluated_key = resp.get("LastEvaluatedKey")
         if not last_evaluated_key:
             break
 
+    # Case-insensitive Python post-filter on `recipient` (see docstring +
+    # F-DSAR3 for why this is in Python and not in FilterExpression).
+    matched = [
+        row for row in all_tenant_rows
+        if isinstance(row.get("recipient"), str)
+        and row["recipient"].strip().lower() == normalized_email
+    ]
     rows_found = len(matched)
     # message_ids feed _walk_notification_events. Some send rows have empty
     # message_id (failed-send rows record `message_id: ''`); skip those for
@@ -534,24 +560,56 @@ def _walk_notification_events(message_ids, request_type, dry_run):
 
     Returns:
       {
-        "rows_found":     int,
-        "action":         "exported" | "dry_run_count" | "deleted" | "error" | "no_messages",
-        "exported_rows":  [<event row>, ...]    # access only
-        "rows_deleted":   int                    # delete-real only
-        "rows_skipped_corrupted": int            # delete-real only
-        "error":          <code>                 # error only
+        "rows_found":             int,
+        "action":                 "exported" | "dry_run_count" | "deleted" | "error" | "no_messages",
+        "exported_rows":          [<event row>, ...]   # access only
+        "rows_deleted":           int                  # delete-real only
+        "rows_skipped_corrupted": int                  # delete-real only
+        "error":                  <code>               # error only
+        "failed_message_ids":     [<message_id>, ...]  # set when partial errors
+        "truncated_message_id_count": int              # set when cap hit
       }
 
     If `message_ids` is empty, returns `{"action": "no_messages",
     "rows_found": 0}` immediately — no GSI queries are issued. This is the
     common case when the consumer has no direct-recipient notifications.
+
+    Bounded fan-out (Security advisor Finding 3, 2026-05-21):
+    `len(message_ids) > MAX_MESSAGE_IDS_PER_INVOCATION` is truncated to the
+    cap; the overflow count is returned so the dispatcher can surface a
+    manual_followup. This prevents a high-volume subject from exhausting
+    the 60s Lambda timeout before the `closed` audit row is written.
+
+    Continue-on-error (Security advisor Finding 2, 2026-05-21): per-
+    message_id GSI failures are logged + recorded in `failed_message_ids`;
+    the walker continues to the next message_id rather than short-circuiting.
+    Operator gets a complete picture of which IDs succeeded vs failed
+    instead of a binary "query_failed" with hidden progress.
+
+    GSI eventual consistency note: DynamoDB GSI reads are eventually
+    consistent by default. A row deleted on the base table during or just
+    before a GSI query window may still appear in the GSI's response. The
+    walker's subsequent `DeleteItem` is idempotent (DDB silently succeeds
+    on non-existent items), so `rows_deleted` may overcount by the phantom
+    window. Operationally harmless; not a correctness risk.
     """
     if not message_ids:
         return {"rows_found": 0, "action": "no_messages"}
 
+    # Bounded fan-out per Security advisor Finding 3.
+    truncated_message_id_count = 0
+    if len(message_ids) > MAX_MESSAGE_IDS_PER_INVOCATION:
+        truncated_message_id_count = len(message_ids) - MAX_MESSAGE_IDS_PER_INVOCATION
+        message_ids = message_ids[:MAX_MESSAGE_IDS_PER_INVOCATION]
+        logger.warning(
+            "notification_events_message_ids_truncated: cap=%d overflow=%d",
+            MAX_MESSAGE_IDS_PER_INVOCATION, truncated_message_id_count,
+        )
+
     table = ddb.Table(TABLE_NOTIFICATION_EVENTS)
 
     matched = []
+    failed_message_ids = []
     for message_id in message_ids:
         last_evaluated_key = None
         while True:
@@ -568,10 +626,11 @@ def _walk_notification_events(message_ids, request_type, dry_run):
                     "notification_events_query_failed: message_id=%s code=%s",
                     message_id, exc.response.get("Error", {}).get("Code"),
                 )
-                return {
-                    "rows_found": len(matched),
-                    "error": "query_failed",
-                }
+                # Continue-on-error per Security Finding 2: record this
+                # message_id as failed and proceed to the next; do not
+                # short-circuit the whole walk.
+                failed_message_ids.append(message_id)
+                break
             matched.extend(resp.get("Items", []))
             last_evaluated_key = resp.get("LastEvaluatedKey")
             if not last_evaluated_key:
@@ -579,15 +638,29 @@ def _walk_notification_events(message_ids, request_type, dry_run):
 
     rows_found = len(matched)
 
+    # Build a base result dict with the progress-tracking fields always
+    # included so the dispatcher can emit accurate followups regardless of
+    # request_type or outcome.
+    progress_fields = {}
+    if failed_message_ids:
+        progress_fields["failed_message_ids"] = failed_message_ids
+    if truncated_message_id_count:
+        progress_fields["truncated_message_id_count"] = truncated_message_id_count
+
     if request_type == "access":
         return {
             "rows_found": rows_found,
             "action": "exported",
             "exported_rows": matched,
+            **progress_fields,
         }
 
     if dry_run:
-        return {"rows_found": rows_found, "action": "dry_run_count"}
+        return {
+            "rows_found": rows_found,
+            "action": "dry_run_count",
+            **progress_fields,
+        }
 
     deleted = 0
     skipped_corrupted = 0
@@ -616,6 +689,7 @@ def _walk_notification_events(message_ids, request_type, dry_run):
         "action": "deleted",
         "rows_deleted": deleted,
         "rows_skipped_corrupted": skipped_corrupted,
+        **progress_fields,
     }
 
 
@@ -915,6 +989,45 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             ne_result["status"] = "errored"
             ne_result["error"] = "rows_skipped_corrupted"
         walker_results["notification-events"] = ne_result
+
+    # Surface advisor-audit fix-now items #2 + #4: per-message_id failures
+    # and message_id cap overflow. Both apply across any walker action; emit
+    # followups + taint walker status to errored when failures occurred so
+    # close_status reflects partial_error per audit fix-now #5 semantics.
+    failed_ids = ne.get("failed_message_ids", []) if ne else []
+    truncated_count = ne.get("truncated_message_id_count", 0) if ne else 0
+    if failed_ids:
+        manual_followups.append(
+            f"notification-events: {len(failed_ids)} message_id(s) failed "
+            f"per-id GSI query and were skipped (walker continued on remaining "
+            f"IDs). Failed message_ids: {failed_ids[:5]}"
+            f"{'...' if len(failed_ids) > 5 else ''}. "
+            f"Re-invoke with the same dsar_id (new event_timestamp) to retry, "
+            f"or inspect CloudWatch logs for the specific GSI error codes."
+        )
+        existing = walker_results.get("notification-events", {})
+        walker_results["notification-events"] = {
+            **existing,
+            "status": "errored",
+            "error": "partial_query_failures",
+            "failed_message_ids_count": len(failed_ids),
+        }
+    if truncated_count:
+        manual_followups.append(
+            f"notification-events: chained walker capped at "
+            f"{MAX_MESSAGE_IDS_PER_INVOCATION} message_ids per invocation "
+            f"(Lambda timeout protection). {truncated_count} message_id(s) "
+            f"were NOT walked. Re-invoke with a narrower scope or wait for "
+            f"item 6's integration-test batching."
+        )
+        existing = walker_results.get("notification-events", {})
+        if existing.get("status") == "completed":
+            walker_results["notification-events"] = {
+                **existing,
+                "status": "errored",
+                "error": "message_ids_truncated",
+                "truncated_count": truncated_count,
+            }
 
     # Other surfaces: still scaffolded.
     for surface, reason in MFS_SCOPED_SURFACES.items():
