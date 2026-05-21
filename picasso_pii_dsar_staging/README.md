@@ -10,12 +10,23 @@ MFS-scoped surfaces. Capability-bundle item 1a per
 - Cold-start env-guard (refuses to run outside staging account 525)
 - Operator input validation (typed payload, `dry_run` default `true`)
 - Subject resolution via `picasso-pii-subject-index-staging`
-- Append-only audit writes to `picasso-pii-dsar-audit-staging`
+- **Idempotent audit writes** to `picasso-pii-dsar-audit-staging` — `ConditionExpression` refuses replay on identical (`dsar_id`, `event_timestamp`). Per-DSAR events: `request_received` → `surface_walked:<surface>` (one per non-deferred walker) → `closed`. Audit log is the legal trail; idempotency prevents silent overwrite.
 - **`form-submissions` walker** — tenant-scoped Query (PK=`tenant_id`) + FilterExpression on `pii_subject_id`:
   - `request_type=access` → matched rows in `exported_rows`
   - `request_type=delete` + `dry_run=true` → count only
-  - `request_type=delete` + `dry_run=false` → `DeleteItem` per matched row
-- Other 5 surfaces (`notification-sends/events`, `recent-messages`, `conversation-summaries`, `audit-read-only`) return honest `manual_followup`
+  - `request_type=delete` + `dry_run=false` → `DeleteItem` per matched row (corrupted rows missing PK/SK are logged + skipped, batch continues)
+- Other 5 surfaces (`notification-sends/events`, `recent-messages`, `conversation-summaries`, `audit-read-only`) return honest `manual_followup` and `walker_results[surface].status = "deferred"`
+
+## Status semantics
+
+The response `status` field discriminates between four outcomes (per audit fix-now #5):
+
+| Status | Meaning |
+|---|---|
+| `completed` | All walkers ran cleanly; no errors; no deferred surfaces. (Will not occur until all 6 walkers ship.) |
+| `partial` | At least one walker ran successfully but at least one surface is still deferred. **Today's default outcome** for every DSAR (5 of 6 surfaces are deferred). |
+| `partial_error` | At least one walker errored mid-batch — query failure, corrupted-row skip, or surface-audit collision. Operator must inspect logs to determine completeness. |
+| `failed` | Env-guard, input validation, or `request_received` audit-collision failure. Lambda never reached the walker dispatch. |
 
 ## Coverage gap (form-submissions)
 
@@ -53,7 +64,7 @@ aws lambda invoke \
 ```json
 {
   "dsar_id":           "<echo>",
-  "status":            "partial",
+  "status":            "completed | partial | partial_error | failed",
   "pii_subject_id":    "<resolved-opaque-id-or-null>",
   "rows_touched":      {"form-submissions": 2, "notification-sends": 0, "...": 0},
   "exported_rows":     {"form-submissions": [<row>, <row>]},
@@ -63,6 +74,8 @@ aws lambda invoke \
 ```
 
 `exported_rows` is populated only on `request_type=access` and only for surfaces with implemented walkers.
+
+`audit_row_pks` lists every audit event written: `request_received` + one `surface_walked:<surface>` per non-deferred walker outcome + `closed`.
 
 ## Runtime
 
