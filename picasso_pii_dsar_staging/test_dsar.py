@@ -177,6 +177,9 @@ def test_write_audit_event_uses_correct_table_and_shape(dsar):
     assert item["status"] == "in_progress"
     payload_back = json.loads(item["details"])
     assert payload_back == {"operator": "op@x", "tenant_id": "TEN"}
+    # H4 (PR1 fix-now-4 / 🟡 N-2): ByCreatedAt GSI hash key, format YYYY-MM
+    assert item["created_at_partition"] == ts[:7]
+    assert len(item["created_at_partition"]) == 7  # YYYY-MM
     # Audit fix-now #4: idempotency invariant — must reject replay on
     # identical (dsar_id, event_timestamp).
     assert "ConditionExpression" in kwargs
@@ -2215,3 +2218,199 @@ def test_compute_close_status_partial_error_when_any_errored(dsar):
         "notification-sends": {"status": "deferred"},
     }
     assert mod._compute_close_status(walker_results) == "partial_error"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# H4 (PR1 fix-now-4 / 🟡 N-2): ByCreatedAt GSI partition key
+# ───────────────────────────────────────────────────────────────────────────
+def test_h4_audit_row_carries_created_at_partition_ym(dsar):
+    """Every audit row must carry created_at_partition derived from
+    event_timestamp[:7] (ISO YYYY-MM). Required by the ByCreatedAt GSI."""
+    import re
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_ddb.Table.return_value = mock_table
+    ts = mod._write_audit_event(
+        dsar_id="h4-canary", event_type="request_received",
+        status="in_progress", payload={},
+    )
+    item = mock_table.put_item.call_args.kwargs["Item"]
+    assert item["created_at_partition"] == ts[:7]
+    # YYYY-MM regex: 4-digit year, dash, 2-digit month
+    assert re.match(r"^\d{4}-\d{2}$", item["created_at_partition"])
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# D1 (PR1 fix-now-4): PII redaction in corrupted-row error logs.
+# pii_subject_id (form-submissions) and recipient (notification-sends) must
+# NOT appear in error log messages — both are PII per current classification.
+# ───────────────────────────────────────────────────────────────────────────
+def test_d1_form_submissions_corrupted_row_log_omits_pii_subject_id(dsar, caplog):
+    """D1: form_submissions_delete_skipped_corrupted log must NOT contain
+    pii_subject_id — it's PII (opaque PSID still classified as PII per D5 G-H)."""
+    import logging
+    mod, mock_ddb, _ = dsar
+    fs_table = MagicMock()
+    leaked_psid = "subj_LEAK_CANARY_XYZ"
+    corrupted = {"tenant_id": "TEN", "pii_subject_id": leaked_psid}  # no submission_id
+    fs_table.query.return_value = {"Items": [corrupted]}
+    mock_ddb.Table.return_value = fs_table
+
+    with caplog.at_level(logging.ERROR):
+        result = mod._walk_form_submissions(
+            pii_subject_id=leaked_psid, tenant_id="TEN",
+            request_type="delete", dry_run=False,
+        )
+
+    assert result["rows_skipped_corrupted"] == 1
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert leaked_psid not in log_text, "pii_subject_id leaked into error log"
+    # Operator-actionable identifiers retained
+    assert "tenant_id=TEN" in log_text
+    assert "form_submissions_delete_skipped_corrupted" in log_text
+
+
+def test_d1_notification_sends_corrupted_row_log_omits_recipient(dsar, caplog):
+    """D1: notification_sends_delete_skipped_corrupted log must NOT contain
+    recipient — direct email PII."""
+    import logging
+    mod, mock_ddb, _ = dsar
+    ns_table = MagicMock()
+    leaked_email = "LEAK_CANARY@example.com"
+    corrupted = {"recipient": leaked_email, "message_id": "m-corrupt"}  # no pk/sk
+    ns_table.query.return_value = {"Items": [corrupted]}
+    mock_ddb.Table.return_value = ns_table
+
+    with caplog.at_level(logging.ERROR):
+        result = mod._walk_notification_sends(
+            tenant_id="TEN123", normalized_email="leak_canary@example.com",
+            request_type="delete", dry_run=False,
+        )
+
+    assert result["rows_skipped_corrupted"] == 1
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert leaked_email not in log_text, "recipient leaked into error log"
+    assert leaked_email.lower() not in log_text, "recipient (case-folded) leaked into error log"
+    assert "notification_sends_delete_skipped_corrupted" in log_text
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# E2 (PR1 fix-now-4): subject-resolution ClientError handling.
+# Previously: ClientError from _resolve_subject propagated uncaught → Lambda
+# crashed with no audit row. Now: audit-write a subject_resolution_failed
+# event and return a clean failed response. normalized_email must NOT appear
+# in the response/log.
+# ───────────────────────────────────────────────────────────────────────────
+def test_e2_subject_resolution_client_error_writes_audit_and_returns_failed(dsar):
+    """E2: ClientError on subject-index get_item → audit row +
+    failed response, no crash."""
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    subject_table = MagicMock()
+    audit_table = MagicMock()
+    subject_table.get_item.side_effect = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException",
+                   "Message": "throttled"}},
+        "GetItem",
+    )
+
+    def route(name):
+        if name == "picasso-pii-subject-index-staging":
+            return subject_table
+        if name == "picasso-pii-dsar-audit-staging":
+            return audit_table
+        raise AssertionError(f"unexpected DDB Table call: {name}")
+    mock_ddb.Table.side_effect = route
+
+    resp = mod.lambda_handler(
+        _valid_event(subject_identifier="leak_canary@example.com"),
+        context=None,
+    )
+
+    assert resp["status"] == "failed"
+    assert resp["error"] == "subject_resolution_failed"
+    assert "ProvisionedThroughputExceededException" in resp["message"]
+    # Two audit rows: request_received + subject_resolution_failed
+    assert audit_table.put_item.call_count == 2
+    event_types = [c.kwargs["Item"]["event_type"]
+                   for c in audit_table.put_item.call_args_list]
+    assert event_types == ["request_received", "subject_resolution_failed"]
+    # subject_resolution_failed row uses status=failed; payload carries the
+    # error code and tenant_id but NOT the normalized_email (PII).
+    failure_row = audit_table.put_item.call_args_list[1].kwargs["Item"]
+    assert failure_row["status"] == "failed"
+    details = json.loads(failure_row["details"])
+    assert details["error_code"] == "ProvisionedThroughputExceededException"
+    assert details["tenant_id"] == "TEN123"
+    assert "normalized_email" not in details
+    assert "leak_canary" not in json.dumps(failure_row)
+
+
+def test_e2_subject_resolution_client_error_does_not_leak_email_in_response(dsar):
+    """E2: response body must NOT contain the consumer email (subject_identifier)."""
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    subject_table = MagicMock()
+    audit_table = MagicMock()
+    subject_table.get_item.side_effect = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "no access"}},
+        "GetItem",
+    )
+
+    def route(name):
+        if name == "picasso-pii-subject-index-staging":
+            return subject_table
+        if name == "picasso-pii-dsar-audit-staging":
+            return audit_table
+        raise AssertionError(f"unexpected DDB Table call: {name}")
+    mock_ddb.Table.side_effect = route
+
+    leak_canary = "leak_canary_response@example.com"
+    resp = mod.lambda_handler(
+        _valid_event(subject_identifier=leak_canary), context=None,
+    )
+
+    resp_json = json.dumps(resp)
+    assert leak_canary not in resp_json
+    assert leak_canary.lower() not in resp_json
+    assert resp["error"] == "subject_resolution_failed"
+
+
+def test_e2_subject_resolution_client_error_survives_audit_collision_on_failure_event(dsar):
+    """E2 edge case: if the subject_resolution_failed audit event itself
+    collides (extremely rare — dsar_id replay), the handler still returns a
+    clean failed response rather than crashing.
+    """
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    subject_table = MagicMock()
+    audit_table = MagicMock()
+    subject_table.get_item.side_effect = ClientError(
+        {"Error": {"Code": "InternalServerError", "Message": "boom"}},
+        "GetItem",
+    )
+    # First put_item (request_received) succeeds; second put_item
+    # (subject_resolution_failed) collides.
+    audit_table.put_item.side_effect = [
+        None,
+        ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException",
+                       "Message": "exists"}},
+            "PutItem",
+        ),
+    ]
+
+    def route(name):
+        if name == "picasso-pii-subject-index-staging":
+            return subject_table
+        if name == "picasso-pii-dsar-audit-staging":
+            return audit_table
+        raise AssertionError(f"unexpected DDB Table call: {name}")
+    mock_ddb.Table.side_effect = route
+
+    resp = mod.lambda_handler(_valid_event(), context=None)
+
+    # Still returns the failed envelope — does NOT crash on audit collision
+    # during failure-path audit write.
+    assert resp["status"] == "failed"
+    assert resp["error"] == "subject_resolution_failed"
