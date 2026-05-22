@@ -295,6 +295,11 @@ def _write_audit_event(dsar_id, event_type, status, payload):
         "event_type": event_type,
         "status": status,
         "details": json.dumps(payload, default=str),
+        # H4 (PR1 fix-now-4 / 🟡 N-2): ByCreatedAt GSI hash key. Format =
+        # ISO YYYY-MM (event_timestamp[:7]). Enables future counsel-determined
+        # purge to Query a year-month partition instead of full-table Scan.
+        # See docs/roadmap/PII-Project/audit-table-retention-runbook.md §3.
+        "created_at_partition": event_timestamp[:7],
     }
     try:
         table.put_item(
@@ -402,11 +407,14 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
         row_submission_id = row.get("submission_id")
         if row_tenant_id is None or row_submission_id is None:
             skipped_corrupted += 1
+            # D1 (PR1 fix-now-4): pii_subject_id REDACTED — opaque PSID is
+            # still PII per current classification (D5 G-H). tenant_id + the
+            # corrupted PK/SK marker are sufficient for operator triage.
             logger.error(
                 "form_submissions_delete_skipped_corrupted: "
-                "tenant_id=%s submission_id=%s pii_subject_id=%s "
+                "tenant_id=%s submission_id=%s "
                 "— row missing PK/SK; cannot delete safely",
-                row_tenant_id, row_submission_id, row.get("pii_subject_id"),
+                row_tenant_id, row_submission_id,
             )
             continue
         try:
@@ -546,10 +554,12 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
         row_sk = row.get("sk")
         if row_pk is None or row_sk is None:
             skipped_corrupted += 1
+            # D1 (PR1 fix-now-4): recipient REDACTED — direct email PII.
+            # pk/sk markers are sufficient for operator triage.
             logger.error(
                 "notification_sends_delete_skipped_corrupted: "
-                "pk=%s sk=%s recipient=%s — row missing PK/SK",
-                row_pk, row_sk, row.get("recipient"),
+                "pk=%s sk=%s — row missing PK/SK",
+                row_pk, row_sk,
             )
             continue
         try:
@@ -1527,10 +1537,38 @@ def lambda_handler(event, context):
             "message": str(exc),
         }
 
-    pii_subject_id = _resolve_subject(
-        tenant_id=inputs["tenant_id"],
-        normalized_email=inputs["subject_identifier"],
-    )
+    # E2 (PR1 fix-now-4): subject-index lookup is a DDB call — ClientError
+    # (throttle, AccessDenied, network) previously propagated uncaught and
+    # crashed the Lambda with no audit row. Now: audit-write the failure and
+    # return failed cleanly. normalized_email NOT logged/returned (consumer PII).
+    try:
+        pii_subject_id = _resolve_subject(
+            tenant_id=inputs["tenant_id"],
+            normalized_email=inputs["subject_identifier"],
+        )
+    except ClientError as exc:
+        error_code = exc.response.get("Error", {}).get("Code")
+        try:
+            _write_audit_event(
+                dsar_id=dsar_id,
+                event_type="subject_resolution_failed",
+                status="failed",
+                payload={
+                    "tenant_id": inputs["tenant_id"],
+                    "error_code": error_code,
+                },
+            )
+        except AuditCollision as audit_exc:
+            logger.error(
+                "subject_resolution_failure_audit_collision: dsar_id=%s err=%s",
+                dsar_id, audit_exc,
+            )
+        return {
+            "dsar_id": dsar_id,
+            "status": "failed",
+            "error": "subject_resolution_failed",
+            "message": f"DDB ClientError on subject-index lookup: {error_code}",
+        }
     logger.info(
         "dsar_subject_resolved: dsar_id=%s tenant=%s found=%s",
         dsar_id, inputs["tenant_id"], pii_subject_id is not None,
