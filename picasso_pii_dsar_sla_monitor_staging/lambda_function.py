@@ -137,7 +137,7 @@ def _publish_alert(at_risk_rows: list) -> None:
         f'(open longer than {SLA_DAYS_INTAKE_PLUS} days; 5 days before CCPA 30-day target).',
         '',
         'Action: open the DSAR operator playbook and review per-DSAR.',
-        'Playbook: docs/roadmap/PII-Project/dsar-operator-playbook.md',
+        'Playbook: https://github.com/longhornrumble/picasso/blob/staging/docs/roadmap/PII-Project/dsar-operator-playbook.md',
         '',
         'At-risk DSARs:',
     ]
