@@ -651,7 +651,18 @@ class FormHandler:
                     'submitted_at': timestamp,
                     'timestamp': timestamp,  # Keep for backwards compatibility
                     'status': 'pending_fulfillment',
-                    'priority': 'normal'
+                    'priority': 'normal',
+                    # M4 done-bar #2 (master plan v0.3 §M4): TTL enables the existing
+                    # table-level TTL config (infra/modules/ddb-form-submissions-staging
+                    # /main.tf attribute_name='ttl', enabled=true) so form-submission
+                    # rows actually expire instead of persisting indefinitely. Closes
+                    # the writer half of D5 G-A (widget claim corrected in companion
+                    # picasso PR — StateManagementPanel.jsx no longer asserts "No
+                    # personal information stored permanently"). 365 days chosen as
+                    # interim default to align with archive-bucket lifecycle (365d)
+                    # and CCPA §1798.105 12-month common reference; counsel-pending
+                    # refinement may shorten/extend post-M8 Q1 response.
+                    'ttl': int(time.time()) + (365 * 24 * 3600),
                 }
             )
             logger.info(f"Stored submission: {submission_id} with form_title: {form_title}")
