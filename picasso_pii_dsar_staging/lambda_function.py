@@ -124,22 +124,31 @@ MAX_SESSION_IDS_PER_INVOCATION = 200
 # MAX_EXPORTED_MESSAGES rows.
 MAX_EXPORTED_MESSAGES = 1000
 
-# Surfaces still scaffolded with deferred walkers. form-submissions +
-# notification-sends + notification-events + recent-messages have their
-# walkers implemented; the rest return human-readable manual_followup until
-# each surface's subject-linking attribute is verified against the MFS
-# writer code.
-MFS_SCOPED_SURFACES = {
+# Surfaces explicitly deferred from M1 (re-scoped 2026-05-23 per
+# phase-completion-audit row 5 / tech-lead B1). M1 outcome scope: form-
+# submissions + notification-sends + notification-events + recent-messages
+# walkers, plus subject resolution + audit-write + dispatcher. The two
+# entries below were originally listed in M1 outcome statement (master
+# plan §2) but never had walkers implemented; M1 v0.3 re-scopes them out
+# explicitly with named routing — see MASTER_PROJECT_PLAN.md M1 done-bar
+# revision history v0.3.
+DEFERRED_SURFACES = {
     "conversation-summaries": (
         "Walker pending: sessionId-keyed (no subject linkage on row); "
         "chained walk via form-submissions session_ids — pattern mirrors "
-        "recent-messages once verified against writer."
+        "recent-messages once verified against writer. M1 scope-excluded "
+        "(v0.3 2026-05-23); routed to a follow-on milestone."
     ),
     "audit-read-only": (
         "Walker pending: picasso-audit-staging is read-only per Art 17(3)(b) "
-        "carve-out (D5 G-C). Access-type DSAR exports rows; never delete."
+        "carve-out (D5 G-C). Access-type DSAR exports rows; never delete. "
+        "M1 scope-excluded (v0.3 2026-05-23); routed to a follow-on milestone."
     ),
 }
+
+# Backward-compat alias (callers in _walk_mfs_surfaces). The rename is
+# documentation, not behavior — same dict, clearer name.
+MFS_SCOPED_SURFACES = DEFERRED_SURFACES
 
 SUPPORTED_REQUEST_TYPES = {"access", "delete"}
 SUPPORTED_IDENTIFIER_TYPES = {"email"}  # milestone 1; psid arrives in 1b
@@ -155,19 +164,28 @@ sts = boto3.client("sts")
 # Cold-start guard
 # ───────────────────────────────────────────────────────────────────────────
 def _assert_account():
-    """Refuse to run in any account other than staging.
+    """Refuse to run in any account other than staging; return caller ARN.
 
     Raises RuntimeError on mismatch — Lambda returns 500, no DDB ops happen,
     no audit row written. The Lambda execution role grants sts:GetCallerIdentity
     explicitly (lambda-pii-dsar-staging module).
+
+    Audit row 12 (Security SR3): returns the caller ARN so the handler can
+    log it into the `request_received` audit row. The `operator` payload
+    field is self-reported; the caller ARN is the actual identity AWS sees
+    (the Lambda's execution role, since invocation hops through Lambda's
+    own service principal). This preserves accountability when the operator
+    payload value can't be trusted.
     """
-    actual = sts.get_caller_identity()["Account"]
+    identity = sts.get_caller_identity()
+    actual = identity["Account"]
     if actual != EXPECTED_ACCOUNT:
         raise RuntimeError(
             f"dsar_account_guard: refusing to run in account {actual}; "
             f"expected staging account {EXPECTED_ACCOUNT}. "
             f"Prod promotion requires explicit code change."
         )
+    return identity.get("Arn")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -375,9 +393,10 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
             break
 
     rows_found = len(matched)
+    # Schema discipline (CLAUDE.md): use .get() exclusively on optional fields.
+    # Inline guard rejects None / empty strings.
     session_ids = [
-        row["session_id"] for row in matched
-        if row.get("session_id")
+        sid for sid in (row.get("session_id") for row in matched) if sid
     ]
 
     if request_type == "access":
@@ -397,6 +416,7 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
         }
 
     deleted = 0
+    delete_failed = 0
     skipped_corrupted = 0
     for row in matched:
         # Schema discipline (CLAUDE.md §"Schema Discipline"): the walker MUST
@@ -424,6 +444,12 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
             })
             deleted += 1
         except ClientError as exc:
+            # Audit row 8 (code-reviewer SR1): count delete failures so the
+            # response can distinguish "matched but not deleted" from
+            # "matched and deleted". Without this counter, rows_deleted
+            # silently undercounts and the operator believes the delete
+            # completed when it didn't.
+            delete_failed += 1
             logger.error(
                 "form_submissions_delete_failed: submission=%s code=%s",
                 row_submission_id,
@@ -434,6 +460,7 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
         "session_ids": session_ids,
         "action": "deleted",
         "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
         "rows_skipped_corrupted": skipped_corrupted,
     }
 
@@ -523,10 +550,9 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
     rows_found = len(matched)
     # message_ids feed _walk_notification_events. Some send rows have empty
     # message_id (failed-send rows record `message_id: ''`); skip those for
-    # the chained event lookup.
+    # the chained event lookup. Schema discipline: .get() only.
     message_ids = [
-        row["message_id"] for row in matched
-        if row.get("message_id")
+        mid for mid in (row.get("message_id") for row in matched) if mid
     ]
 
     if request_type == "access":
@@ -548,6 +574,7 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
         }
 
     deleted = 0
+    delete_failed = 0
     skipped_corrupted = 0
     for row in matched:
         row_pk = row.get("pk")
@@ -566,6 +593,8 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
             table.delete_item(Key={"pk": row_pk, "sk": row_sk})
             deleted += 1
         except ClientError as exc:
+            # Audit row 8 (code-reviewer SR1): count delete failures.
+            delete_failed += 1
             logger.error(
                 "notification_sends_delete_failed: sk=%s code=%s",
                 row_sk,
@@ -577,6 +606,7 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
         "message_ids": message_ids,
         "action": "deleted",
         "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
         "rows_skipped_corrupted": skipped_corrupted,
     }
 
@@ -698,6 +728,7 @@ def _walk_notification_events(message_ids, request_type, dry_run):
         }
 
     deleted = 0
+    delete_failed = 0
     skipped_corrupted = 0
     for row in matched:
         row_pk = row.get("pk")
@@ -714,6 +745,8 @@ def _walk_notification_events(message_ids, request_type, dry_run):
             table.delete_item(Key={"pk": row_pk, "sk": row_sk})
             deleted += 1
         except ClientError as exc:
+            # Audit row 8 (code-reviewer SR1): count delete failures.
+            delete_failed += 1
             logger.error(
                 "notification_events_delete_failed: sk=%s code=%s",
                 row_sk,
@@ -723,6 +756,7 @@ def _walk_notification_events(message_ids, request_type, dry_run):
         "rows_found": rows_found,
         "action": "deleted",
         "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
         "rows_skipped_corrupted": skipped_corrupted,
         **progress_fields,
     }
@@ -901,6 +935,7 @@ def _walk_recent_messages(tenant_id, session_ids, request_type, dry_run):
         }
 
     deleted = 0
+    delete_failed = 0
     skipped_corrupted = 0
     for row in matched:
         row_session_id = row.get("sessionId")
@@ -922,6 +957,8 @@ def _walk_recent_messages(tenant_id, session_ids, request_type, dry_run):
             })
             deleted += 1
         except ClientError as exc:
+            # Audit row 8 (code-reviewer SR1): count delete failures.
+            delete_failed += 1
             logger.error(
                 "recent_messages_delete_failed: sessionId=%s messageTimestamp=%s code=%s",
                 row_session_id, row_timestamp,
@@ -931,12 +968,13 @@ def _walk_recent_messages(tenant_id, session_ids, request_type, dry_run):
         "rows_found": rows_found,
         "action": "deleted",
         "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
         "rows_skipped_corrupted": skipped_corrupted,
         **progress_fields,
     }
 
 
-def _recent_messages_chat_only_cli_snippet(normalized_email, tenant_id):
+def _recent_messages_chat_only_cli_snippet(tenant_id):
     """Operator-actionable CLI snippet for the chat-only F-DSAR4 gap.
 
     Used in the manual_followup block to give the operator a concrete next
@@ -946,8 +984,11 @@ def _recent_messages_chat_only_cli_snippet(normalized_email, tenant_id):
     session_id from out-of-band sources (support transcript, browser
     history, etc.) and can query directly.
 
-    Includes a content-substring scan as a last-resort path, with explicit
-    caveats about case-sensitivity and false positives.
+    Audit row 11 (Security SR2): `<SUBJECT_EMAIL>` placeholder substituted
+    for the operator's normalized email — the operator fills it in at run
+    time from the DSAR ledger. Prevents consumer email from leaking into
+    operator-side response storage (CLI snippets get pasted into tickets,
+    log files, etc.).
     """
     return (
         f"  # Operator-known session_id direct query (preferred):\n"
@@ -962,22 +1003,16 @@ def _recent_messages_chat_only_cli_snippet(normalized_email, tenant_id):
         f"    --filter-expression 'contains(#c, :e)' \\\n"
         f"    --expression-attribute-names '{{\"#c\":\"content\"}}' \\\n"
         f"    --expression-attribute-values "
-        f"'{{\":e\":{{\"S\":\"{normalized_email}\"}}}}'"
+        f"'{{\":e\":{{\"S\":\"<SUBJECT_EMAIL>\"}}}}'"
     )
 
 
-def _staff_notification_cli_snippet(normalized_email, tenant_id):
+def _staff_notification_cli_snippet(tenant_id):
     """Operator-actionable CLI snippet for staff-recipient notification inspection.
 
-    Used in the manual_followup block to explain why staff-recipient
-    notifications (where staff were notified ABOUT the consumer) are NOT
-    automatically deleted by this walker. Substitutes the operator's
-    normalized email + tenant so the snippet is copy-pasteable. The pattern
-    matches `_pre_phase1_cli_snippet` (audit fix-now #3 / 2026-05-21).
-
-    Filtering by `submission_id` requires the operator to fan-in from the
-    form-submissions walker output — the snippet uses a placeholder
-    `<SUBMISSION_ID>` rather than synthesizing the list at runtime.
+    Audit row 11: tenant_id kept (not consumer PII); submission_id is also
+    a placeholder. Pattern matches the other snippets — operator fills in
+    placeholders at run time from the DSAR ledger.
     """
     return (
         f"  aws dynamodb query --table-name picasso-notification-sends-staging \\\n"
@@ -989,20 +1024,24 @@ def _staff_notification_cli_snippet(normalized_email, tenant_id):
     )
 
 
-def _pre_phase1_cli_snippet(normalized_email, tenant_id):
+def _pre_phase1_cli_snippet(tenant_id):
     """Operator-actionable CLI snippet for manual email-keyed Scan.
 
     Used when the pii-subject-index does not yield a hit — likely cause is a
     pre-Phase-1 row (submitted before lambda #130 wrote pii_subject_id on
-    2026-05-18). The snippet is copy-pasteable and tenant/email-substituted
-    so the operator can run it directly without templating mistakes.
+    2026-05-18).
+
+    Audit row 11 (Security SR2): `<SUBJECT_EMAIL>` placeholder substituted
+    for the operator's normalized email. The operator fills it in at run
+    time from the DSAR ledger; prevents PII leak into operator response
+    storage.
     """
     return (
         f"  aws dynamodb scan --table-name picasso-form-submissions-staging \\\n"
         f"    --profile myrecruiter-staging \\\n"
         f"    --filter-expression 'submitter_email = :e AND tenant_id = :t' \\\n"
         f"    --expression-attribute-values "
-        f"'{{\":e\":{{\"S\":\"{normalized_email}\"}},\":t\":{{\"S\":\"{tenant_id}\"}}}}'"
+        f"'{{\":e\":{{\"S\":\"<SUBJECT_EMAIL>\"}},\":t\":{{\"S\":\"{tenant_id}\"}}}}'"
     )
 
 
@@ -1042,7 +1081,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         # zero-templating fallback path. Pre-Phase-1 rows are the dominant
         # cause of subject-not-found and the prior soft message offered no
         # concrete next step.
-        cli = _pre_phase1_cli_snippet(normalized_email, tenant_id)
+        cli = _pre_phase1_cli_snippet(tenant_id)
         manual_followups.append(
             f"Subject {normalized_email!r} not found in pii-subject-index "
             f"(tenant {tenant_id!r}). Possible reasons: (a) subject has no "
@@ -1139,7 +1178,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         "from lambda #130). Submissions written before 2026-05-18 do not carry "
         "this attribute; durable fix = Apply-2 backfill (deferred); interim = "
         "manual email-keyed walk if a pre-Phase-1 subject is suspected:\n"
-        f"{_pre_phase1_cli_snippet(normalized_email, tenant_id)}"
+        f"{_pre_phase1_cli_snippet(tenant_id)}"
     )
 
     # notification-sends: tenant-Query + FilterExpression on
@@ -1206,7 +1245,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         "under a different controller relationship (D5 G-H + F9) and are "
         "NOT auto-deleted. For each submission_id from the form-submissions "
         "walker, the operator may inspect with:\n"
-        f"{_staff_notification_cli_snippet(normalized_email, tenant_id)}"
+        f"{_staff_notification_cli_snippet(tenant_id)}"
     )
 
     # notification-events: chained walk via captured message_ids. If
@@ -1444,7 +1483,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         "below is the primary fallback. Operator-actionable fallback if "
         "an out-of-band session_id is known, OR for content-substring "
         "scan (case-sensitive — false positives likely):\n"
-        f"{_recent_messages_chat_only_cli_snippet(normalized_email, tenant_id)}"
+        f"{_recent_messages_chat_only_cli_snippet(tenant_id)}"
     )
     # Article 15 — third-party disclosure caveat for access exports only.
     if request_type == "access" and rm.get("action") == "exported":
@@ -1504,7 +1543,7 @@ def lambda_handler(event, context):
 
     See module docstring for contract.
     """
-    _assert_account()
+    caller_arn = _assert_account()
 
     try:
         inputs = _validate(event)
@@ -1516,6 +1555,9 @@ def lambda_handler(event, context):
 
     # request_received audit event. AuditCollision here means dsar_id replay —
     # fail loud (Q2 decision: loudest signal beats silent overwrite).
+    # Audit row 12 (Security SR3): caller_arn = STS-derived identity, not the
+    # operator self-report. Distinguishes attribution-claim (operator) from
+    # actual-identity (caller_arn) in audit trail.
     try:
         received_ts = _write_audit_event(
             dsar_id=dsar_id,
@@ -1523,6 +1565,7 @@ def lambda_handler(event, context):
             status="in_progress",
             payload={
                 "operator": inputs["operator"],
+                "caller_arn": caller_arn,
                 "tenant_id": inputs["tenant_id"],
                 "identifier_type": inputs["identifier_type"],
                 "request_type": inputs["request_type"],

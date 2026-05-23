@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 import boto3
 import pytest
 from boto3.dynamodb.conditions import Key
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -59,6 +59,9 @@ REGION = "us-east-1"
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
 TABLE_AUDIT = "picasso-pii-dsar-audit-staging"
+TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
+TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
+TABLE_RECENT_MESSAGES = "staging-recent-messages"
 
 TEST_TENANT_PREFIX = "TEN-SMOKE-INT-"
 TEST_DSAR_PREFIX = "smoke-int-"
@@ -72,13 +75,18 @@ SKIP_REASON = (
 # ───────────────────────────────────────────────────────────────────────────
 # Helpers (module scope; available to all tests)
 # ───────────────────────────────────────────────────────────────────────────
-def _aws_available():
+def _aws_identity():
+    """Return STS get-caller-identity result, or None if any auth-class error.
+
+    Audit row 4 (test-eng B3): catches BotoCoreError too (covers
+    SSOTokenLoadError, which is a BotoCoreError subclass, not a ClientError).
+    Without this, expired-SSO causes collection error rather than clean skip.
+    """
     try:
         sts = boto3.client("sts", region_name=REGION)
-        identity = sts.get_caller_identity()
-        return identity["Account"] == EXPECTED_ACCOUNT
-    except (NoCredentialsError, ClientError):
-        return False
+        return sts.get_caller_identity()
+    except (NoCredentialsError, ClientError, BotoCoreError):
+        return None
 
 
 @pytest.fixture(scope="module")
@@ -86,10 +94,19 @@ def aws():
     """Module-level boto3 clients. Skips entire module if AWS unavailable."""
     if os.environ.get("AWS_INTEGRATION_TESTS") != "1":
         pytest.skip(SKIP_REASON)
-    if not _aws_available():
+    identity = _aws_identity()
+    if identity is None:
         pytest.skip(
-            "AWS auth failed or wrong account; "
+            "AWS auth unavailable (no creds / expired SSO / wrong profile); "
             "run `aws sso login --profile myrecruiter-staging` first"
+        )
+    # Audit row 28 (code-rev N1): include the actual returned account in
+    # the skip message so misconfigured profiles diagnose at-a-glance.
+    if identity["Account"] != EXPECTED_ACCOUNT:
+        pytest.skip(
+            f"wrong account: AWS returned {identity['Account']}; "
+            f"expected staging account {EXPECTED_ACCOUNT}. "
+            f"Set AWS_PROFILE=myrecruiter-staging"
         )
     return {
         "lambda": boto3.client("lambda", region_name=REGION),
@@ -139,19 +156,112 @@ def _seed_form_submission(aws, tenant_id, email, pii_subject_id=None):
 
 
 def _cleanup_seed(aws, tenant_id, submission_id, email):
-    """Best-effort cleanup; never raises."""
+    """Best-effort cleanup; never raises (audit row 27 — broadened).
+
+    Catches Exception (not just ClientError) so non-AWS errors (e.g.,
+    TypeError on malformed key) in cleanup don't obscure the actual test
+    failure.
+    """
     try:
         aws["ddb"].Table(TABLE_FORM_SUBMISSIONS).delete_item(
             Key={"tenant_id": tenant_id, "submission_id": submission_id}
         )
-    except ClientError:
+    except Exception:
         pass
     try:
         aws["ddb"].Table(TABLE_SUBJECT_INDEX).delete_item(
             Key={"tenant_id": tenant_id, "normalized_email": _normalize_email(email)}
         )
-    except ClientError:
+    except Exception:
         pass
+
+
+def _seed_notification_sends_row(aws, tenant_id, recipient, message_id=None,
+                                  channel="email", status="sent"):
+    """Seed one notification-sends row keyed by tenant_id partition.
+
+    Returns (pk, sk, message_id) for cleanup + assertion. Mirrors the
+    form_handler.py:_store_submission writer pattern. Audit row 1 helper.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    iso_date = now[:10]
+    msg_id = message_id or f"smoke-msg-{uuid.uuid4().hex[:12]}"
+    pk = f"TENANT#{tenant_id}"
+    sk = f"{iso_date}#{channel}#{msg_id}"
+    aws["ddb"].Table(TABLE_NOTIFICATION_SENDS).put_item(Item={
+        "pk": pk,
+        "sk": sk,
+        "channel": channel,
+        "recipient": recipient,
+        "submission_id": "smoke-int-test",
+        "form_id": "smoke_integration_test",
+        "template": "smoke_test_template",
+        "status": status,
+        "error": "",
+        "message_id": msg_id,
+        "timestamp": now,
+        "ttl": int(time.time()) + 3600,  # 1h safety net
+    })
+    return pk, sk, msg_id
+
+
+def _seed_notification_events_row(aws, message_id, event_type="delivered"):
+    """Seed one notification-events row reachable via ByMessageId GSI.
+
+    Returns (pk, sk) for cleanup. The GSI is keyed
+    (message_id HASH, event_type_timestamp RANGE) — the RANGE key is a
+    COMPOSITE so both attributes must be present for the GSI to index
+    the row.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    pk = f"MSG#{message_id}"
+    sk = f"{event_type}#{now}"
+    event_type_timestamp = f"{event_type}#{now}"
+    aws["ddb"].Table(TABLE_NOTIFICATION_EVENTS).put_item(Item={
+        "pk": pk,
+        "sk": sk,
+        "message_id": message_id,
+        "event_type": event_type,
+        "event_type_timestamp": event_type_timestamp,  # GSI RANGE composite
+        "timestamp": now,
+        "ttl": int(time.time()) + 3600,
+    })
+    return pk, sk
+
+
+def _seed_recent_messages_row(aws, session_id, content="smoke test content",
+                               role="user"):
+    """Seed one recent-messages row keyed by sessionId + messageTimestamp.
+
+    Returns (sessionId, messageTimestamp) for cleanup. messageTimestamp is
+    Number (epoch ms) per the table schema (not ISO string).
+    """
+    msg_ts = int(time.time() * 1000)  # epoch ms (Number per table schema)
+    aws["ddb"].Table(TABLE_RECENT_MESSAGES).put_item(Item={
+        "sessionId": session_id,
+        "messageTimestamp": msg_ts,
+        "messageId": f"smoke-{uuid.uuid4().hex[:12]}",
+        "role": role,
+        "content": content,
+        "expires_at": int(time.time()) + 3600,
+    })
+    return session_id, msg_ts
+
+
+def _cleanup_ddb_row(aws, table_name, key):
+    """Generic best-effort row cleanup."""
+    try:
+        aws["ddb"].Table(table_name).delete_item(Key=key)
+    except Exception:
+        pass
+
+
+def _extract_details(audit_row):
+    """Parse the audit-row details blob (handles dict or JSON-string forms)."""
+    details = audit_row.get("details", {})
+    if isinstance(details, str):
+        return json.loads(details)
+    return details
 
 
 def _make_payload(tenant_id, email, dsar_id, request_type="delete", dry_run=True):
@@ -194,7 +304,13 @@ def _row_exists(aws, table_name, key):
 # Tests
 # ───────────────────────────────────────────────────────────────────────────
 def test_a_dry_run_does_not_delete(aws):
-    """(a) dry-run: response succeeds; seed row is NOT deleted; audit row written."""
+    """(a) dry-run: response succeeds; seed row is NOT deleted; audit row written.
+
+    Audit row 3 (test-eng B2): asserts status == "partial" specifically
+    (M1 always returns partial because conversation-summaries + audit-read-only
+    are explicitly deferred). Loose `in (completed, partial)` would mask a
+    future partial_error regression.
+    """
     tid = _gen_id("a")
     tenant_id, email, dsar_id = (
         f"{TEST_TENANT_PREFIX}{tid}",
@@ -208,7 +324,13 @@ def test_a_dry_run_does_not_delete(aws):
         ))
 
         assert http_status == 200, f"http status: {http_status}; body: {body}"
-        assert body.get("status") in ("completed", "partial"), body.get("status")
+        # M1 always returns partial (2 deferred surfaces); partial_error
+        # would indicate a real failure.
+        assert body.get("status") == "partial", \
+            f"unexpected status (expected 'partial'): {body.get('status')}; body: {body}"
+        # The form-submissions walker must have RUN (rows_touched > 0).
+        assert body.get("rows_touched", {}).get("form-submissions", 0) >= 1, \
+            f"form-submissions walker did not touch seed row; body: {body}"
 
         # Critical: dry_run MUST NOT delete the seed row.
         assert _row_exists(aws, TABLE_FORM_SUBMISSIONS, {
@@ -224,7 +346,12 @@ def test_a_dry_run_does_not_delete(aws):
 
 
 def test_b_real_delete_removes_row_and_writes_audit(aws):
-    """(b) real delete (dry_run=false): seed row deleted; audit row written with closed event."""
+    """(b) real delete (dry_run=false): seed row deleted; audit row with closed event.
+
+    Audit rows fixed: #2 (operator-precedence bug on closed assertion),
+    #3 (status precision), #17 (deserialize closed event details + assert
+    operation status), #18 (assert surface_walked event present).
+    """
     tid = _gen_id("b")
     tenant_id, email, dsar_id = (
         f"{TEST_TENANT_PREFIX}{tid}",
@@ -238,7 +365,14 @@ def test_b_real_delete_removes_row_and_writes_audit(aws):
         ))
 
         assert http_status == 200, f"http status: {http_status}; body: {body}"
-        assert body.get("status") in ("completed", "partial"), body.get("status")
+        # Audit row 3: assert exact "partial" (M1 always returns partial).
+        assert body.get("status") == "partial", \
+            f"unexpected status (expected 'partial'): {body.get('status')}; body: {body}"
+        # Audit row 8: rows_deleted should match (1 seed row), rows_delete_failed = 0.
+        assert body.get("rows_touched", {}).get("form-submissions", 0) == 1, body
+        # If rows_delete_failed key exists (new field), it must be 0.
+        # (Walker results live in body details, not top-level — leave detail check
+        # to surface_walked event below.)
 
         # Critical: real delete MUST remove the row.
         assert not _row_exists(aws, TABLE_FORM_SUBMISSIONS, {
@@ -249,8 +383,19 @@ def test_b_real_delete_removes_row_and_writes_audit(aws):
         assert audit_rows
         event_types = {r.get("event_type") for r in audit_rows}
         assert "request_received" in event_types
-        assert any(et and et.startswith("closed") or et == "closed" for et in event_types), \
+        # Audit row 2: fix operator-precedence bug. Use literal membership.
+        assert "closed" in event_types, \
             f"closed event missing; event_types: {event_types}"
+        # Audit row 17: closed audit ROW's `status` field (not in details)
+        # must show 'completed' or 'partial' (NOT partial_error).
+        closed_row = next(r for r in audit_rows if r.get("event_type") == "closed")
+        assert closed_row.get("status") in ("partial", "completed"), \
+            f"closed event status indicates error: row={closed_row}"
+        # Audit row 18: surface_walked:form-submissions event must exist
+        # (proves walker actually ran, not just that input validation passed).
+        assert any(et and et.startswith("surface_walked:form-submissions")
+                   for et in event_types), \
+            f"surface_walked:form-submissions missing; event_types: {event_types}"
     finally:
         # Seed already deleted by Lambda; cleanup is index-only
         _cleanup_seed(aws, tenant_id, submission_id, email)
@@ -306,20 +451,34 @@ def test_d_psid_subset_email_walker_reaches_pii_subject_linked_row(aws):
         # The walker must have resolved the pii_subject_id from the email.
         assert body.get("pii_subject_id") == pii_subject_id, \
             f"walker did not resolve pii_subject_id; got: {body.get('pii_subject_id')}"
-        # The walker must have reached the form-submission row.
+        # Audit row 15 (test-eng Y1): assert exported row VALUES match seed,
+        # not just that some row was returned. A walker that returned any
+        # tenant-A row (ignoring pii_subject_id filter) would still return
+        # something — this asserts the FILTERED match.
         exported = body.get("exported_rows", {}).get("form-submissions") or []
         assert exported, f"walker did not export form-submission row; body: {body}"
+        assert any(r.get("submission_id") == submission_id for r in exported), \
+            f"exported rows do not include the seeded submission_id; " \
+            f"got: {[r.get('submission_id') for r in exported]}"
+        # Cross-check pii_subject_id on the exported row matches the seed.
+        for r in exported:
+            if r.get("submission_id") == submission_id:
+                assert r.get("pii_subject_id") == pii_subject_id
+                break
     finally:
         _cleanup_seed(aws, tenant_id, submission_id, email)
 
 
 def test_e_per_tenant_s3_walk_placeholder_surfaces_in_manual_followup(aws):
     """(e) per-tenant S3 walk M1 placeholder: response includes manual_followup
-    that mentions S3-related deferral (M2 / item 1b territory). No S3 walk
-    attempted by M1.
+    naming a deferred surface (M2 / item 1b territory). No S3 walk attempted
+    by M1.
 
-    Looser assertion: at least one manual_followup mentions a deferred surface
-    or S3-adjacent gap; M1 docstring guarantees these followups.
+    Audit row 20 (test-eng Y6): asserts specific manual_followup CONTENT
+    mentioning a deferred-by-M1 surface name. Previous version asserted
+    only that followups were non-empty — that duplicated test (a) with a
+    looser assertion. Now confirms the M1 scope boundary is explicit in
+    the operator response.
     """
     tid = _gen_id("e")
     tenant_id, email, dsar_id = (
@@ -334,8 +493,15 @@ def test_e_per_tenant_s3_walk_placeholder_surfaces_in_manual_followup(aws):
         ))
         assert http_status == 200, body
         followups = body.get("manual_followups", [])
-        # M1 always produces followups (5 of 6 surfaces deferred per module docstring).
         assert followups, f"no manual_followups returned; body: {body}"
+        # Audit row 20: assert specific M1-deferred surfaces are named in
+        # the followups so the operator response is explicit about scope.
+        joined = " ".join(followups)
+        assert "conversation-summaries" in joined, \
+            f"M1-deferred surface 'conversation-summaries' not named in " \
+            f"manual_followups: {followups}"
+        assert "audit-read-only" in joined or "picasso-audit-staging" in joined, \
+            f"M1-deferred surface 'audit-read-only' not named in followups: {followups}"
     finally:
         _cleanup_seed(aws, tenant_id, submission_id, email)
 
@@ -371,13 +537,24 @@ def test_f_audit_row_tenant_id_matches_invocation_tenant(aws):
             None,
         )
         assert request_received, "no request_received audit row"
-        details = request_received.get("details", {})
-        if isinstance(details, str):
-            details = json.loads(details)
+        details = _extract_details(request_received)
         assert details.get("tenant_id") == tenant_id, (
             f"audit row tenant_id mismatch: got={details.get('tenant_id')} "
             f"expected={tenant_id}"
         )
+        # Audit row 12 (Security SR3): caller_arn must be present and
+        # reflect the actual STS identity (not the self-reported operator).
+        assert details.get("caller_arn"), \
+            f"caller_arn missing from request_received audit (Security SR3); " \
+            f"details: {details}"
+        assert ":sts::" in details["caller_arn"] or ":iam::" in details["caller_arn"], \
+            f"caller_arn does not look like an STS/IAM ARN: {details['caller_arn']}"
+        # Audit row 18 (test-eng Y4): assert at least one surface_walked event
+        # exists, proving the walker actually executed past input validation.
+        event_types = {r.get("event_type") for r in audit_rows}
+        assert any(et and et.startswith("surface_walked:") for et in event_types), \
+            f"no surface_walked:* events; walker did not run. " \
+            f"event_types: {event_types}"
     finally:
         _cleanup_seed(aws, tenant_id, submission_id, email)
 
@@ -414,9 +591,21 @@ def test_fprime_access_returns_exported_rows_equivalent_to_delete(aws):
 
         # form-submissions: field-constrained design returns full rows;
         # operator-visible labeled data must be reachable.
-        first = fs_rows[0]
-        assert "form_data_labeled" in first, \
-            f"form_data_labeled missing from access export: {first.keys()}"
+        # Audit row 16 (test-eng Y2): assert exported field VALUES match seed,
+        # not just key presence. A walker returning any row would also have
+        # form_data_labeled present.
+        matched = next(
+            (r for r in fs_rows if r.get("submission_id") == submission_id),
+            None,
+        )
+        assert matched, \
+            f"exported rows do not include seeded submission_id; " \
+            f"got: {[r.get('submission_id') for r in fs_rows]}"
+        assert "form_data_labeled" in matched, \
+            f"form_data_labeled missing from access export: {matched.keys()}"
+        assert matched["form_data_labeled"].get("email") == email, \
+            f"exported form_data_labeled.email mismatch: " \
+            f"got={matched['form_data_labeled'].get('email')} expected={email}"
 
         # Audit row written with request_type='access'.
         audit_rows = _get_audit_rows(aws, dsar_id)
@@ -426,10 +615,200 @@ def test_fprime_access_returns_exported_rows_equivalent_to_delete(aws):
             None,
         )
         assert request_received, "no request_received audit row"
-        details = request_received.get("details", {})
-        if isinstance(details, str):
-            details = json.loads(details)
+        details = _extract_details(request_received)
         assert details.get("request_type") == "access", \
             f"audit row request_type mismatch: {details.get('request_type')}"
+    finally:
+        _cleanup_seed(aws, tenant_id, submission_id, email)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Walker coverage tests (audit row 1; code-rev B2 + test-eng B1)
+# Each walker exercised against REAL DDB with seeded rows.
+# ───────────────────────────────────────────────────────────────────────────
+def test_g_notification_sends_walker_finds_direct_recipient_row(aws):
+    """Walker `_walk_notification_sends` finds rows where `recipient` matches
+    normalized_email via tenant-Query + case-insensitive Python post-filter.
+
+    Audit row 1 closure: previously only form-submissions was integration-
+    tested; this exercises the notification-sends walker against real DDB.
+    """
+    tid = _gen_id("g")
+    tenant_id, email, dsar_id = (
+        f"{TEST_TENANT_PREFIX}{tid}",
+        _gen_email(tid),
+        f"{TEST_DSAR_PREFIX}{tid}",
+    )
+    # Seed: form-submission (for pii_subject_id linkage) + a notification-sends
+    # row with this email as recipient.
+    submission_id, _ = _seed_form_submission(aws, tenant_id, email)
+    pk, sk, msg_id = _seed_notification_sends_row(aws, tenant_id, recipient=email)
+    try:
+        body, http_status = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="access", dry_run=True,
+        ))
+        assert http_status == 200, body
+        # notification-sends export must include the seeded row.
+        exported = body.get("exported_rows", {}).get("notification-sends") or []
+        assert any(r.get("message_id") == msg_id for r in exported), \
+            f"notification-sends walker did not return seeded message_id={msg_id}; " \
+            f"got: {[r.get('message_id') for r in exported]}"
+    finally:
+        _cleanup_seed(aws, tenant_id, submission_id, email)
+        _cleanup_ddb_row(aws, TABLE_NOTIFICATION_SENDS, {"pk": pk, "sk": sk})
+
+
+def test_h_notification_events_chained_walker_finds_events_via_message_id(aws):
+    """Walker `_walk_notification_events` chains off message_ids from the
+    notification-sends walker, querying the ByMessageId GSI per message_id.
+
+    Audit row 1 closure: exercises the GSI chained walk end-to-end against
+    real DDB. The GSI's `message_id` hash key + `event_type#timestamp`
+    range pattern is verified here, not just in mocks.
+    """
+    tid = _gen_id("h")
+    tenant_id, email, dsar_id = (
+        f"{TEST_TENANT_PREFIX}{tid}",
+        _gen_email(tid),
+        f"{TEST_DSAR_PREFIX}{tid}",
+    )
+    submission_id, _ = _seed_form_submission(aws, tenant_id, email)
+    pk_ns, sk_ns, msg_id = _seed_notification_sends_row(aws, tenant_id, recipient=email)
+    pk_ne, sk_ne = _seed_notification_events_row(aws, message_id=msg_id, event_type="delivered")
+    try:
+        body, http_status = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="access", dry_run=True,
+        ))
+        assert http_status == 200, body
+        # notification-events export must include an event for the seeded
+        # message_id (chained walker reached it).
+        exported = body.get("exported_rows", {}).get("notification-events") or []
+        assert any(r.get("message_id") == msg_id for r in exported), \
+            f"chained notification-events walker did not reach seeded " \
+            f"message_id={msg_id}; got: {[r.get('message_id') for r in exported]}"
+    finally:
+        _cleanup_seed(aws, tenant_id, submission_id, email)
+        _cleanup_ddb_row(aws, TABLE_NOTIFICATION_SENDS, {"pk": pk_ns, "sk": sk_ns})
+        _cleanup_ddb_row(aws, TABLE_NOTIFICATION_EVENTS, {"pk": pk_ne, "sk": sk_ne})
+
+
+def test_i_recent_messages_walker_finds_messages_for_chained_session(aws):
+    """Walker `_walk_recent_messages` chains off session_ids from the
+    form-submissions walker; per session_id, queries `staging-recent-messages`
+    on sessionId hash key.
+
+    Audit row 1 closure: exercises the recent-messages walker against real
+    DDB + verifies the F-DSAR4 projection drops sessionId/messageId/expires_at.
+    """
+    tid = _gen_id("i")
+    tenant_id, email, dsar_id = (
+        f"{TEST_TENANT_PREFIX}{tid}",
+        _gen_email(tid),
+        f"{TEST_DSAR_PREFIX}{tid}",
+    )
+    # Seed a form-submission carrying a session_id; then seed a recent-messages
+    # row at that session_id. Walker chains off the session_id.
+    submission_id = str(uuid.uuid4())
+    pii_subject_id = f"psub_{uuid.uuid4().hex}"
+    session_id = f"smoke-session-{uuid.uuid4().hex[:12]}"
+    timestamp = datetime.now(timezone.utc).isoformat()
+    normalized = _normalize_email(email)
+
+    aws["ddb"].Table(TABLE_FORM_SUBMISSIONS).put_item(Item={
+        "tenant_id": tenant_id,
+        "submission_id": submission_id,
+        "pii_subject_id": pii_subject_id,
+        "form_id": "smoke_integration_test",
+        "form_data_labeled": {"email": email},
+        "session_id": session_id,
+        "submitted_at": timestamp,
+        "ttl": int(time.time()) + 3600,
+    })
+    aws["ddb"].Table(TABLE_SUBJECT_INDEX).put_item(Item={
+        "tenant_id": tenant_id,
+        "normalized_email": normalized,
+        "pii_subject_id": pii_subject_id,
+    })
+    session_key, msg_ts = _seed_recent_messages_row(
+        aws, session_id, content="smoke test integration content"
+    )
+    try:
+        body, http_status = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="access", dry_run=True,
+        ))
+        assert http_status == 200, body
+        exported = body.get("exported_rows", {}).get("recent-messages") or []
+        assert exported, \
+            f"recent-messages walker did not export any messages; body: {body}"
+        # F-DSAR4 projection: must contain content, NOT sessionId/messageId/expires_at.
+        first = exported[0]
+        assert "content" in first, f"projected row missing content: {first}"
+        assert "sessionId" not in first, \
+            f"projection leaked sessionId: {first}"
+        assert "messageId" not in first, \
+            f"projection leaked messageId: {first}"
+        assert "expires_at" not in first, \
+            f"projection leaked expires_at: {first}"
+    finally:
+        _cleanup_seed(aws, tenant_id, submission_id, email)
+        _cleanup_ddb_row(aws, TABLE_RECENT_MESSAGES, {
+            "sessionId": session_key, "messageTimestamp": msg_ts,
+        })
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Audit replay test (audit row 31; test-eng G1)
+# ───────────────────────────────────────────────────────────────────────────
+def test_j_audit_replay_documents_actual_idempotency_scope(aws):
+    """Documents the ACTUAL audit-write idempotency scope: protection is
+    per (dsar_id, event_timestamp) composite, NOT per dsar_id.
+
+    INTEGRATION FINDING (audit row 31 closure): the AuditCollision class
+    docstring claims protection against "operator replay of the same
+    dsar_id" but the ConditionExpression at lambda_function.py:325 only
+    refuses overwrite of an existing (dsar_id, event_timestamp) row.
+    Microsecond-precision timestamps mean cross-second replays succeed.
+    The real protection is "no two writes can clobber the same audit row"
+    — NOT "no dsar_id can be reused."
+
+    This test ASSERTS the actual behavior (replay succeeds with new
+    timestamps) so the test suite documents the truth. A follow-up PR
+    should EITHER strengthen the audit-write to refuse if any row with
+    this dsar_id exists (Query check, +1 RCU per audit-write) OR update
+    the docstring to match. Filed as audit-finding-post-M1 for the next
+    milestone's gap-router.
+    """
+    tid = _gen_id("j")
+    tenant_id, email, dsar_id = (
+        f"{TEST_TENANT_PREFIX}{tid}",
+        _gen_email(tid),
+        f"{TEST_DSAR_PREFIX}{tid}",
+    )
+    submission_id, _ = _seed_form_submission(aws, tenant_id, email)
+    try:
+        body1, _ = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="delete", dry_run=True,
+        ))
+        assert body1.get("status") == "partial", body1
+        # Pause to ensure microsecond-distinct event_timestamps
+        # (defensive — the system actually only needs sub-microsecond
+        # distinction, which is guaranteed by datetime.now() resolution).
+        time.sleep(0.01)
+        body2, _ = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="delete", dry_run=True,
+        ))
+        # Actual behavior: replay SUCCEEDS at the dsar_id level because the
+        # audit-write ConditionExpression is per (dsar_id, event_timestamp).
+        assert body2.get("status") == "partial", \
+            f"replay returned unexpected status; body: {body2}"
+        # Verify the audit table now has 2 sets of events under same dsar_id
+        # (proves replay duplicates rather than collides).
+        audit_rows = _get_audit_rows(aws, dsar_id)
+        request_received_count = sum(
+            1 for r in audit_rows if r.get("event_type") == "request_received"
+        )
+        assert request_received_count == 2, \
+            f"expected 2 request_received rows under same dsar_id; " \
+            f"got {request_received_count}; audit_rows={len(audit_rows)}"
     finally:
         _cleanup_seed(aws, tenant_id, submission_id, email)
