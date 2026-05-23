@@ -160,6 +160,69 @@ class TestFormHandler(unittest.TestCase):
         self.assertEqual(item['responses']['first_name'], 'John')
         self.assertEqual(item['status'], 'pending_fulfillment')
 
+    def test_store_submission_writes_ttl(self):
+        """M4 done-bar #2 (master plan v0.3 §M4): _store_submission writes a `ttl`
+        attribute on every form-submission row so the existing table-level TTL config
+        (infra/modules/ddb-form-submissions-staging/main.tf attribute_name='ttl',
+        enabled=true) actually fires. Without this, rows persist indefinitely despite
+        the IaC saying otherwise (the writer half of D5 G-A widget claim falsehood).
+
+        Moto-independent (same pattern as test_store_submission_writes_and_indexes_pii_subject_id)
+        — the @mock_dynamodb harness for form_handler is pre-existing broken (audit C2);
+        this MagicMock approach captures the put_item call directly so the assertion
+        is deterministic.
+        """
+        import form_handler as fh
+        import time as _time
+
+        class _FakeIndex:
+            def __init__(self):
+                self.store = {}
+
+            def get_item(self, Key, ConsistentRead=False):
+                v = self.store.get((Key['tenant_id'], Key['normalized_email']))
+                return {'Item': v} if v else {}
+
+            def put_item(self, Item, ConditionExpression=None):
+                k = (Item['tenant_id'], Item['normalized_email'])
+                if ConditionExpression and k in self.store:
+                    raise ClientError(
+                        {'Error': {'Code': 'ConditionalCheckFailedException'}},
+                        'PutItem')
+                self.store[k] = Item
+
+        fake_index = _FakeIndex()
+        fake_res = MagicMock()
+        fake_res.Table.return_value = fake_index
+        pii_subject._dynamodb = fake_res
+        self.addCleanup(setattr, pii_subject, '_dynamodb', None)
+
+        stored = {}
+        subs_table = MagicMock()
+        subs_table.put_item.side_effect = (
+            lambda Item: stored.__setitem__(Item['submission_id'], Item))
+
+        handler = FormHandler(self.tenant_config)
+        responses = {'first_name': 'John', 'email': 'jane@example.com'}
+
+        write_start = int(_time.time())
+        with patch.object(fh, 'dynamodb') as md:
+            md.Table.return_value = subs_table
+            sid = handler._store_submission(
+                'volunteer_signup', responses, 'sess_1', 'conv_1',
+            )
+        write_end = int(_time.time())
+
+        item = stored[sid]
+        # ttl is present + integer + ~365 days from write time (1s tolerance)
+        self.assertIn('ttl', item,
+                      "M4 G-A writer fix: form-submission rows MUST carry a ttl attribute")
+        self.assertIsInstance(item['ttl'], int)
+        expected_min = write_start + (365 * 24 * 3600) - 1
+        expected_max = write_end + (365 * 24 * 3600) + 1
+        self.assertGreaterEqual(item['ttl'], expected_min)
+        self.assertLessEqual(item['ttl'], expected_max)
+
     def test_store_submission_writes_and_indexes_pii_subject_id(self):
         """SC4 (audit #1): _store_submission writes an ADDITIVE pii_subject_id and
         a repeat submission from the same email REUSES it (the real indexed path).
