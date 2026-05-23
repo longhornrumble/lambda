@@ -560,7 +560,19 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
       processed_by: null,
       contacted_at: null,
       archived_at: null,
-      updated_at: now
+      updated_at: now,
+      // M4 done-bar #2 (master plan v0.3 §M4 / D5 G-A writer-half closure).
+      // Mirrors Master_Function_Staging/form_handler.py:_store_submission ttl
+      // writer (PR longhornrumble/lambda#142) for the picasso-form-submissions
+      // table TTL config (infra/modules/ddb-form-submissions-staging/main.tf
+      // attribute_name='ttl', enabled=true). BSH form_handler.js is the actual
+      // active writer for staging widget chat-form submissions (empirically
+      // verified 2026-05-23: submission_id pattern `<form_id>_<ms-timestamp>`
+      // is BSH's; the Python writer is dormant for the widget chat path).
+      // 365 days matches Python writer + archive-bucket lifecycle + CCPA
+      // §1798.105 12-month common reference; counsel-pending refinement may
+      // shorten/extend post-M8 Q1 response.
+      ttl: Math.floor(Date.now() / 1000) + (365 * 24 * 3600)
     }
   };
 
