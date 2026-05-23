@@ -1279,7 +1279,12 @@ def test_dispatcher_coverage_gap_followup_includes_cli_snippet_when_walker_ran(d
     gap = next(f for f in followups
                if "Submissions written before 2026-05-18" in f)
     assert "aws dynamodb scan" in gap
-    assert "match@example.com" in gap
+    # Audit row 11 (Security SR2): CLI snippet uses <SUBJECT_EMAIL>
+    # placeholder, NOT the actual consumer email. Prevents leak into
+    # operator-side response storage when the snippet is pasted into
+    # tickets / logs / scripts.
+    assert "<SUBJECT_EMAIL>" in gap, "CLI snippet must use placeholder, not actual email"
+    assert "match@example.com" not in gap, "CLI snippet must NOT contain consumer email"
     assert "TEN999" in gap
 
 
