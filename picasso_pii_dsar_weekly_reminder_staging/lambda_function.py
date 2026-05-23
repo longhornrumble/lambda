@@ -82,6 +82,11 @@ def _build_message() -> str:
     return '\n'.join([
         'Weekly DSAR SLA monitor health-check reminder.',
         '',
+        'Status: REMINDER ONLY — this Lambda intentionally does NOT fetch live',
+        'data (no DDB Query, no CloudWatch metrics read) so it stays independent',
+        'of the primary SLA monitor\'s surfaces. The actual status is what you',
+        'find when you run the two CLI checks embedded below.',
+        '',
         f'This is the belt-and-suspenders secondary control for the primary',
         f'SLA monitor Lambda ({SLA_MONITOR_FUNCTION_NAME}). It fires every',
         'week regardless of the primary\'s state. If the primary has silently',

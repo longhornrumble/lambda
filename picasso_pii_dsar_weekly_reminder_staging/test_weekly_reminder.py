@@ -83,6 +83,20 @@ class TestBuildMessage(unittest.TestCase):
         body = mod._build_message()
         self.assertIn('https://example.com/playbook', body)
 
+    def test_message_explicitly_frames_as_reminder_only(self):
+        """The reminder body must explicitly state it is a REMINDER ONLY
+        and does not fetch live data — operator was confused by missing
+        status field in the first test-fire (2026-05-23). Framing prevents
+        the missing-status-as-bug interpretation."""
+        mod = _reload_module({
+            'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:000000000000:test',
+        })
+        body = mod._build_message()
+        self.assertIn('REMINDER ONLY', body)
+        # The reason for no-live-data MUST also be stated (the independence
+        # property is the whole point of M9.G6).
+        self.assertIn('independent', body.lower())
+
 
 class TestPublishReminder(unittest.TestCase):
     def test_publish_called_with_topic_and_subject(self):
