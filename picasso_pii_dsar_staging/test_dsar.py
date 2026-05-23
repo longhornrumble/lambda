@@ -405,6 +405,57 @@ def test_walker_delete_rows_skipped_corrupted_zero_on_clean_batch(dsar):
     assert result["rows_skipped_corrupted"] == 0
 
 
+def test_walker_tolerates_old_and_new_ttl_row_shapes(dsar):
+    """Schema-discipline (CLAUDE.md §"Schema Discipline"): forward-compat reader.
+
+    M4 done-bar #2 (master plan v0.3 §M4) adds a `ttl` attribute to NEW
+    form-submission rows (writer-side change in form_handler.py:_store_submission).
+    Pre-M4 rows have NO `ttl`. The DSAR walker MUST tolerate both shapes —
+    it doesn't use ttl for any decision logic; the assertion is "doesn't
+    crash, returns identical result shape, exported_rows preserve the
+    original row content."
+
+    Per CLAUDE.md schema-discipline rule, this contract test ships with the
+    writer change (M4 PR2 form_handler.py edit) so old data without the new
+    field cannot break the reader on prod-deploy promotion.
+    """
+    import time as _time
+
+    mod, mock_ddb, _ = dsar
+    fs_table = MagicMock()
+    old_shape = _row("s_old")  # pre-M4: no ttl key
+    new_shape = _row("s_new", ttl=int(_time.time()) + (365 * 24 * 3600))  # M4 PR2 writer
+    fs_table.query.return_value = {"Items": [old_shape, new_shape]}
+    mock_ddb.Table.return_value = fs_table
+
+    # Access mode: exported_rows must contain both rows verbatim.
+    result_access = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN",
+        request_type="access", dry_run=True,
+    )
+    assert result_access["rows_found"] == 2
+    assert result_access["action"] == "exported"
+    assert len(result_access["exported_rows"]) == 2
+    exported_ids = {r["submission_id"] for r in result_access["exported_rows"]}
+    assert exported_ids == {"s_old", "s_new"}
+    # The walker passes rows through unchanged; ttl is preserved on the new row
+    # and absent on the old row (verifying no normalization happens).
+    by_id = {r["submission_id"]: r for r in result_access["exported_rows"]}
+    assert "ttl" not in by_id["s_old"]
+    assert "ttl" in by_id["s_new"]
+    assert isinstance(by_id["s_new"]["ttl"], int)
+
+    # Delete mode: both rows must be deleted regardless of ttl presence.
+    # ttl is a DDB-managed expiration; the walker's job is on-demand erasure.
+    result_delete = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN",
+        request_type="delete", dry_run=False,
+    )
+    assert result_delete["rows_found"] == 2
+    assert result_delete["rows_deleted"] == 2
+    assert result_delete["rows_skipped_corrupted"] == 0
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # notification-sends walker (_walk_notification_sends)
 # ───────────────────────────────────────────────────────────────────────────
