@@ -155,6 +155,34 @@ describe('Form Handler - Phase 1: AWS SDK v3 Migration', () => {
       });
     });
 
+    it('should write ttl attribute on form-submission row (~365d from now) — M4 done-bar #2', async () => {
+      // BSH form_handler is the ACTIVE writer for staging widget chat-form
+      // submissions (empirically verified 2026-05-23 against picasso-form-
+      // submissions-staging). M4 done-bar #2 (master plan v0.3 §M4 / D5 G-A
+      // writer half) requires the writer to emit `ttl` so the table-level
+      // TTL config fires and rows actually expire. Companion: Python writer
+      // PR longhornrumble/lambda#142 covers the dormant Master_Function path.
+      sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-email-id' });
+      dynamoMock.on(PutCommand).resolves({});
+      dynamoMock.on(GetCommand).resolves({});
+      lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+      const writeStart = Math.floor(Date.now() / 1000);
+      await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+      const writeEnd = Math.floor(Date.now() / 1000);
+
+      const submissionPut = dynamoMock.commandCalls(PutCommand)
+        .find(c => c.args[0].input.TableName === 'test-form-submissions');
+      expect(submissionPut).toBeDefined();
+      const item = submissionPut.args[0].input.Item;
+      expect(item).toHaveProperty('ttl');
+      expect(typeof item.ttl).toBe('number');
+      const expectedMin = writeStart + (365 * 24 * 3600) - 1;
+      const expectedMax = writeEnd + (365 * 24 * 3600) + 1;
+      expect(item.ttl).toBeGreaterThanOrEqual(expectedMin);
+      expect(item.ttl).toBeLessThanOrEqual(expectedMax);
+    });
+
     it('should use LambdaClient with InvokeCommand for Lambda fulfillment', async () => {
       lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
       dynamoMock.on(PutCommand).resolves({});
