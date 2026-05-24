@@ -128,12 +128,19 @@ def get_or_create_pii_subject_id(
     responses: Dict[str, Any],
     *,
     table=None,
+    known_email: Optional[str] = None,
 ) -> str:
     """Return the subject id for this submission, minting/indexing as needed.
 
     Always returns a usable id. A subject exists even when the submission has no
     email (it just is not email-indexed). Never raises — index failures fall back
     to the freshly-minted candidate so the submission still records a stable id.
+
+    Sprint F2 / audit-of-audit finding 14: parity with pii_subject.js's
+    ``knownEmail`` option. Callers that already extracted a canonical email
+    (e.g., from a contact-form workflow) can pass it via ``known_email`` to
+    skip re-walking the responses bag. Pre-normalization is the caller's
+    responsibility — same contract as the JS port.
     """
     candidate = mint_pii_subject_id()
 
@@ -159,7 +166,10 @@ def get_or_create_pii_subject_id(
         return candidate
 
     try:
-        raw = extract_email(responses)
+        # Sprint F2 / audit-of-audit finding 14: prefer caller-supplied
+        # known_email (parity with pii_subject.js's knownEmail option) and
+        # fall back to extract_email walking the responses bag.
+        raw = known_email if known_email else extract_email(responses)
         normalized = normalize_email(raw)
         if not normalized:
             return candidate

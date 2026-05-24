@@ -347,3 +347,97 @@ def test_now_iso_runtime_shape():
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", ts), (
         f"format must be YYYY-MM-DDTHH:MM:SS.NNNZ; got {ts!r}"
     )
+
+
+# ── Sprint F2 / audit-of-audit finding 14 — known_email parity ──────────────
+def test_get_or_create_uses_known_email_when_provided():
+    """Parity with pii_subject.js's knownEmail option: when the caller
+    supplies a pre-extracted email, skip the extract_email walk and use
+    that email directly for normalization + index lookup."""
+    tbl = MagicMock()
+    tbl.get_item.return_value = {}  # no existing index entry
+    sid = get_or_create_pii_subject_id(
+        "T1",
+        {},  # empty responses bag — extract_email would return None
+        table=tbl,
+        known_email="Pre.Known@Gmail.Com",
+    )
+    assert sid.startswith("psub_")
+    # PUT was called with the known_email normalized
+    args = tbl.put_item.call_args.kwargs
+    assert args["Item"]["normalized_email"] == "preknown@gmail.com"
+
+
+def test_get_or_create_known_email_overrides_responses_extract():
+    """known_email takes precedence over what extract_email would find in
+    responses (caller-asserted canonical email wins)."""
+    tbl = MagicMock()
+    tbl.get_item.return_value = {}
+    sid = get_or_create_pii_subject_id(
+        "T1",
+        {"email": "responses-email@example.com"},
+        table=tbl,
+        known_email="caller-canonical@example.com",
+    )
+    assert sid.startswith("psub_")
+    args = tbl.put_item.call_args.kwargs
+    assert args["Item"]["normalized_email"] == "caller-canonical@example.com"
+
+
+# ── Sprint F2 / audit-of-audit finding 17 — EMF metric emission contract ────
+def test_emf_metric_emitted_on_unresolved_race(caplog):
+    """N19 EMF emission path: when the index race exhausts 3 attempts, the
+    Lambda emits a CW Embedded Metric Format log line with
+    Namespace=PII/SubjectIndex + Metric=IndexRaceUnresolved + TenantId
+    dimension. CW Logs auto-extracts the metric (no PutMetricData IAM)."""
+    import json as _json
+    import logging
+    import pii_subject
+
+    tbl = MagicMock()
+    tbl.get_item.return_value = {}  # never finds existing
+    # Trigger CCF on every put: simulate unresolved 3-attempt race
+    ccf_err = ClientError(
+        {"Error": {"Code": "ConditionalCheckFailedException"}}, "PutItem"
+    )
+    tbl.put_item.side_effect = [ccf_err, ccf_err, ccf_err]
+
+    with caplog.at_level(logging.INFO, logger=pii_subject.__name__):
+        pii_subject.get_or_create_pii_subject_id(
+            "TEN", {"email": "a@b.com"}, table=tbl
+        )
+
+    emf_logs = [r for r in caplog.records
+                if "CloudWatchMetrics" in r.getMessage()
+                and "IndexRaceUnresolved" in r.getMessage()]
+    assert len(emf_logs) >= 1, "EMF metric must be emitted on race unresolved"
+    parsed = _json.loads(emf_logs[0].getMessage())
+    assert parsed["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "PII/SubjectIndex"
+    assert parsed["_aws"]["CloudWatchMetrics"][0]["Metrics"][0]["Name"] == "IndexRaceUnresolved"
+    assert parsed["_aws"]["CloudWatchMetrics"][0]["Metrics"][0]["Unit"] == "Count"
+    assert parsed["TenantId"] == "TEN"
+    assert parsed["IndexRaceUnresolved"] == 1
+
+
+def test_emf_metric_emitted_on_index_unavailable(caplog):
+    """IndexUnavailable is the sibling metric: emitted when an unhandled
+    exception (non-CCF) escapes the inner try/except."""
+    import json as _json
+    import logging
+    import pii_subject
+
+    tbl = MagicMock()
+    # Raise an unhandled exception on the first get_item
+    tbl.get_item.side_effect = RuntimeError("throttled")
+
+    with caplog.at_level(logging.INFO, logger=pii_subject.__name__):
+        pii_subject.get_or_create_pii_subject_id(
+            "TEN", {"email": "a@b.com"}, table=tbl
+        )
+
+    emf_logs = [r for r in caplog.records
+                if "IndexUnavailable" in r.getMessage()]
+    assert len(emf_logs) >= 1, "EMF metric must be emitted on index unavailable"
+    parsed = _json.loads(emf_logs[0].getMessage())
+    assert parsed["_aws"]["CloudWatchMetrics"][0]["Metrics"][0]["Name"] == "IndexUnavailable"
+    assert parsed["IndexUnavailable"] == 1

@@ -48,7 +48,9 @@ def _reload_module(env: dict):
 class _EnvIsolatedTestCase(unittest.TestCase):
     """Base class providing per-test env snapshot+restore for the keys
     _reload_module mutates. Subclasses inherit setUp/tearDown automatically;
-    if they define their own, they MUST call super().setUp()/tearDown()."""
+    if they define their own, they MUST call super().setUp()/tearDown()
+    (enforced via __init_subclass__ guard, audit-of-audit finding 16).
+    """
 
     def setUp(self):
         self._env_snapshot = {k: os.environ.get(k) for k in _TEST_ENV_KEYS}
@@ -59,6 +61,49 @@ class _EnvIsolatedTestCase(unittest.TestCase):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+    # Sprint F2 / audit-of-audit finding 16: previous "subclasses MUST call
+    # super()" rule was convention-only. A subclass defining setUp/tearDown
+    # without invoking super() would silently break env isolation. Reviewer
+    # (test-engineer) flagged this as latent fragility. __init_subclass__ now
+    # AST-walks the override at class-definition time and asserts at least
+    # one `super(...)` call exists in the function body. (String-match on
+    # source would false-positive on `# super()` in a comment.)
+    # If detection ever needs to be bypassed (e.g., super() invoked via an
+    # unusual mechanism), opt-out by setting _SUPER_SETUP_VERIFIED = True.
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if getattr(cls, "_SUPER_SETUP_VERIFIED", False):
+            return
+        import ast
+        import inspect
+        import textwrap
+        for method_name in ("setUp", "tearDown"):
+            if method_name not in cls.__dict__:
+                continue  # not overridden
+            method = cls.__dict__[method_name]
+            try:
+                src = textwrap.dedent(inspect.getsource(method))
+                tree = ast.parse(src)
+            except (OSError, TypeError, SyntaxError):
+                # Can't parse — skip rather than break test collection.
+                continue
+            # Walk the AST looking for `super(...)` calls
+            has_super_call = any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "super"
+                for node in ast.walk(tree)
+            )
+            if not has_super_call:
+                raise TypeError(
+                    f"{cls.__name__}.{method_name}() overrides "
+                    f"_EnvIsolatedTestCase but does not call super() — "
+                    f"env-var snapshot/restore will silently break. Either "
+                    f"call super().{method_name}() or set "
+                    f"_SUPER_SETUP_VERIFIED = True on the subclass to opt "
+                    f"out of this check."
+                )
 
 
 class TestBuildMessage(_EnvIsolatedTestCase):
@@ -203,6 +248,45 @@ class TestLambdaHandler(_EnvIsolatedTestCase):
         msg_1 = mock_sns.publish.call_args_list[0].kwargs['Message']
         msg_2 = mock_sns.publish.call_args_list[1].kwargs['Message']
         self.assertEqual(msg_1, msg_2)
+
+
+class TestEnvIsolationSubclassGuard(unittest.TestCase):
+    """Sprint F2 / audit-of-audit finding 16: assert __init_subclass__ guard
+    fires when a subclass overrides setUp without calling super()."""
+
+    def test_subclass_setup_without_super_raises_typeerror(self):
+        with self.assertRaises(TypeError) as ctx:
+            class _BadSubclass(_EnvIsolatedTestCase):
+                def setUp(self):
+                    # Intentionally NOT calling super().setUp()
+                    pass
+        self.assertIn('setUp', str(ctx.exception))
+        self.assertIn('super()', str(ctx.exception))
+
+    def test_subclass_teardown_without_super_raises_typeerror(self):
+        with self.assertRaises(TypeError) as ctx:
+            class _BadSubclass(_EnvIsolatedTestCase):
+                def tearDown(self):
+                    pass
+        self.assertIn('tearDown', str(ctx.exception))
+
+    def test_subclass_with_super_call_passes(self):
+        """No raise: legitimate subclass that does call super()."""
+        class _GoodSubclass(_EnvIsolatedTestCase):
+            def setUp(self):
+                super().setUp()
+            def tearDown(self):
+                super().tearDown()
+        # Reaching here means no TypeError raised at class-def time
+        self.assertTrue(True)
+
+    def test_subclass_with_opt_out_marker_passes(self):
+        """Escape hatch: _SUPER_SETUP_VERIFIED bypasses the check."""
+        class _OptOut(_EnvIsolatedTestCase):
+            _SUPER_SETUP_VERIFIED = True
+            def setUp(self):
+                pass  # No super() call, but opted out
+        self.assertTrue(True)
 
 
 if __name__ == '__main__':
