@@ -244,6 +244,10 @@ async function getOrCreatePiiSubjectId(tenantId, responses, options) {
  */
 function _emitEmfMetric(metricName, tenantId) {
   try {
+    // Sprint F4 / audit-of-audit finding 18: `source` field added so CW
+    // Logs Insights filters can include/exclude EMF lines precisely:
+    //   filter source != 'pii_subject_emf'  → non-EMF analysis
+    //   filter source =  'pii_subject_emf'  → EMF only
     console.log(JSON.stringify({
       _aws: {
         Timestamp: Date.now(),
@@ -253,6 +257,7 @@ function _emitEmfMetric(metricName, tenantId) {
           Metrics: [{ Name: metricName, Unit: 'Count' }],
         }],
       },
+      source: 'pii_subject_emf',
       TenantId: tenantId || 'unknown',
       [metricName]: 1,
     }));
