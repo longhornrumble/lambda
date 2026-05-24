@@ -136,6 +136,21 @@ def get_or_create_pii_subject_id(
     to the freshly-minted candidate so the submission still records a stable id.
     """
     candidate = mint_pii_subject_id()
+
+    # Sprint E1 / audit blocker B1 (cross-tenant collision): tenant_id missing
+    # or literal 'unknown' MUST NOT be indexed. Two unrelated submissions from
+    # differently-misconfigured tenants would otherwise collide on the index
+    # key (tenant_id, normalized_email) — either reusing a single subject id
+    # across distinct subjects or minting divergent ids depending on ordering.
+    # Mint UNINDEXED instead; the Phase-2 orphan-sweep gate covers UNINDEXED
+    # rows by design. Mirror in pii_subject.js.
+    if not tenant_id or tenant_id == "unknown":
+        logger.warning(
+            "pii_subject tenant_id missing/unknown — minting UNINDEXED "
+            "pii_subject_id to avoid cross-tenant index collision"
+        )
+        return candidate
+
     try:
         raw = extract_email(responses)
         normalized = normalize_email(raw)

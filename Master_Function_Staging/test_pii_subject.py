@@ -269,3 +269,17 @@ def test_read_subject_id_new_shape_returns_value():
 def test_read_subject_id_robust_to_garbage(bad_record):
     # Never raises; empty/None/non-str/non-dict all collapse to None.
     assert read_subject_id(bad_record) is None
+
+
+# ── Sprint E1 / audit blocker B1 — cross-tenant collision guard ─────────────
+@pytest.mark.parametrize("bad_tenant", ["unknown", "", None])
+def test_get_or_create_tenant_id_missing_or_unknown_is_unindexed(bad_tenant):
+    """A submission with tenant_id missing/'unknown' must NOT index. Two such
+    submissions from differently-misconfigured tenants would otherwise collide
+    on (tenant_id='unknown', normalized_email=...). Mirror in pii_subject.js.
+    """
+    tbl = MagicMock()
+    sid = get_or_create_pii_subject_id(bad_tenant, {"email": "a@b.com"}, table=tbl)
+    assert sid.startswith("psub_") and len(sid) == 5 + 32
+    tbl.get_item.assert_not_called()
+    tbl.put_item.assert_not_called()

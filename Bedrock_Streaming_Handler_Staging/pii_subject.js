@@ -131,6 +131,23 @@ function extractEmail(responses) {
 async function getOrCreatePiiSubjectId(tenantId, responses, options) {
   const { docClient, knownEmail } = options || {};
   const candidate = mintPiiSubjectId();
+
+  // Sprint E1 / audit blocker B1 (cross-tenant collision): tenant_id missing
+  // or literal 'unknown' MUST NOT be indexed. If two unrelated submissions
+  // from differently-misconfigured tenants both fall through to
+  // `tenant_id='unknown'`, they would collide on the index key
+  // (tenant_id, normalized_email) and either reuse a single subject id across
+  // distinct subjects or mint divergent ids depending on which got there
+  // first. Mint UNINDEXED instead — the Phase-2 orphan-sweep gate covers
+  // UNINDEXED rows by design. Mirror in pii_subject.py.
+  if (!tenantId || tenantId === 'unknown') {
+    console.warn(
+      '[pii_subject] tenant_id missing/unknown — minting UNINDEXED '
+      + 'pii_subject_id to avoid cross-tenant index collision'
+    );
+    return candidate;
+  }
+
   if (!docClient) {
     // Caller misuse — but stay best-effort and never throw.
     console.warn('[pii_subject] docClient not provided; row will be UNINDEXED');
