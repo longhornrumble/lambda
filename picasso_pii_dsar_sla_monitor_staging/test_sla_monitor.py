@@ -316,13 +316,16 @@ def test_ddb_table_called_with_correct_name(monitor):
     mod.lambda_handler({}, None)
 
     expected_name = os.environ['AUDIT_TABLE']
-    # Both StatusIndex Query AND _has_closed_event Query must hit the
-    # configured table name. assert_any_call passes if either call matches.
-    mock_ddb.Table.assert_any_call(expected_name)
-    # Defense-in-depth: confirm the per-candidate call site ran (2 total
-    # Table() calls — StatusIndex pass + per-candidate pass)
+    from unittest.mock import call
+
+    # Sprint F2 / audit-of-audit finding 4: assert_any_call + call_count==2
+    # could pass even if the SECOND call site switched to a hardcoded table
+    # name. assert_has_calls pins BOTH calls' args explicitly so a regression
+    # on either call site (StatusIndex Query OR _has_closed_event Query)
+    # surfaces in CI.
+    mock_ddb.Table.assert_has_calls([call(expected_name), call(expected_name)])
     assert mock_ddb.Table.call_count == 2, (
-        f'expected 2 Table() calls (StatusIndex + per-candidate), '
+        f'expected exactly 2 Table() calls (StatusIndex + per-candidate); '
         f'got {mock_ddb.Table.call_count}'
     )
 
@@ -478,4 +481,39 @@ def test_event_timestamp_iso_format_contract(monitor):
     assert '.' in threshold_in_query, (
         'monitor must emit microsecond-precision threshold to lexicographically '
         'match the writer format'
+    )
+
+
+# Sprint F2 / audit-of-audit finding 12 — N17 truncation path test
+def test_publish_alert_logs_warning_when_subject_exceeds_100_chars(monitor, caplog):
+    """The Sprint E2 N17 fix added a logger.warning before truncating SNS
+    subjects >100 chars, but the path was untested. Trigger it by monkey-
+    patching SLA_DAYS_INTAKE_PLUS to a long-string sentinel (simulating
+    env-var misconfiguration) so the subject overflows. Verifies (a) warning
+    fires with the expected log key, (b) subject is truncated to exactly
+    100 chars, (c) SNS.publish still gets called.
+    """
+    import logging
+    mod, mock_ddb, mock_sns = monitor
+    # Long sentinel for SLA_DAYS_INTAKE_PLUS — 80 chars of 'x' pushes the
+    # subject format well past the 100-char cap.
+    original = mod.SLA_DAYS_INTAKE_PLUS
+    try:
+        mod.SLA_DAYS_INTAKE_PLUS = 'x' * 80
+        with caplog.at_level(logging.WARNING):
+            mod._publish_alert([{'dsar_id': 'd1', 'event_timestamp': '2026-05-24T00:00:00Z'}])
+    finally:
+        mod.SLA_DAYS_INTAKE_PLUS = original
+
+    # Subject should have been truncated to exactly 100
+    publish_call = mock_sns.publish.call_args
+    assert len(publish_call.kwargs['Subject']) == 100, (
+        f'truncated subject must be exactly 100 chars; '
+        f'got {len(publish_call.kwargs["Subject"])}'
+    )
+    # Warning log line present with expected structured key
+    truncation_logs = [r for r in caplog.records
+                       if 'sla_monitor_subject_truncated' in r.getMessage()]
+    assert len(truncation_logs) == 1, (
+        f'expected exactly 1 truncation warning; got {len(truncation_logs)}'
     )

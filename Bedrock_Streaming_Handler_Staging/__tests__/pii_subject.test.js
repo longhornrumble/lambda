@@ -285,6 +285,59 @@ describe('getOrCreatePiiSubjectId — tenant_id guard (audit blocker B1)', () =>
   });
 });
 
+// Sprint F2 / audit-of-audit finding 17 — EMF metric emission contract
+describe('getOrCreatePiiSubjectId — EMF metric emission (audit-of-audit F2)', () => {
+  let logSpy;
+  beforeEach(() => {
+    logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  test('IndexRaceUnresolved emitted on 3-attempt race timeout', async () => {
+    docClientMock.on(GetCommand).resolves({});  // never finds existing
+    const ccfErr = new Error('ConditionalCheckFailed');
+    ccfErr.name = 'ConditionalCheckFailedException';
+    docClientMock.on(PutCommand).rejects(ccfErr);
+
+    await getOrCreatePiiSubjectId('TEN', { email: 'a@example.com' }, {
+      docClient: fakeDocClient,
+    });
+
+    // Filter by SPECIFIC metric name (not just 'CloudWatchMetrics') so the
+    // test is order-independent — both EMF metric names share the namespace
+    // marker so the broader filter could grab the wrong line.
+    const raceLines = logSpy.mock.calls
+      .map(args => args[0])
+      .filter(line => typeof line === 'string' && line.includes('IndexRaceUnresolved'));
+    expect(raceLines.length).toBeGreaterThanOrEqual(1);
+    const parsed = JSON.parse(raceLines[0]);
+    expect(parsed._aws.CloudWatchMetrics[0].Namespace).toBe('PII/SubjectIndex');
+    expect(parsed._aws.CloudWatchMetrics[0].Metrics[0].Name).toBe('IndexRaceUnresolved');
+    expect(parsed._aws.CloudWatchMetrics[0].Metrics[0].Unit).toBe('Count');
+    expect(parsed._aws.CloudWatchMetrics[0].Dimensions[0]).toEqual(['TenantId']);
+    expect(parsed.TenantId).toBe('TEN');
+    expect(parsed.IndexRaceUnresolved).toBe(1);
+  });
+
+  test('IndexUnavailable emitted on non-CCF DDB error', async () => {
+    docClientMock.on(GetCommand).rejects(new Error('throttled'));
+
+    await getOrCreatePiiSubjectId('TEN', { email: 'a@example.com' }, {
+      docClient: fakeDocClient,
+    });
+
+    const unavailLines = logSpy.mock.calls
+      .map(args => args[0])
+      .filter(line => typeof line === 'string' && line.includes('IndexUnavailable'));
+    expect(unavailLines.length).toBeGreaterThanOrEqual(1);
+    const parsed = JSON.parse(unavailLines[0]);
+    expect(parsed._aws.CloudWatchMetrics[0].Metrics[0].Name).toBe('IndexUnavailable');
+    expect(parsed.IndexUnavailable).toBe(1);
+  });
+});
+
 // Sprint F1 / audit-of-audit finding 1 — case/whitespace normalization
 describe('getOrCreatePiiSubjectId — tenant_id normalization (audit-of-audit F1)', () => {
   test.each([
