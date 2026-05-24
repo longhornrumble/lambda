@@ -172,7 +172,14 @@ def lambda_handler(event, context):
     """EventBridge invokes this daily. Event payload ignored (only schedule fires)."""
     now = _now()
     threshold = now - timedelta(days=SLA_DAYS_INTAKE_PLUS)
-    threshold_iso = threshold.isoformat()
+    # M9.G7 / F-DSAR27: explicit microseconds-precision matches the writer
+    # (picasso_pii_dsar_staging/lambda_function.py:_now_iso uses
+    # `isoformat(timespec="microseconds")`). DDB does lexicographic string
+    # comparison on the GSI range key; format mismatch would silently
+    # mis-order rows at boundary moments (e.g., now() landing on a zero-
+    # microsecond instant in tests). Don't change without also re-pinning
+    # the writer.
+    threshold_iso = threshold.isoformat(timespec='microseconds')
     logger.info(
         'sla_monitor_scan_start: now=%s threshold=%s (intake+%dd)',
         now.isoformat(), threshold_iso, SLA_DAYS_INTAKE_PLUS,

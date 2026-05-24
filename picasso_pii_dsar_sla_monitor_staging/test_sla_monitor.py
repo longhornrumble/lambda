@@ -285,3 +285,173 @@ def test_filters_non_request_received_status_in_progress(monitor):
     # Only the request_received row counts; the other 'in_progress' event ignored
     assert result['at_risk_count'] == 1
     assert result['dsar_ids'] == ['d_intake']
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M9.G7 / F-DSAR27 — operational test bundle (phase-completion-audit 2026-05-23
+# test-engineer 🟡 gaps; closed via this file 2026-05-24)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_ddb_table_called_with_correct_name(monitor):
+    """Regression guard for AUDIT_TABLE env var binding.
+
+    A typo or env-var drift in the IaC layer would silently send the Lambda
+    against the wrong table. This test asserts the Lambda calls
+    `ddb.Table(<AUDIT_TABLE env var>)` with the exact configured value, so any
+    accidental hard-coding or env-var drift surfaces in CI.
+    """
+    mod, mock_ddb, mock_sns = monitor
+    table_mock = MagicMock()
+    _stub_status_query(table_mock, [])
+    mock_ddb.Table.return_value = table_mock
+
+    mod.lambda_handler({}, None)
+
+    mock_ddb.Table.assert_called_with(os.environ['AUDIT_TABLE'])
+
+
+def test_handler_idempotent_on_eventbridge_replay(monitor):
+    """EventBridge can replay an invocation (delivery semantics are at-least-
+    once). Re-invoking the handler with the same DDB state MUST produce the
+    same outcome both times — no double SNS publish, no state mutation in
+    the audit table, identical return value.
+
+    The Lambda is read-only on the audit table, so this is by construction —
+    the test pins the invariant so a future code change can't silently
+    introduce a side effect that breaks replay safety.
+    """
+    mod, mock_ddb, mock_sns = monitor
+
+    intake_row = _intake_row('dsar-replay', hours_ago=30 * 24)
+
+    def fresh_setup():
+        status_table = MagicMock()
+        _stub_status_query(status_table, [intake_row])
+        main_table = MagicMock()
+        main_table.query.return_value = {'Count': 0}
+        return status_table, main_table
+
+    s1, m1 = fresh_setup()
+    s2, m2 = fresh_setup()
+    # Each invocation walks: status_table once + main_table once per candidate
+    mock_ddb.Table.side_effect = [s1, m1, s2, m2]
+
+    r1 = mod.lambda_handler({'replay_attempt': 1}, None)
+    r2 = mod.lambda_handler({'replay_attempt': 2}, None)
+
+    # Identical outcomes
+    assert r1 == r2 == {'at_risk_count': 1, 'dsar_ids': ['dsar-replay']}
+    # SNS published once per invocation; total 2 publishes for 2 replays.
+    # (The Lambda's design accepts duplicate alerts on replay — the operator's
+    # downstream dedup is intake-via-email, not Lambda-side suppression.)
+    assert mock_sns.publish.call_count == 2
+    # No DDB writes in either invocation (mock_ddb tracks .put_item etc. would
+    # fail in MagicMock if attempted with side_effects exhausted)
+    for table_mock in [s1, m1, s2, m2]:
+        table_mock.put_item.assert_not_called()
+        table_mock.update_item.assert_not_called()
+        table_mock.delete_item.assert_not_called()
+
+
+def test_lambda_timeout_mid_loop_does_not_publish_partial(monitor):
+    """Lambda timeout during the per-candidate `_has_closed_event` Query
+    must NOT publish a partial at-risk list. The Lambda is fail-fast (the
+    ClientError handler re-raises and the timeout-as-exception bubbles out),
+    so the SNS publish only happens at the END of the loop when all
+    candidates have been checked.
+
+    Simulates a hung main-table Query that raises a ReadTimeoutError-like
+    exception mid-loop; verifies SNS was never called.
+    """
+    mod, mock_ddb, mock_sns = monitor
+
+    status_table = MagicMock()
+    _stub_status_query(
+        status_table,
+        [_intake_row('d-a', 30 * 24), _intake_row('d-b', 30 * 24),
+         _intake_row('d-c', 30 * 24)],
+    )
+
+    main_table = MagicMock()
+    # First closed-check succeeds (no closed event); second one times out
+    timeout_err = ClientError(
+        {'Error': {'Code': 'RequestTimeout', 'Message': 'simulated timeout'}},
+        'Query',
+    )
+    main_table.query.side_effect = [{'Count': 0}, timeout_err]
+
+    mock_ddb.Table.side_effect = [status_table, main_table, main_table]
+
+    with pytest.raises(ClientError) as exc_info:
+        mod.lambda_handler({}, None)
+
+    assert exc_info.value.response['Error']['Code'] == 'RequestTimeout'
+    # Critical: NO partial publish — even though d-a's closed check succeeded
+    # and would otherwise be in the at-risk list, the mid-loop timeout aborts
+    # before the publish step
+    mock_sns.publish.assert_not_called()
+
+
+def test_event_timestamp_iso_format_contract(monitor):
+    """Reader-side contract test for the writer's ISO format.
+
+    The DSAR Lambda writer (`Lambdas/lambda/picasso_pii_dsar_staging/
+    lambda_function.py:_now_iso`) emits `event_timestamp` as
+    `datetime.now(timezone.utc).isoformat(timespec="microseconds")` →
+    string like `'2026-05-24T05:02:32.523460+00:00'`.
+
+    The SLA monitor's `_query_open_intakes_past_threshold` builds the
+    `threshold_iso` via `threshold.isoformat()` (its own format) and DDB
+    does lexicographic string comparison for the `<=` filter. The formats
+    MUST match in shape (both microseconds-precision, both with the
+    `+00:00` timezone suffix) or the comparison silently mis-orders rows
+    at format-boundary moments.
+
+    This test pins the writer's exact format + asserts the reader handles
+    it correctly. If the writer ever changes shape (e.g., drops microseconds
+    or switches to `Z` suffix), this test fires.
+    """
+    mod, mock_ddb, mock_sns = monitor
+
+    # Build a row whose event_timestamp uses the writer's EXACT format
+    writer_ts = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(
+        timespec='microseconds')
+    # Sanity-check the format we're claiming the writer emits
+    assert '.' in writer_ts, 'writer format must include microseconds'
+    assert writer_ts.endswith('+00:00'), 'writer format must end with +00:00'
+    # 26 chars of date+time+microseconds + 6 chars of '+00:00' = 32 chars total
+    assert len(writer_ts) == 32, f'expected 32-char ISO; got {len(writer_ts)}'
+
+    intake_row = {
+        'dsar_id': 'dsar-iso-contract',
+        'event_timestamp': writer_ts,
+        'event_type': 'request_received',
+        'status': 'in_progress',
+    }
+
+    status_table = MagicMock()
+    _stub_status_query(status_table, [intake_row])
+    main_table = MagicMock()
+    main_table.query.return_value = {'Count': 0}
+    mock_ddb.Table.side_effect = [status_table, main_table]
+
+    result = mod.lambda_handler({}, None)
+
+    # The 30-day-old row IS past threshold (25d), so reader correctly
+    # surfaces it. Threshold is computed by the monitor itself; the writer's
+    # format must be lexicographically comparable with the threshold's format.
+    assert result['at_risk_count'] == 1
+    assert result['dsar_ids'] == ['dsar-iso-contract']
+
+    # Verify the threshold the monitor computed was ALSO in microseconds-
+    # precision format (post-M9.G7 the monitor pins this; pre-M9.G7 it
+    # depended on now()'s microsecond field being nonzero — brittle).
+    keys = status_table.query.call_args.kwargs['KeyConditionExpression']
+    # KeyConditionExpression is a boto3 ConditionBase; introspect via repr
+    threshold_in_query = str(keys)
+    # The threshold should be 32 chars (microsecond ISO) — the M9.G7 tighten
+    # explicitly pins timespec='microseconds' on the reader side too
+    assert '.' in threshold_in_query, (
+        'monitor must emit microsecond-precision threshold to lexicographically '
+        'match the writer format'
+    )

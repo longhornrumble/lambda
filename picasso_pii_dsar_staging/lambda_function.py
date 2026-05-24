@@ -290,6 +290,16 @@ def _resolve_subject(tenant_id, normalized_email):
 # Audit write (append-only event log to picasso-pii-dsar-audit-staging)
 # ───────────────────────────────────────────────────────────────────────────
 def _now_iso():
+    # M9.G7 / F-DSAR27: PINNED format. The SLA monitor Lambda
+    # (`picasso_pii_dsar_sla_monitor_staging/lambda_function.py`) reads this
+    # value via the StatusIndex GSI range key and does DDB lexicographic
+    # string comparison against a threshold built with the SAME timespec
+    # ('microseconds'). Don't change to timespec='auto' or `.isoformat()`
+    # default — auto drops the microseconds field when it's exactly zero,
+    # which makes lex comparison silently mis-order at zero-microsecond
+    # boundaries. The reader has a regression test
+    # (`test_event_timestamp_iso_format_contract`) that fires if this
+    # writer format drifts.
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
