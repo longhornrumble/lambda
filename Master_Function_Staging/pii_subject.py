@@ -200,6 +200,8 @@ def get_or_create_pii_subject_id(
         # by the Phase-2 orphan-sweep gate (sweep form-submissions for
         # pii_subject_id absent from the index — see PII_IDENTITY_CONTRACT §7/§8).
         # A submission must never fail for this, so we stay best-effort + log loud.
+        # Sprint E2 / audit N19: emit CW EMF metric for observability.
+        _emit_emf_metric("IndexRaceUnresolved", tenant_id)
         logger.warning(
             "pii_subject index race unresolved after %d attempts (tenant=%s); "
             "row is UNINDEXED — incomplete-deletion risk, requires Phase-2 "
@@ -209,12 +211,40 @@ def get_or_create_pii_subject_id(
         )
         return candidate
     except Exception as err:  # noqa: BLE001 - index access is best-effort, never fatal
+        _emit_emf_metric("IndexUnavailable", tenant_id)
         logger.warning(
             "pii_subject index unavailable (non-fatal): %s — row is UNINDEXED, "
             "requires the Phase-2 orphan-sweep gate (incomplete-deletion risk)",
             type(err).__name__,
         )
         return candidate
+
+
+def _emit_emf_metric(metric_name: str, tenant_id: Optional[str]) -> None:
+    """Emit a CloudWatch custom metric via Embedded Metric Format (EMF).
+
+    Lambda's CW Logs agent auto-extracts metrics from any log line containing
+    ``_aws.CloudWatchMetrics`` — no PutMetricData IAM permission needed.
+    Metric appears at PII/SubjectIndex namespace; alarm on Sum > 0 in any 1h
+    window catches index degradation that the writer's best-effort fallback
+    would otherwise hide (audit N19). Mirrors pii_subject.js _emitEmfMetric.
+    """
+    import json  # local import keeps cold-start lean for the common path
+    try:
+        logger.info(json.dumps({
+            "_aws": {
+                "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
+                "CloudWatchMetrics": [{
+                    "Namespace": "PII/SubjectIndex",
+                    "Dimensions": [["TenantId"]],
+                    "Metrics": [{"Name": metric_name, "Unit": "Count"}],
+                }],
+            },
+            "TenantId": tenant_id or "unknown",
+            metric_name: 1,
+        }))
+    except Exception:  # noqa: BLE001 - metric emission must never block writer
+        pass
 
 
 def _now_iso() -> str:

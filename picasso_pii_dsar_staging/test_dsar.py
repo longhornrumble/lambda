@@ -157,6 +157,48 @@ def test_validate_accepts_smoke_prefix_dsar_id_with_explicit_marker(dsar):
     assert out["dsar_id"] == "smoke-sla-monitor-001"
 
 
+# ── Sprint E2 / audit defer-ok D8 — writer-side _now_iso format contract ────
+def test_now_iso_format_contract(dsar):
+    """Writer-side pinning of the audit `event_timestamp` ISO format.
+
+    The SLA monitor Lambda (`picasso_pii_dsar_sla_monitor_staging`) builds its
+    threshold via `threshold.isoformat(timespec='microseconds')` and DDB does
+    LEXICOGRAPHIC string comparison on the StatusIndex GSI range key
+    (`event_timestamp`). If the writer's format ever drifts (drops microseconds
+    or switches to 'Z' suffix), the reader's threshold comparison silently
+    mis-orders rows at format-boundary instants.
+
+    Companion reader-side test lives in
+    `picasso_pii_dsar_sla_monitor_staging/test_sla_monitor.py::test_event_timestamp_iso_format_contract`.
+    Both sides must pin the same shape — that's the contract.
+
+    Sprint E2 / audit D8: the reader-side test previously constructed the
+    expected format test-side rather than importing it. This writer-side
+    test asserts the actual writer output matches the shape both tests rely
+    on, closing the loop.
+    """
+    from datetime import datetime
+    mod, _, _ = dsar
+    ts = mod._now_iso()
+    # Shape: 'YYYY-MM-DDTHH:MM:SS.ffffff+00:00' → 32 chars total
+    assert isinstance(ts, str), "writer must return str"
+    assert len(ts) == 32, f"expected 32-char ISO; got {len(ts)} ({ts!r})"
+    assert "." in ts, "writer format must include microseconds delimiter"
+    assert ts.endswith("+00:00"), "writer format must end with +00:00 (UTC tz)"
+    # Parse-back to confirm valid ISO-8601 and tz-aware
+    parsed = datetime.fromisoformat(ts)
+    assert parsed.tzinfo is not None, "writer ts must be tz-aware"
+    # Boundary case: zero-microsecond instant must serialize with .000000,
+    # NOT drop the field (which is what timespec='auto' would do). If the
+    # writer ever switches to default isoformat(), this assertion catches it.
+    boundary = datetime(2026, 1, 1, tzinfo=parsed.tzinfo).isoformat(
+        timespec="microseconds")
+    assert boundary == "2026-01-01T00:00:00.000000+00:00", (
+        f"timespec=microseconds must preserve .000000 on zero-us boundary; "
+        f"writer format produced {boundary!r}"
+    )
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Subject resolution
 # ───────────────────────────────────────────────────────────────────────────

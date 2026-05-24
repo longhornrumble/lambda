@@ -105,6 +105,13 @@ def _has_closed_event(dsar_id: str) -> bool:
     (each DSAR has O(10) events maximum). FilterExpression on event_type
     is a server-side filter, not key-condition — DDB returns all events
     for the DSAR and filters in-stream.
+
+    Sprint E2 / audit N16: `ddb.Table()` is intentionally instantiated per
+    call here rather than cached at module-level. The handle is a thin
+    metadata wrapper (no socket / no DDB call), and per-call instantiation
+    keeps the test fixture's `mock_ddb.Table.side_effect = [...]` pattern
+    intact (caching would consume only the first side_effect element across
+    all calls, breaking per-call test assertions).
     """
     table = ddb.Table(AUDIT_TABLE)
     try:
@@ -150,9 +157,18 @@ def _publish_alert(at_risk_rows: list) -> None:
         body_lines.append(f'  - {dsar_id} (intake {ts})')
 
     message = '\n'.join(body_lines)
-    # SNS Subject capped at 100 chars
+    # SNS Subject capped at 100 chars. With realistic at_risk_count values
+    # the subject is ~50 chars, but the truncation was silent for any
+    # accidental future format change. Sprint E2 / audit N17: log a warning
+    # if truncation would actually fire so the operator catches the format
+    # drift before it ships.
     subject = f'[Picasso DSAR] {len(at_risk_rows)} DSAR(s) at SLA risk past {SLA_DAYS_INTAKE_PLUS}d'
-    subject = subject[:100]
+    if len(subject) > 100:
+        logger.warning(
+            'sla_monitor_subject_truncated: original_len=%d at_risk_count=%d',
+            len(subject), len(at_risk_rows),
+        )
+        subject = subject[:100]
 
     try:
         sns.publish(
