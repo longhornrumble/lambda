@@ -599,8 +599,26 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
     await dynamodb.send(new PutCommand(params));
     console.log(`✅ Form saved to DynamoDB with pipeline_status: new, priority: ${priority}`);
   } catch (error) {
-    console.error('Error saving to DynamoDB:', error);
-    // Don't fail the submission if DynamoDB fails
+    // M9.G8 / F-DSAR24: phase-completion-audit code-reviewer 🔴 — this
+    // catch is intentional (preserves consumer UX when DDB is unreachable,
+    // matches the original "Don't fail the submission if DynamoDB fails"
+    // intent) but was previously silent. Empirical 2026-05-14T13:39:29Z
+    // incident in staging (AccessDeniedException due to env-var-table-name
+    // drift) proved a real submission was lost without operator visibility.
+    //
+    // Fix: keep the catch (UX preserved), but emit a structured error log
+    // the CW Logs metric filter `bsh-form-handler-ddb-write-error` (picasso
+    // IaC) can dimension by tenant_id + alarm on ≥1 in any 5-min window.
+    // The literal prefix "Error saving to DynamoDB:" is preserved so the
+    // existing metric filter pattern keeps matching; tenant_id +
+    // submission_id are appended for operator forensics.
+    console.error(
+      `Error saving to DynamoDB: tenant_id=${params.Item?.tenant_id || 'unknown'} `
+      + `submission_id=${params.Item?.submission_id || 'unknown'} `
+      + `error_name=${error?.name || 'unknown'} `
+      + `error_message=${error?.message || String(error)}`
+    );
+    // Don't fail the submission if DynamoDB fails (UX preservation).
   }
 }
 
@@ -1170,10 +1188,16 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
     `;
 
     for (const [key, value] of Object.entries(formData)) {
+      // M9.G8 / F-DSAR25: escape consumer-controlled form_data values before
+      // interpolating into staff-facing HTML email. escapeHtml() at line 79
+      // is already applied to otherRecipients (line 1193) and tenant-controlled
+      // orgName (sendConfirmationEmail), but was missing here in the default
+      // (no-template) notification path — surfaced by phase-completion-audit
+      // security-reviewer 2026-05-23 as unasked finding.
       htmlBody += `
         <tr>
-          <td><strong>${key}:</strong></td>
-          <td>${value}</td>
+          <td><strong>${escapeHtml(key)}:</strong></td>
+          <td>${escapeHtml(String(value ?? ''))}</td>
         </tr>
       `;
     }
