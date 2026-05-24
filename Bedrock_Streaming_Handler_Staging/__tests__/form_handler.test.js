@@ -208,6 +208,97 @@ describe('Form Handler - Phase 1: AWS SDK v3 Migration', () => {
       expect(item.ttl).toBeLessThanOrEqual(expectedMax);
     });
 
+    it('should log structured tenant_id + submission_id when DDB PutCommand fails — M9.G8 / F-DSAR24 closure', async () => {
+      // F-DSAR24 (phase-completion-audit code-reviewer 2026-05-23, 🔴 HIGH):
+      // saveFormSubmission's catch is intentional (preserves consumer UX
+      // when DDB is unreachable) but was previously silent. The 2026-05-14
+      // staging incident (AccessDeniedException due to env-var-table-name
+      // drift) proved a real submission was lost without operator visibility.
+      // M9.G8 fix: keep the catch, but emit structured fields the CW Logs
+      // metric filter `bsh-form-handler-ddb-write-error` (picasso IaC) can
+      // dimension by tenant_id and alarm on ≥1 in any 5-min window. The
+      // literal prefix "Error saving to DynamoDB:" is preserved so the
+      // metric filter pattern keeps matching.
+      sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-email-id' });
+      dynamoMock.on(GetCommand).resolves({});
+      lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+      // Reject ONLY the form-submission PutCommand (not the audit-log or
+      // pii-subject-index puts — those use separate table names).
+      dynamoMock.on(PutCommand).callsFake((input) => {
+        if (input.TableName === 'test-form-submissions') {
+          const err = new Error('User: ... is not authorized to perform: dynamodb:PutItem');
+          err.name = 'AccessDeniedException';
+          return Promise.reject(err);
+        }
+        return Promise.resolve({});
+      });
+
+      const errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        // Submission must NOT throw — UX preservation is the original intent.
+        const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+        expect(result).toBeDefined();
+
+        // The catch must have logged exactly the structured shape the metric
+        // filter expects.
+        const ddbErrorCall = errorSpy.mock.calls.find(
+          call => typeof call[0] === 'string' && call[0].startsWith('Error saving to DynamoDB:')
+        );
+        expect(ddbErrorCall).toBeDefined();
+        const logLine = ddbErrorCall[0];
+        // Metric-filter prefix is preserved verbatim.
+        expect(logLine).toMatch(/^Error saving to DynamoDB:/);
+        // Structured fields for operator forensics + future EMF dimension.
+        expect(logLine).toMatch(/tenant_id=TEST123/);
+        expect(logLine).toMatch(/submission_id=\S+/);
+        expect(logLine).toMatch(/error_name=AccessDeniedException/);
+        expect(logLine).toMatch(/error_message=User: \.\.\. is not authorized/);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it('should escape consumer-controlled form_data in staff notification HTML — M9.G8 / F-DSAR25 closure', async () => {
+      // F-DSAR25 (phase-completion-audit security-reviewer 2026-05-23, unasked):
+      // form_handler.js sendInternalNotificationEmail default HTML body
+      // interpolated formData key + value directly into the staff-facing
+      // <table>, while the surrounding code (otherRecipients, orgName) was
+      // escaped. A consumer submitting `<img onerror="...">` could render
+      // active HTML in the staff email client. Fix: wrap key + value with
+      // escapeHtml() at the interpolation site.
+      sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-email-id' });
+      dynamoMock.on(PutCommand).resolves({});
+      dynamoMock.on(GetCommand).resolves({});
+      lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+      const xssFormData = {
+        ...mockFormData,
+        evil_key: '<img src=x onerror="alert(1)">',
+        '<script>': 'value-with-script-key',
+        quote_test: 'has "quotes" and <tags>',
+      };
+
+      await submitForm('volunteer_apply', xssFormData, mockTenantConfig);
+
+      const internalCalls = sesMock.commandCalls(SendEmailCommand)
+        .filter(c => c.args[0].input.Tags?.some(t => t.Name === 'email_type' && t.Value === 'internal_notification'));
+      expect(internalCalls.length).toBeGreaterThanOrEqual(1);
+      const htmlBody = internalCalls[0].args[0].input.Message.Body.Html.Data;
+
+      // Raw consumer-controlled payloads must NOT appear unescaped in the HTML.
+      expect(htmlBody).not.toContain('<img src=x onerror=');
+      expect(htmlBody).not.toContain('<script>');
+      // Escaped value MUST appear (the realistic attack surface: a value
+      // typed by the consumer into a legitimate form field).
+      expect(htmlBody).toContain('&lt;img src=x onerror=&quot;alert(1)&quot;&gt;');
+      // Quotes + tags inside values are also escaped end-to-end.
+      expect(htmlBody).toContain('has &quot;quotes&quot; and &lt;tags&gt;');
+      // Defense-in-depth: even though keys flow through buildFormDataDisplay's
+      // title-case transform (so `<script>` becomes `<Script>`), the key is
+      // ALSO escaped at the interpolation site (matches case-insensitively).
+      expect(htmlBody).toMatch(/&lt;script&gt;/i);
+    });
+
     it('should use LambdaClient with InvokeCommand for Lambda fulfillment', async () => {
       lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
       dynamoMock.on(PutCommand).resolves({});
