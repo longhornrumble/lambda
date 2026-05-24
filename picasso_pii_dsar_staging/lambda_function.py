@@ -248,13 +248,39 @@ def _validate(event):
             raise InvalidInput(f"subject_identifier does not look like an email")
         subject_identifier = normalized
 
+    # Sprint E1 / audit blocker B2 (smoke-prefix is UX, not security boundary):
+    # the operator playbook §8 JMESPath at-risk filter excludes
+    # dsar_id starting with 'smoke-' as hygiene. Without a write-side gate, a
+    # mistyped operator (or malicious actor with operator role) could create
+    # `dsar_id='smoke-real-001'` for a real DSAR — that DSAR would then be
+    # permanently hidden from the operator view AND undeletable per the C2
+    # 4-action Deny resource policy. The marker below ELIMINATES the
+    # accident/typo failure mode by requiring an explicit smoke_test_marker
+    # field; it is NOT a security boundary against an attacker with legitimate
+    # operator privileges (no code-level boundary is possible there) but it
+    # makes the existence of any smoke-prefixed row in production explicit and
+    # security-logged for the forensic trail.
+    dsar_id = event["dsar_id"]
+    if dsar_id.startswith("smoke-") and not event.get("smoke_test_marker", False):
+        raise InvalidInput(
+            "dsar_id starts with reserved 'smoke-' prefix; re-invoke with "
+            "smoke_test_marker=true if this is intentional (will be "
+            "security-logged), or change the dsar_id."
+        )
+    if dsar_id.startswith("smoke-") and event.get("smoke_test_marker", False):
+        logger.warning(
+            "SECURITY: smoke-prefix dsar_id accepted via explicit "
+            "smoke_test_marker=true: dsar_id=%s operator=%s tenant_id=%s",
+            dsar_id, event.get("operator"), event.get("tenant_id"),
+        )
+
     return {
         "subject_identifier": subject_identifier,
         "identifier_type": identifier_type,
         "request_type": request_type,
         "tenant_id": event["tenant_id"],
         "operator": event["operator"],
-        "dsar_id": event["dsar_id"],
+        "dsar_id": dsar_id,
         "dry_run": bool(event.get("dry_run", True)),
     }
 

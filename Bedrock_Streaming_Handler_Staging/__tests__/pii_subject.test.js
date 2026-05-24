@@ -256,3 +256,31 @@ describe('PII_SUBJECT_INDEX_TABLE default', () => {
     expect(PII_SUBJECT_INDEX_TABLE).toBe('picasso-pii-subject-index-staging');
   });
 });
+
+// Sprint E1 / audit blocker B1 — cross-tenant collision guard.
+describe('getOrCreatePiiSubjectId — tenant_id guard (audit blocker B1)', () => {
+  test('tenant_id="unknown" → UNINDEXED candidate, no DDB calls', async () => {
+    const sid = await getOrCreatePiiSubjectId('unknown', { email: 'a@example.com' }, {
+      docClient: fakeDocClient,
+    });
+    expect(sid).toMatch(/^psub_[0-9a-f]{32}$/);
+    expect(docClientMock.commandCalls(GetCommand).length).toBe(0);
+    expect(docClientMock.commandCalls(PutCommand).length).toBe(0);
+  });
+
+  test('tenant_id null → UNINDEXED candidate, no DDB calls', async () => {
+    const sid = await getOrCreatePiiSubjectId(null, { email: 'a@example.com' }, {
+      docClient: fakeDocClient,
+    });
+    expect(sid).toMatch(/^psub_[0-9a-f]{32}$/);
+    expect(docClientMock.commandCalls(GetCommand).length).toBe(0);
+  });
+
+  test('tenant_id "" → UNINDEXED candidate, no DDB calls', async () => {
+    const sid = await getOrCreatePiiSubjectId('', { email: 'a@example.com' }, {
+      docClient: fakeDocClient,
+    });
+    expect(sid).toMatch(/^psub_[0-9a-f]{32}$/);
+    expect(docClientMock.commandCalls(GetCommand).length).toBe(0);
+  });
+});

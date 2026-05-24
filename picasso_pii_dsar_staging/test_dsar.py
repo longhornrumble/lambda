@@ -132,6 +132,31 @@ def test_validate_respects_explicit_false_dry_run(dsar):
     assert out["dry_run"] is False
 
 
+# ── Sprint E1 / audit blocker B2 — smoke-prefix write-side enforcement ──────
+def test_validate_rejects_smoke_prefix_dsar_id_without_marker(dsar):
+    """A mistyped operator (or malicious actor with operator role) could create
+    `dsar_id='smoke-real-001'` for a real DSAR — that would permanently hide
+    the DSAR from the operator's at-risk view (playbook §8 filter) AND prevent
+    deletion via the C2 4-action Deny policy. Require explicit
+    smoke_test_marker=true to opt in.
+    """
+    mod, _, _ = dsar
+    event = _valid_event(dsar_id="smoke-real-001")
+    with pytest.raises(mod.InvalidInput, match="reserved 'smoke-' prefix"):
+        mod._validate(event)
+
+
+def test_validate_accepts_smoke_prefix_dsar_id_with_explicit_marker(dsar):
+    """The smoke runner sets smoke_test_marker=true. The Lambda accepts the
+    smoke-prefixed dsar_id and emits a SECURITY log line for the forensic trail.
+    """
+    mod, _, _ = dsar
+    event = _valid_event(dsar_id="smoke-sla-monitor-001")
+    event["smoke_test_marker"] = True
+    out = mod._validate(event)
+    assert out["dsar_id"] == "smoke-sla-monitor-001"
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Subject resolution
 # ───────────────────────────────────────────────────────────────────────────
