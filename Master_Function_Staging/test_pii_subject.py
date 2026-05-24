@@ -283,3 +283,67 @@ def test_get_or_create_tenant_id_missing_or_unknown_is_unindexed(bad_tenant):
     assert sid.startswith("psub_") and len(sid) == 5 + 32
     tbl.get_item.assert_not_called()
     tbl.put_item.assert_not_called()
+
+
+# ── Sprint F1 / audit-of-audit finding 1 — case/whitespace normalization ────
+@pytest.mark.parametrize("bypass_attempt", [
+    "Unknown",           # capital U
+    "UNKNOWN",           # all caps
+    "uNkNoWn",           # mixed case
+    " unknown ",         # whitespace padding
+    "\nunknown\n",       # newline padding
+    "  ",                # whitespace-only
+])
+def test_get_or_create_tenant_id_normalization_blocks_bypass(bypass_attempt):
+    """Case-sensitive exact-match guard let 'Unknown'/'UNKNOWN'/' unknown '
+    bypass to the index-write path, re-introducing the B1 cross-tenant
+    collision via misconfigured tenant_id. Fix: normalize .strip().lower()
+    before guard. Reviewer convergent: code-reviewer + Security-Reviewer."""
+    tbl = MagicMock()
+    sid = get_or_create_pii_subject_id(bypass_attempt, {"email": "a@b.com"}, table=tbl)
+    assert sid.startswith("psub_") and len(sid) == 5 + 32
+    tbl.get_item.assert_not_called()
+    tbl.put_item.assert_not_called()
+
+
+# ── Sprint F1 / audit-of-audit blocker B — _now_iso format pinning ──────────
+def test_now_iso_pinned_to_millisecond_z_format():
+    """Default isoformat() drops fractional-seconds at zero-microsecond
+    instants. The DSAR audit writer pins timespec='microseconds' because its
+    event_timestamp is a GSI range key under lex comparison. The subject-
+    index `created_at` field is NOT a comparison key, so we pin to ms+Z to
+    match pii_subject.js Date.toISOString() output for cross-writer parity
+    (audit-of-audit finding 5).
+
+    Boundary: zero-microsecond instant MUST serialize with `.000Z` suffix.
+    """
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+    import pii_subject
+
+    zero_us_dt = datetime(2026, 1, 1, 0, 0, 0, microsecond=0, tzinfo=timezone.utc)
+
+    class _MockDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return zero_us_dt
+
+    with patch.object(pii_subject, "datetime", _MockDatetime):
+        boundary_ts = pii_subject._now_iso()
+
+    assert boundary_ts == "2026-01-01T00:00:00.000Z", (
+        f"_now_iso must produce ms+Z format with explicit .000 on zero-us "
+        f"boundary; got {boundary_ts!r}."
+    )
+
+
+def test_now_iso_runtime_shape():
+    """Always-on runtime-shape assertion: 24-char total, .NNN before Z."""
+    import re
+    import pii_subject
+    ts = pii_subject._now_iso()
+    assert isinstance(ts, str)
+    assert len(ts) == 24, f"expected 24-char ms+Z; got {len(ts)} ({ts!r})"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", ts), (
+        f"format must be YYYY-MM-DDTHH:MM:SS.NNNZ; got {ts!r}"
+    )

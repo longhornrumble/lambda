@@ -132,18 +132,26 @@ async function getOrCreatePiiSubjectId(tenantId, responses, options) {
   const { docClient, knownEmail } = options || {};
   const candidate = mintPiiSubjectId();
 
+  // Sprint F1 / audit-of-audit finding 1: normalize tenant_id before guard
+  // so case/whitespace variants ('Unknown', 'UNKNOWN', ' unknown ') don't
+  // bypass. Reviewer convergent (code-reviewer + Security-Reviewer): the
+  // original exact-match guard was case-sensitive; a misconfigured tenant
+  // config with tenant_id="Unknown" would silently bypass and re-introduce
+  // the cross-tenant collision. Mirror in pii_subject.py.
+  const normalizedTenant = tenantId
+    ? String(tenantId).trim().toLowerCase()
+    : '';
+
   // Sprint E1 / audit blocker B1 (cross-tenant collision): tenant_id missing
-  // or literal 'unknown' MUST NOT be indexed. If two unrelated submissions
-  // from differently-misconfigured tenants both fall through to
-  // `tenant_id='unknown'`, they would collide on the index key
-  // (tenant_id, normalized_email) and either reuse a single subject id across
-  // distinct subjects or mint divergent ids depending on which got there
-  // first. Mint UNINDEXED instead — the Phase-2 orphan-sweep gate covers
-  // UNINDEXED rows by design. Mirror in pii_subject.py.
-  if (!tenantId || tenantId === 'unknown') {
+  // or normalizing to 'unknown' MUST NOT be indexed. If two unrelated
+  // submissions from differently-misconfigured tenants both normalize to the
+  // 'unknown' sentinel, they would collide on the index key
+  // (tenant_id, normalized_email). Mint UNINDEXED instead — the Phase-2
+  // orphan-sweep gate covers UNINDEXED rows by design.
+  if (!normalizedTenant || normalizedTenant === 'unknown') {
     console.warn(
-      '[pii_subject] tenant_id missing/unknown — minting UNINDEXED '
-      + 'pii_subject_id to avoid cross-tenant index collision'
+      `[pii_subject] tenant_id missing/unknown (raw=${JSON.stringify(tenantId)}) — `
+      + 'minting UNINDEXED pii_subject_id to avoid cross-tenant index collision'
     );
     return candidate;
   }

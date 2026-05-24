@@ -284,3 +284,22 @@ describe('getOrCreatePiiSubjectId — tenant_id guard (audit blocker B1)', () =>
     expect(docClientMock.commandCalls(GetCommand).length).toBe(0);
   });
 });
+
+// Sprint F1 / audit-of-audit finding 1 — case/whitespace normalization
+describe('getOrCreatePiiSubjectId — tenant_id normalization (audit-of-audit F1)', () => {
+  test.each([
+    ['Unknown',       'capital U'],
+    ['UNKNOWN',       'all caps'],
+    ['uNkNoWn',       'mixed case'],
+    [' unknown ',     'whitespace padding'],
+    ['\nunknown\n',   'newline padding'],
+    ['  ',            'whitespace-only'],
+  ])('tenant_id %j (%s) → UNINDEXED, no DDB calls', async (bypassAttempt, _label) => {
+    const sid = await getOrCreatePiiSubjectId(bypassAttempt, { email: 'a@example.com' }, {
+      docClient: fakeDocClient,
+    });
+    expect(sid).toMatch(/^psub_[0-9a-f]{32}$/);
+    expect(docClientMock.commandCalls(GetCommand).length).toBe(0);
+    expect(docClientMock.commandCalls(PutCommand).length).toBe(0);
+  });
+});

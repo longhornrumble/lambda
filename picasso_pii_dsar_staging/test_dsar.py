@@ -157,6 +157,40 @@ def test_validate_accepts_smoke_prefix_dsar_id_with_explicit_marker(dsar):
     assert out["dsar_id"] == "smoke-sla-monitor-001"
 
 
+# Sprint F1 / audit-of-audit finding 6: case-insensitive smoke-prefix check
+@pytest.mark.parametrize("dsar_id", [
+    "Smoke-real-001",
+    "SMOKE-real-001",
+    "sMoKe-real-001",
+])
+def test_validate_rejects_smoke_prefix_case_insensitive(dsar, dsar_id):
+    """Case-sensitive lowercase-only check would have let capital-S variants
+    bypass the guard silently (audit reviewer finding 6). The fix normalizes
+    via .lower() before .startswith()."""
+    mod, _, _ = dsar
+    with pytest.raises(mod.InvalidInput, match="reserved 'smoke-' prefix"):
+        mod._validate(_valid_event(dsar_id=dsar_id))
+
+
+# Sprint F1 / audit-of-audit finding 15: smoke_test_marker MUST be bool
+@pytest.mark.parametrize("bad_marker", ["true", "false", "True", 1, 0, "yes", None])
+def test_validate_rejects_non_bool_smoke_test_marker(dsar, bad_marker):
+    """String 'true'/'false' is truthy in Python; CLI callers JSON-deserializing
+    a string into the event payload would silently activate (or fail to
+    activate) the marker. Strict bool requirement closes the footgun."""
+    mod, _, _ = dsar
+    event = _valid_event(dsar_id="smoke-test-001")
+    event["smoke_test_marker"] = bad_marker
+    if bad_marker is None:
+        # None defaults via .get(..., False) — not a marker-misuse case;
+        # _validate should treat as absent and reject smoke- prefix
+        with pytest.raises(mod.InvalidInput, match="reserved 'smoke-' prefix"):
+            mod._validate(event)
+    else:
+        with pytest.raises(mod.InvalidInput, match="smoke_test_marker must be boolean"):
+            mod._validate(event)
+
+
 # ── Sprint E2 / audit defer-ok D8 — writer-side _now_iso format contract ────
 def test_now_iso_format_contract(dsar):
     """Writer-side pinning of the audit `event_timestamp` ISO format.
@@ -177,25 +211,42 @@ def test_now_iso_format_contract(dsar):
     test asserts the actual writer output matches the shape both tests rely
     on, closing the loop.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
+    from unittest.mock import patch
     mod, _, _ = dsar
+
+    # Part 1: runtime shape assertions (always-on)
     ts = mod._now_iso()
-    # Shape: 'YYYY-MM-DDTHH:MM:SS.ffffff+00:00' → 32 chars total
     assert isinstance(ts, str), "writer must return str"
     assert len(ts) == 32, f"expected 32-char ISO; got {len(ts)} ({ts!r})"
     assert "." in ts, "writer format must include microseconds delimiter"
     assert ts.endswith("+00:00"), "writer format must end with +00:00 (UTC tz)"
-    # Parse-back to confirm valid ISO-8601 and tz-aware
     parsed = datetime.fromisoformat(ts)
     assert parsed.tzinfo is not None, "writer ts must be tz-aware"
-    # Boundary case: zero-microsecond instant must serialize with .000000,
-    # NOT drop the field (which is what timespec='auto' would do). If the
-    # writer ever switches to default isoformat(), this assertion catches it.
-    boundary = datetime(2026, 1, 1, tzinfo=parsed.tzinfo).isoformat(
-        timespec="microseconds")
-    assert boundary == "2026-01-01T00:00:00.000000+00:00", (
-        f"timespec=microseconds must preserve .000000 on zero-us boundary; "
-        f"writer format produced {boundary!r}"
+
+    # Sprint F1 / audit-of-audit blocker A: previous boundary assertion called
+    # datetime(...).isoformat(timespec='microseconds') test-side, which only
+    # exercises Python's stdlib — NOT mod._now_iso. The bug it was meant to
+    # catch (drift to timespec='auto') would pass silently. Fix: patch
+    # datetime.now inside the writer's module to return a zero-microsecond
+    # instant, then assert mod._now_iso()'s actual output preserves .000000.
+    zero_us_dt = datetime(2026, 1, 1, 0, 0, 0, microsecond=0, tzinfo=timezone.utc)
+
+    class _MockDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return zero_us_dt
+
+    with patch.object(mod, "datetime", _MockDatetime):
+        boundary_ts = mod._now_iso()
+
+    assert boundary_ts == "2026-01-01T00:00:00.000000+00:00", (
+        f"_now_iso must preserve .000000 on zero-us boundary instants; "
+        f"got {boundary_ts!r}. If writer was changed to timespec='auto' or "
+        f"default isoformat(), the fractional-seconds field would be dropped "
+        f"at this exact instant and DDB lexicographic comparison on the "
+        f"StatusIndex GSI would silently mis-order rows. Re-pin to "
+        f"timespec='microseconds' to fix."
     )
 
 

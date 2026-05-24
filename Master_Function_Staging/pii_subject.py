@@ -137,17 +137,24 @@ def get_or_create_pii_subject_id(
     """
     candidate = mint_pii_subject_id()
 
+    # Sprint F1 / audit-of-audit finding 1: normalize tenant_id before guard
+    # check so case/whitespace variants (e.g. 'Unknown', 'UNKNOWN', ' unknown ')
+    # don't bypass. Reviewer (code-reviewer + Security-Reviewer convergent)
+    # observed the original exact-match guard was case-sensitive and
+    # whitespace-naive; a misconfigured tenant config with `tenant_id: "Unknown"`
+    # would silently bypass and re-introduce the cross-tenant collision.
+    normalized_tenant = (tenant_id or "").strip().lower() if tenant_id else ""
+
     # Sprint E1 / audit blocker B1 (cross-tenant collision): tenant_id missing
-    # or literal 'unknown' MUST NOT be indexed. Two unrelated submissions from
-    # differently-misconfigured tenants would otherwise collide on the index
-    # key (tenant_id, normalized_email) — either reusing a single subject id
-    # across distinct subjects or minting divergent ids depending on ordering.
-    # Mint UNINDEXED instead; the Phase-2 orphan-sweep gate covers UNINDEXED
-    # rows by design. Mirror in pii_subject.js.
-    if not tenant_id or tenant_id == "unknown":
+    # or normalizing to 'unknown' MUST NOT be indexed. Two unrelated submissions
+    # from differently-misconfigured tenants would otherwise collide on the
+    # index key (tenant_id, normalized_email). Mint UNINDEXED instead; the
+    # Phase-2 orphan-sweep gate covers UNINDEXED rows by design.
+    if not normalized_tenant or normalized_tenant == "unknown":
         logger.warning(
-            "pii_subject tenant_id missing/unknown — minting UNINDEXED "
-            "pii_subject_id to avoid cross-tenant index collision"
+            "pii_subject tenant_id missing/unknown (raw=%r) — minting "
+            "UNINDEXED pii_subject_id to avoid cross-tenant index collision",
+            tenant_id,
         )
         return candidate
 
@@ -248,4 +255,21 @@ def _emit_emf_metric(metric_name: str, tenant_id: Optional[str]) -> None:
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """Return UTC ISO-8601 timestamp pinned to millisecond+Z format.
+
+    Sprint F1 / audit-of-audit findings B + 5: previous default ``isoformat()``
+    dropped the fractional-seconds field at zero-microsecond instants
+    (producing a 19-char ``+00:00`` string instead of the usual 32-char
+    form). This is the ``created_at`` field on the subject-index row, NOT a
+    GSI range key, so lex-comparison isn't required — but consistent format
+    matters for cross-writer parity with ``pii_subject.js`` which uses
+    ``Date.prototype.toISOString()`` (yielding millisecond+Z, e.g.
+    ``2026-05-24T05:02:32.523Z``). Pinning Python to the same shape (rather
+    than the DSAR audit writer's microsecond+offset pattern) closes both
+    findings in one decision: ms+Z is JS-native and zero-allocation, while
+    the DSAR audit writer needs microsecond precision because its
+    ``event_timestamp`` IS a GSI range key under lex comparison.
+    """
+    now = datetime.now(timezone.utc)
+    ms = now.microsecond // 1000
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms:03d}Z"
