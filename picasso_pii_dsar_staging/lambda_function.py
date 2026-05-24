@@ -261,13 +261,38 @@ def _validate(event):
     # makes the existence of any smoke-prefixed row in production explicit and
     # security-logged for the forensic trail.
     dsar_id = event["dsar_id"]
-    if dsar_id.startswith("smoke-") and not event.get("smoke_test_marker", False):
+
+    # Sprint F1 / audit-of-audit finding 6: prefix check is case-insensitive
+    # so 'Smoke-real-001' / 'SMOKE-001' don't bypass the guard. Reviewer
+    # (test-engineer) observed the original lowercase-only check let
+    # capital-S variants through silently.
+    is_smoke_prefix = dsar_id.lower().startswith("smoke-")
+
+    # Sprint F1 / audit-of-audit finding 15: smoke_test_marker MUST be a true
+    # boolean — string 'true'/'false' would otherwise be truthy in Python and
+    # silently activate the marker. Reviewer (test-engineer) noted CLI callers
+    # passing JSON-deserialized strings are the realistic footgun. None is
+    # treated as "absent" (same as the .get() default) and falls through to
+    # the smoke-prefix-without-marker rejection.
+    smoke_marker = event.get("smoke_test_marker", False)
+    if smoke_marker is None:
+        smoke_marker = False
+    if not isinstance(smoke_marker, bool):
         raise InvalidInput(
-            "dsar_id starts with reserved 'smoke-' prefix; re-invoke with "
-            "smoke_test_marker=true if this is intentional (will be "
-            "security-logged), or change the dsar_id."
+            f"smoke_test_marker must be boolean true/false; got "
+            f"{type(smoke_marker).__name__}={smoke_marker!r}"
         )
-    if dsar_id.startswith("smoke-") and event.get("smoke_test_marker", False):
+
+    # Sprint F1 / audit-of-audit finding 13: if/elif (not two parallel ifs).
+    # Original sequential ifs were functionally correct but a future
+    # early-return refactor could silently break the contract.
+    if is_smoke_prefix and not smoke_marker:
+        raise InvalidInput(
+            "dsar_id starts with reserved 'smoke-' prefix (case-insensitive); "
+            "re-invoke with smoke_test_marker=true if this is intentional "
+            "(will be security-logged), or change the dsar_id."
+        )
+    elif is_smoke_prefix and smoke_marker:
         logger.warning(
             "SECURITY: smoke-prefix dsar_id accepted via explicit "
             "smoke_test_marker=true: dsar_id=%s operator=%s tenant_id=%s",
