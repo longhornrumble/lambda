@@ -204,6 +204,10 @@ async function getOrCreatePiiSubjectId(tenantId, responses, options) {
     // UNINDEXED. Across multiple submissions this orphans the row — the
     // Phase-2 orphan-sweep gate covers it (see PII_IDENTITY_CONTRACT §7/§8
     // and the Python module's docstring for the full reasoning).
+    // Sprint E2 / audit N19: CloudWatch Embedded Metric Format emits
+    // PII/SubjectIndex.IndexRaceUnresolved so operator can alarm on >0 in any
+    // 1h window. No PutMetricData IAM grant needed — CW Logs auto-extracts.
+    _emitEmfMetric('IndexRaceUnresolved', tenantId);
     console.warn(
       `[pii_subject] index race unresolved after ${MAX_INDEX_ATTEMPTS} attempts `
       + `(tenant=${tenantId}); row is UNINDEXED — incomplete-deletion risk, `
@@ -211,12 +215,41 @@ async function getOrCreatePiiSubjectId(tenantId, responses, options) {
     );
     return candidate;
   } catch (err) {
+    _emitEmfMetric('IndexUnavailable', tenantId);
     console.warn(
       `[pii_subject] index unavailable (non-fatal): ${err && err.name || err} `
       + `— row is UNINDEXED, requires Phase-2 orphan-sweep gate `
       + `(incomplete-deletion risk)`
     );
     return candidate;
+  }
+}
+
+/**
+ * Emit a CloudWatch custom metric via Embedded Metric Format (EMF).
+ *
+ * Lambda's CW Logs agent auto-extracts metrics from any log line containing
+ * `_aws.CloudWatchMetrics` — no PutMetricData IAM permission needed.
+ * Metric appears at PII/SubjectIndex namespace; alarm on Sum > 0 in any
+ * 1h window catches index degradation that the writer's best-effort fallback
+ * would otherwise hide (audit N19).
+ */
+function _emitEmfMetric(metricName, tenantId) {
+  try {
+    console.log(JSON.stringify({
+      _aws: {
+        Timestamp: Date.now(),
+        CloudWatchMetrics: [{
+          Namespace: 'PII/SubjectIndex',
+          Dimensions: [['TenantId']],
+          Metrics: [{ Name: metricName, Unit: 'Count' }],
+        }],
+      },
+      TenantId: tenantId || 'unknown',
+      [metricName]: 1,
+    }));
+  } catch (_) {
+    // Never fatal — metric emission failure must not block the writer.
   }
 }
 

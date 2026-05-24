@@ -18,15 +18,50 @@ from unittest.mock import MagicMock, patch
 from botocore.exceptions import ClientError
 
 
+# Sprint E2 / audit N14 — env-var test isolation.
+# Tests below mutate os.environ via _reload_module(); the keys we manipulate
+# are enumerated here so the per-class setUp/tearDown snapshots and restores
+# them. Without this, a test's env mutation persists to later tests
+# (especially across test files when pytest collects modules in series),
+# producing brittle pass/fail depending on collection order.
+_TEST_ENV_KEYS = (
+    'SNS_TOPIC_ARN',
+    'SLA_MONITOR_FUNCTION_NAME',
+    'AUDIT_TABLE',
+    'SLA_DAYS_INTAKE_PLUS',
+    'PLAYBOOK_URL',
+)
+
+
 def _reload_module(env: dict):
-    """Reload lambda_function with a clean env so env-var reads are fresh."""
+    """Reload lambda_function with a clean env so env-var reads are fresh.
+
+    NOTE: this mutates os.environ. The TestCase classes below snapshot+restore
+    via setUp/tearDown so the mutation does not leak across tests (audit N14).
+    """
     for k, v in env.items():
         os.environ[k] = v
     import lambda_function
     return importlib.reload(lambda_function)
 
 
-class TestBuildMessage(unittest.TestCase):
+class _EnvIsolatedTestCase(unittest.TestCase):
+    """Base class providing per-test env snapshot+restore for the keys
+    _reload_module mutates. Subclasses inherit setUp/tearDown automatically;
+    if they define their own, they MUST call super().setUp()/tearDown()."""
+
+    def setUp(self):
+        self._env_snapshot = {k: os.environ.get(k) for k in _TEST_ENV_KEYS}
+
+    def tearDown(self):
+        for k, v in self._env_snapshot.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class TestBuildMessage(_EnvIsolatedTestCase):
     def test_message_includes_function_name(self):
         mod = _reload_module({
             'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:000000000000:test',
@@ -64,10 +99,15 @@ class TestBuildMessage(unittest.TestCase):
         body = mod._build_message()
         self.assertIn('25', body)
 
-    def test_message_no_consumer_pii(self):
-        """The reminder body is static text — must not include any consumer
-        identifier fields (email, phone, name, IP, PSID, etc.) or operator
-        metadata (operator name, tenant id). D1 posture."""
+    def test_message_template_excludes_pii_terms_regression_guard(self):
+        """Regression guard against a future code change adding consumer or
+        operator metadata to the reminder body. The body is static text today
+        (the message-building function takes no PII inputs), so this test is
+        vacuously true at present — that is intentional. Its purpose is to
+        FIRE when someone later adds a parameter that surfaces email / phone /
+        tenant_id / caller_arn into the body, which would violate the D1
+        posture. Renamed from `test_message_no_consumer_pii` per audit N13
+        to make the regression-guard intent explicit."""
         mod = _reload_module({
             'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:000000000000:test',
         })
@@ -98,7 +138,7 @@ class TestBuildMessage(unittest.TestCase):
         self.assertIn('independent', body.lower())
 
 
-class TestPublishReminder(unittest.TestCase):
+class TestPublishReminder(_EnvIsolatedTestCase):
     def test_publish_called_with_topic_and_subject(self):
         mod = _reload_module({
             'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:000000000000:test',
@@ -137,7 +177,7 @@ class TestPublishReminder(unittest.TestCase):
                 mod._publish_reminder('body')
 
 
-class TestLambdaHandler(unittest.TestCase):
+class TestLambdaHandler(_EnvIsolatedTestCase):
     def test_handler_publishes_and_returns_published(self):
         mod = _reload_module({
             'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:000000000000:test',

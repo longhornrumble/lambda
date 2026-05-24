@@ -296,18 +296,35 @@ def test_ddb_table_called_with_correct_name(monitor):
     """Regression guard for AUDIT_TABLE env var binding.
 
     A typo or env-var drift in the IaC layer would silently send the Lambda
-    against the wrong table. This test asserts the Lambda calls
-    `ddb.Table(<AUDIT_TABLE env var>)` with the exact configured value, so any
-    accidental hard-coding or env-var drift surfaces in CI.
+    against the wrong table. This test asserts BOTH call sites use the
+    configured table name: the StatusIndex Query (line ~74) AND the per-
+    candidate `_has_closed_event` Query (line ~109). Sprint E2 / audit D6:
+    switched from assert_called_with (LAST call only) + 0 candidates (which
+    only exercised the StatusIndex path) to assert_any_call + 1 candidate so
+    both Table() calls are pinned.
     """
     mod, mock_ddb, mock_sns = monitor
-    table_mock = MagicMock()
-    _stub_status_query(table_mock, [])
-    mock_ddb.Table.return_value = table_mock
+
+    intake_row = _intake_row('dsar-table-name-check', hours_ago=30 * 24)
+
+    status_table = MagicMock()
+    _stub_status_query(status_table, [intake_row])
+    main_table = MagicMock()
+    main_table.query.return_value = {'Count': 0}  # no closed event → at-risk
+    mock_ddb.Table.side_effect = [status_table, main_table]
 
     mod.lambda_handler({}, None)
 
-    mock_ddb.Table.assert_called_with(os.environ['AUDIT_TABLE'])
+    expected_name = os.environ['AUDIT_TABLE']
+    # Both StatusIndex Query AND _has_closed_event Query must hit the
+    # configured table name. assert_any_call passes if either call matches.
+    mock_ddb.Table.assert_any_call(expected_name)
+    # Defense-in-depth: confirm the per-candidate call site ran (2 total
+    # Table() calls — StatusIndex pass + per-candidate pass)
+    assert mock_ddb.Table.call_count == 2, (
+        f'expected 2 Table() calls (StatusIndex + per-candidate), '
+        f'got {mock_ddb.Table.call_count}'
+    )
 
 
 def test_handler_idempotent_on_eventbridge_replay(monitor):
@@ -341,9 +358,16 @@ def test_handler_idempotent_on_eventbridge_replay(monitor):
 
     # Identical outcomes
     assert r1 == r2 == {'at_risk_count': 1, 'dsar_ids': ['dsar-replay']}
+    # DESIGN DECISION (audit N12, pinned by this test scope):
     # SNS published once per invocation; total 2 publishes for 2 replays.
-    # (The Lambda's design accepts duplicate alerts on replay — the operator's
-    # downstream dedup is intake-via-email, not Lambda-side suppression.)
+    # This is INTENTIONAL — the Lambda's design accepts duplicate alerts on
+    # replay because the operator's de-dup happens DOWNSTREAM (intake-via-
+    # email reading; Gmail thread groups by Subject). Lambda-side state
+    # suppression would require a write to the audit table, violating the
+    # read-only posture + the C2 4-action Deny resource policy.
+    # The test scope is intentionally "idempotency = same OUTPUT", NOT
+    # "idempotency = no duplicate notifications". Don't try to add the
+    # latter without also re-architecting the read-only contract.
     assert mock_sns.publish.call_count == 2
     # No DDB writes in either invocation (mock_ddb tracks .put_item etc. would
     # fail in MagicMock if attempted with side_effects exhausted)
