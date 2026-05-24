@@ -39,20 +39,19 @@ module.exports = {
       lines: 55,
       statements: 55,
     },
-    // prompt_v4.js: included in coverage (scheduling sub-phase A1 / audit
-    // Row 2) so the intent-label additions are measured + regression-guarded.
-    // A1's added lines (intentLabel start_scheduling/resume_scheduling →
-    // SCHEDULE) are 100% covered by __tests__/prompt_v4_intent_label.test.js;
-    // the rest of the file is legacy prompt-builder code out of sub-phase-A
-    // scope. Path-keyed → Jest excludes it from the global pool, so the
-    // global ratchet still guards the other BSH files. Ratchet set just
-    // below current measured (stmts 31.35 / br 23.5 / fns 31.57 / ln 32.42)
-    // per this config's ratchet convention — raise as coverage improves.
+    // prompt_v4.js: comprehensive coverage added per audit B7
+    // (project_scheduling_subphase_a_phase_completion_audit_2026-05-24).
+    // The new __tests__/prompt_v4_full.test.js covers selectActionsV4 +
+    // classifyTopic + selectCTAsFromPool + validateTopicDefinitions +
+    // determineDepthPreference + buildTopicClassificationPrompt + the
+    // buildV4ConversationPrompt formatting chain. Current measured:
+    // stmts 99.15 / br 89.55 / fns 100 / ln 100. Ratchet set just below
+    // the floor per this config's convention.
     './prompt_v4.js': {
-      branches: 22,
-      functions: 30,
-      lines: 31,
-      statements: 30,
+      branches: 88,
+      functions: 95,
+      lines: 95,
+      statements: 95,
     },
   },
   setupFilesAfterEnv: ['<rootDir>/__tests__/setup.js'],
