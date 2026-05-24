@@ -155,6 +155,31 @@ describe('Form Handler - Phase 1: AWS SDK v3 Migration', () => {
       });
     });
 
+    it('should write pii_subject_id attribute on form-submission row — M1.G6 / F-DSAR18 closure', async () => {
+      // BSH form_handler is the ACTIVE writer for staging widget chat-form
+      // submissions. M1.G6 (master plan v0.12 / F-DSAR18 closure) requires
+      // the writer to emit pii_subject_id so the DSAR walker's
+      // `_walk_form_submissions` FilterExpression doesn't false-negative
+      // every BSH row. Companion: Python writer Master_Function_Staging/
+      // form_handler.py:622-640 (PR longhornrumble/lambda#142).
+      sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-email-id' });
+      // GET on pii-subject-index returns no existing entry, then PUT succeeds
+      // → fresh mint + index entry created.
+      dynamoMock.on(GetCommand).resolves({});
+      dynamoMock.on(PutCommand).resolves({});
+      lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+      await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+
+      const submissionPut = dynamoMock.commandCalls(PutCommand)
+        .find(c => c.args[0].input.TableName === 'test-form-submissions');
+      expect(submissionPut).toBeDefined();
+      const item = submissionPut.args[0].input.Item;
+      expect(item).toHaveProperty('pii_subject_id');
+      // Format: 'psub_' + 32 lowercase hex chars (matches Python uuid4.hex)
+      expect(item.pii_subject_id).toMatch(/^psub_[0-9a-f]{32}$/);
+    });
+
     it('should write ttl attribute on form-submission row (~365d from now) — M4 done-bar #2', async () => {
       // BSH form_handler is the ACTIVE writer for staging widget chat-form
       // submissions (empirically verified 2026-05-23 against picasso-form-
@@ -339,9 +364,13 @@ describe('Form Handler - Phase 2: SMS Rate Limiting', () => {
 
     await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
 
-    expect(dynamoMock.commandCalls(GetCommand)).toHaveLength(1);
-    const getCall = dynamoMock.commandCalls(GetCommand)[0];
-    expect(getCall.args[0].input).toMatchObject({
+    // BSH may also issue a GetCommand against the pii-subject-index table
+    // (M1.G6 / F-DSAR18 closure); narrow this assertion to the SMS-usage
+    // table specifically so unrelated table reads don't bleed in.
+    const smsUsageGets = dynamoMock.commandCalls(GetCommand)
+      .filter(c => c.args[0].input.TableName === 'test-sms-usage');
+    expect(smsUsageGets).toHaveLength(1);
+    expect(smsUsageGets[0].args[0].input).toMatchObject({
       TableName: 'test-sms-usage',
       Key: {
         tenant_id: 'TEST123',

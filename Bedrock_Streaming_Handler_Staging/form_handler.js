@@ -17,6 +17,9 @@ const {
   extractCanonicalContact,
 } = require('./contact_extractor');
 const {
+  getOrCreatePiiSubjectId,
+} = require('./pii_subject');
+const {
   resolveEmailsFromUserIds,
   resolvePhonesFromUserIds,
   resolveQuietHoursFallbackEmails,
@@ -530,11 +533,27 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
   const now = new Date().toISOString();
   const tenantId = config.tenant_id || 'unknown';
 
+  // M1.G6 (master plan v0.12 / F-DSAR18 closure). Mirrors the Python writer
+  // (Master_Function_Staging/form_handler.py:622-633 — PR longhornrumble/
+  // lambda#142). DSAR walker `_walk_form_submissions` filters by
+  // pii_subject_id; without this field the walker silently false-negatives
+  // every BSH-written row. Best-effort + never-fatal: any error returns a
+  // freshly-minted candidate (UNINDEXED row, covered by Phase-2 orphan-sweep
+  // gate). canonicalContact.email is the BSH-extracted form-email when present
+  // — passed as knownEmail to skip re-walking the responses bag.
+  const piiSubjectId = await getOrCreatePiiSubjectId(tenantId, formData, {
+    docClient: dynamodb,
+    knownEmail: canonicalContact && canonicalContact.email
+      ? canonicalContact.email
+      : undefined,
+  });
+
   const params = {
     TableName: FORM_SUBMISSIONS_TABLE,
     Item: {
       // Core submission fields
       submission_id: submissionId,
+      pii_subject_id: piiSubjectId,
       form_id: formId,
       form_title: formConfig.title || formId,
       tenant_id: tenantId,
