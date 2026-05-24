@@ -248,6 +248,10 @@ def _emit_emf_metric(metric_name: str, tenant_id: Optional[str]) -> None:
     """
     import json  # local import keeps cold-start lean for the common path
     try:
+        # Sprint F4 / audit-of-audit finding 18: `source` field added so CW
+        # Logs Insights filters can include/exclude EMF lines precisely:
+        #   filter source != 'pii_subject_emf'  → non-EMF analysis
+        #   filter source =  'pii_subject_emf'  → EMF only
         logger.info(json.dumps({
             "_aws": {
                 "Timestamp": int(datetime.now(timezone.utc).timestamp() * 1000),
@@ -257,6 +261,7 @@ def _emit_emf_metric(metric_name: str, tenant_id: Optional[str]) -> None:
                     "Metrics": [{"Name": metric_name, "Unit": "Count"}],
                 }],
             },
+            "source": "pii_subject_emf",
             "TenantId": tenant_id or "unknown",
             metric_name: 1,
         }))
