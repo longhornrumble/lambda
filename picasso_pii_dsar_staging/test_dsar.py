@@ -96,9 +96,54 @@ def test_validate_rejects_missing_fields(dsar):
 
 
 def test_validate_rejects_unsupported_identifier_type(dsar):
+    """M2 Sprint B: email + psid are supported; phone + name+address are
+    walker-NOT-supported per F-DSAR30 (manual M3 playbook procedures cover)."""
     mod, _, _ = dsar
-    with pytest.raises(mod.InvalidInput, match="identifier_type 'psid'"):
-        mod._validate(_valid_event(identifier_type="psid"))
+    with pytest.raises(mod.InvalidInput, match="identifier_type 'phone'"):
+        mod._validate(_valid_event(identifier_type="phone"))
+
+
+def test_validate_rejects_name_address_identifier_type(dsar):
+    """M2 Sprint B: 'name+address' identifier_type is walker-NOT-supported
+    per F-DSAR30 — error message points operator at manual playbook procedure."""
+    mod, _, _ = dsar
+    with pytest.raises(mod.InvalidInput, match="manual fallback"):
+        mod._validate(_valid_event(identifier_type="name+address"))
+
+
+def test_validate_accepts_psid_identifier_type(dsar):
+    """M2 Sprint B: identifier_type=psid is supported. PSIDs are opaque
+    numeric strings (typically 15-17 digits); the Lambda strips whitespace
+    but does NOT normalize beyond that (cross-tenant isolation is enforced
+    upstream by _resolve_psid_subject via channel-mappings TenantIndex GSI)."""
+    mod, _, _ = dsar
+    out = mod._validate(_valid_event(
+        identifier_type="psid",
+        subject_identifier="  1234567890123456  ",
+    ))
+    assert out["identifier_type"] == "psid"
+    assert out["subject_identifier"] == "1234567890123456"
+
+
+def test_validate_rejects_empty_psid_subject_identifier(dsar):
+    """M2 Sprint B: psid subject_identifier must be a non-empty string after strip."""
+    mod, _, _ = dsar
+    with pytest.raises(mod.InvalidInput, match="non-empty string for identifier_type=psid"):
+        mod._validate(_valid_event(
+            identifier_type="psid",
+            subject_identifier="   ",
+        ))
+
+
+def test_validate_rejects_non_string_psid_subject_identifier(dsar):
+    """M2 Sprint B: a non-string PSID (e.g. JSON-deserialized integer) is
+    rejected — operators must pass the PSID as the canonical string form."""
+    mod, _, _ = dsar
+    with pytest.raises(mod.InvalidInput, match="non-empty string for identifier_type=psid"):
+        mod._validate(_valid_event(
+            identifier_type="psid",
+            subject_identifier=1234567890123456,
+        ))
 
 
 def test_validate_rejects_unsupported_request_type(dsar):
@@ -271,6 +316,89 @@ def test_resolve_subject_returns_none_when_not_found(dsar):
     mock_table.get_item.return_value = {}  # no Item key
     mock_ddb.Table.return_value = mock_table
     assert mod._resolve_subject("TEN123", "a@b.co") is None
+
+
+# ── M2 Sprint B — psid subject resolution ──────────────────────────────────
+def test_resolve_psid_subject_returns_sessionIds_for_each_page(dsar):
+    """Two-step lookup: TenantIndex GSI Query returns N PAGE# rows; resolver
+    composes one sessionId per page in 'meta:{pageId}:{psid}' shape."""
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {
+        "Items": [
+            {"PK": "PAGE#100200300400500"},
+            {"PK": "PAGE#600700800900100"},
+        ],
+    }
+    mock_ddb.Table.return_value = mock_table
+
+    out = mod._resolve_psid_subject("TEN123", "9876543210")
+
+    assert out == [
+        "meta:100200300400500:9876543210",
+        "meta:600700800900100:9876543210",
+    ]
+    mock_ddb.Table.assert_called_with("picasso-channel-mappings-staging")
+    # Verify the GSI Query is scoped to the tenant + channelType=messenger.
+    call_kwargs = mock_table.query.call_args.kwargs
+    assert call_kwargs["IndexName"] == "TenantIndex"
+    assert call_kwargs["ProjectionExpression"] == "PK"
+
+
+def test_resolve_psid_subject_returns_empty_list_when_tenant_has_no_pages(dsar):
+    """Tenant has no Messenger channel configured → empty list. Downstream
+    walkers treat this as 'no Meta surface to walk' (not an error)."""
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {"Items": []}
+    mock_ddb.Table.return_value = mock_table
+    assert mod._resolve_psid_subject("TEN_NO_META", "9876543210") == []
+
+
+def test_resolve_psid_subject_paginates_via_last_evaluated_key(dsar):
+    """Tenant with > 1 page of Messenger pages: pagination via LastEvaluatedKey
+    until exhausted. (Bounded by GSI Query response size; no explicit cap.)"""
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.side_effect = [
+        {"Items": [{"PK": "PAGE#111"}], "LastEvaluatedKey": {"tenantId": "TEN", "channelType": "messenger"}},
+        {"Items": [{"PK": "PAGE#222"}, {"PK": "PAGE#333"}]},
+    ]
+    mock_ddb.Table.return_value = mock_table
+    out = mod._resolve_psid_subject("TEN", "psid_abc")
+    assert out == ["meta:111:psid_abc", "meta:222:psid_abc", "meta:333:psid_abc"]
+    assert mock_table.query.call_count == 2
+
+
+def test_resolve_psid_subject_ignores_non_page_rows(dsar):
+    """Defense-in-depth: if the channel-mappings table grows to include
+    non-PAGE# row types via the same GSI, the resolver skips them rather
+    than crash on the split."""
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {
+        "Items": [
+            {"PK": "PAGE#111"},
+            {"PK": "OTHER#222"},  # unknown shape — skip
+            {"PK": "PAGE#333"},
+        ],
+    }
+    mock_ddb.Table.return_value = mock_table
+    out = mod._resolve_psid_subject("TEN", "psid_z")
+    assert out == ["meta:111:psid_z", "meta:333:psid_z"]
+
+
+def test_resolve_psid_subject_raises_on_client_error(dsar):
+    """Matches _resolve_subject contract — handler catches ClientError and
+    audit-writes the failure."""
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.side_effect = ClientError(
+        {"Error": {"Code": "ThrottlingException"}}, "Query")
+    mock_ddb.Table.return_value = mock_table
+    with pytest.raises(ClientError):
+        mod._resolve_psid_subject("TEN", "psid_x")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1201,6 +1329,236 @@ def test_rm_walker_does_not_log_content_on_query_failure(dsar, caplog):
     # log shape — sessionId is the only PII-ish field that should appear.
     error_records = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
     assert any("sess-secret" in m for m in error_records)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# M2 Sprint B — session-events walker (_walk_session_events)
+# ───────────────────────────────────────────────────────────────────────────
+def _se_row(session_id, step="STEP#001", **extra):
+    """Synthesize a session-events row with pk=SESSION#{sessionId}, sk=STEP#{n}."""
+    row = {"pk": f"SESSION#{session_id}", "sk": step}
+    row.update(extra)
+    return row
+
+
+def test_walk_session_events_returns_no_sessions_for_empty_input(dsar):
+    mod, _, _ = dsar
+    result = mod._walk_session_events("TEN", [], "access", dry_run=True)
+    assert result == {"rows_found": 0, "action": "no_sessions"}
+
+
+def test_walk_session_events_requires_non_empty_tenant_id(dsar):
+    """Defense-in-depth: walker rejects empty tenant_id even though it doesn't
+    use it in the Query (table has no tenantId column)."""
+    mod, _, _ = dsar
+    with pytest.raises(ValueError, match="defense-in-depth"):
+        mod._walk_session_events("", ["sid1"], "access", dry_run=True)
+
+
+def test_walk_session_events_access_exports_all_step_rows(dsar):
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    rows = [
+        _se_row("meta:p1:psid_abc", step="STEP#001", tenant_hash="my87674d777bf9"),
+        _se_row("meta:p1:psid_abc", step="STEP#002", tenant_hash="my87674d777bf9"),
+    ]
+    mock_table.query.return_value = {"Items": rows}
+    mock_ddb.Table.return_value = mock_table
+
+    result = mod._walk_session_events(
+        "TEN", ["meta:p1:psid_abc"], "access", dry_run=True)
+
+    assert result["rows_found"] == 2
+    assert result["action"] == "exported"
+    assert result["exported_rows"] == rows  # full rows (not projected)
+    # Query was keyed by pk=SESSION#{sessionId}
+    call_kwargs = mock_table.query.call_args.kwargs
+    assert "KeyConditionExpression" in call_kwargs
+    mock_ddb.Table.assert_called_with("picasso-session-events-staging")
+
+
+def test_walk_session_events_delete_dry_run_counts_no_deletes(dsar):
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {"Items": [_se_row("s1"), _se_row("s1", step="STEP#002")]}
+    mock_ddb.Table.return_value = mock_table
+    result = mod._walk_session_events("TEN", ["s1"], "delete", dry_run=True)
+    assert result == {"rows_found": 2, "action": "dry_run_count"}
+    mock_table.delete_item.assert_not_called()
+
+
+def test_walk_session_events_delete_real_calls_delete_item_per_row(dsar):
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {
+        "Items": [_se_row("s1", step="STEP#001"), _se_row("s1", step="STEP#002")],
+    }
+    mock_ddb.Table.return_value = mock_table
+
+    result = mod._walk_session_events("TEN", ["s1"], "delete", dry_run=False)
+
+    assert result["action"] == "deleted"
+    assert result["rows_deleted"] == 2
+    assert result["rows_skipped_corrupted"] == 0
+    assert mock_table.delete_item.call_count == 2
+    # Verify Key shape on first delete call
+    first_key = mock_table.delete_item.call_args_list[0].kwargs["Key"]
+    assert first_key == {"pk": "SESSION#s1", "sk": "STEP#001"}
+
+
+def test_walk_session_events_paginates_through_last_evaluated_key(dsar):
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.side_effect = [
+        {"Items": [_se_row("s1", step="STEP#001")],
+         "LastEvaluatedKey": {"pk": "SESSION#s1", "sk": "STEP#001"}},
+        {"Items": [_se_row("s1", step="STEP#002")]},
+    ]
+    mock_ddb.Table.return_value = mock_table
+    result = mod._walk_session_events("TEN", ["s1"], "access", dry_run=True)
+    assert result["rows_found"] == 2
+    assert mock_table.query.call_count == 2
+
+
+def test_walk_session_events_continues_on_per_session_query_error(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.side_effect = [
+        ClientError({"Error": {"Code": "ThrottlingException"}}, "Query"),
+        {"Items": [_se_row("s2")]},
+    ]
+    mock_ddb.Table.return_value = mock_table
+    result = mod._walk_session_events("TEN", ["s1", "s2"], "access", dry_run=True)
+    assert result["rows_found"] == 1
+    assert result["failed_session_ids"] == ["s1"]
+
+
+def test_walk_session_events_skips_corrupted_row_missing_pk_continues_batch(dsar):
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {
+        "Items": [
+            {"sk": "STEP#001"},  # missing pk — corrupted
+            _se_row("s1", step="STEP#002"),
+        ],
+    }
+    mock_ddb.Table.return_value = mock_table
+    result = mod._walk_session_events("TEN", ["s1"], "delete", dry_run=False)
+    assert result["rows_skipped_corrupted"] == 1
+    assert result["rows_deleted"] == 1
+
+
+def test_walk_session_events_continues_on_per_row_delete_failure(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {
+        "Items": [
+            _se_row("s1", step="STEP#001"),
+            _se_row("s1", step="STEP#002"),
+        ],
+    }
+    mock_table.delete_item.side_effect = [
+        ClientError({"Error": {"Code": "ConditionalCheckFailedException"}}, "DeleteItem"),
+        None,
+    ]
+    mock_ddb.Table.return_value = mock_table
+    result = mod._walk_session_events("TEN", ["s1"], "delete", dry_run=False)
+    assert result["rows_deleted"] == 1
+    assert result["rows_delete_failed"] == 1
+
+
+def test_walk_session_events_truncates_session_ids_above_cap(dsar):
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.query.return_value = {"Items": []}
+    mock_ddb.Table.return_value = mock_table
+    # Pass MAX + 5 to exercise the bounded fan-out path
+    over_cap = [f"s{i}" for i in range(mod.MAX_SESSION_IDS_PER_INVOCATION + 5)]
+    result = mod._walk_session_events("TEN", over_cap, "access", dry_run=True)
+    assert result["truncated_session_id_count"] == 5
+    # Only MAX_SESSION_IDS_PER_INVOCATION queries should have been issued
+    assert mock_table.query.call_count == mod.MAX_SESSION_IDS_PER_INVOCATION
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# M2 Sprint B — psid dispatcher (_walk_psid_surfaces)
+# ───────────────────────────────────────────────────────────────────────────
+def _stub_psid_tables(mock_ddb, *, rm_items=None, se_items=None):
+    """Plumb recent-messages + session-events Query onto separate per-table mocks
+    for the psid dispatcher tests. Mirrors _stub_handler_tables pattern."""
+    rm_table = MagicMock()
+    se_table = MagicMock()
+    rm_table.query.return_value = {"Items": rm_items or []}
+    se_table.query.return_value = {"Items": se_items or []}
+
+    def route(name):
+        if name == "staging-recent-messages":
+            return rm_table
+        if name == "picasso-session-events-staging":
+            return se_table
+        raise AssertionError(f"unexpected DDB Table call: {name}")
+
+    mock_ddb.Table.side_effect = route
+    return rm_table, se_table
+
+
+def test_walk_psid_surfaces_no_sessions_surfaces_completed_no_data(dsar):
+    """No sessionIds resolved → both walkers report completed/no_sessions,
+    operator gets a follow-up explaining the 3 possible reasons."""
+    mod, mock_ddb, _ = dsar
+    rows_touched, followups, exported, results = mod._walk_psid_surfaces(
+        tenant_id="TEN", psid="psid_abc", session_ids=[],
+        request_type="access", dry_run=True,
+    )
+    assert rows_touched == {"recent-messages": 0, "session-events": 0}
+    assert exported == {}
+    assert results["recent-messages"]["status"] == "completed"
+    assert results["recent-messages"]["action"] == "no_sessions"
+    assert results["session-events"]["status"] == "completed"
+    assert any("0 sessionIds resolved" in f for f in followups)
+    # session-summaries explicitly NOT in walker_results (deferred per F-DSAR31)
+    assert "session-summaries" not in results
+
+
+def test_walk_psid_surfaces_access_exports_both_surfaces(dsar):
+    mod, mock_ddb, _ = dsar
+    rm_table, se_table = _stub_psid_tables(
+        mock_ddb,
+        rm_items=[{"sessionId": "meta:p1:psid_abc", "messageTimestamp": 100,
+                   "role": "user", "content": "hi"}],
+        se_items=[_se_row("meta:p1:psid_abc", step="STEP#001", tenant_hash="t")],
+    )
+    rows_touched, _, exported, results = mod._walk_psid_surfaces(
+        tenant_id="TEN", psid="psid_abc",
+        session_ids=["meta:p1:psid_abc"],
+        request_type="access", dry_run=True,
+    )
+    assert rows_touched == {"recent-messages": 1, "session-events": 1}
+    assert "recent-messages" in exported and "session-events" in exported
+    assert results["recent-messages"]["action"] == "exported"
+    assert results["session-events"]["action"] == "exported"
+
+
+def test_walk_psid_surfaces_delete_dry_run_counts_both_surfaces(dsar):
+    mod, mock_ddb, _ = dsar
+    _stub_psid_tables(
+        mock_ddb,
+        rm_items=[{"sessionId": "meta:p1:psid_abc", "messageTimestamp": 100,
+                   "role": "user", "content": "x"}],
+        se_items=[_se_row("meta:p1:psid_abc")],
+    )
+    rows_touched, followups, _, results = mod._walk_psid_surfaces(
+        tenant_id="TEN", psid="psid_abc",
+        session_ids=["meta:p1:psid_abc"],
+        request_type="delete", dry_run=True,
+    )
+    assert rows_touched == {"recent-messages": 1, "session-events": 1}
+    assert results["recent-messages"]["action"] == "dry_run_count"
+    assert results["session-events"]["action"] == "dry_run_count"
+    assert any("recent-messages: dry_run=true" in f for f in followups)
+    assert any("session-events: dry_run=true" in f for f in followups)
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2588,3 +2946,133 @@ def test_e2_subject_resolution_client_error_survives_audit_collision_on_failure_
     # during failure-path audit write.
     assert resp["status"] == "failed"
     assert resp["error"] == "subject_resolution_failed"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# M2 Sprint B — handler psid path end-to-end
+# ───────────────────────────────────────────────────────────────────────────
+def _stub_psid_handler_tables(mock_ddb, *, page_ids=("p1",), rm_items=None, se_items=None):
+    """Plumb channel-mappings + audit + recent-messages + session-events
+    Tables for the psid-path handler tests. Mirrors _stub_handler_tables."""
+    cm_table = MagicMock()
+    audit_table = MagicMock()
+    rm_table = MagicMock()
+    se_table = MagicMock()
+    cm_table.query.return_value = {
+        "Items": [{"PK": f"PAGE#{pid}"} for pid in page_ids],
+    }
+    rm_table.query.return_value = {"Items": rm_items or []}
+    se_table.query.return_value = {"Items": se_items or []}
+
+    def route(name):
+        if name == "picasso-channel-mappings-staging":
+            return cm_table
+        if name == "picasso-pii-dsar-audit-staging":
+            return audit_table
+        if name == "staging-recent-messages":
+            return rm_table
+        if name == "picasso-session-events-staging":
+            return se_table
+        raise AssertionError(f"unexpected DDB Table call: {name}")
+
+    mock_ddb.Table.side_effect = route
+    return cm_table, audit_table, rm_table, se_table
+
+
+def test_handler_psid_path_access_exports_recent_messages_and_session_events(dsar):
+    """End-to-end psid path: tenant → 1 page via TenantIndex GSI → sessionId
+    composed → both walkers run → access export returns rows from both
+    surfaces. Audit log records request_received + surface_walked for both
+    walkers + closed = 4 events."""
+    mod, mock_ddb, _ = dsar
+    rm_items = [{"sessionId": "meta:p1:9876543210", "messageTimestamp": 100,
+                 "role": "user", "content": "hi"}]
+    se_items = [_se_row("meta:p1:9876543210", step="STEP#001",
+                        tenant_hash="my87674d777bf9")]
+    cm_table, audit_table, rm_table, se_table = _stub_psid_handler_tables(
+        mock_ddb, page_ids=("p1",), rm_items=rm_items, se_items=se_items)
+
+    resp = mod.lambda_handler(_valid_event(
+        identifier_type="psid",
+        subject_identifier="9876543210",
+        request_type="access",
+        dry_run=True,
+    ), context=None)
+
+    assert resp["status"] == "completed"  # both walkers ran cleanly
+    assert resp["pii_subject_id"] is None  # Meta-only subjects have no subject-index entry
+    assert resp["rows_touched"]["recent-messages"] == 1
+    assert resp["rows_touched"]["session-events"] == 1
+    assert "recent-messages" in resp["exported_rows"]
+    assert "session-events" in resp["exported_rows"]
+    # 4 audit events: request_received + 2 surface_walked + closed
+    assert audit_table.put_item.call_count == 4
+    event_types = [c.kwargs["Item"]["event_type"] for c in audit_table.put_item.call_args_list]
+    assert event_types == [
+        "request_received",
+        "surface_walked:recent-messages",
+        "surface_walked:session-events",
+        "closed",
+    ]
+    # Sessions table was queried with the composed sessionId
+    rm_table.query.assert_called()
+    se_table.query.assert_called()
+
+
+def test_handler_psid_path_no_meta_pages_for_tenant_returns_completed_with_followup(dsar):
+    """Tenant has no Messenger channel → 0 sessionIds → walkers report
+    completed/no_sessions. Operator gets the 3-reason followup."""
+    mod, mock_ddb, _ = dsar
+    cm_table, audit_table, rm_table, se_table = _stub_psid_handler_tables(
+        mock_ddb, page_ids=())
+
+    resp = mod.lambda_handler(_valid_event(
+        identifier_type="psid",
+        subject_identifier="9876543210",
+        request_type="access",
+    ), context=None)
+
+    assert resp["status"] == "completed"
+    assert resp["rows_touched"]["recent-messages"] == 0
+    assert resp["rows_touched"]["session-events"] == 0
+    assert resp["exported_rows"] == {}
+    assert any("0 sessionIds resolved" in f for f in resp["manual_followups"])
+    # No walker queries should have been issued
+    rm_table.query.assert_not_called()
+    se_table.query.assert_not_called()
+
+
+def test_handler_psid_path_subject_resolution_clienterror_returns_failed_with_audit(dsar):
+    """ClientError on the TenantIndex GSI Query during _resolve_psid_subject
+    → handler audit-writes the failure event with identifier_type=psid and
+    returns failed cleanly (parallel to email path's contract)."""
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    cm_table = MagicMock()
+    audit_table = MagicMock()
+    cm_table.query.side_effect = ClientError(
+        {"Error": {"Code": "ThrottlingException"}}, "Query")
+
+    def route(name):
+        if name == "picasso-channel-mappings-staging":
+            return cm_table
+        if name == "picasso-pii-dsar-audit-staging":
+            return audit_table
+        raise AssertionError(f"unexpected DDB Table call: {name}")
+    mock_ddb.Table.side_effect = route
+
+    resp = mod.lambda_handler(_valid_event(
+        identifier_type="psid",
+        subject_identifier="9876543210",
+    ), context=None)
+
+    assert resp["status"] == "failed"
+    assert resp["error"] == "subject_resolution_failed"
+    # 2 audit attempts: request_received (succeeds) + subject_resolution_failed
+    assert audit_table.put_item.call_count == 2
+    failed_event = audit_table.put_item.call_args_list[1].kwargs["Item"]
+    assert failed_event["event_type"] == "subject_resolution_failed"
+    # identifier_type recorded in failure event (lets operator distinguish
+    # email-path vs psid-path subject-resolution failures in the audit log)
+    details = json.loads(failed_event["details"])
+    assert details["identifier_type"] == "psid"

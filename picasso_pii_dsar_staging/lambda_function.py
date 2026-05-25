@@ -102,7 +102,10 @@ TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
 TABLE_RECENT_MESSAGES = "staging-recent-messages"
+TABLE_CHANNEL_MAPPINGS = "picasso-channel-mappings-staging"
+TABLE_SESSION_EVENTS = "picasso-session-events-staging"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
+GSI_CHANNEL_MAPPINGS_TENANT_INDEX = "TenantIndex"
 
 # Bound the chained notification-events GSI walk so a single DSAR cannot
 # exhaust the 60s Lambda timeout (Security advisor Finding 3, 2026-05-21).
@@ -151,7 +154,10 @@ DEFERRED_SURFACES = {
 MFS_SCOPED_SURFACES = DEFERRED_SURFACES
 
 SUPPORTED_REQUEST_TYPES = {"access", "delete"}
-SUPPORTED_IDENTIFIER_TYPES = {"email"}  # milestone 1; psid arrives in 1b
+# Milestone 1 shipped email; M2 Sprint B adds psid (Meta Messenger subjects).
+# phone + name+address remain walker-NOT-supported per M2 Sprint A design §3.3
+# (D5 row F-DSAR30); manual M3 playbook procedures cover those gaps.
+SUPPORTED_IDENTIFIER_TYPES = {"email", "psid"}
 
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -230,14 +236,16 @@ def _validate(event):
     identifier_type = event["identifier_type"]
     if identifier_type not in SUPPORTED_IDENTIFIER_TYPES:
         raise InvalidInput(
-            f"identifier_type {identifier_type!r} not supported in milestone 1; "
-            f"supported: {sorted(SUPPORTED_IDENTIFIER_TYPES)}"
+            f"identifier_type {identifier_type!r} not supported; "
+            f"supported: {sorted(SUPPORTED_IDENTIFIER_TYPES)}. "
+            f"phone / name+address are walker-NOT-supported per F-DSAR30 — "
+            f"see dsar-operator-playbook.md §Per-surface manual fallback."
         )
 
     request_type = event["request_type"]
     if request_type not in SUPPORTED_REQUEST_TYPES:
         raise InvalidInput(
-            f"request_type {request_type!r} not supported in milestone 1; "
+            f"request_type {request_type!r} not supported; "
             f"supported: {sorted(SUPPORTED_REQUEST_TYPES)}"
         )
 
@@ -247,6 +255,14 @@ def _validate(event):
         if not EMAIL_RE.match(normalized):
             raise InvalidInput(f"subject_identifier does not look like an email")
         subject_identifier = normalized
+    elif identifier_type == "psid":
+        # Facebook PSIDs are opaque numeric strings (typically 15-17 digits)
+        # scoped to the (page, user) pair. No normalization beyond strip;
+        # cross-tenant isolation is enforced upstream by _resolve_psid_subject
+        # via the channel-mappings TenantIndex GSI Query.
+        if not isinstance(subject_identifier, str) or not subject_identifier.strip():
+            raise InvalidInput("subject_identifier must be a non-empty string for identifier_type=psid")
+        subject_identifier = subject_identifier.strip()
 
     # Sprint E1 / audit blocker B2 (smoke-prefix is UX, not security boundary):
     # the operator playbook §8 JMESPath at-risk filter excludes
@@ -335,6 +351,69 @@ def _resolve_subject(tenant_id, normalized_email):
     if not item:
         return None
     return item.get("pii_subject_id")
+
+
+def _resolve_psid_subject(tenant_id, psid):
+    """Resolve psid → list of Meta sessionIds for the tenant.
+
+    M2 Sprint B subject resolver for identifier_type=psid. Two-step lookup:
+      1. tenant → list of pageIds via channel-mappings TenantIndex GSI
+         (KEY: tenantId=HASH, channelType=RANGE; channelType="messenger").
+         The row's PK ("PAGE#{pageId}") yields the pageId.
+      2. For each pageId: construct sessionId = "meta:{pageId}:{psid}".
+         (Per Meta_Response_Processor/index.js:230-263, the session key is
+         derived from the (pageId, psid) pair at write time.)
+
+    Returns a list of sessionId strings. Empty list = no Meta pages for the
+    tenant; downstream walkers treat this as "no Meta surface to walk."
+
+    Cross-tenant isolation: the GSI Query is bounded by tenantId; only pages
+    belonging to the requested tenant are enumerated. PSIDs themselves are
+    NOT tenant-scoped attributes (the same PSID could appear on different
+    tenants' pages), so the (pageId, psid) composition is what scopes the
+    sessionId list to the tenant.
+
+    Why this returns sessionIds (not pii_subject_id): Meta-only subjects
+    have no entry in picasso-pii-subject-index-staging (the index is built
+    from form-submission writes per Phase-1; PSID-only subjects never
+    submit forms). The sessionId list IS the subject context for the
+    psid-path walkers — _walk_recent_messages + _walk_session_events
+    consume it the same way the email-path walkers consume session_ids
+    chained from _walk_form_submissions.
+
+    On ClientError: raises (handler audit-writes the failure and returns
+    failed cleanly — same contract as _resolve_subject's error path).
+    """
+    table = ddb.Table(TABLE_CHANNEL_MAPPINGS)
+    page_ids = []
+    last_evaluated_key = None
+    while True:
+        kwargs = {
+            "IndexName": GSI_CHANNEL_MAPPINGS_TENANT_INDEX,
+            "KeyConditionExpression": (
+                Key("tenantId").eq(tenant_id) & Key("channelType").eq("messenger")
+            ),
+            "ProjectionExpression": "PK",
+        }
+        if last_evaluated_key:
+            kwargs["ExclusiveStartKey"] = last_evaluated_key
+        try:
+            resp = table.query(**kwargs)
+        except ClientError as exc:
+            logger.error(
+                "psid_subject_resolution_failed: tenant=%s err=%s",
+                tenant_id, exc.response.get("Error", {}).get("Code"),
+            )
+            raise
+        for item in resp.get("Items", []):
+            pk = item.get("PK", "")
+            if pk.startswith("PAGE#"):
+                page_ids.append(pk.split("#", 1)[1])
+        last_evaluated_key = resp.get("LastEvaluatedKey")
+        if not last_evaluated_key:
+            break
+
+    return [f"meta:{page_id}:{psid}" for page_id in page_ids]
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1035,6 +1114,138 @@ def _walk_recent_messages(tenant_id, session_ids, request_type, dry_run):
     }
 
 
+def _walk_session_events(tenant_id, session_ids, request_type, dry_run):
+    """Walk picasso-session-events-staging for one subject via session_ids.
+
+    M2 Sprint B walker. Chained input: session_ids derived from either
+    _walk_form_submissions (email path, via the subject's submitted forms)
+    OR _resolve_psid_subject (psid path, via tenant→pageIds composition).
+
+    Table schema (live as of 2026-05-25): pk=SESSION#{sessionId},
+    sk=STEP#{n}. No tenantId on row (cross-tenant isolation enforced
+    upstream — tenant_id arg is defense-in-depth only).
+
+    The walker mirrors _walk_recent_messages's contract precisely:
+    pagination, continue-on-error per session_id, bounded fan-out,
+    skip-corrupted-on-delete with audit-visible counter. Differs only
+    in (a) the PK shape (SESSION# prefix on pk vs sessionId column on
+    recent-messages) and (b) the projection — STEP rows carry workflow
+    state, not free-text consumer content, so the access export returns
+    the full row (no _project_* function needed).
+
+    Returns shape mirrors _walk_recent_messages.
+    """
+    # Defense-in-depth: tenant_id MUST be non-empty even though the walker
+    # doesn't use it in the Query. Upstream resolver (form-submissions for
+    # email path; channel-mappings TenantIndex GSI for psid path) enforces
+    # tenant scoping. If a future caller bypasses both, fail loud.
+    if not tenant_id:
+        raise ValueError(
+            "_walk_session_events requires non-empty tenant_id "
+            "(defense-in-depth — table has no tenantId on row; upstream "
+            "resolver must enforce tenant scoping)"
+        )
+
+    if not session_ids:
+        return {"rows_found": 0, "action": "no_sessions"}
+
+    # Bounded fan-out — same cap as _walk_recent_messages.
+    truncated_session_id_count = 0
+    if len(session_ids) > MAX_SESSION_IDS_PER_INVOCATION:
+        truncated_session_id_count = len(session_ids) - MAX_SESSION_IDS_PER_INVOCATION
+        session_ids = session_ids[:MAX_SESSION_IDS_PER_INVOCATION]
+        logger.warning(
+            "session_events_session_ids_truncated: cap=%d overflow=%d",
+            MAX_SESSION_IDS_PER_INVOCATION, truncated_session_id_count,
+        )
+
+    table = ddb.Table(TABLE_SESSION_EVENTS)
+
+    matched = []
+    failed_session_ids = []
+    for session_id in session_ids:
+        pk_value = f"SESSION#{session_id}"
+        last_evaluated_key = None
+        while True:
+            kwargs = {
+                "KeyConditionExpression": Key("pk").eq(pk_value),
+            }
+            if last_evaluated_key:
+                kwargs["ExclusiveStartKey"] = last_evaluated_key
+            try:
+                resp = table.query(**kwargs)
+            except ClientError as exc:
+                logger.error(
+                    "session_events_query_failed: sessionId=%s code=%s",
+                    session_id, exc.response.get("Error", {}).get("Code"),
+                )
+                failed_session_ids.append(session_id)
+                break
+            matched.extend(resp.get("Items", []))
+            last_evaluated_key = resp.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                break
+
+    rows_found = len(matched)
+
+    progress_fields = {}
+    if failed_session_ids:
+        progress_fields["failed_session_ids"] = failed_session_ids
+    if truncated_session_id_count:
+        progress_fields["truncated_session_id_count"] = truncated_session_id_count
+
+    if request_type == "access":
+        # STEP rows are workflow state (not free-text consumer content);
+        # return full rows. The access response is bounded by the upstream
+        # session_id cap, so no per-row soft cap is added here.
+        return {
+            "rows_found": rows_found,
+            "action": "exported",
+            "exported_rows": matched,
+            **progress_fields,
+        }
+
+    if dry_run:
+        return {
+            "rows_found": rows_found,
+            "action": "dry_run_count",
+            **progress_fields,
+        }
+
+    deleted = 0
+    delete_failed = 0
+    skipped_corrupted = 0
+    for row in matched:
+        row_pk = row.get("pk")
+        row_sk = row.get("sk")
+        if row_pk is None or row_sk is None:
+            skipped_corrupted += 1
+            logger.error(
+                "session_events_delete_skipped_corrupted: "
+                "pk=%s sk=%s — row missing PK/SK",
+                row_pk, row_sk,
+            )
+            continue
+        try:
+            table.delete_item(Key={"pk": row_pk, "sk": row_sk})
+            deleted += 1
+        except ClientError as exc:
+            delete_failed += 1
+            logger.error(
+                "session_events_delete_failed: pk=%s sk=%s code=%s",
+                row_pk, row_sk,
+                exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
+        "rows_skipped_corrupted": skipped_corrupted,
+        **progress_fields,
+    }
+
+
 def _recent_messages_chat_only_cli_snippet(tenant_id):
     """Operator-actionable CLI snippet for the chat-only F-DSAR4 gap.
 
@@ -1567,6 +1778,178 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
     return rows_touched, manual_followups, exported_rows, walker_results
 
 
+def _walk_psid_surfaces(tenant_id, psid, session_ids, request_type, dry_run):
+    """Dispatch per-surface walkers for the psid path (M2 Sprint B).
+
+    Parallel to _walk_mfs_surfaces but for identifier_type=psid. The
+    surfaces walked are a SUBSET of the email-path surfaces — Meta-only
+    subjects appear in conversation surfaces (recent-messages,
+    session-events) but NOT in form-keyed surfaces (form-submissions,
+    notification-sends/events were never written for a PSID-only subject;
+    those are email-keyed by definition).
+
+    session-summaries deferred to a follow-on sprint per D5 row F-DSAR31
+    (requires tenant_hash resolution — session-summaries pk uses
+    TENANT#{tenant_hash} not tenant_id; Sprint B narrows to surfaces
+    reachable without tenant_hash discovery).
+
+    Returns the same shape as _walk_mfs_surfaces.
+
+    Cross-tenant isolation: session_ids are pre-composed by
+    _resolve_psid_subject as "meta:{pageId}:{psid}" where pageId belongs
+    to the requested tenant per the TenantIndex GSI Query. The walkers
+    here accept session_ids opaquely.
+    """
+    rows_touched = {
+        "recent-messages": 0,
+        "session-events": 0,
+    }
+    manual_followups = []
+    exported_rows = {}
+    walker_results = {}
+
+    if not session_ids:
+        # tenant has no Meta pages OR pages had no matching sessions for
+        # this psid. Surface as completed-with-no-data; operator may need
+        # to verify the PSID is correct, or the subject's TTL may have
+        # purged the rows already (staging-recent-messages has a 7-day
+        # TTL per Meta_Response_Processor).
+        manual_followups.append(
+            f"psid path: 0 sessionIds resolved for tenant {tenant_id!r} + "
+            f"psid {psid!r}. Verify: (a) tenant has Messenger channel "
+            f"configured (channel-mappings TenantIndex GSI Query); (b) "
+            f"PSID belongs to a page in the tenant's channel mappings; "
+            f"(c) subject's messages may have aged out via 7-day TTL on "
+            f"staging-recent-messages."
+        )
+        walker_results["recent-messages"] = {
+            "status": "completed",
+            "action": "no_sessions",
+            "rows_touched": 0,
+        }
+        walker_results["session-events"] = {
+            "status": "completed",
+            "action": "no_sessions",
+            "rows_touched": 0,
+        }
+        # Note: session-summaries is intentionally NOT in this dict — it's
+        # deferred to F-DSAR31. Including it here would noise up the audit
+        # log and the operator-facing response.
+        return rows_touched, manual_followups, exported_rows, walker_results
+
+    # recent-messages: reuse the M1 walker. session_ids are tenant-scoped
+    # upstream via channel-mappings TenantIndex GSI.
+    rm = _walk_recent_messages(tenant_id, session_ids, request_type, dry_run)
+    rows_touched["recent-messages"] = rm["rows_found"]
+    if rm.get("error"):
+        manual_followups.append(
+            f"recent-messages: query failed ({rm['error']}); retry advised"
+        )
+        walker_results["recent-messages"] = {
+            "status": "errored",
+            "error": rm["error"],
+            "rows_touched": rm["rows_found"],
+        }
+    elif rm.get("action") == "no_sessions":
+        walker_results["recent-messages"] = {
+            "status": "completed",
+            "action": "no_sessions",
+            "rows_touched": 0,
+        }
+    elif rm.get("action") == "exported":
+        exported_rows["recent-messages"] = rm["exported_rows"]
+        walker_results["recent-messages"] = {
+            "status": "completed",
+            "action": "exported",
+            "rows_touched": rm["rows_found"],
+        }
+    elif rm.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"recent-messages: dry_run=true; {rm['rows_found']} row(s) would "
+            f"be deleted; re-invoke with dry_run=false to delete"
+        )
+        walker_results["recent-messages"] = {
+            "status": "completed",
+            "action": "dry_run_count",
+            "rows_touched": rm["rows_found"],
+        }
+    else:  # action == "deleted"
+        result = {
+            "status": "completed",
+            "action": "deleted",
+            "rows_touched": rm["rows_found"],
+            "rows_deleted": rm.get("rows_deleted", 0),
+            "rows_skipped_corrupted": rm.get("rows_skipped_corrupted", 0),
+        }
+        if rm.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"recent-messages: {rm['rows_skipped_corrupted']} row(s) "
+                f"skipped due to corrupted PK/SK schema — see CloudWatch "
+                f"logs for sessionId+messageTimestamp values; manual "
+                f"inspection required."
+            )
+            result["status"] = "errored"
+            result["error"] = "rows_skipped_corrupted"
+        walker_results["recent-messages"] = result
+
+    # session-events: new M2 Sprint B walker. session_ids are the same as
+    # for recent-messages (the "meta:{pageId}:{psid}" sessionId is shared
+    # across both tables; session-events keys on SESSION#{sessionId}).
+    se = _walk_session_events(tenant_id, session_ids, request_type, dry_run)
+    rows_touched["session-events"] = se["rows_found"]
+    if se.get("error"):
+        manual_followups.append(
+            f"session-events: query failed ({se['error']}); retry advised"
+        )
+        walker_results["session-events"] = {
+            "status": "errored",
+            "error": se["error"],
+            "rows_touched": se["rows_found"],
+        }
+    elif se.get("action") == "no_sessions":
+        walker_results["session-events"] = {
+            "status": "completed",
+            "action": "no_sessions",
+            "rows_touched": 0,
+        }
+    elif se.get("action") == "exported":
+        exported_rows["session-events"] = se["exported_rows"]
+        walker_results["session-events"] = {
+            "status": "completed",
+            "action": "exported",
+            "rows_touched": se["rows_found"],
+        }
+    elif se.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"session-events: dry_run=true; {se['rows_found']} row(s) would "
+            f"be deleted; re-invoke with dry_run=false to delete"
+        )
+        walker_results["session-events"] = {
+            "status": "completed",
+            "action": "dry_run_count",
+            "rows_touched": se["rows_found"],
+        }
+    else:  # action == "deleted"
+        result = {
+            "status": "completed",
+            "action": "deleted",
+            "rows_touched": se["rows_found"],
+            "rows_deleted": se.get("rows_deleted", 0),
+            "rows_skipped_corrupted": se.get("rows_skipped_corrupted", 0),
+        }
+        if se.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"session-events: {se['rows_skipped_corrupted']} row(s) "
+                f"skipped due to corrupted PK/SK schema — see CloudWatch "
+                f"logs for pk+sk values; manual inspection required."
+            )
+            result["status"] = "errored"
+            result["error"] = "rows_skipped_corrupted"
+        walker_results["session-events"] = result
+
+    return rows_touched, manual_followups, exported_rows, walker_results
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Handler
 # ───────────────────────────────────────────────────────────────────────────
@@ -1641,15 +2024,32 @@ def lambda_handler(event, context):
             "message": str(exc),
         }
 
-    # E2 (PR1 fix-now-4): subject-index lookup is a DDB call — ClientError
+    # E2 (PR1 fix-now-4): subject resolution is a DDB call — ClientError
     # (throttle, AccessDenied, network) previously propagated uncaught and
     # crashed the Lambda with no audit row. Now: audit-write the failure and
-    # return failed cleanly. normalized_email NOT logged/returned (consumer PII).
+    # return failed cleanly. subject_identifier NOT logged/returned (consumer PII).
+    #
+    # M2 Sprint B: branch on identifier_type.
+    #   - email path: _resolve_subject → pii_subject_id → _walk_mfs_surfaces
+    #     (email-keyed surfaces: form-submissions + notification-sends/events
+    #     + recent-messages chained from form-submissions session_ids).
+    #   - psid path: _resolve_psid_subject → list of Meta sessionIds →
+    #     _walk_psid_surfaces (recent-messages + session-events).
+    # pii_subject_id is None on the psid path (Meta-only subjects have no
+    # subject-index entry); the close-event payload reflects this honestly.
+    pii_subject_id = None
+    psid_session_ids = None
     try:
-        pii_subject_id = _resolve_subject(
-            tenant_id=inputs["tenant_id"],
-            normalized_email=inputs["subject_identifier"],
-        )
+        if inputs["identifier_type"] == "email":
+            pii_subject_id = _resolve_subject(
+                tenant_id=inputs["tenant_id"],
+                normalized_email=inputs["subject_identifier"],
+            )
+        else:  # identifier_type == "psid" — guaranteed by _validate
+            psid_session_ids = _resolve_psid_subject(
+                tenant_id=inputs["tenant_id"],
+                psid=inputs["subject_identifier"],
+            )
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code")
         try:
@@ -1659,6 +2059,7 @@ def lambda_handler(event, context):
                 status="failed",
                 payload={
                     "tenant_id": inputs["tenant_id"],
+                    "identifier_type": inputs["identifier_type"],
                     "error_code": error_code,
                 },
             )
@@ -1671,22 +2072,39 @@ def lambda_handler(event, context):
             "dsar_id": dsar_id,
             "status": "failed",
             "error": "subject_resolution_failed",
-            "message": f"DDB ClientError on subject-index lookup: {error_code}",
+            "message": f"DDB ClientError on subject resolution: {error_code}",
         }
-    logger.info(
-        "dsar_subject_resolved: dsar_id=%s tenant=%s found=%s",
-        dsar_id, inputs["tenant_id"], pii_subject_id is not None,
-    )
-
-    rows_touched, manual_followups, exported_rows, walker_results = (
-        _walk_mfs_surfaces(
-            pii_subject_id=pii_subject_id,
-            tenant_id=inputs["tenant_id"],
-            normalized_email=inputs["subject_identifier"],
-            request_type=inputs["request_type"],
-            dry_run=inputs["dry_run"],
+    if inputs["identifier_type"] == "email":
+        logger.info(
+            "dsar_subject_resolved: dsar_id=%s tenant=%s found=%s",
+            dsar_id, inputs["tenant_id"], pii_subject_id is not None,
         )
-    )
+    else:
+        logger.info(
+            "dsar_psid_subject_resolved: dsar_id=%s tenant=%s sessionIds=%d",
+            dsar_id, inputs["tenant_id"], len(psid_session_ids),
+        )
+
+    if inputs["identifier_type"] == "email":
+        rows_touched, manual_followups, exported_rows, walker_results = (
+            _walk_mfs_surfaces(
+                pii_subject_id=pii_subject_id,
+                tenant_id=inputs["tenant_id"],
+                normalized_email=inputs["subject_identifier"],
+                request_type=inputs["request_type"],
+                dry_run=inputs["dry_run"],
+            )
+        )
+    else:  # psid path
+        rows_touched, manual_followups, exported_rows, walker_results = (
+            _walk_psid_surfaces(
+                tenant_id=inputs["tenant_id"],
+                psid=inputs["subject_identifier"],
+                session_ids=psid_session_ids,
+                request_type=inputs["request_type"],
+                dry_run=inputs["dry_run"],
+            )
+        )
 
     # Per-surface audit events (audit fix-now #5). Skip deferred surfaces —
     # writing an audit row for "we did nothing because the walker doesn't
