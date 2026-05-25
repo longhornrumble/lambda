@@ -106,6 +106,13 @@ TABLE_CHANNEL_MAPPINGS = "picasso-channel-mappings-staging"
 TABLE_SESSION_EVENTS = "picasso-session-events-staging"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 GSI_CHANNEL_MAPPINGS_TENANT_INDEX = "TenantIndex"
+# M2 Sprint C: ARCHIVE_BUCKET. Per archive-reachability-decision.md
+# (2026-05-23): bucket exists in staging acct 525 only (prod has no archive
+# surface — F-DSAR17 routing). Key shape: sessions/{sessionId}/...
+# Versioning ENABLED with 7-day NoncurrentVersionExpiration compensating
+# control; walker must enumerate versions on delete to fully erase.
+S3_ARCHIVE_BUCKET = "picasso-archive-staging"
+S3_ARCHIVE_KEY_PREFIX = "sessions/"
 
 # Bound the chained notification-events GSI walk so a single DSAR cannot
 # exhaust the 60s Lambda timeout (Security advisor Finding 3, 2026-05-21).
@@ -164,6 +171,9 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # Module-level clients (boto3 connection pool warm on cold-start).
 ddb = boto3.resource("dynamodb")
 sts = boto3.client("sts")
+# M2 Sprint C: S3 client for the ARCHIVE_BUCKET walker. Eager region from the
+# Lambda runtime (AWS_DEFAULT_REGION); no explicit region kwarg.
+s3 = boto3.client("s3")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1246,6 +1256,187 @@ def _walk_session_events(tenant_id, session_ids, request_type, dry_run):
     }
 
 
+def _walk_archive_bucket(tenant_id, session_ids, request_type, dry_run):
+    """Walk picasso-archive-staging for one subject via session_ids.
+
+    M2 Sprint C walker for the S7 surface. Chained input: session_ids from
+    upstream resolver (email path: _walk_form_submissions output; psid path:
+    _resolve_psid_subject output).
+
+    Bucket posture (per archive-reachability-decision.md, 2026-05-23):
+      - Region: us-east-1 (matches Lambda region)
+      - Encryption: SSE-S3 (no CMK)
+      - Versioning: ENABLED (7-day NoncurrentVersionExpiration compensating
+        control). Walker MUST enumerate versions on delete to fully erase —
+        a plain delete_object leaves a delete-marker, not actual erasure.
+      - Key shape: sessions/{sessionId}/...
+
+    request_type:
+      - "access":            list objects under sessions/{sid}/; return key list
+                             (object content NOT fetched — operator-actionable
+                             via aws s3 cp on the returned keys; keeps Lambda
+                             response under 6 MB)
+      - "delete" + dry_run:  list objects + version count; no delete calls
+      - "delete" + real:     list_object_versions → delete_object(key, version_id)
+                             per (key, version) tuple. The single-shot
+                             delete_object (no version_id) is INSUFFICIENT
+                             under versioning=ENABLED (leaves prior versions).
+
+    tenant_id is unused by the walk but required for defense-in-depth
+    (mirrors _walk_recent_messages / _walk_session_events pattern).
+    session_ids are tenant-scoped upstream.
+
+    Continue-on-error per session_id and per (key, version) delete failure
+    (mirrors M1 DDB walker patterns).
+
+    Returns:
+      {
+        "objects_found":              int,   # number of distinct keys
+        "versions_found":             int,   # total (key, version) tuples
+        "action":                     "exported" | "dry_run_count" | "deleted" | "no_sessions",
+        "exported_keys":              [str, ...]                # access only
+        "versions_deleted":           int                       # delete-real only
+        "versions_delete_failed":     int                       # delete-real only
+        "failed_session_ids":         [str, ...]                # set on partial errors
+        "truncated_session_id_count": int                       # set when cap hit
+      }
+    """
+    if not tenant_id:
+        raise ValueError(
+            "_walk_archive_bucket requires non-empty tenant_id "
+            "(defense-in-depth — S3 walk has no tenant ARN scoping; upstream "
+            "resolver must enforce tenant scoping via the session_id list)"
+        )
+
+    if not session_ids:
+        return {"objects_found": 0, "versions_found": 0, "action": "no_sessions"}
+
+    truncated_session_id_count = 0
+    if len(session_ids) > MAX_SESSION_IDS_PER_INVOCATION:
+        truncated_session_id_count = len(session_ids) - MAX_SESSION_IDS_PER_INVOCATION
+        session_ids = session_ids[:MAX_SESSION_IDS_PER_INVOCATION]
+        logger.warning(
+            "archive_session_ids_truncated: cap=%d overflow=%d",
+            MAX_SESSION_IDS_PER_INVOCATION, truncated_session_id_count,
+        )
+
+    # Collect (key, version_id) tuples across all sessions. Two distinct
+    # structures: `keys` (unique object keys for access export) and
+    # `versions` (every (key, version_id) tuple for delete enumeration).
+    keys = []
+    versions = []
+    failed_session_ids = []
+
+    for session_id in session_ids:
+        prefix = f"{S3_ARCHIVE_KEY_PREFIX}{session_id}/"
+        # Use list_object_versions — returns BOTH current + non-current
+        # versions in one paginated stream. (list_objects_v2 only returns
+        # current versions, missing non-current copies that the 7-day
+        # NoncurrentVersionExpiration window allows.)
+        continuation_kwargs = {}
+        session_had_error = False
+        while True:
+            try:
+                resp = s3.list_object_versions(
+                    Bucket=S3_ARCHIVE_BUCKET,
+                    Prefix=prefix,
+                    **continuation_kwargs,
+                )
+            except ClientError as exc:
+                logger.error(
+                    "archive_list_failed: sessionId=%s code=%s",
+                    session_id, exc.response.get("Error", {}).get("Code"),
+                )
+                failed_session_ids.append(session_id)
+                session_had_error = True
+                break
+            for v in resp.get("Versions", []):
+                versions.append((v["Key"], v.get("VersionId", "null")))
+                keys.append(v["Key"])
+            for dm in resp.get("DeleteMarkers", []):
+                # Delete-markers themselves must be removed to fully erase
+                # the object history (otherwise the marker persists as a row
+                # in the version list even after all real versions go).
+                versions.append((dm["Key"], dm.get("VersionId", "null")))
+                # Don't add to `keys` — a delete-marker is not an object
+                # the subject can access; only count it for the version
+                # erase path.
+            if not resp.get("IsTruncated"):
+                break
+            # list_object_versions pagination uses KeyMarker + VersionIdMarker
+            continuation_kwargs = {}
+            if resp.get("NextKeyMarker"):
+                continuation_kwargs["KeyMarker"] = resp["NextKeyMarker"]
+            if resp.get("NextVersionIdMarker"):
+                continuation_kwargs["VersionIdMarker"] = resp["NextVersionIdMarker"]
+            if not continuation_kwargs:
+                # Defensive: no markers but IsTruncated=true → break to avoid
+                # infinite loop (boto3 shouldn't return this, but belt-and-
+                # suspenders given S3 API surface complexity).
+                break
+        if session_had_error:
+            continue
+
+    # Distinct keys for access export
+    unique_keys = sorted(set(keys))
+    objects_found = len(unique_keys)
+    versions_found = len(versions)
+
+    progress_fields = {}
+    if failed_session_ids:
+        progress_fields["failed_session_ids"] = failed_session_ids
+    if truncated_session_id_count:
+        progress_fields["truncated_session_id_count"] = truncated_session_id_count
+
+    if request_type == "access":
+        # Return key list only (not object bodies) — operator runs
+        # `aws s3 cp` on returned keys if subject requests the content.
+        # Keeps Lambda response payload under 6 MB even on chatty archives.
+        return {
+            "objects_found": objects_found,
+            "versions_found": versions_found,
+            "action": "exported",
+            "exported_keys": unique_keys,
+            **progress_fields,
+        }
+
+    if dry_run:
+        return {
+            "objects_found": objects_found,
+            "versions_found": versions_found,
+            "action": "dry_run_count",
+            **progress_fields,
+        }
+
+    # Delete-real: enumerate every (key, version_id) tuple.
+    versions_deleted = 0
+    versions_delete_failed = 0
+    for key, version_id in versions:
+        try:
+            s3.delete_object(
+                Bucket=S3_ARCHIVE_BUCKET,
+                Key=key,
+                VersionId=version_id,
+            )
+            versions_deleted += 1
+        except ClientError as exc:
+            versions_delete_failed += 1
+            logger.error(
+                "archive_delete_failed: key=%s version_id=%s code=%s",
+                key, version_id,
+                exc.response.get("Error", {}).get("Code"),
+            )
+
+    return {
+        "objects_found": objects_found,
+        "versions_found": versions_found,
+        "action": "deleted",
+        "versions_deleted": versions_deleted,
+        "versions_delete_failed": versions_delete_failed,
+        **progress_fields,
+    }
+
+
 def _recent_messages_chat_only_cli_snippet(tenant_id):
     """Operator-actionable CLI snippet for the chat-only F-DSAR4 gap.
 
@@ -1341,6 +1532,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         "notification-sends": 0,
         "notification-events": 0,
         "recent-messages": 0,
+        "archive": 0,
     }
     rows_touched.update({s: 0 for s in MFS_SCOPED_SURFACES})
     manual_followups = []
@@ -1389,6 +1581,11 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "form-submissions to run first)"
         )
         walker_results["recent-messages"] = {"status": "skipped_no_subject"}
+        manual_followups.append(
+            "archive: skipped (chained walker requires form-submissions "
+            "session_ids; no subject resolved → no chain)"
+        )
+        walker_results["archive"] = {"status": "skipped_no_subject"}
         for surface, reason in MFS_SCOPED_SURFACES.items():
             manual_followups.append(f"{surface}: {reason}")
             walker_results[surface] = {"status": "deferred", "reason": reason}
@@ -1770,6 +1967,14 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "Art 15 data-minimization (advisor 2026-05-21)."
         )
 
+    # archive: M2 Sprint C — chained walk via the same form-submissions
+    # session_ids. session_ids are tenant-scoped upstream by
+    # _walk_form_submissions (Query bounded by pii_subject_id + tenant_id).
+    _apply_archive_walker_result(
+        tenant_id, captured_session_ids, request_type, dry_run,
+        rows_touched, manual_followups, exported_rows, walker_results,
+    )
+
     # Other surfaces: still scaffolded.
     for surface, reason in MFS_SCOPED_SURFACES.items():
         manual_followups.append(f"{surface}: {reason}")
@@ -1803,6 +2008,7 @@ def _walk_psid_surfaces(tenant_id, psid, session_ids, request_type, dry_run):
     rows_touched = {
         "recent-messages": 0,
         "session-events": 0,
+        "archive": 0,
     }
     manual_followups = []
     exported_rows = {}
@@ -1828,6 +2034,11 @@ def _walk_psid_surfaces(tenant_id, psid, session_ids, request_type, dry_run):
             "rows_touched": 0,
         }
         walker_results["session-events"] = {
+            "status": "completed",
+            "action": "no_sessions",
+            "rows_touched": 0,
+        }
+        walker_results["archive"] = {
             "status": "completed",
             "action": "no_sessions",
             "rows_touched": 0,
@@ -1947,7 +2158,96 @@ def _walk_psid_surfaces(tenant_id, psid, session_ids, request_type, dry_run):
             result["error"] = "rows_skipped_corrupted"
         walker_results["session-events"] = result
 
+    # archive: M2 Sprint C — list versions under sessions/{sessionId}/ for
+    # each Meta sessionId. Version-aware delete required (versioning ENABLED
+    # per archive-reachability-decision.md). session_ids same as upstream
+    # walkers; tenant-scoped via the channel-mappings GSI Query.
+    _apply_archive_walker_result(
+        tenant_id, session_ids, request_type, dry_run,
+        rows_touched, manual_followups, exported_rows, walker_results,
+    )
+
     return rows_touched, manual_followups, exported_rows, walker_results
+
+
+def _apply_archive_walker_result(
+    tenant_id, session_ids, request_type, dry_run,
+    rows_touched, manual_followups, exported_rows, walker_results,
+):
+    """Invoke _walk_archive_bucket and fold its output into the dispatcher's
+    accumulators. Extracted to a helper because both _walk_psid_surfaces
+    (M2 Sprint C path) and _walk_mfs_surfaces (M2 Sprint C path) share the
+    exact same archive walker invocation + result-handling shape.
+
+    Mutates rows_touched, manual_followups, exported_rows, walker_results
+    in place. No return value.
+
+    Surface key in walker_results: "archive".
+    """
+    arc = _walk_archive_bucket(tenant_id, session_ids, request_type, dry_run)
+    # Archive walker returns objects_found (distinct keys) + versions_found
+    # (total tuples). Use objects_found for rows_touched display — that's
+    # what the operator-facing audit row shows; versions_found is detail.
+    rows_touched["archive"] = arc["objects_found"]
+
+    if arc.get("error"):
+        manual_followups.append(
+            f"archive: list/walk failed ({arc['error']}); retry advised"
+        )
+        walker_results["archive"] = {
+            "status": "errored",
+            "error": arc["error"],
+            "rows_touched": arc["objects_found"],
+        }
+        return
+
+    if arc.get("action") == "no_sessions":
+        walker_results["archive"] = {
+            "status": "completed",
+            "action": "no_sessions",
+            "rows_touched": 0,
+        }
+        return
+
+    if arc.get("action") == "exported":
+        exported_rows["archive"] = arc["exported_keys"]
+        walker_results["archive"] = {
+            "status": "completed",
+            "action": "exported",
+            "rows_touched": arc["objects_found"],
+        }
+        return
+
+    if arc.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"archive: dry_run=true; {arc['objects_found']} object(s) / "
+            f"{arc['versions_found']} version(s) would be deleted; "
+            f"re-invoke with dry_run=false to delete"
+        )
+        walker_results["archive"] = {
+            "status": "completed",
+            "action": "dry_run_count",
+            "rows_touched": arc["objects_found"],
+        }
+        return
+
+    # action == "deleted"
+    result = {
+        "status": "completed",
+        "action": "deleted",
+        "rows_touched": arc["objects_found"],
+        "versions_deleted": arc.get("versions_deleted", 0),
+        "versions_delete_failed": arc.get("versions_delete_failed", 0),
+    }
+    if arc.get("versions_delete_failed", 0) > 0:
+        manual_followups.append(
+            f"archive: {arc['versions_delete_failed']} version(s) failed "
+            f"to delete — see CloudWatch logs for (key, version_id) "
+            f"values; manual `aws s3api delete-object` required."
+        )
+        result["status"] = "errored"
+        result["error"] = "versions_delete_failed"
+    walker_results["archive"] = result
 
 
 # ───────────────────────────────────────────────────────────────────────────

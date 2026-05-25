@@ -27,18 +27,41 @@ def dsar(monkeypatch):
     """Load lambda_function with mocked boto3 clients.
 
     Each test gets fresh mocks so per-test assertions don't leak across cases.
+
+    M2 Sprint C: distinct mock_s3 attached to mod.s3 so the ARCHIVE_BUCKET
+    walker's list_object_versions / delete_object calls are isolated from
+    the STS mock. Default mod.s3.list_object_versions returns no Versions
+    (zero-row archive) so dispatcher tests that don't care about archive
+    don't have to stub it explicitly.
     """
     mock_ddb_resource = MagicMock()
     mock_sts = MagicMock()
+    mock_s3 = MagicMock()
     mock_sts.get_caller_identity.return_value = {"Account": "525409062831"}
+    # Default: empty archive (no Versions, no DeleteMarkers, not truncated).
+    # Tests that exercise the archive walker override this on the per-test
+    # mock_s3 (via mod.s3.list_object_versions.return_value = ...).
+    mock_s3.list_object_versions.return_value = {
+        "Versions": [], "DeleteMarkers": [], "IsTruncated": False,
+    }
+
+    def _client_router(name, *args, **kwargs):
+        if name == "sts":
+            return mock_sts
+        if name == "s3":
+            return mock_s3
+        # Any other client name surfaces as an explicit AssertionError so a
+        # future code addition surfaces here instead of leaking real-AWS calls.
+        raise AssertionError(f"unexpected boto3.client({name!r})")
 
     with patch("boto3.resource", return_value=mock_ddb_resource), \
-         patch("boto3.client", return_value=mock_sts):
+         patch("boto3.client", side_effect=_client_router):
         if "lambda_function" in sys.modules:
             del sys.modules["lambda_function"]
         import lambda_function as mod
         mod.ddb = mock_ddb_resource
         mod.sts = mock_sts
+        mod.s3 = mock_s3
         yield mod, mock_ddb_resource, mock_sts
 
 
@@ -1505,24 +1528,30 @@ def _stub_psid_tables(mock_ddb, *, rm_items=None, se_items=None):
 
 
 def test_walk_psid_surfaces_no_sessions_surfaces_completed_no_data(dsar):
-    """No sessionIds resolved → both walkers report completed/no_sessions,
+    """No sessionIds resolved → all 3 walkers report completed/no_sessions,
     operator gets a follow-up explaining the 3 possible reasons."""
     mod, mock_ddb, _ = dsar
     rows_touched, followups, exported, results = mod._walk_psid_surfaces(
         tenant_id="TEN", psid="psid_abc", session_ids=[],
         request_type="access", dry_run=True,
     )
-    assert rows_touched == {"recent-messages": 0, "session-events": 0}
+    # M2 Sprint C added "archive" surface to the psid dispatcher.
+    assert rows_touched == {"recent-messages": 0, "session-events": 0, "archive": 0}
     assert exported == {}
     assert results["recent-messages"]["status"] == "completed"
     assert results["recent-messages"]["action"] == "no_sessions"
     assert results["session-events"]["status"] == "completed"
+    assert results["archive"]["status"] == "completed"
+    assert results["archive"]["action"] == "no_sessions"
     assert any("0 sessionIds resolved" in f for f in followups)
     # session-summaries explicitly NOT in walker_results (deferred per F-DSAR31)
     assert "session-summaries" not in results
 
 
 def test_walk_psid_surfaces_access_exports_both_surfaces(dsar):
+    """M2 Sprint C: archive walker also runs (empty by default in the fixture
+    mock; rows_touched["archive"]=0, action=exported, exported_keys=[]).
+    Recent-messages + session-events still export 1 row each."""
     mod, mock_ddb, _ = dsar
     rm_table, se_table = _stub_psid_tables(
         mock_ddb,
@@ -1535,13 +1564,18 @@ def test_walk_psid_surfaces_access_exports_both_surfaces(dsar):
         session_ids=["meta:p1:psid_abc"],
         request_type="access", dry_run=True,
     )
-    assert rows_touched == {"recent-messages": 1, "session-events": 1}
+    assert rows_touched == {"recent-messages": 1, "session-events": 1, "archive": 0}
     assert "recent-messages" in exported and "session-events" in exported
     assert results["recent-messages"]["action"] == "exported"
     assert results["session-events"]["action"] == "exported"
+    # Archive walker ran but found nothing (default empty mock_s3 in fixture).
+    assert results["archive"]["action"] == "exported"
+    assert exported["archive"] == []
 
 
 def test_walk_psid_surfaces_delete_dry_run_counts_both_surfaces(dsar):
+    """M2 Sprint C: archive walker reports dry_run_count alongside the
+    DDB walkers."""
     mod, mock_ddb, _ = dsar
     _stub_psid_tables(
         mock_ddb,
@@ -1554,11 +1588,180 @@ def test_walk_psid_surfaces_delete_dry_run_counts_both_surfaces(dsar):
         session_ids=["meta:p1:psid_abc"],
         request_type="delete", dry_run=True,
     )
-    assert rows_touched == {"recent-messages": 1, "session-events": 1}
+    assert rows_touched == {"recent-messages": 1, "session-events": 1, "archive": 0}
     assert results["recent-messages"]["action"] == "dry_run_count"
     assert results["session-events"]["action"] == "dry_run_count"
+    assert results["archive"]["action"] == "dry_run_count"
     assert any("recent-messages: dry_run=true" in f for f in followups)
     assert any("session-events: dry_run=true" in f for f in followups)
+    # Archive followup format: "archive: dry_run=true; N object(s) / V version(s)..."
+    assert any("archive: dry_run=true" in f for f in followups)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# M2 Sprint C — _walk_archive_bucket (version-aware S3 walker)
+# ───────────────────────────────────────────────────────────────────────────
+def _arc_resp(versions=None, delete_markers=None, is_truncated=False, next_key=None, next_version=None):
+    """Synthesize an s3.list_object_versions response."""
+    resp = {
+        "Versions": versions or [],
+        "DeleteMarkers": delete_markers or [],
+        "IsTruncated": is_truncated,
+    }
+    if next_key:
+        resp["NextKeyMarker"] = next_key
+    if next_version:
+        resp["NextVersionIdMarker"] = next_version
+    return resp
+
+
+def test_walk_archive_no_sessions_returns_no_sessions(dsar):
+    mod, _, _ = dsar
+    result = mod._walk_archive_bucket("TEN", [], "access", dry_run=True)
+    assert result == {"objects_found": 0, "versions_found": 0, "action": "no_sessions"}
+
+
+def test_walk_archive_requires_non_empty_tenant_id(dsar):
+    """Defense-in-depth: walker rejects empty tenant_id even though the
+    S3 walk has no tenant ARN scoping; upstream resolver must enforce."""
+    mod, _, _ = dsar
+    with pytest.raises(ValueError, match="defense-in-depth"):
+        mod._walk_archive_bucket("", ["sid1"], "access", dry_run=True)
+
+
+def test_walk_archive_access_exports_distinct_keys(dsar):
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.return_value = _arc_resp(versions=[
+        {"Key": "sessions/sid1/summary.json", "VersionId": "v1"},
+        {"Key": "sessions/sid1/summary.json", "VersionId": "v2"},  # same key, 2 versions
+        {"Key": "sessions/sid1/meta.json", "VersionId": "v1"},
+    ])
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "access", dry_run=True)
+    assert result["objects_found"] == 2  # distinct keys
+    assert result["versions_found"] == 3  # total version tuples
+    assert result["action"] == "exported"
+    assert result["exported_keys"] == sorted([
+        "sessions/sid1/summary.json", "sessions/sid1/meta.json",
+    ])
+    # Verify the Prefix was scoped to the sessionId
+    call_kwargs = mod.s3.list_object_versions.call_args.kwargs
+    assert call_kwargs["Prefix"] == "sessions/sid1/"
+    assert call_kwargs["Bucket"] == "picasso-archive-staging"
+
+
+def test_walk_archive_delete_dry_run_counts_objects_and_versions(dsar):
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.return_value = _arc_resp(versions=[
+        {"Key": "sessions/sid1/x.json", "VersionId": "v1"},
+        {"Key": "sessions/sid1/x.json", "VersionId": "v2"},
+    ])
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "delete", dry_run=True)
+    assert result["action"] == "dry_run_count"
+    assert result["objects_found"] == 1
+    assert result["versions_found"] == 2
+    mod.s3.delete_object.assert_not_called()
+
+
+def test_walk_archive_delete_real_deletes_per_version(dsar):
+    """Critical: per archive-reachability-decision.md, versioning is ENABLED
+    on picasso-archive-staging. A single delete_object (no VersionId) only
+    creates a delete-marker; prior versions persist. Walker MUST iterate
+    versions and delete each (key, version_id) tuple."""
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.return_value = _arc_resp(versions=[
+        {"Key": "sessions/sid1/x.json", "VersionId": "v1"},
+        {"Key": "sessions/sid1/x.json", "VersionId": "v2"},
+    ])
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "delete", dry_run=False)
+    assert result["action"] == "deleted"
+    assert result["versions_deleted"] == 2
+    assert result["versions_delete_failed"] == 0
+    assert mod.s3.delete_object.call_count == 2
+    # Verify each delete_object call carried VersionId
+    for call in mod.s3.delete_object.call_args_list:
+        assert "VersionId" in call.kwargs
+        assert call.kwargs["Bucket"] == "picasso-archive-staging"
+
+
+def test_walk_archive_delete_real_includes_delete_markers(dsar):
+    """Delete-markers themselves must be removed to fully erase the object
+    history (otherwise a marker persists in the version list even after
+    all real versions are gone)."""
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.return_value = _arc_resp(
+        versions=[{"Key": "sessions/sid1/x.json", "VersionId": "v1"}],
+        delete_markers=[{"Key": "sessions/sid1/x.json", "VersionId": "dm1"}],
+    )
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "delete", dry_run=False)
+    assert result["versions_found"] == 2  # 1 version + 1 delete-marker
+    assert result["versions_deleted"] == 2
+    assert mod.s3.delete_object.call_count == 2
+    # Delete-marker is NOT counted as an exported object — only real versions
+    # contribute to objects_found.
+    assert result["objects_found"] == 1
+
+
+def test_walk_archive_paginates_via_key_marker(dsar):
+    """list_object_versions pagination — IsTruncated=true with NextKeyMarker
+    + NextVersionIdMarker requires continuation."""
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.side_effect = [
+        _arc_resp(
+            versions=[{"Key": "sessions/sid1/a.json", "VersionId": "v1"}],
+            is_truncated=True,
+            next_key="sessions/sid1/a.json",
+            next_version="v1",
+        ),
+        _arc_resp(versions=[{"Key": "sessions/sid1/b.json", "VersionId": "v1"}]),
+    ]
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "access", dry_run=True)
+    assert result["objects_found"] == 2
+    assert mod.s3.list_object_versions.call_count == 2
+    # Second call carries KeyMarker + VersionIdMarker
+    second_call_kwargs = mod.s3.list_object_versions.call_args_list[1].kwargs
+    assert second_call_kwargs["KeyMarker"] == "sessions/sid1/a.json"
+    assert second_call_kwargs["VersionIdMarker"] == "v1"
+
+
+def test_walk_archive_continues_on_per_session_list_error(dsar):
+    """ClientError on list_object_versions for one sessionId → record failed
+    + continue to next sessionId (mirrors DDB walker continue-on-error)."""
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.side_effect = [
+        ClientError({"Error": {"Code": "InternalError"}}, "ListObjectVersions"),
+        _arc_resp(versions=[{"Key": "sessions/sid2/x.json", "VersionId": "v1"}]),
+    ]
+    result = mod._walk_archive_bucket("TEN", ["sid1", "sid2"], "access", dry_run=True)
+    assert result["objects_found"] == 1  # only sid2 succeeded
+    assert result["failed_session_ids"] == ["sid1"]
+
+
+def test_walk_archive_continues_on_per_version_delete_failure(dsar):
+    """ClientError on individual delete_object → increment versions_delete_failed
+    + continue to next (key, version_id) tuple. Returns errored status when
+    versions_delete_failed > 0."""
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.return_value = _arc_resp(versions=[
+        {"Key": "sessions/sid1/x.json", "VersionId": "v1"},
+        {"Key": "sessions/sid1/x.json", "VersionId": "v2"},
+    ])
+    mod.s3.delete_object.side_effect = [
+        ClientError({"Error": {"Code": "AccessDenied"}}, "DeleteObject"),
+        None,
+    ]
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "delete", dry_run=False)
+    assert result["versions_deleted"] == 1
+    assert result["versions_delete_failed"] == 1
+
+
+def test_walk_archive_truncates_session_ids_above_cap(dsar):
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.return_value = _arc_resp()
+    over_cap = [f"sid{i}" for i in range(mod.MAX_SESSION_IDS_PER_INVOCATION + 3)]
+    result = mod._walk_archive_bucket("TEN", over_cap, "access", dry_run=True)
+    assert result["truncated_session_id_count"] == 3
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2351,11 +2554,11 @@ def test_handler_happy_path_access_exports_form_submission_rows(dsar):
     assert len(resp["exported_rows"]["form-submissions"]) == 2
     # Audit rows: request_received + surface_walked:form-submissions +
     # surface_walked:notification-sends + surface_walked:notification-events
-    # + surface_walked:recent-messages + closed = 6. Deferred surfaces (2)
-    # still suppressed.
-    assert audit_table.put_item.call_count == 6
+    # + surface_walked:recent-messages + surface_walked:archive (M2 Sprint C)
+    # + closed = 7. Deferred surfaces (2) still suppressed.
+    assert audit_table.put_item.call_count == 7
     fs_table.delete_item.assert_not_called()  # access never deletes
-    assert len(resp["audit_row_pks"]) == 6
+    assert len(resp["audit_row_pks"]) == 7
 
 
 def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
@@ -2373,8 +2576,8 @@ def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
     assert any("dry_run=true" in f and "1 row(s) would be deleted" in f
                for f in resp["manual_followups"])
     fs_table.delete_item.assert_not_called()
-    # request_received + 4 surface_walked + closed
-    assert audit_table.put_item.call_count == 6
+    # request_received + 5 surface_walked (M2 Sprint C added archive) + closed = 7
+    assert audit_table.put_item.call_count == 7
 
 
 def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
@@ -2389,10 +2592,10 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
     assert "not found in pii-subject-index" in resp["manual_followups"][0]
     assert resp["exported_rows"] == {}
     # Audit rows: request_received + surface_walked for form-submissions +
-    # notification-sends + notification-events + recent-messages (all
-    # skipped_no_subject) + closed. Deferred surfaces (2) still suppressed
-    # → 6 total.
-    assert audit_table.put_item.call_count == 6
+    # notification-sends + notification-events + recent-messages + archive
+    # (all skipped_no_subject; M2 Sprint C added archive) + closed. Deferred
+    # surfaces (2) still suppressed → 7 total.
+    assert audit_table.put_item.call_count == 7
     event_types = [c.kwargs["Item"]["event_type"] for c in audit_table.put_item.call_args_list]
     assert event_types == [
         "request_received",
@@ -2400,9 +2603,10 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
         "surface_walked:notification-sends",
         "surface_walked:notification-events",
         "surface_walked:recent-messages",
+        "surface_walked:archive",
         "closed",
     ]
-    for i in (1, 2, 3, 4):
+    for i in (1, 2, 3, 4, 5):
         skipped_event = audit_table.put_item.call_args_list[i].kwargs["Item"]
         assert skipped_event["status"] == "skipped_no_subject"
     # No walker actually queried — all skipped
@@ -2462,6 +2666,7 @@ def test_handler_writes_surface_walked_audit_event_for_form_submissions(dsar):
         "surface_walked:notification-sends",
         "surface_walked:notification-events",
         "surface_walked:recent-messages",
+        "surface_walked:archive",
         "closed",
     ]
 
@@ -2482,6 +2687,7 @@ def test_handler_does_not_emit_surface_walked_for_deferred_surfaces(dsar):
         "surface_walked:notification-sends",
         "surface_walked:notification-events",
         "surface_walked:recent-messages",
+        "surface_walked:archive",  # M2 Sprint C
     }
     extraneous_surface_walked = [
         call.kwargs["Item"]["event_type"]
@@ -2595,19 +2801,21 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (6 audit attempts):
+    # PutItem sequence (7 audit attempts post-M2 Sprint C):
     #   1: request_received                    → succeed
     #   2: surface_walked:form-submissions     → CCFE (taints walker_results)
     #   3: surface_walked:notification-sends   → succeed
     #   4: surface_walked:notification-events  → succeed
     #   5: surface_walked:recent-messages      → succeed
-    #   6: closed                              → succeed
+    #   6: surface_walked:archive              → succeed (M2 Sprint C)
+    #   7: closed                              → succeed
     audit_table.put_item.side_effect = [
         None,
         ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException", "Message": "..."}},
             "PutItem",
         ),
+        None,
         None,
         None,
         None,
@@ -2643,7 +2851,8 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     # Close status reflects the audit-collision taint on the walker
     assert resp["status"] == "partial_error"
     # closed event was still written (recoverable failure path)
-    assert audit_table.put_item.call_count == 6
+    # Count: 1 request_received + 5 surface_walked (incl. archive) + 1 closed = 7
+    assert audit_table.put_item.call_count == 7
     close_item = audit_table.put_item.call_args_list[-1].kwargs["Item"]
     assert close_item["event_type"] == "closed"
     assert close_item["status"] == "partial_error"
@@ -2656,14 +2865,16 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (6 attempts):
+    # PutItem sequence (7 attempts post-M2 Sprint C):
     #   1: request_received                    → succeed
     #   2: surface_walked:form-submissions     → succeed
     #   3: surface_walked:notification-sends   → succeed
     #   4: surface_walked:notification-events  → succeed
     #   5: surface_walked:recent-messages      → succeed
-    #   6: closed                              → CCFE → return failed
+    #   6: surface_walked:archive              → succeed (M2 Sprint C)
+    #   7: closed                              → CCFE → return failed
     audit_table.put_item.side_effect = [
+        None,
         None,
         None,
         None,
@@ -2707,9 +2918,9 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     # needs visibility into what completed before the closed event failed.
     assert resp["pii_subject_id"] == "subj_opaque"
     assert resp["rows_touched"]["form-submissions"] == 1
-    # audit_row_pks lists the 5 successful events (no closed entry):
-    # request_received + 4 surface_walked
-    assert len(resp["audit_row_pks"]) == 5
+    # audit_row_pks lists the 6 successful events (no closed entry):
+    # request_received + 5 surface_walked (incl. archive M2 Sprint C)
+    assert len(resp["audit_row_pks"]) == 6
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3003,15 +3214,18 @@ def test_handler_psid_path_access_exports_recent_messages_and_session_events(dsa
     assert resp["pii_subject_id"] is None  # Meta-only subjects have no subject-index entry
     assert resp["rows_touched"]["recent-messages"] == 1
     assert resp["rows_touched"]["session-events"] == 1
+    assert resp["rows_touched"]["archive"] == 0  # M2 Sprint C — empty archive in fixture mock
     assert "recent-messages" in resp["exported_rows"]
     assert "session-events" in resp["exported_rows"]
-    # 4 audit events: request_received + 2 surface_walked + closed
-    assert audit_table.put_item.call_count == 4
+    # 5 audit events post-M2 Sprint C: request_received + 3 surface_walked
+    # (recent-messages + session-events + archive) + closed
+    assert audit_table.put_item.call_count == 5
     event_types = [c.kwargs["Item"]["event_type"] for c in audit_table.put_item.call_args_list]
     assert event_types == [
         "request_received",
         "surface_walked:recent-messages",
         "surface_walked:session-events",
+        "surface_walked:archive",
         "closed",
     ]
     # Sessions table was queried with the composed sessionId
