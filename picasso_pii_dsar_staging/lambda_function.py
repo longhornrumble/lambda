@@ -32,8 +32,13 @@ RESPONSE (JSON):
 STATUS SEMANTICS (audit fix-now #5):
     - "completed":     all walkers ran cleanly; no errors; no deferred surfaces
     - "partial":       walker(s) ran cleanly but at least one surface is still
-                       deferred (today: all DSARs return "partial" because 5
-                       of 6 surfaces are still deferred)
+                       deferred (today: email-path DSARs typically return
+                       "partial" because the 2 surfaces in DEFERRED_SURFACES —
+                       conversation-summaries (session-summaries; F-DSAR31)
+                       and audit-read-only — remain deferred. The 5 walked
+                       surfaces today: form-submissions, notification-sends,
+                       notification-events, recent-messages, archive. psid-path
+                       DSARs walk 3: recent-messages, session-events, archive)
     - "partial_error": at least one walker errored mid-batch (query failure,
                        corrupted-row skip, surface audit collision)
     - "failed":        env-guard / input validation / audit-write collision
@@ -61,15 +66,46 @@ WHAT THIS LAMBDA DOES TODAY:
       by notification-sends. Queries the ByMessageId GSI per message_id.
       If notification-sends produces no message_ids (today's common case),
       records `action=no_messages_to_walk` with rows_touched=0.
-    - Remaining surfaces (recent-messages, conversation-summaries, audit)
-      return manual_followup + walker_results status=deferred until each
-      surface's subject-linking attribute is verified against MFS writer code
+    - recent-messages walker — chained walk via `session_id`s captured by
+      form-submissions (email path) OR composed `meta:{pageId}:{psid}` session
+      ids (psid path). Queries `staging-recent-messages` per sessionId.
+      Per-message export projected to {role, content, messageTimestamp};
+      delete-real iterates DeleteItem per (sessionId, messageTimestamp).
+    - session-events walker (M2 Sprint B) — chained walk via the same
+      sessionId list as recent-messages. Queries
+      `picasso-session-events-staging` by `pk=SESSION#{sessionId}`. Access
+      exports full STEP rows; delete real deletes per (pk, sk).
+    - archive walker (M2 Sprint C) — version-aware S3 walk over
+      `picasso-archive-staging/sessions/{sessionId}/` prefix. Uses
+      `list_object_versions` + per-version `DeleteObject(VersionId)` +
+      delete-marker enumeration (versioning=ENABLED per
+      archive-reachability-decision.md; single-shot DeleteObject would
+      leave prior versions). Access returns object keys (not bodies —
+      operator pulls bodies with `aws s3 cp` under own SSO role).
+    - psid resolver (M2 Sprint B) — for `identifier_type=psid`, the
+      handler branches: tenant → list of pageIds via channel-mappings
+      `TenantIndex` GSI Query; composes `sessionId=meta:{pageId}:{psid}`
+      per page; routes through `_walk_psid_surfaces` dispatcher
+      (recent-messages + session-events + archive).
+    - Remaining surfaces (conversation-summaries / session-summaries,
+      audit-read-only) return manual_followup + walker_results
+      status=deferred. session-summaries needs `tenant_hash` discovery
+      (pk=TENANT#{tenant_hash}) — deferred per F-DSAR31 + Sprint B
+      descope; audit-read-only stays deferred per Art 17(3)(b) carve-out.
 
 WHAT IT DOES NOT YET DO (follow-up PRs):
-    - Per-surface walkers for the 5 remaining MFS surfaces (one PR per surface)
-    - picasso-audit-staging read for access-type DSARs (Art 17(3)(b) read-only)
-    - Meta channel-mappings PSID-keyed walk (milestone 2 / item 1b)
-    - S3 / ARCHIVE_BUCKET walks (milestone 2 / item 1b)
+    - session-summaries walker — F-DSAR31 (Sprint B descope; needs
+      tenant_hash discovery via either operator-passed field on event OR
+      tenant_id → tenant_hash lookup via tenant-registry; defer-with-
+      trigger recommended, calendar backstop 2026-08-22)
+    - picasso-audit-staging read for access-type DSARs (Art 17(3)(b)
+      carve-out, D5 G-C — counsel-pending; UpdateItem deliberately omitted)
+    - Per-tenant S3 fulfillment walker (M2 Sprint D pending; per-row
+      `fulfillment_path` ∪ tenant-config bucket per
+      `PII_DELETE_PIPELINE_DESIGN.md` Arm 3)
+    - phone / name+address identifier_types — walker-NOT-supported per
+      F-DSAR30 (Sprint A §3.3 decision); M3 playbook documents manual
+      fallback procedures (Sprint E adds the entries)
     - Pre-Phase-1 form-submission backfill walk (deferred per Apply-2)
 
 The Lambda is intentionally deployable and invocable now. Calls succeed end-to-end
@@ -134,25 +170,32 @@ MAX_SESSION_IDS_PER_INVOCATION = 200
 # MAX_EXPORTED_MESSAGES rows.
 MAX_EXPORTED_MESSAGES = 1000
 
-# Surfaces explicitly deferred from M1 (re-scoped 2026-05-23 per
-# phase-completion-audit row 5 / tech-lead B1). M1 outcome scope: form-
-# submissions + notification-sends + notification-events + recent-messages
-# walkers, plus subject resolution + audit-write + dispatcher. The two
-# entries below were originally listed in M1 outcome statement (master
-# plan §2) but never had walkers implemented; M1 v0.3 re-scopes them out
-# explicitly with named routing — see MASTER_PROJECT_PLAN.md M1 done-bar
-# revision history v0.3.
+# Surfaces still deferred after M2 Sprint B + Sprint C. Original M1 deferral
+# context: re-scoped 2026-05-23 per phase-completion-audit row 5 / tech-lead
+# B1; both surfaces were listed in M1 outcome statement (master plan §2)
+# but never had walkers implemented. Post-M2 Sprint B/C, the deferral
+# rationale for `conversation-summaries` (session-summaries surface) has
+# evolved — F-DSAR31 names tenant_hash discovery as the new prerequisite.
+# `audit-read-only` deferral rationale is unchanged (Art 17(3)(b) carve-out).
 DEFERRED_SURFACES = {
     "conversation-summaries": (
-        "Walker pending: sessionId-keyed (no subject linkage on row); "
-        "chained walk via form-submissions session_ids — pattern mirrors "
-        "recent-messages once verified against writer. M1 scope-excluded "
-        "(v0.3 2026-05-23); routed to a follow-on milestone."
+        "Walker pending: picasso-session-summaries-staging uses "
+        "pk=TENANT#{tenant_hash}, sk=SESSION#{sessionId} — requires "
+        "tenant_id → tenant_hash discovery before any Query can run. M2 "
+        "Sprint A §3.2 absorbed under M2; M2 Sprint B (lambda PR #157) "
+        "discovered the asymmetry vs session-events (sessionId-keyed) and "
+        "descoped to F-DSAR31. Three resolution options: (a) operator-passed "
+        "tenant_hash field on DSAR event (contract change), (b) tenant_id → "
+        "tenant_hash lookup via tenant-registry (new code path), (c) defer-"
+        "with-trigger until first DSAR shows recent-messages walker missed "
+        "Meta session-summary content (recommended at current product scale). "
+        "Calendar backstop: 2026-08-22 (D2/D3/D4 currency review pair)."
     ),
     "audit-read-only": (
         "Walker pending: picasso-audit-staging is read-only per Art 17(3)(b) "
-        "carve-out (D5 G-C). Access-type DSAR exports rows; never delete. "
-        "M1 scope-excluded (v0.3 2026-05-23); routed to a follow-on milestone."
+        "carve-out (D5 G-C; counsel-pending). Access-type DSAR exports rows; "
+        "never delete. M1 scope-excluded (v0.3 2026-05-23) and remains "
+        "deferred under the carve-out until counsel determination changes."
     ),
 }
 
