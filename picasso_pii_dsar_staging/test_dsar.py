@@ -1823,6 +1823,168 @@ def test_walk_archive_truncates_session_ids_above_cap(dsar):
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# M2 Sprint D — _walk_fulfillment_s3 (per-tenant S3 fulfillment walker)
+# ───────────────────────────────────────────────────────────────────────────
+def _fs_row(submission_id, fulfillment_path=None, **extra):
+    """Synthesize a form-submission row with optional fulfillment_path."""
+    row = {
+        "tenant_id": "TEN",
+        "submission_id": submission_id,
+        "pii_subject_id": "subj_xyz",
+    }
+    if fulfillment_path is not None:
+        row["fulfillment_path"] = fulfillment_path
+    row.update(extra)
+    return row
+
+
+def test_walk_fulfillment_requires_non_empty_tenant_id(dsar):
+    """Defense-in-depth: walker rejects empty tenant_id (mirrors
+    _walk_archive_bucket pattern + per-row cross-tenant validation)."""
+    mod, _, _ = dsar
+    with pytest.raises(ValueError, match="defense-in-depth"):
+        mod._walk_fulfillment_s3("", [_fs_row("s1")], "access", dry_run=True)
+
+
+def test_walk_fulfillment_no_rows_returns_no_paths(dsar):
+    mod, _, _ = dsar
+    result = mod._walk_fulfillment_s3("TEN", [], "access", dry_run=True)
+    assert result["action"] == "no_fulfillment_paths"
+    assert result["objects_found"] == 0
+    assert result["rows_with_path"] == 0
+    assert result["rows_without_path"] == 0
+
+
+def test_walk_fulfillment_rows_without_path_surface_as_pending_writer(dsar):
+    """Pre-writer-extension form-submission rows have no `fulfillment_path`
+    attribute. Walker must tolerate the absence (schema discipline) and
+    surface the count for the dispatcher's manual_followup."""
+    mod, _, _ = dsar
+    rows = [_fs_row("s1"), _fs_row("s2"), _fs_row("s3")]
+    result = mod._walk_fulfillment_s3("TEN", rows, "access", dry_run=True)
+    assert result["action"] == "no_fulfillment_paths"
+    assert result["rows_without_path"] == 3
+    assert result["rows_with_path"] == 0
+    mod.s3.delete_object.assert_not_called()
+
+
+def test_walk_fulfillment_access_exports_uris(dsar):
+    mod, _, _ = dsar
+    rows = [
+        _fs_row("s1", fulfillment_path="s3://tenant-bucket/submissions/TEN/contact/s1.json"),
+        _fs_row("s2"),  # no path — pre-extension row
+        _fs_row("s3", fulfillment_path="s3://tenant-bucket/submissions/TEN/contact/s3.json"),
+    ]
+    result = mod._walk_fulfillment_s3("TEN", rows, "access", dry_run=True)
+    assert result["action"] == "exported"
+    assert result["objects_found"] == 2
+    assert sorted(result["exported_keys"]) == sorted([
+        "s3://tenant-bucket/submissions/TEN/contact/s1.json",
+        "s3://tenant-bucket/submissions/TEN/contact/s3.json",
+    ])
+    assert result["rows_with_path"] == 2
+    assert result["rows_without_path"] == 1
+    mod.s3.delete_object.assert_not_called()
+
+
+def test_walk_fulfillment_delete_dry_run_counts_objects(dsar):
+    mod, _, _ = dsar
+    rows = [_fs_row("s1", fulfillment_path="s3://tenant-bucket/submissions/TEN/f/s1.json")]
+    result = mod._walk_fulfillment_s3("TEN", rows, "delete", dry_run=True)
+    assert result["action"] == "dry_run_count"
+    assert result["objects_found"] == 1
+    mod.s3.delete_object.assert_not_called()
+
+
+def test_walk_fulfillment_delete_real_calls_delete_object_per_path(dsar):
+    mod, _, _ = dsar
+    rows = [
+        _fs_row("s1", fulfillment_path="s3://tenant-bucket/submissions/TEN/contact/s1.json"),
+        _fs_row("s2", fulfillment_path="s3://tenant-bucket/submissions/TEN/contact/s2.json"),
+    ]
+    result = mod._walk_fulfillment_s3("TEN", rows, "delete", dry_run=False)
+    assert result["action"] == "deleted"
+    assert result["objects_deleted"] == 2
+    assert result["objects_delete_failed"] == 0
+    assert mod.s3.delete_object.call_count == 2
+    # Verify each delete_object got the right (Bucket, Key)
+    call_kwargs = [c.kwargs for c in mod.s3.delete_object.call_args_list]
+    assert {c["Bucket"] for c in call_kwargs} == {"tenant-bucket"}
+    assert sorted(c["Key"] for c in call_kwargs) == [
+        "submissions/TEN/contact/s1.json",
+        "submissions/TEN/contact/s2.json",
+    ]
+
+
+def test_walk_fulfillment_continues_on_delete_failure(dsar):
+    """Per-design: DeleteObject failure → hard partial-failure (counted in
+    objects_delete_failed; status="errored" upstream); never reported
+    complete. AccessDenied is the dominant cause (missing IAM grant per
+    (bucket, tenant_id) — design intent: fail-closed)."""
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    rows = [
+        _fs_row("s1", fulfillment_path="s3://unknown-bucket/submissions/TEN/contact/s1.json"),
+        _fs_row("s2", fulfillment_path="s3://known-bucket/submissions/TEN/contact/s2.json"),
+    ]
+    mod.s3.delete_object.side_effect = [
+        ClientError({"Error": {"Code": "AccessDenied"}}, "DeleteObject"),
+        None,
+    ]
+    result = mod._walk_fulfillment_s3("TEN", rows, "delete", dry_run=False)
+    assert result["objects_deleted"] == 1
+    assert result["objects_delete_failed"] == 1
+
+
+def test_walk_fulfillment_rejects_cross_tenant_path(dsar):
+    """Per-row defense: `fulfillment_path` must point INTO the requested
+    tenant's prefix (`submissions/{tenant_id}/...`). Any mismatch =
+    suspected cross-tenant pointer (writer drift OR stale row) =
+    hard-skip + log; never delete."""
+    mod, _, _ = dsar
+    rows = [
+        _fs_row("s1", fulfillment_path="s3://bucket/submissions/OTHER_TEN/contact/s1.json"),
+        _fs_row("s2", fulfillment_path="s3://bucket/submissions/TEN/contact/s2.json"),
+    ]
+    result = mod._walk_fulfillment_s3("TEN", rows, "delete", dry_run=False)
+    assert result.get("skipped_cross_tenant") == 1
+    assert result["objects_deleted"] == 1  # only s2 deleted
+    assert mod.s3.delete_object.call_count == 1
+    call = mod.s3.delete_object.call_args_list[0]
+    assert call.kwargs["Key"] == "submissions/TEN/contact/s2.json"
+
+
+def test_walk_fulfillment_rejects_malformed_path(dsar):
+    """Per-row defense: invalid URI (not s3://, missing key) = parse-failure
+    counted in failed_paths; row's object not located but other rows
+    proceed."""
+    mod, _, _ = dsar
+    rows = [
+        _fs_row("s1", fulfillment_path="http://wrong-scheme/foo"),
+        _fs_row("s2", fulfillment_path="s3://"),                    # no bucket+key
+        _fs_row("s3", fulfillment_path="s3://no-slash-after-bucket"),  # no key
+        _fs_row("s4", fulfillment_path=12345),                       # non-string
+        _fs_row("s5", fulfillment_path="s3://bucket/submissions/TEN/f/s5.json"),
+    ]
+    result = mod._walk_fulfillment_s3("TEN", rows, "access", dry_run=True)
+    assert result["objects_found"] == 1  # only s5 passed validation
+    assert result.get("failed_paths") == 4
+    assert result["exported_keys"] == ["s3://bucket/submissions/TEN/f/s5.json"]
+
+
+def test_walk_fulfillment_no_versioning_enumeration(dsar):
+    """Per-design: fulfillment buckets are NOT versioning-aware (writer
+    does single put_object). Unlike _walk_archive_bucket, a plain
+    delete_object is sufficient — walker MUST NOT call
+    list_object_versions on fulfillment paths (different bucket posture
+    than picasso-archive-staging)."""
+    mod, _, _ = dsar
+    rows = [_fs_row("s1", fulfillment_path="s3://bucket/submissions/TEN/f/s1.json")]
+    mod._walk_fulfillment_s3("TEN", rows, "delete", dry_run=False)
+    mod.s3.list_object_versions.assert_not_called()
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # form-submissions walker — session_ids surfacing for chained walks
 # ───────────────────────────────────────────────────────────────────────────
 def test_fs_walker_surfaces_session_ids_in_result(dsar):
@@ -2644,13 +2806,13 @@ def test_handler_happy_path_access_exports_form_submission_rows(dsar):
     assert resp["rows_touched"]["form-submissions"] == 2
     assert "form-submissions" in resp["exported_rows"]
     assert len(resp["exported_rows"]["form-submissions"]) == 2
-    # Audit rows: request_received + surface_walked:form-submissions +
-    # surface_walked:notification-sends + surface_walked:notification-events
-    # + surface_walked:recent-messages + surface_walked:archive (M2 Sprint C)
-    # + closed = 7. Deferred surfaces (2) still suppressed.
-    assert audit_table.put_item.call_count == 8
+    # Audit rows: request_received + 7 surface_walked
+    # (form-submissions, notification-sends, notification-events,
+    # recent-messages, session-events, archive [M2 Sprint C],
+    # fulfillment [M2 Sprint D]) + closed = 9. Deferred surfaces (2) suppressed.
+    assert audit_table.put_item.call_count == 9
     fs_table.delete_item.assert_not_called()  # access never deletes
-    assert len(resp["audit_row_pks"]) == 8
+    assert len(resp["audit_row_pks"]) == 9
 
 
 def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
@@ -2668,8 +2830,8 @@ def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
     assert any("dry_run=true" in f and "1 row(s) would be deleted" in f
                for f in resp["manual_followups"])
     fs_table.delete_item.assert_not_called()
-    # request_received + 5 surface_walked (M2 Sprint C added archive) + closed = 7
-    assert audit_table.put_item.call_count == 8
+    # request_received + 7 surface_walked (M2 Sprint D added fulfillment) + closed = 9
+    assert audit_table.put_item.call_count == 9
 
 
 def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
@@ -2683,11 +2845,10 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
     assert resp["pii_subject_id"] is None
     assert "not found in pii-subject-index" in resp["manual_followups"][0]
     assert resp["exported_rows"] == {}
-    # Audit rows: request_received + surface_walked for form-submissions +
-    # notification-sends + notification-events + recent-messages + archive
-    # (all skipped_no_subject; M2 Sprint C added archive) + closed. Deferred
-    # surfaces (2) still suppressed → 7 total.
-    assert audit_table.put_item.call_count == 8
+    # Audit rows: request_received + 7 surface_walked (all skipped_no_subject;
+    # M2 Sprint D added fulfillment) + closed. Deferred surfaces (2) still
+    # suppressed → 9 total.
+    assert audit_table.put_item.call_count == 9
     event_types = [c.kwargs["Item"]["event_type"] for c in audit_table.put_item.call_args_list]
     assert event_types == [
         "request_received",
@@ -2698,9 +2859,12 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
         # Audit fix #1: session-events now walked on email path too.
         "surface_walked:session-events",
         "surface_walked:archive",
+        # M2 Sprint D: per-tenant S3 fulfillment walker chained off form-
+        # submissions matched rows (email path only).
+        "surface_walked:fulfillment",
         "closed",
     ]
-    for i in (1, 2, 3, 4, 5, 6):
+    for i in (1, 2, 3, 4, 5, 6, 7):
         skipped_event = audit_table.put_item.call_args_list[i].kwargs["Item"]
         assert skipped_event["status"] == "skipped_no_subject"
     # No walker actually queried — all skipped
@@ -2763,6 +2927,9 @@ def test_handler_writes_surface_walked_audit_event_for_form_submissions(dsar):
         # Audit fix #1: session-events now walked on email path too.
         "surface_walked:session-events",
         "surface_walked:archive",
+        # M2 Sprint D: per-tenant S3 fulfillment walker chained off form-
+        # submissions matched rows (email path only).
+        "surface_walked:fulfillment",
         "closed",
     ]
 
@@ -2785,6 +2952,7 @@ def test_handler_does_not_emit_surface_walked_for_deferred_surfaces(dsar):
         "surface_walked:recent-messages",
         "surface_walked:session-events",  # audit fix #1
         "surface_walked:archive",  # M2 Sprint C
+        "surface_walked:fulfillment",  # M2 Sprint D
     }
     extraneous_surface_walked = [
         call.kwargs["Item"]["event_type"]
@@ -2900,7 +3068,7 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (8 audit attempts post audit fix #1 — session-events):
+    # PutItem sequence (9 audit attempts post M2 Sprint D — fulfillment):
     #   1: request_received                    → succeed
     #   2: surface_walked:form-submissions     → CCFE (taints walker_results)
     #   3: surface_walked:notification-sends   → succeed
@@ -2908,13 +3076,15 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     #   5: surface_walked:recent-messages      → succeed
     #   6: surface_walked:session-events       → succeed (audit fix #1)
     #   7: surface_walked:archive              → succeed (M2 Sprint C)
-    #   8: closed                              → succeed
+    #   8: surface_walked:fulfillment          → succeed (M2 Sprint D)
+    #   9: closed                              → succeed
     audit_table.put_item.side_effect = [
         None,
         ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException", "Message": "..."}},
             "PutItem",
         ),
+        None,
         None,
         None,
         None,
@@ -2955,8 +3125,9 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     # Close status reflects the audit-collision taint on the walker
     assert resp["status"] == "partial_error"
     # closed event was still written (recoverable failure path)
-    # Count: 1 request_received + 5 surface_walked (incl. archive) + 1 closed = 7
-    assert audit_table.put_item.call_count == 8
+    # Count: 1 request_received + 7 surface_walked (incl. archive M2 Sprint C
+    # + fulfillment M2 Sprint D) + 1 closed = 9
+    assert audit_table.put_item.call_count == 9
     close_item = audit_table.put_item.call_args_list[-1].kwargs["Item"]
     assert close_item["event_type"] == "closed"
     assert close_item["status"] == "partial_error"
@@ -2969,7 +3140,7 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (8 attempts post audit fix #1 — session-events):
+    # PutItem sequence (9 attempts post M2 Sprint D — fulfillment):
     #   1: request_received                    → succeed
     #   2: surface_walked:form-submissions     → succeed
     #   3: surface_walked:notification-sends   → succeed
@@ -2977,8 +3148,10 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     #   5: surface_walked:recent-messages      → succeed
     #   6: surface_walked:session-events       → succeed (audit fix #1)
     #   7: surface_walked:archive              → succeed (M2 Sprint C)
-    #   8: closed                              → CCFE → return failed
+    #   8: surface_walked:fulfillment          → succeed (M2 Sprint D)
+    #   9: closed                              → CCFE → return failed
     audit_table.put_item.side_effect = [
+        None,
         None,
         None,
         None,
@@ -3027,9 +3200,10 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     # needs visibility into what completed before the closed event failed.
     assert resp["pii_subject_id"] == "subj_opaque"
     assert resp["rows_touched"]["form-submissions"] == 1
-    # audit_row_pks lists the 6 successful events (no closed entry):
-    # request_received + 5 surface_walked (incl. archive M2 Sprint C)
-    assert len(resp["audit_row_pks"]) == 7
+    # audit_row_pks lists the 8 successful events (no closed entry):
+    # request_received + 7 surface_walked (incl. archive M2 Sprint C
+    # + fulfillment M2 Sprint D)
+    assert len(resp["audit_row_pks"]) == 8
 
 
 # ───────────────────────────────────────────────────────────────────────────
