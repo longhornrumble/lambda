@@ -456,6 +456,64 @@ def test_write_audit_event_uses_correct_table_and_shape(dsar):
     assert "attribute_not_exists(event_timestamp)" in kwargs["ConditionExpression"]
 
 
+def test_write_audit_event_stamps_is_smoke_test_when_marker_true(dsar):
+    """Closeout-audit row #15: is_smoke_test=True propagates to a top-level
+    attribute on the audit row so operator scans can FilterExpression them
+    out without depending on the dsar_id prefix (which is a UX convention).
+    """
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_ddb.Table.return_value = mock_table
+    mod._write_audit_event(
+        dsar_id="smoke-test-2026-05-26-deploy-verify",
+        event_type="request_received",
+        status="in_progress",
+        payload={"operator": "op@x"},
+        is_smoke_test=True,
+    )
+    item = mock_table.put_item.call_args.kwargs["Item"]
+    assert item["is_smoke_test"] is True
+
+
+def test_write_audit_event_omits_is_smoke_test_when_marker_false(dsar):
+    """Forward-compatible: default is_smoke_test=False means NO attribute is
+    written (readers MUST use .get() per CLAUDE.md schema discipline).
+    Pre-fix audit rows have no is_smoke_test attribute; new rows for real
+    DSARs (marker omitted/False) match the same shape.
+    """
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_ddb.Table.return_value = mock_table
+    mod._write_audit_event(
+        dsar_id="real-dsar-001",
+        event_type="request_received",
+        status="in_progress",
+        payload={"operator": "op@x"},
+        # is_smoke_test omitted -> default False
+    )
+    item = mock_table.put_item.call_args.kwargs["Item"]
+    assert "is_smoke_test" not in item
+
+
+def test_validate_propagates_smoke_test_marker_to_normalized_inputs(dsar):
+    """Closeout-audit row #15: _validate's return dict carries
+    smoke_test_marker so downstream _write_audit_event calls in the handler
+    can stamp the audit-row attribute. Without this, the handler can only
+    pass False (the prior behavior) and synthetic rows remain unmarked.
+    """
+    mod, _, _ = dsar
+    event = _valid_event()
+    event["dsar_id"] = "smoke-handler-prop-001"
+    event["smoke_test_marker"] = True
+    normalized = mod._validate(event)
+    assert normalized["smoke_test_marker"] is True
+
+    # And for real DSARs (no marker): defaults to False
+    event2 = _valid_event()
+    normalized2 = mod._validate(event2)
+    assert normalized2["smoke_test_marker"] is False
+
+
 def test_write_audit_event_raises_audit_collision_on_conditional_check_failure(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
