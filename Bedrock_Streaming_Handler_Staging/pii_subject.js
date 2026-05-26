@@ -248,12 +248,20 @@ function _emitEmfMetric(metricName, tenantId) {
     // Logs Insights filters can include/exclude EMF lines precisely:
     //   filter source != 'pii_subject_emf'  → non-EMF analysis
     //   filter source =  'pii_subject_emf'  → EMF only
+    // Closeout-audit row #9 / F-DSAR33: emit BOTH a per-TenantId series
+    // (for dashboards) AND a no-dimension series (for alarming). AWS
+    // CloudWatch Metric Alarms do not support SEARCH expressions — the
+    // prior approach (SEARCH across TenantId streams via metric_query)
+    // failed apply with `SEARCH is not supported on Metric Alarms`.
+    // Dimensions: [['TenantId'], []] tells the EMF agent to publish the
+    // metric TWICE — once with the TenantId dimension (cross-tenant
+    // dashboarding) and once without (single-series alarm path).
     console.log(JSON.stringify({
       _aws: {
         Timestamp: Date.now(),
         CloudWatchMetrics: [{
           Namespace: 'PII/SubjectIndex',
-          Dimensions: [['TenantId']],
+          Dimensions: [['TenantId'], []],
           Metrics: [{ Name: metricName, Unit: 'Count' }],
         }],
       },

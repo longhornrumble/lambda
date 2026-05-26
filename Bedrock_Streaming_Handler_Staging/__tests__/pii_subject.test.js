@@ -317,6 +317,13 @@ describe('getOrCreatePiiSubjectId — EMF metric emission (audit-of-audit F2)', 
     expect(parsed._aws.CloudWatchMetrics[0].Metrics[0].Name).toBe('IndexRaceUnresolved');
     expect(parsed._aws.CloudWatchMetrics[0].Metrics[0].Unit).toBe('Count');
     expect(parsed._aws.CloudWatchMetrics[0].Dimensions[0]).toEqual(['TenantId']);
+    // Closeout-audit row #9 / F-DSAR33: second dimensions slot is empty
+    // array → metric also emitted with NO dimension. Aggregate series
+    // (Namespace=PII/SubjectIndex, MetricName=IndexRaceUnresolved, no
+    // dimensions) is what the alarm targets. AWS rejects SEARCH in
+    // alarms, so this dual-emit is the alarming path.
+    expect(parsed._aws.CloudWatchMetrics[0].Dimensions[1]).toEqual([]);
+    expect(parsed._aws.CloudWatchMetrics[0].Dimensions.length).toBe(2);
     expect(parsed.TenantId).toBe('TEN');
     expect(parsed.IndexRaceUnresolved).toBe(1);
   });
@@ -334,6 +341,9 @@ describe('getOrCreatePiiSubjectId — EMF metric emission (audit-of-audit F2)', 
     expect(unavailLines.length).toBeGreaterThanOrEqual(1);
     const parsed = JSON.parse(unavailLines[0]);
     expect(parsed._aws.CloudWatchMetrics[0].Metrics[0].Name).toBe('IndexUnavailable');
+    // Closeout-audit row #9 / F-DSAR33: dual-emit dimensions contract
+    // applies to all PII/SubjectIndex metrics (not only IndexRaceUnresolved).
+    expect(parsed._aws.CloudWatchMetrics[0].Dimensions).toEqual([['TenantId'], []]);
     expect(parsed.IndexUnavailable).toBe(1);
   });
 });
