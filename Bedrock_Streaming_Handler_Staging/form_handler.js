@@ -306,6 +306,11 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     // Route to appropriate fulfillment channel
     const fulfillmentResult = await routeFulfillment(formId, formData, config, submissionId, priority, sessionId, conversationId);
 
+    // Sprint D writer extension: persist S3 fulfillment URI onto the row so
+    // the PII DSAR walker can delete the per-tenant S3 object on subject
+    // deletion. Best-effort, non-fatal.
+    await persistFulfillmentPath(submissionId, config.tenant_id || 'unknown', fulfillmentResult);
+
     // Applicant confirmation: per-form config takes precedence over tenant-level legacy flag.
     // - New config (notifications.applicant_confirmation): requires enabled === true (strict boolean)
     // - Legacy (config.send_confirmation_email): defaults to true if absent
@@ -619,6 +624,58 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
       + `error_message=${error?.message || String(error)}`
     );
     // Don't fail the submission if DynamoDB fails (UX preservation).
+  }
+}
+
+/**
+ * Sprint D writer extension. If the fulfillment results array contains an
+ * S3 entry with status='stored' + a string `location`, persist that s3://
+ * URI to the form-submission row as `fulfillment_path`. The PII DSAR
+ * fulfillment walker (picasso_pii_dsar_staging::_walk_fulfillment_s3)
+ * reads it per-row to delete the per-tenant S3 object on subject deletion.
+ * Walker is forward-compatible — rows without this attribute surface as
+ * walker manual followup.
+ *
+ * Best-effort + non-fatal: a failed UpdateItem reverts to the walker's
+ * manual-followup branch.
+ *
+ * Mirrors Master_Function_Staging/form_handler.py::_persist_fulfillment_path.
+ */
+async function persistFulfillmentPath(submissionId, tenantId, fulfillmentResults) {
+  if (!FORM_SUBMISSIONS_TABLE) {
+    return;
+  }
+  if (!Array.isArray(fulfillmentResults)) {
+    return;
+  }
+  const s3Hit = fulfillmentResults.find(r =>
+    r
+    && r.channel === 's3'
+    && r.status === 'stored'
+    && typeof r.location === 'string'
+    && r.location.length > 0
+  );
+  if (!s3Hit) {
+    return;
+  }
+  try {
+    await dynamodb.send(new UpdateCommand({
+      TableName: FORM_SUBMISSIONS_TABLE,
+      Key: {
+        tenant_id: tenantId,
+        submission_id: submissionId,
+      },
+      UpdateExpression: 'SET fulfillment_path = :fp',
+      ExpressionAttributeValues: { ':fp': s3Hit.location },
+    }));
+  } catch (err) {
+    console.warn(
+      `⚠️ fulfillment_path persistence failed: tenant_id=${tenantId} `
+      + `submission_id=${submissionId} `
+      + `error_name=${err?.name || 'unknown'} `
+      + `error_message=${err?.message || String(err)} `
+      + `(non-fatal; DSAR walker will surface manual followup)`
+    );
   }
 }
 

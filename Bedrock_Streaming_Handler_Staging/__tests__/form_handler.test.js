@@ -673,6 +673,86 @@ describe('Form Handler - Phase 2: Advanced Fulfillment Routing', () => {
     });
   });
 
+  // --- Sprint D writer extension: persistFulfillmentPath ---
+  // The PII DSAR fulfillment walker (picasso_pii_dsar_staging) reads
+  // `fulfillment_path` per-row to delete the per-tenant S3 object on subject
+  // deletion. These tests prove the writer half of that contract.
+
+  it('Sprint D: should write fulfillment_path UpdateCommand after S3 fulfillment stores', async () => {
+    s3Mock.on(PutObjectCommand).resolves({});
+    dynamoMock.on(UpdateCommand).resolves({});
+
+    const result = await submitForm('newsletter', mockFormData, mockTenantConfig);
+
+    // S3 PUT happened
+    expect(s3Mock.commandCalls(PutObjectCommand)).toHaveLength(1);
+
+    // Exactly one UpdateCommand fired with the fulfillment_path attribute
+    const updateCalls = dynamoMock.commandCalls(UpdateCommand);
+    expect(updateCalls).toHaveLength(1);
+
+    const updateInput = updateCalls[0].args[0].input;
+    expect(typeof updateInput.TableName).toBe('string');
+    expect(updateInput.TableName.length).toBeGreaterThan(0);
+    expect(updateInput.Key).toMatchObject({
+      tenant_id: 'TEST123',
+    });
+    expect(updateInput.Key.submission_id).toMatch(/^newsletter_\d+$/);
+    expect(updateInput.UpdateExpression).toBe('SET fulfillment_path = :fp');
+    expect(updateInput.ExpressionAttributeValues[':fp']).toMatch(
+      /^s3:\/\/test-forms-bucket\/submissions\/TEST123\/newsletter\/newsletter_\d+\.json$/
+    );
+
+    // Form submit still succeeds
+    expect(result.status).toBe('success');
+    expect(result.fulfillment).toContainEqual(
+      expect.objectContaining({ channel: 's3', status: 'stored' })
+    );
+  });
+
+  it('Sprint D: should NOT write fulfillment_path UpdateCommand when fulfillment is not S3', async () => {
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+    dynamoMock.on(UpdateCommand).resolves({});
+
+    await submitForm('request_support', mockFormData, mockTenantConfig);
+
+    // Lambda fulfillment ran but NO UpdateCommand should fire (only PutCommand
+    // from saveFormSubmission).
+    expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(0);
+  });
+
+  it('Sprint D: should NOT write fulfillment_path UpdateCommand when S3 PUT fails', async () => {
+    s3Mock.on(PutObjectCommand).rejects(new Error('AccessDenied'));
+    dynamoMock.on(UpdateCommand).resolves({});
+
+    const result = await submitForm('newsletter', mockFormData, mockTenantConfig);
+
+    // S3 PUT was attempted
+    expect(s3Mock.commandCalls(PutObjectCommand)).toHaveLength(1);
+
+    // But fulfillment_path persistence MUST be skipped (status !== 'stored')
+    expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(0);
+
+    // Form submit still returns success per UX-preservation policy
+    expect(result.status).toBe('success');
+    expect(result.fulfillment).toContainEqual(
+      expect.objectContaining({ channel: 's3', status: 'failed' })
+    );
+  });
+
+  it('Sprint D: should swallow fulfillment_path UpdateCommand errors (form succeeds)', async () => {
+    s3Mock.on(PutObjectCommand).resolves({});
+    dynamoMock.on(UpdateCommand).rejects(new Error('UpdateItem AccessDenied'));
+
+    const result = await submitForm('newsletter', mockFormData, mockTenantConfig);
+
+    // UpdateCommand was attempted
+    expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(1);
+
+    // Form submit still returns success (walker manual-followup is the fallback)
+    expect(result.status).toBe('success');
+  });
+
   // NOTE: Priority indicator is no longer embedded in the internal-notification
   // email HTML template. The current sendFormEmail() default-path template has
   // no "Priority: HIGH" marker anywhere, so this assertion is unreachable.
