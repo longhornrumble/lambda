@@ -1,0 +1,19 @@
+# picasso-pii-dsar-staging Lambda dependencies
+#
+# Closeout-audit row #6 (2026-05-26 phase-completion-audit, code-reviewer):
+# the deploy zip contains ONLY lambda_function.py — no pip-installed deps.
+# This file is the explicit, machine-readable declaration that the Lambda
+# runs on stdlib + boto3/botocore (provided by the managed Python 3.x
+# runtime). Adding a third-party import without first updating this file
+# AND the deploy build step (zip -j lambda_function.py) WILL produce a
+# silent runtime ImportError on next invocation.
+#
+# DO NOT add packages here without also updating the deploy procedure in
+# CLAUDE.md "Lambda Functions" section. Pinning policy: if a third-party
+# dep is added, pin to exact version + checksum (`pip install -t .` +
+# include the resulting site-packages in the deploy zip).
+#
+# Stdlib used: hashlib, json, logging, os, re, datetime, uuid, typing.
+# Runtime-provided: boto3, botocore (per AWS Lambda Python 3.11 runtime).
+
+# (intentionally empty — runtime-only)

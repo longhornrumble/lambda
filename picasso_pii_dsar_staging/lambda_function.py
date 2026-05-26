@@ -399,6 +399,13 @@ def _validate(event):
         "operator": event["operator"],
         "dsar_id": dsar_id,
         "dry_run": bool(event.get("dry_run", True)),
+        # Closeout-audit row #15: propagate the validated marker so the
+        # audit writer can stamp a top-level `is_smoke_test` attribute on
+        # every row this invocation writes. Operator scans can then
+        # FilterExpression `is_smoke_test = :false` to exclude synthetic
+        # rows without relying on `begins_with(dsar_id, 'smoke-')` (the
+        # prefix is a UX convention, not a hard contract).
+        "smoke_test_marker": smoke_marker,
     }
 
 
@@ -526,7 +533,7 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
-def _write_audit_event(dsar_id, event_type, status, payload):
+def _write_audit_event(dsar_id, event_type, status, payload, is_smoke_test=False):
     """PutItem append-only event row. PK=dsar_id, SK=event_timestamp.
 
     `payload` is serialized to JSON in the `details` attribute. `status` is
@@ -537,6 +544,13 @@ def _write_audit_event(dsar_id, event_type, status, payload):
     (dsar_id, event_timestamp) row. Collision raises AuditCollision so the
     handler can surface the replay condition to the operator instead of
     silently mutating prior audit state. See class docstring for rationale.
+
+    is_smoke_test (closeout-audit row #15): when True, stamps a top-level
+    `is_smoke_test=True` attribute on the audit row so operator scans of
+    `picasso-pii-dsar-audit-staging` can FilterExpression them out without
+    depending on the `dsar_id` prefix (which is a UX convention, not a
+    schema guarantee). When False (default), no attribute is written
+    (forward-compatible with pre-fix rows; readers MUST use .get()).
     """
     table = ddb.Table(TABLE_DSAR_AUDIT)
     event_timestamp = _now_iso()
@@ -552,6 +566,8 @@ def _write_audit_event(dsar_id, event_type, status, payload):
         # See docs/roadmap/PII-Project/audit-table-retention-runbook.md §3.
         "created_at_partition": event_timestamp[:7],
     }
+    if is_smoke_test:
+        item["is_smoke_test"] = True
     try:
         table.put_item(
             Item=item,
@@ -2550,6 +2566,7 @@ def lambda_handler(event, context):
                 "request_type": inputs["request_type"],
                 "dry_run": inputs["dry_run"],
             },
+            is_smoke_test=inputs.get("smoke_test_marker", False),
         )
     except AuditCollision as exc:
         return {
@@ -2597,6 +2614,7 @@ def lambda_handler(event, context):
                     "identifier_type": inputs["identifier_type"],
                     "error_code": error_code,
                 },
+                is_smoke_test=inputs.get("smoke_test_marker", False),
             )
         except AuditCollision as audit_exc:
             logger.error(
@@ -2660,6 +2678,7 @@ def lambda_handler(event, context):
                     "rows_deleted": result.get("rows_deleted"),
                     "rows_skipped_corrupted": result.get("rows_skipped_corrupted"),
                 },
+                is_smoke_test=inputs.get("smoke_test_marker", False),
             )
             surface_audit_ts.append(ts)
         except AuditCollision as exc:
@@ -2695,6 +2714,7 @@ def lambda_handler(event, context):
                     s: r.get("status") for s, r in walker_results.items()
                 },
             },
+            is_smoke_test=inputs.get("smoke_test_marker", False),
         )
     except AuditCollision as exc:
         return {
