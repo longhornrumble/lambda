@@ -1825,14 +1825,19 @@ def test_fs_walker_error_returns_empty_session_ids(dsar):
 def _stub_dispatch(mock_ddb, *, fs_items=None, fs_error=False,
                    ns_items=None, ns_error=False,
                    ne_items=None, ne_error=False,
-                   rm_items=None, rm_error=False):
+                   rm_items=None, rm_error=False,
+                   se_items=None, se_error=False):
     """Route ddb.Table(...) calls to per-table mocks. Used by dispatcher +
     handler tests where multiple tables are queried in one flow.
 
     Default behavior: notification-sends + notification-events +
-    recent-messages tables return empty Query results (the dispatcher will
-    still call them for any pii_subject_id-resolved subject). Tests can
-    override via ns_items / ne_items / rm_items / *_error kwargs.
+    recent-messages + session-events tables return empty Query results
+    (the dispatcher will still call them for any pii_subject_id-resolved
+    subject). Tests can override via ns_items / ne_items / rm_items /
+    se_items / *_error kwargs.
+
+    Audit fix #15: session-events added (Sprint B oversight; the email-path
+    dispatcher now calls _walk_session_events too post audit fix #1).
     """
     from botocore.exceptions import ClientError
     fs_table = MagicMock()
@@ -1841,6 +1846,7 @@ def _stub_dispatch(mock_ddb, *, fs_items=None, fs_error=False,
     ns_table = MagicMock()
     ne_table = MagicMock()
     rm_table = MagicMock()
+    se_table = MagicMock()
     if fs_error:
         fs_table.query.side_effect = ClientError(
             {"Error": {"Code": "InternalServerError"}}, "Query")
@@ -1861,6 +1867,11 @@ def _stub_dispatch(mock_ddb, *, fs_items=None, fs_error=False,
             {"Error": {"Code": "InternalServerError"}}, "Query")
     else:
         rm_table.query.return_value = {"Items": rm_items or []}
+    if se_error:
+        se_table.query.side_effect = ClientError(
+            {"Error": {"Code": "InternalServerError"}}, "Query")
+    else:
+        se_table.query.return_value = {"Items": se_items or []}
 
     def route(name):
         if name == "picasso-form-submissions-staging":
@@ -1875,10 +1886,12 @@ def _stub_dispatch(mock_ddb, *, fs_items=None, fs_error=False,
             return ne_table
         if name == "staging-recent-messages":
             return rm_table
+        if name == "picasso-session-events-staging":
+            return se_table
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
     mock_ddb.Table.side_effect = route
-    return fs_table, subject_table, audit_table, ns_table, ne_table, rm_table
+    return fs_table, subject_table, audit_table, ns_table, ne_table, rm_table, se_table
 
 
 def test_dispatcher_includes_form_submissions_in_rows_touched(dsar):
@@ -1948,7 +1961,7 @@ def test_dispatcher_emits_error_followup_on_walker_error(dsar):
 
 def test_dispatcher_skips_all_walkers_when_subject_not_found(dsar):
     mod, mock_ddb, _ = dsar
-    fs_table, _, _, ns_table, ne_table, rm_table = _stub_dispatch(mock_ddb)
+    fs_table, _, _, ns_table, ne_table, rm_table, se_table = _stub_dispatch(mock_ddb)
     rows, followups, exported, walker_results = mod._walk_mfs_surfaces(
         pii_subject_id=None, tenant_id="TEN",
         normalized_email="test@x.co",
@@ -2067,7 +2080,7 @@ def test_dispatcher_notification_events_no_messages_when_ns_empty(dsar):
     received direct notifications). notification-events records action=
     no_messages_to_walk, status=completed, rows_touched=0 — NO GSI query."""
     mod, mock_ddb, _ = dsar
-    _, _, _, _, ne_table, _ = _stub_dispatch(mock_ddb)  # all empty by default
+    _, _, _, _, ne_table, _, _ = _stub_dispatch(mock_ddb)  # all empty by default
     _rows, _f, _exp, walker_results = mod._walk_mfs_surfaces(
         pii_subject_id="subj_xyz", tenant_id="TEN123",
         normalized_email="test@x.co",
@@ -2172,7 +2185,7 @@ def test_dispatcher_chains_recent_messages_via_form_submissions_session_ids(dsar
         _row("s1", session_id="sess-a"),
         _row("s2", session_id="sess-b"),
     ]
-    fs_table, _, _, _, _, rm_table = _stub_dispatch(
+    fs_table, _, _, _, _, rm_table, _ = _stub_dispatch(
         mock_ddb, fs_items=fs_items,
     )
     # Distinct response per session_id Query — avoid mock return_value
@@ -2198,7 +2211,7 @@ def test_dispatcher_recent_messages_no_sessions_when_no_form_submissions(dsar):
     """No form-submissions matches → no session_ids → recent-messages
     short-circuits to no_sessions_to_walk; rm_table never queried."""
     mod, mock_ddb, _ = dsar
-    _, _, _, _, _, rm_table = _stub_dispatch(mock_ddb, fs_items=[])
+    _, _, _, _, _, rm_table, _ = _stub_dispatch(mock_ddb, fs_items=[])
     rows, _f, _exp, walker_results = mod._walk_mfs_surfaces(
         pii_subject_id="subj_xyz", tenant_id="TEN123",
         normalized_email="test@x.co",
@@ -2291,6 +2304,8 @@ def test_dispatcher_recent_messages_partial_error_taint_on_failed_session_ids(ds
     ns_table.query.return_value = {"Items": []}
     ne_table = MagicMock()
     ne_table.query.return_value = {"Items": []}
+    se_table = MagicMock()
+    se_table.query.return_value = {"Items": []}
 
     def route(name):
         return {
@@ -2300,6 +2315,7 @@ def test_dispatcher_recent_messages_partial_error_taint_on_failed_session_ids(ds
             "picasso-notification-sends-staging": ns_table,
             "picasso-notification-events-staging": ne_table,
             "staging-recent-messages": rm_table,
+            "picasso-session-events-staging": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2336,6 +2352,8 @@ def test_dispatcher_recent_messages_truncation_taints_completed_to_errored(dsar)
     ns_table.query.return_value = {"Items": []}
     ne_table = MagicMock()
     ne_table.query.return_value = {"Items": []}
+    se_table = MagicMock()
+    se_table.query.return_value = {"Items": []}
 
     def route(name):
         return {
@@ -2345,6 +2363,7 @@ def test_dispatcher_recent_messages_truncation_taints_completed_to_errored(dsar)
             "picasso-notification-sends-staging": ns_table,
             "picasso-notification-events-staging": ne_table,
             "staging-recent-messages": rm_table,
+            "picasso-session-events-staging": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2386,6 +2405,8 @@ def test_dispatcher_recent_messages_combined_failures_and_truncation_taint(dsar)
     ns_table.query.return_value = {"Items": []}
     ne_table = MagicMock()
     ne_table.query.return_value = {"Items": []}
+    se_table = MagicMock()
+    se_table.query.return_value = {"Items": []}
 
     def route(name):
         return {
@@ -2395,6 +2416,7 @@ def test_dispatcher_recent_messages_combined_failures_and_truncation_taint(dsar)
             "picasso-notification-sends-staging": ns_table,
             "picasso-notification-events-staging": ne_table,
             "staging-recent-messages": rm_table,
+            "picasso-session-events-staging": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2443,6 +2465,8 @@ def test_dispatcher_notification_events_combined_failures_and_truncation_taint(d
     audit_table = MagicMock()
     rm_table = MagicMock()
     rm_table.query.return_value = {"Items": []}
+    se_table = MagicMock()
+    se_table.query.return_value = {"Items": []}
 
     def route(name):
         return {
@@ -2452,6 +2476,7 @@ def test_dispatcher_notification_events_combined_failures_and_truncation_taint(d
             "picasso-notification-sends-staging": ns_table,
             "picasso-notification-events-staging": ne_table,
             "staging-recent-messages": rm_table,
+            "picasso-session-events-staging": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2489,21 +2514,27 @@ def test_dispatcher_recent_messages_followup_includes_f_dsar1_inheritance(dsar):
 # End-to-end handler
 # ───────────────────────────────────────────────────────────────────────────
 def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
-                          ns_items=None, ne_items=None, rm_items=None):
+                          ns_items=None, ne_items=None, rm_items=None,
+                          se_items=None):
     """Plumb the subject-index Query + form-submissions Query +
     notification-sends Query + notification-events Query +
-    recent-messages Query + audit PutItem onto separate per-table mocks.
+    recent-messages Query + session-events Query + audit PutItem onto
+    separate per-table mocks.
 
-    Default: notification-sends + notification-events + recent-messages
-    return empty Items (consumer rarely receives direct notifications
-    today; recent-messages typically empty given 24h TTL). Override via
-    ns_items / ne_items / rm_items to exercise the chained walker paths."""
+    Default: notification-sends + notification-events + recent-messages +
+    session-events return empty Items (consumer rarely receives direct
+    notifications today; recent-messages typically empty given 24h TTL).
+    Override via ns_items / ne_items / rm_items / se_items to exercise
+    the chained walker paths.
+
+    Audit fix #15: se_items + session-events route added (Sprint B oversight)."""
     subject_table = MagicMock()
     audit_table = MagicMock()
     fs_table = MagicMock()
     ns_table = MagicMock()
     ne_table = MagicMock()
     rm_table = MagicMock()
+    se_table = MagicMock()
     if subject_found:
         subject_table.get_item.return_value = {
             "Item": {"tenant_id": "TEN123", "normalized_email": "test@x.co",
@@ -2515,6 +2546,7 @@ def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
     ns_table.query.return_value = {"Items": ns_items or []}
     ne_table.query.return_value = {"Items": ne_items or []}
     rm_table.query.return_value = {"Items": rm_items or []}
+    se_table.query.return_value = {"Items": se_items or []}
 
     def route(name):
         if name == "picasso-pii-subject-index-staging":
@@ -2529,16 +2561,18 @@ def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
             return ne_table
         if name == "staging-recent-messages":
             return rm_table
+        if name == "picasso-session-events-staging":
+            return se_table
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
     mock_ddb.Table.side_effect = route
-    return subject_table, audit_table, fs_table, ns_table, ne_table, rm_table
+    return subject_table, audit_table, fs_table, ns_table, ne_table, rm_table, se_table
 
 
 def test_handler_happy_path_access_exports_form_submission_rows(dsar):
     mod, mock_ddb, _ = dsar
     fs_items = [_row("s1", tenant_id="TEN123"), _row("s2", tenant_id="TEN123")]
-    _, audit_table, fs_table, _, _, _ = _stub_handler_tables(
+    _, audit_table, fs_table, _, _, _, _ = _stub_handler_tables(
         mock_ddb, subject_found=True, fs_items=fs_items)
 
     resp = mod.lambda_handler(
@@ -2556,15 +2590,15 @@ def test_handler_happy_path_access_exports_form_submission_rows(dsar):
     # surface_walked:notification-sends + surface_walked:notification-events
     # + surface_walked:recent-messages + surface_walked:archive (M2 Sprint C)
     # + closed = 7. Deferred surfaces (2) still suppressed.
-    assert audit_table.put_item.call_count == 7
+    assert audit_table.put_item.call_count == 8
     fs_table.delete_item.assert_not_called()  # access never deletes
-    assert len(resp["audit_row_pks"]) == 7
+    assert len(resp["audit_row_pks"]) == 8
 
 
 def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
     mod, mock_ddb, _ = dsar
     fs_items = [_row("s1", tenant_id="TEN123")]
-    _, audit_table, fs_table, _, _, _ = _stub_handler_tables(
+    _, audit_table, fs_table, _, _, _, _ = _stub_handler_tables(
         mock_ddb, subject_found=True, fs_items=fs_items)
 
     resp = mod.lambda_handler(
@@ -2577,12 +2611,12 @@ def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
                for f in resp["manual_followups"])
     fs_table.delete_item.assert_not_called()
     # request_received + 5 surface_walked (M2 Sprint C added archive) + closed = 7
-    assert audit_table.put_item.call_count == 7
+    assert audit_table.put_item.call_count == 8
 
 
 def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
     mod, mock_ddb, _ = dsar
-    _, audit_table, fs_table, ns_table, ne_table, rm_table = _stub_handler_tables(
+    _, audit_table, fs_table, ns_table, ne_table, rm_table, _ = _stub_handler_tables(
         mock_ddb, subject_found=False)
 
     resp = mod.lambda_handler(_valid_event(), context=None)
@@ -2595,7 +2629,7 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
     # notification-sends + notification-events + recent-messages + archive
     # (all skipped_no_subject; M2 Sprint C added archive) + closed. Deferred
     # surfaces (2) still suppressed → 7 total.
-    assert audit_table.put_item.call_count == 7
+    assert audit_table.put_item.call_count == 8
     event_types = [c.kwargs["Item"]["event_type"] for c in audit_table.put_item.call_args_list]
     assert event_types == [
         "request_received",
@@ -2603,10 +2637,12 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
         "surface_walked:notification-sends",
         "surface_walked:notification-events",
         "surface_walked:recent-messages",
+        # Audit fix #1: session-events now walked on email path too.
+        "surface_walked:session-events",
         "surface_walked:archive",
         "closed",
     ]
-    for i in (1, 2, 3, 4, 5):
+    for i in (1, 2, 3, 4, 5, 6):
         skipped_event = audit_table.put_item.call_args_list[i].kwargs["Item"]
         assert skipped_event["status"] == "skipped_no_subject"
     # No walker actually queried — all skipped
@@ -2651,7 +2687,7 @@ def test_handler_writes_surface_walked_audit_event_for_form_submissions(dsar):
     request_received and closed."""
     mod, mock_ddb, _ = dsar
     fs_items = [_row("s1", tenant_id="TEN123")]
-    _, audit_table, _, _, _, _ = _stub_handler_tables(
+    _, audit_table, _, _, _, _, _ = _stub_handler_tables(
         mock_ddb, subject_found=True, fs_items=fs_items)
 
     mod.lambda_handler(_valid_event(request_type="access"), context=None)
@@ -2666,6 +2702,8 @@ def test_handler_writes_surface_walked_audit_event_for_form_submissions(dsar):
         "surface_walked:notification-sends",
         "surface_walked:notification-events",
         "surface_walked:recent-messages",
+        # Audit fix #1: session-events now walked on email path too.
+        "surface_walked:session-events",
         "surface_walked:archive",
         "closed",
     ]
@@ -2677,7 +2715,7 @@ def test_handler_does_not_emit_surface_walked_for_deferred_surfaces(dsar):
     those. Shipped walkers (form-submissions, notification-sends,
     notification-events, recent-messages) DO emit surface_walked events."""
     mod, mock_ddb, _ = dsar
-    _, audit_table, _, _, _, _ = _stub_handler_tables(
+    _, audit_table, _, _, _, _, _ = _stub_handler_tables(
         mock_ddb, subject_found=True, fs_items=[])
 
     mod.lambda_handler(_valid_event(request_type="access"), context=None)
@@ -2687,6 +2725,7 @@ def test_handler_does_not_emit_surface_walked_for_deferred_surfaces(dsar):
         "surface_walked:notification-sends",
         "surface_walked:notification-events",
         "surface_walked:recent-messages",
+        "surface_walked:session-events",  # audit fix #1
         "surface_walked:archive",  # M2 Sprint C
     }
     extraneous_surface_walked = [
@@ -2720,6 +2759,8 @@ def test_handler_close_status_partial_error_when_walker_errors(dsar):
     # partial_error (any errored walker promotes status).
     ns_table.query.return_value = {"Items": []}
     ne_table.query.return_value = {"Items": []}
+    se_table = MagicMock()
+    se_table.query.return_value = {"Items": []}
 
     def route(name):
         return {
@@ -2747,7 +2788,7 @@ def test_handler_close_status_partial_error_when_corrupted_rows_skipped(dsar):
     mod, mock_ddb, _ = dsar
     corrupted = {"tenant_id": "TEN123", "pii_subject_id": "subj_opaque"}  # no SK
     fs_items = [_row("s1", tenant_id="TEN123"), corrupted]
-    _, audit_table, _, _, _, _ = _stub_handler_tables(
+    _, audit_table, _, _, _, _, _ = _stub_handler_tables(
         mock_ddb, subject_found=True, fs_items=fs_items)
 
     resp = mod.lambda_handler(
@@ -2801,20 +2842,22 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (7 audit attempts post-M2 Sprint C):
+    # PutItem sequence (8 audit attempts post audit fix #1 — session-events):
     #   1: request_received                    → succeed
     #   2: surface_walked:form-submissions     → CCFE (taints walker_results)
     #   3: surface_walked:notification-sends   → succeed
     #   4: surface_walked:notification-events  → succeed
     #   5: surface_walked:recent-messages      → succeed
-    #   6: surface_walked:archive              → succeed (M2 Sprint C)
-    #   7: closed                              → succeed
+    #   6: surface_walked:session-events       → succeed (audit fix #1)
+    #   7: surface_walked:archive              → succeed (M2 Sprint C)
+    #   8: closed                              → succeed
     audit_table.put_item.side_effect = [
         None,
         ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException", "Message": "..."}},
             "PutItem",
         ),
+        None,
         None,
         None,
         None,
@@ -2834,6 +2877,8 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     ne_table.query.return_value = {"Items": []}
     rm_table = MagicMock()
     rm_table.query.return_value = {"Items": []}
+    se_table = MagicMock()
+    se_table.query.return_value = {"Items": []}
 
     def route(name):
         return {
@@ -2843,6 +2888,7 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
             "picasso-notification-sends-staging": ns_table,
             "picasso-notification-events-staging": ne_table,
             "staging-recent-messages": rm_table,
+            "picasso-session-events-staging": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2852,7 +2898,7 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     assert resp["status"] == "partial_error"
     # closed event was still written (recoverable failure path)
     # Count: 1 request_received + 5 surface_walked (incl. archive) + 1 closed = 7
-    assert audit_table.put_item.call_count == 7
+    assert audit_table.put_item.call_count == 8
     close_item = audit_table.put_item.call_args_list[-1].kwargs["Item"]
     assert close_item["event_type"] == "closed"
     assert close_item["status"] == "partial_error"
@@ -2865,15 +2911,17 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (7 attempts post-M2 Sprint C):
+    # PutItem sequence (8 attempts post audit fix #1 — session-events):
     #   1: request_received                    → succeed
     #   2: surface_walked:form-submissions     → succeed
     #   3: surface_walked:notification-sends   → succeed
     #   4: surface_walked:notification-events  → succeed
     #   5: surface_walked:recent-messages      → succeed
-    #   6: surface_walked:archive              → succeed (M2 Sprint C)
-    #   7: closed                              → CCFE → return failed
+    #   6: surface_walked:session-events       → succeed (audit fix #1)
+    #   7: surface_walked:archive              → succeed (M2 Sprint C)
+    #   8: closed                              → CCFE → return failed
     audit_table.put_item.side_effect = [
+        None,
         None,
         None,
         None,
@@ -2898,6 +2946,8 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     ne_table.query.return_value = {"Items": []}
     rm_table = MagicMock()
     rm_table.query.return_value = {"Items": []}
+    se_table = MagicMock()
+    se_table.query.return_value = {"Items": []}
 
     def route(name):
         return {
@@ -2907,6 +2957,7 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
             "picasso-notification-sends-staging": ns_table,
             "picasso-notification-events-staging": ne_table,
             "staging-recent-messages": rm_table,
+            "picasso-session-events-staging": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2920,7 +2971,7 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     assert resp["rows_touched"]["form-submissions"] == 1
     # audit_row_pks lists the 6 successful events (no closed entry):
     # request_received + 5 surface_walked (incl. archive M2 Sprint C)
-    assert len(resp["audit_row_pks"]) == 6
+    assert len(resp["audit_row_pks"]) == 7
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3290,3 +3341,188 @@ def test_handler_psid_path_subject_resolution_clienterror_returns_failed_with_au
     # email-path vs psid-path subject-resolution failures in the audit log)
     details = json.loads(failed_event["details"])
     assert details["identifier_type"] == "psid"
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Audit closure tests (post phase-completion-audit M2 Sprints A+B+C)
+# ───────────────────────────────────────────────────────────────────────────
+
+# ── #1 email-path session-events integration ───────────────────────────────
+def test_email_path_session_events_walks_when_form_submissions_yields_session_ids(dsar):
+    """Audit fix #1: Sprint A walker matrix §4 row S6 required session-events
+    on BOTH email + psid paths; Sprint B missed email. This test guards
+    against regression: session-events must Query when form-submissions
+    surfaces session_ids."""
+    mod, mock_ddb, _ = dsar
+    fs_table, _subject, _audit, _ns, _ne, _rm, se_table = _stub_dispatch(
+        mock_ddb,
+        fs_items=[_row("s1", session_id="sess-a"), _row("s2", session_id="sess-b")],
+        se_items=[_se_row("sess-a"), _se_row("sess-b")],
+    )
+    rows, _f, exported, results = mod._walk_mfs_surfaces(
+        pii_subject_id="subj_xyz", tenant_id="TEN123",
+        normalized_email="test@x.co",
+        request_type="access", dry_run=True,
+    )
+    # 2 form-submissions sessions × 2 STEP items per session in mock = 4
+    # (mock returns the same Items list for every Query; not realistic but
+    # exercises the walker dispatch).
+    assert rows["session-events"] == 4
+    assert results["session-events"]["status"] == "completed"
+    assert results["session-events"]["action"] == "exported"
+    assert "session-events" in exported
+    # se_table.query called twice — once per chained session_id
+    assert se_table.query.call_count == 2
+
+
+def test_email_path_session_events_skipped_when_subject_not_found(dsar):
+    """Audit fix #1 sibling: skipped_no_subject branch must also include
+    session-events alongside the other deferred-by-no-subject surfaces."""
+    mod, mock_ddb, _ = dsar
+    _stub_dispatch(mock_ddb)
+    rows, _f, _exp, results = mod._walk_mfs_surfaces(
+        pii_subject_id=None, tenant_id="TEN",
+        normalized_email="test@x.co",
+        request_type="delete", dry_run=True,
+    )
+    assert results["session-events"]["status"] == "skipped_no_subject"
+    assert rows["session-events"] == 0
+
+
+# ── #2 VersionId None fallback (was "null" string) ─────────────────────────
+def test_walk_archive_skips_version_without_id(dsar):
+    """Audit fix #2: missing VersionId surfaces as skipped+logged, not as
+    literal "null" string (which would have caused a silent S3 400 on
+    delete_object(VersionId="null"))."""
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.return_value = _arc_resp(versions=[
+        {"Key": "sessions/sid1/a.json", "VersionId": "v1"},
+        {"Key": "sessions/sid1/a.json"},  # no VersionId — must be skipped
+        {"Key": "sessions/sid1/b.json", "VersionId": "v2"},
+    ])
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "delete", dry_run=False)
+    # Only 2 valid versions; the one without VersionId is skipped.
+    assert result["versions_deleted"] == 2
+    assert result["versions_delete_failed"] == 0
+    # delete_object must NEVER be called with VersionId="null"
+    for call in mod.s3.delete_object.call_args_list:
+        assert call.kwargs["VersionId"] != "null"
+
+
+# ── #3 bounded PSID resolver page enumeration ──────────────────────────────
+def test_resolve_psid_subject_truncates_at_max_page_ids(dsar):
+    """Audit fix #3: large-tenant Messenger fan-out caps at
+    MAX_PAGE_IDS_PER_INVOCATION; resolver doesn't burn full 60s timeout
+    enumerating all pages."""
+    mod, mock_ddb, _ = dsar
+    cap = mod.MAX_PAGE_IDS_PER_INVOCATION
+    # Tenant with cap+5 pages → resolver caps + logs warning
+    mock_table = MagicMock()
+    mock_table.query.return_value = {
+        "Items": [{"PK": f"PAGE#{i}"} for i in range(cap + 5)],
+    }
+    mock_ddb.Table.return_value = mock_table
+    out = mod._resolve_psid_subject("TEN", "psid_abc")
+    assert len(out) == cap
+
+
+# ── #18 archive walker failed_session_ids propagation ─────────────────────
+def test_apply_archive_walker_result_taints_status_on_failed_sessions(dsar):
+    """Audit fix #18: previously, failed_session_ids was silently dropped
+    by the dispatcher — operator saw status=completed even when N sessions
+    failed enumeration. Now propagated as errored."""
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.side_effect = [
+        ClientError({"Error": {"Code": "InternalError"}}, "ListObjectVersions"),
+        _arc_resp(versions=[{"Key": "sessions/sid2/a.json", "VersionId": "v1"}]),
+    ]
+    rows_touched = {"archive": 0}
+    followups = []
+    exported = {}
+    walker_results = {}
+    mod._apply_archive_walker_result(
+        "TEN", ["sid1", "sid2"], "access", True,
+        rows_touched, followups, exported, walker_results,
+    )
+    assert walker_results["archive"]["status"] == "errored"
+    assert walker_results["archive"]["error"] == "failed_session_ids"
+    assert walker_results["archive"]["failed_session_ids_count"] == 1
+
+
+# ── #10 MFA-Delete cold-start posture check ───────────────────────────────
+def test_walk_archive_aborts_delete_when_mfa_delete_enabled(dsar):
+    """Audit fix #10: if archive bucket has MFA-Delete=Enabled, every
+    DeleteObjectVersion returns 403 with uninformative log. Cold-start
+    check fails loud + returns action=errored before any delete attempt."""
+    mod, _, _ = dsar
+    # Reset cache + stub get_bucket_versioning to report MFA-Delete enabled
+    mod._archive_mfa_delete_enabled = None
+    mod.s3.get_bucket_versioning.return_value = {"Status": "Enabled", "MFADelete": "Enabled"}
+    mod.s3.list_object_versions.return_value = _arc_resp(
+        versions=[{"Key": "sessions/sid1/a.json", "VersionId": "v1"}],
+    )
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "delete", dry_run=False)
+    assert result["action"] == "errored"
+    assert result["error"] == "mfa_delete_enabled"
+    mod.s3.delete_object.assert_not_called()
+
+
+def test_walk_archive_proceeds_when_mfa_delete_disabled(dsar):
+    """Audit fix #10 sibling: MFA-Delete=disabled (or absent key) → walker
+    proceeds normally with delete-real."""
+    mod, _, _ = dsar
+    mod._archive_mfa_delete_enabled = None
+    mod.s3.get_bucket_versioning.return_value = {"Status": "Enabled"}  # no MFADelete key
+    mod.s3.list_object_versions.return_value = _arc_resp(
+        versions=[{"Key": "sessions/sid1/a.json", "VersionId": "v1"}],
+    )
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "delete", dry_run=False)
+    assert result["action"] == "deleted"
+    assert result["versions_deleted"] == 1
+
+
+# ── #17 _arc_resp Versions key absent ─────────────────────────────────────
+def test_walk_archive_handles_absent_versions_key(dsar):
+    """Audit fix #17: real S3 API can omit the Versions key entirely when
+    a prefix has never had versioned objects. Source uses .get("Versions", [])
+    correctly — this test guards against a regression to bracket access."""
+    mod, _, _ = dsar
+    # No Versions or DeleteMarkers keys in response
+    mod.s3.list_object_versions.return_value = {"IsTruncated": False}
+    result = mod._walk_archive_bucket("TEN", ["sid1"], "access", dry_run=True)
+    assert result["objects_found"] == 0
+    assert result["versions_found"] == 0
+    assert result["action"] == "exported"
+
+
+# ── #28 DEFERRED_SURFACES count sentinel ──────────────────────────────────
+def test_deferred_surfaces_count_sentinel(dsar):
+    """Audit fix #28: pin DEFERRED_SURFACES count at exactly 2. Future
+    additions to the dict require updating shipped_walker_surfaces in
+    test_handler_does_not_emit_surface_walked_for_deferred_surfaces; this
+    sentinel makes that contract explicit."""
+    mod, _, _ = dsar
+    assert len(mod.DEFERRED_SURFACES) == 2
+    assert set(mod.DEFERRED_SURFACES.keys()) == {"conversation-summaries", "audit-read-only"}
+
+
+# ── #16 psid dispatcher partial-error tests ──────────────────────────────
+def test_walk_psid_surfaces_archive_failed_sessions_taint_status(dsar):
+    """Audit fix #16: psid dispatcher must propagate archive failed-session
+    errors to walker_results status (was untested)."""
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    mod.s3.list_object_versions.side_effect = [
+        ClientError({"Error": {"Code": "InternalError"}}, "ListObjectVersions"),
+    ]
+    # Mock both DDB walkers to return clean no-op responses
+    _stub_psid_tables(mock_ddb_arg := MagicMock())  # not actually used; bypass below
+    mod.ddb.Table.side_effect = lambda name: MagicMock(query=MagicMock(return_value={"Items": []}))
+    rows, _f, _exp, results = mod._walk_psid_surfaces(
+        tenant_id="TEN", psid="psid_abc",
+        session_ids=["meta:p1:psid_abc"],
+        request_type="access", dry_run=True,
+    )
+    assert results["archive"]["status"] == "errored"
+    assert results["archive"]["error"] == "failed_session_ids"
