@@ -100,9 +100,12 @@ WHAT IT DOES NOT YET DO (follow-up PRs):
       trigger recommended, calendar backstop 2026-08-22)
     - picasso-audit-staging read for access-type DSARs (Art 17(3)(b)
       carve-out, D5 G-C — counsel-pending; UpdateItem deliberately omitted)
-    - Per-tenant S3 fulfillment walker (M2 Sprint D pending; per-row
-      `fulfillment_path` ∪ tenant-config bucket per
-      `PII_DELETE_PIPELINE_DESIGN.md` Arm 3)
+    - Per-tenant S3 fulfillment writer extension (writes `fulfillment_path`
+      attribute onto form-submission row at write time; required for the
+      N3 stale-config defense in `PII_DELETE_PIPELINE_DESIGN.md` Arm 3).
+      Walker (this file, Sprint D) reads `fulfillment_path` per-row when
+      present — writer extension is a separate follow-up PR. Until the
+      writer ships, only post-extension rows have an enumerable path.
     - phone / name+address identifier_types — walker-NOT-supported per
       F-DSAR30 (Sprint A §3.3 decision); M3 playbook documents manual
       fallback procedures (Sprint E adds the entries)
@@ -652,6 +655,7 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
         return {
             "rows_found": rows_found,
             "session_ids": session_ids,
+            "matched_rows": matched,
             "action": "exported",
             "exported_rows": matched,
         }
@@ -661,6 +665,7 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
         return {
             "rows_found": rows_found,
             "session_ids": session_ids,
+            "matched_rows": matched,
             "action": "dry_run_count",
         }
 
@@ -707,6 +712,7 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
     return {
         "rows_found": rows_found,
         "session_ids": session_ids,
+        "matched_rows": matched,
         "action": "deleted",
         "rows_deleted": deleted,
         "rows_delete_failed": delete_failed,
@@ -1617,6 +1623,197 @@ def _walk_archive_bucket(tenant_id, session_ids, request_type, dry_run):
     }
 
 
+def _walk_fulfillment_s3(tenant_id, form_submissions_rows, request_type, dry_run):
+    """Walk per-tenant S3 fulfillment objects for one subject.
+
+    M2 Sprint D walker per `PII_DELETE_PIPELINE_DESIGN.md` Arm 3. Chained
+    input: form-submissions rows from `_walk_form_submissions`. The walker
+    reads each row's `fulfillment_path` attribute (when present), parses
+    the `s3://bucket/key` URI, and lists/deletes the object.
+
+    Resolution source (Sprint D scope):
+      - Per-row `fulfillment_path` attribute on the form-submissions row.
+        Form_handler writer does NOT yet stamp this attribute (separate
+        follow-up PR). When writer ships, rows written post-extension carry
+        a stamped path; pre-extension rows fall back to manual_followup.
+
+    Resolution sources NOT in Sprint D (defer-with-trigger):
+      - Tenant config `fulfillment.bucket` synthesis (reading tenant config
+        from S3 requires a new IAM scope addition + tenant-config schema
+        coupling; out of scope for code-only Sprint D). When writer
+        extension ships, the per-row path supersedes the synthesized
+        prediction anyway.
+
+    request_type:
+      - "access":            list the object via HeadObject; return key list
+                             (object body NOT fetched — operator-actionable
+                             via aws s3 cp on returned keys; keeps Lambda
+                             response under 6 MB)
+      - "delete" + dry_run:  count enumerable rows; no delete calls
+      - "delete" + real:     s3.delete_object per (bucket, key) tuple
+
+    Design contract (Arm 3):
+      - No fulfillment declared anywhere ⇒ no-op (logged + manual_followup)
+      - `fulfillment_path` parse failure ⇒ counted in failed_paths; row's
+        object un-located but the subject's other surfaces still proceed
+      - DeleteObject failure ⇒ hard partial-failure (versions_delete_failed
+        > 0 in result; status="errored"); never reported complete
+      - IAM grant is resource-ARN-scoped
+        `arn:aws:s3:::{bucket}/submissions/{tenant_id}/*` per known
+        (bucket, tenant_id) pair (cannot use s3:prefix — that's
+        ListBucket-only). Unknown bucket ⇒ DeleteObject returns
+        AccessDenied ⇒ hard partial-failure until IAM policy updated.
+        "Fail-closed, never silent" is the design intent — the walker does
+        NOT attempt to mask AccessDenied as success.
+
+    tenant_id is defense-in-depth (mirrors _walk_archive_bucket pattern).
+    Per-row `fulfillment_path` should always begin with
+    `s3://<bucket>/submissions/{tenant_id}/...` per the form_handler writer
+    contract (form_handler.py:992-1007). Walker validates the tenant_id
+    segment matches the requested tenant; any mismatch is rejected as
+    suspected cross-tenant pointer (hard skip + log; never delete).
+
+    Returns:
+      {
+        "objects_found":          int,   # number of (bucket, key) pairs
+        "action":                 "exported" | "dry_run_count" | "deleted" | "no_fulfillment_paths",
+        "exported_keys":          [str, ...]                 # access only — "s3://bucket/key" URIs
+        "objects_deleted":        int                        # delete-real only
+        "objects_delete_failed":  int                        # delete-real only
+        "rows_with_path":         int                        # forward-compat metric
+        "rows_without_path":      int                        # pre-extension rows
+        "failed_paths":           int                        # parse-failure count
+        "skipped_cross_tenant":   int                        # tenant_id mismatch
+      }
+    """
+    if not tenant_id:
+        raise ValueError(
+            "_walk_fulfillment_s3 requires non-empty tenant_id "
+            "(defense-in-depth — per-row fulfillment_path is validated "
+            "against the requested tenant_id segment; any mismatch is "
+            "rejected as suspected cross-tenant pointer)"
+        )
+
+    rows_with_path = 0
+    rows_without_path = 0
+    failed_paths = 0
+    skipped_cross_tenant = 0
+    enumerated = []  # [(bucket, key)]
+
+    for row in form_submissions_rows or []:
+        # Schema discipline: writer extension is a future PR; tolerate
+        # absence on every row without crashing the walker.
+        path = row.get("fulfillment_path")
+        if not path:
+            rows_without_path += 1
+            continue
+        # Expected shape: s3://<bucket>/submissions/<tenant_id>/<form_type>/<submission_id>.json
+        # Per form_handler.py:992-1007 writer. Reject anything that
+        # doesn't match the s3:// scheme + tenant segment.
+        if not isinstance(path, str) or not path.startswith("s3://"):
+            failed_paths += 1
+            logger.error(
+                "fulfillment_path_parse_failed: path_type=%s starts_with_s3=%s",
+                type(path).__name__,
+                isinstance(path, str) and path.startswith("s3://"),
+            )
+            continue
+        # Strip s3:// and split bucket from key
+        without_scheme = path[len("s3://"):]
+        slash_idx = without_scheme.find("/")
+        if slash_idx <= 0:
+            failed_paths += 1
+            logger.error("fulfillment_path_parse_failed: no_key_in_uri")
+            continue
+        bucket = without_scheme[:slash_idx]
+        key = without_scheme[slash_idx + 1:]
+        # Tenant-segment validation: key shape is
+        # submissions/{tenant_id}/{form_type}/{submission_id}.json per
+        # form_handler writer. Reject any key whose tenant segment doesn't
+        # match the requested tenant_id — defense against a stale or
+        # tampered row pointing at another tenant's bucket prefix.
+        expected_prefix = f"submissions/{tenant_id}/"
+        if not key.startswith(expected_prefix):
+            skipped_cross_tenant += 1
+            # Mask the actual path in logs (the suffix may contain
+            # submission_id which is operator-only — see D1 redaction rule).
+            logger.error(
+                "fulfillment_path_cross_tenant_rejected: bucket=%s "
+                "expected_prefix=%s",
+                bucket, expected_prefix,
+            )
+            continue
+        rows_with_path += 1
+        enumerated.append((bucket, key))
+
+    objects_found = len(enumerated)
+
+    progress_fields = {
+        "rows_with_path": rows_with_path,
+        "rows_without_path": rows_without_path,
+    }
+    if failed_paths:
+        progress_fields["failed_paths"] = failed_paths
+    if skipped_cross_tenant:
+        progress_fields["skipped_cross_tenant"] = skipped_cross_tenant
+
+    if objects_found == 0:
+        return {
+            "objects_found": 0,
+            "action": "no_fulfillment_paths",
+            **progress_fields,
+        }
+
+    if request_type == "access":
+        # Return URIs as `s3://bucket/key` — operator runs `aws s3 cp`
+        # on each to retrieve content. Keeps Lambda response under 6 MB.
+        return {
+            "objects_found": objects_found,
+            "action": "exported",
+            "exported_keys": [f"s3://{b}/{k}" for b, k in enumerated],
+            **progress_fields,
+        }
+
+    if dry_run:
+        return {
+            "objects_found": objects_found,
+            "action": "dry_run_count",
+            **progress_fields,
+        }
+
+    # Delete-real: per-object DeleteObject. Fulfillment buckets do not
+    # have versioning by contract (form_handler writer does single
+    # put_object; not versioning-aware). A single DeleteObject is
+    # sufficient — unlike `_walk_archive_bucket` which must enumerate
+    # versions because picasso-archive-staging has versioning=ENABLED.
+    objects_deleted = 0
+    objects_delete_failed = 0
+    for bucket, key in enumerated:
+        try:
+            s3.delete_object(Bucket=bucket, Key=key)
+            objects_deleted += 1
+        except ClientError as exc:
+            objects_delete_failed += 1
+            # Mask the key suffix per D1 redaction rule (submission_id is
+            # operator-only); emit bucket + 12-char hash of the full key
+            # for cross-reference in audit_row + manual_followup.
+            key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+            logger.error(
+                "fulfillment_delete_failed: bucket=%s "
+                "key_prefix=submissions/<redacted> key_sha256_12=%s code=%s",
+                bucket, key_hash,
+                exc.response.get("Error", {}).get("Code"),
+            )
+
+    return {
+        "objects_found": objects_found,
+        "action": "deleted",
+        "objects_deleted": objects_deleted,
+        "objects_delete_failed": objects_delete_failed,
+        **progress_fields,
+    }
+
+
 def _recent_messages_chat_only_cli_snippet(tenant_id):
     """Operator-actionable CLI snippet for the chat-only F-DSAR4 gap.
 
@@ -1716,6 +1913,9 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         # (Sprint A walker matrix §4 row S6 required this; Sprint B missed it).
         "session-events": 0,
         "archive": 0,
+        # M2 Sprint D: per-tenant S3 fulfillment walker chained off the
+        # form-submissions matched rows (reads each row's fulfillment_path).
+        "fulfillment": 0,
     }
     rows_touched.update({s: 0 for s in MFS_SCOPED_SURFACES})
     manual_followups = []
@@ -1774,6 +1974,11 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "session_ids; no subject resolved → no chain)"
         )
         walker_results["archive"] = {"status": "skipped_no_subject"}
+        manual_followups.append(
+            "fulfillment: skipped (chained walker requires form-submissions "
+            "matched rows; no subject resolved → no chain)"
+        )
+        walker_results["fulfillment"] = {"status": "skipped_no_subject"}
         for surface, reason in MFS_SCOPED_SURFACES.items():
             manual_followups.append(f"{surface}: {reason}")
             walker_results[surface] = {"status": "deferred", "reason": reason}
@@ -2012,6 +2217,10 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
     # Defense-in-depth: if form-submissions errored, the session_ids list
     # is empty and the walker correctly short-circuits to no_sessions.
     captured_session_ids = fs.get("session_ids", []) if fs else []
+    # M2 Sprint D: capture matched rows (PRE-delete; the Python list still
+    # references the original dicts even after DDB rows are deleted) so the
+    # fulfillment walker can extract per-row `fulfillment_path` attributes.
+    captured_matched_rows = fs.get("matched_rows", []) if fs else []
     rm = _walk_recent_messages(
         tenant_id, captured_session_ids, request_type, dry_run,
     )
@@ -2170,6 +2379,15 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
     # _walk_form_submissions (Query bounded by pii_subject_id + tenant_id).
     _apply_archive_walker_result(
         tenant_id, captured_session_ids, request_type, dry_run,
+        rows_touched, manual_followups, exported_rows, walker_results,
+    )
+
+    # fulfillment: M2 Sprint D — chained walk via the form-submissions
+    # matched rows (read each row's `fulfillment_path` attribute). Email
+    # path only — psid subjects don't submit forms, so there is no
+    # fulfillment surface in `_walk_psid_surfaces`.
+    _apply_fulfillment_walker_result(
+        tenant_id, captured_matched_rows, request_type, dry_run,
         rows_touched, manual_followups, exported_rows, walker_results,
     )
 
@@ -2414,6 +2632,122 @@ def _apply_archive_walker_result(
         result["status"] = "errored"
         result["error"] = "failed_session_ids"
     walker_results["archive"] = result
+
+
+def _apply_fulfillment_walker_result(
+    tenant_id, form_submissions_rows, request_type, dry_run,
+    rows_touched, manual_followups, exported_rows, walker_results,
+):
+    """Invoke _walk_fulfillment_s3 and fold its output into the dispatcher's
+    accumulators. M2 Sprint D helper — per-tenant S3 fulfillment walker is
+    chained off the email-path form-submissions walker only (psid path does
+    NOT submit forms, so there is no fulfillment surface to walk).
+
+    Mutates rows_touched, manual_followups, exported_rows, walker_results
+    in place. No return value.
+
+    Surface key in walker_results: "fulfillment".
+    """
+    fr = _walk_fulfillment_s3(
+        tenant_id, form_submissions_rows, request_type, dry_run,
+    )
+    rows_touched["fulfillment"] = fr["objects_found"]
+
+    base_result = {
+        "rows_touched": fr["objects_found"],
+        "rows_with_path": fr.get("rows_with_path", 0),
+        "rows_without_path": fr.get("rows_without_path", 0),
+    }
+    if fr.get("failed_paths"):
+        base_result["failed_paths"] = fr["failed_paths"]
+    if fr.get("skipped_cross_tenant"):
+        base_result["skipped_cross_tenant"] = fr["skipped_cross_tenant"]
+
+    # Surface the writer-extension-pending gap whenever any matched form-
+    # submission row lacked `fulfillment_path`. This is the dominant case
+    # today (writer extension is a follow-up PR per the module docstring);
+    # operator may need to manually walk per-tenant bucket if subject's
+    # rows pre-date the writer extension.
+    if fr.get("rows_without_path", 0) > 0:
+        manual_followups.append(
+            f"fulfillment: {fr['rows_without_path']} form-submission row(s) "
+            f"lack `fulfillment_path` attribute (writer extension pending — "
+            f"see module docstring 'WHAT IT DOES NOT YET DO'). Per-row path "
+            f"defense (N3 stale-config) is unavailable for these rows. "
+            f"Operator-actionable: query tenant config for "
+            f"`forms.<form_type>.fulfillment.bucket` and manually list "
+            f"`s3://<bucket>/submissions/{tenant_id}/<form_type>/<submission_id>.json` "
+            f"for any submission_id without path."
+        )
+
+    if fr.get("failed_paths", 0) > 0:
+        manual_followups.append(
+            f"fulfillment: {fr['failed_paths']} row(s) had unparseable "
+            f"`fulfillment_path` values (not s3:// URI); see CloudWatch "
+            f"logs. Manual inspection required."
+        )
+    if fr.get("skipped_cross_tenant", 0) > 0:
+        manual_followups.append(
+            f"fulfillment: {fr['skipped_cross_tenant']} row(s) had "
+            f"`fulfillment_path` pointing OUTSIDE the requested tenant "
+            f"prefix — rejected as cross-tenant pointer (writer drift OR "
+            f"stale row). NOT deleted; manual inspection required."
+        )
+
+    if fr.get("action") == "no_fulfillment_paths":
+        walker_results["fulfillment"] = {
+            **base_result,
+            "status": "completed",
+            "action": "no_fulfillment_paths",
+        }
+        return
+
+    if fr.get("action") == "exported":
+        exported_rows["fulfillment"] = fr["exported_keys"]
+        walker_results["fulfillment"] = {
+            **base_result,
+            "status": "completed",
+            "action": "exported",
+        }
+        return
+
+    if fr.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"fulfillment: dry_run=true; {fr['objects_found']} object(s) "
+            f"would be deleted; re-invoke with dry_run=false to delete"
+        )
+        walker_results["fulfillment"] = {
+            **base_result,
+            "status": "completed",
+            "action": "dry_run_count",
+        }
+        return
+
+    # action == "deleted"
+    result = {
+        **base_result,
+        "status": "completed",
+        "action": "deleted",
+        "objects_deleted": fr.get("objects_deleted", 0),
+        "objects_delete_failed": fr.get("objects_delete_failed", 0),
+    }
+    if fr.get("objects_delete_failed", 0) > 0:
+        # Per-design "hard partial-failure, never silent". Most common
+        # cause: AccessDenied because the (bucket, tenant_id) IAM grant
+        # has not been added per the runbook §14 Q4 procedure (Arm 3
+        # design intent — fail-closed on unknown bucket).
+        manual_followups.append(
+            f"fulfillment: {fr['objects_delete_failed']} object(s) failed "
+            f"to delete — see CloudWatch logs for (bucket, key_sha256_12) "
+            f"values. Most likely cause: missing IAM grant for "
+            f"`s3:DeleteObject` on `arn:aws:s3:::<bucket>/submissions/"
+            f"{tenant_id}/*` (Sprint D walker code-only; per-(bucket, "
+            f"tenant_id) IAM additions ship in follow-up PRs per "
+            f"PII_DELETE_PIPELINE_DESIGN.md §14 Q4)."
+        )
+        result["status"] = "errored"
+        result["error"] = "objects_delete_failed"
+    walker_results["fulfillment"] = result
 
 
 def _apply_session_events_walker_result(
