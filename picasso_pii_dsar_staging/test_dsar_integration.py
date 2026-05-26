@@ -71,6 +71,24 @@ SKIP_REASON = (
     "Run with: AWS_INTEGRATION_TESTS=1 pytest test_dsar_integration.py"
 )
 
+# Sprint D fulfillment walker integration test (Q3c — skip-until-fixture).
+# These tests need a real S3 bucket the DSAR Lambda role has been granted
+# s3:DeleteObject on (via picasso `var.fulfillment_grants`; see PR #258).
+# Default: skipped. To run:
+#   1. Operator creates an S3 bucket (e.g., `picasso-pii-dsar-int-staging`).
+#   2. Operator adds `{bucket="picasso-pii-dsar-int-staging", tenant_id="TEN-SMOKE-FULFILL"}`
+#      to `var.fulfillment_grants` + `terraform apply`.
+#   3. Set FULFILLMENT_TEST_BUCKET=<bucket-name> before running pytest.
+# Without the env var, k-prefix tests skip cleanly (no spurious failures).
+FULFILLMENT_TEST_BUCKET = os.environ.get("FULFILLMENT_TEST_BUCKET")
+FULFILLMENT_SKIP_REASON = (
+    "Sprint D fulfillment walker integration test requires FULFILLMENT_TEST_BUCKET "
+    "env var pointing at an S3 bucket the DSAR role has s3:DeleteObject on "
+    "(see picasso var.fulfillment_grants — picasso#258). Test data uses "
+    "tenant_id TEN-SMOKE-FULFILL; grant must scope to that tenant_id."
+)
+FULFILLMENT_TEST_TENANT_ID = "TEN-SMOKE-FULFILL"
+
 
 # ───────────────────────────────────────────────────────────────────────────
 # Helpers (module scope; available to all tests)
@@ -812,3 +830,231 @@ def test_j_audit_replay_documents_actual_idempotency_scope(aws):
             f"got {request_received_count}; audit_rows={len(audit_rows)}"
     finally:
         _cleanup_seed(aws, tenant_id, submission_id, email)
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# Sprint D fulfillment walker — IAM-gated integration tests (Q3c)
+# Skip cleanly when FULFILLMENT_TEST_BUCKET is unset (default state until
+# operator creates the bucket + adds the grant per picasso#258).
+# ───────────────────────────────────────────────────────────────────────────
+
+
+def _seed_form_submission_with_fulfillment(aws, tenant_id, email, bucket,
+                                            submission_id=None):
+    """Seed a form-submission row WITH fulfillment_path + write the S3 object.
+
+    Matches the production writer's key pattern:
+        s3://{bucket}/submissions/{tenant_id}/{form_id}/{submission_id}.json
+    (see Master_Function_Staging/form_handler.py::_process_fulfillment +
+    Bedrock_Streaming_Handler_Staging/form_handler.js::routeFulfillment.)
+
+    Returns (submission_id, pii_subject_id, s3_key) for assertion + cleanup.
+    """
+    submission_id = submission_id or str(uuid.uuid4())
+    pii_subject_id = f"psub_{uuid.uuid4().hex}"
+    timestamp = datetime.now(timezone.utc).isoformat()
+    normalized = _normalize_email(email)
+    form_id = "smoke_fulfillment_test"
+    s3_key = f"submissions/{tenant_id}/{form_id}/{submission_id}.json"
+    fulfillment_path = f"s3://{bucket}/{s3_key}"
+
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=json.dumps({"name": f"Smoke Fulfillment {submission_id[:8]}",
+                         "email": email}),
+        ContentType="application/json",
+    )
+
+    aws["ddb"].Table(TABLE_FORM_SUBMISSIONS).put_item(Item={
+        "tenant_id": tenant_id,
+        "submission_id": submission_id,
+        "pii_subject_id": pii_subject_id,
+        "form_id": form_id,
+        "form_data_labeled": {"name": "Smoke", "email": email},
+        "submitted_at": timestamp,
+        "fulfillment_path": fulfillment_path,
+        "ttl": int(time.time()) + 3600,
+    })
+    aws["ddb"].Table(TABLE_SUBJECT_INDEX).put_item(Item={
+        "tenant_id": tenant_id,
+        "normalized_email": normalized,
+        "pii_subject_id": pii_subject_id,
+    })
+    return submission_id, pii_subject_id, s3_key
+
+
+def _cleanup_fulfillment_seed(aws, tenant_id, submission_id, email, bucket,
+                                s3_key):
+    """Best-effort cleanup of DDB row + S3 object. Never raises."""
+    _cleanup_seed(aws, tenant_id, submission_id, email)
+    try:
+        boto3.client("s3", region_name=REGION).delete_object(
+            Bucket=bucket, Key=s3_key,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@pytest.mark.skipif(
+    not FULFILLMENT_TEST_BUCKET, reason=FULFILLMENT_SKIP_REASON,
+)
+def test_k_fulfillment_walker_dry_run_counts_object_without_delete(aws):
+    """Sprint D walker — dry_run=True counts the S3 object but does NOT delete it.
+
+    Verifies: walker chains off form-submissions matched rows, parses
+    `fulfillment_path`, validates tenant-segment, returns
+    `objects_found:1 action:'dry_run_count'`. S3 object remains present
+    post-invocation.
+    """
+    tid = _gen_id("k")
+    tenant_id = FULFILLMENT_TEST_TENANT_ID
+    email = _gen_email(tid)
+    dsar_id = f"{TEST_DSAR_PREFIX}{tid}"
+    bucket = FULFILLMENT_TEST_BUCKET
+    submission_id, _, s3_key = _seed_form_submission_with_fulfillment(
+        aws, tenant_id, email, bucket,
+    )
+    try:
+        body, http_status = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="delete", dry_run=True,
+        ))
+        assert http_status == 200, body
+        walker_results = body.get("walker_results") or {}
+        fulfillment = walker_results.get("fulfillment") or {}
+        assert fulfillment.get("action") == "dry_run_count", \
+            f"expected action=dry_run_count; got {fulfillment}; body={body}"
+        assert fulfillment.get("objects_found") == 1, \
+            f"expected objects_found=1; got {fulfillment}"
+        # Object still exists
+        s3 = boto3.client("s3", region_name=REGION)
+        head = s3.head_object(Bucket=bucket, Key=s3_key)
+        assert head["ContentLength"] > 0
+    finally:
+        _cleanup_fulfillment_seed(
+            aws, tenant_id, submission_id, email, bucket, s3_key,
+        )
+
+
+@pytest.mark.skipif(
+    not FULFILLMENT_TEST_BUCKET, reason=FULFILLMENT_SKIP_REASON,
+)
+def test_l_fulfillment_walker_real_delete_removes_object_and_writes_audit(aws):
+    """Sprint D walker — dry_run=False deletes the S3 object + writes
+    `surface_walked:fulfillment` audit event.
+    """
+    tid = _gen_id("l")
+    tenant_id = FULFILLMENT_TEST_TENANT_ID
+    email = _gen_email(tid)
+    dsar_id = f"{TEST_DSAR_PREFIX}{tid}"
+    bucket = FULFILLMENT_TEST_BUCKET
+    submission_id, _, s3_key = _seed_form_submission_with_fulfillment(
+        aws, tenant_id, email, bucket,
+    )
+    try:
+        body, http_status = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="delete", dry_run=False,
+        ))
+        assert http_status == 200, body
+        walker_results = body.get("walker_results") or {}
+        fulfillment = walker_results.get("fulfillment") or {}
+        assert fulfillment.get("action") == "deleted", \
+            f"expected action=deleted; got {fulfillment}; body={body}"
+        assert fulfillment.get("objects_found") == 1, \
+            f"expected objects_found=1; got {fulfillment}"
+        assert not fulfillment.get("failed_paths"), \
+            f"unexpected failed_paths: {fulfillment.get('failed_paths')}"
+
+        # S3 object gone
+        s3 = boto3.client("s3", region_name=REGION)
+        try:
+            s3.head_object(Bucket=bucket, Key=s3_key)
+            raise AssertionError(f"S3 object {s3_key} still exists post-delete")
+        except ClientError as e:
+            assert e.response["Error"]["Code"] in ("404", "NoSuchKey",
+                                                    "NotFound"), \
+                f"unexpected ClientError on head_object: {e}"
+
+        # Audit event present
+        audit_rows = _get_audit_rows(aws, dsar_id)
+        fulfillment_events = [
+            r for r in audit_rows
+            if r.get("event_type") == "surface_walked:fulfillment"
+        ]
+        assert len(fulfillment_events) == 1, \
+            f"expected 1 surface_walked:fulfillment audit event; got " \
+            f"{len(fulfillment_events)}; audit_rows={audit_rows}"
+    finally:
+        _cleanup_fulfillment_seed(
+            aws, tenant_id, submission_id, email, bucket, s3_key,
+        )
+
+
+@pytest.mark.skipif(
+    not FULFILLMENT_TEST_BUCKET, reason=FULFILLMENT_SKIP_REASON,
+)
+def test_m_fulfillment_walker_rejects_cross_tenant_path(aws):
+    """Sprint D walker tenant-segment defense — a form-submission row whose
+    `fulfillment_path` is forged to point at ANOTHER tenant's prefix MUST
+    NOT delete the cross-tenant object.
+
+    Seed: walker invoked for tenant TEN-SMOKE-FULFILL, but the row's
+    fulfillment_path points at `submissions/TEN-OTHER/...`. Walker should
+    skip the row (cross-tenant rejection) and surface zero objects_found.
+    """
+    tid = _gen_id("m")
+    tenant_id = FULFILLMENT_TEST_TENANT_ID
+    email = _gen_email(tid)
+    dsar_id = f"{TEST_DSAR_PREFIX}{tid}"
+    bucket = FULFILLMENT_TEST_BUCKET
+
+    # Seed a row whose fulfillment_path references DIFFERENT tenant segment
+    submission_id = str(uuid.uuid4())
+    forged_key = f"submissions/TEN-OTHER/forged/{submission_id}.json"
+    forged_path = f"s3://{bucket}/{forged_key}"
+
+    # Write the forged-key object ourselves so we can verify it survives
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.put_object(Bucket=bucket, Key=forged_key, Body=b"forged",
+                  ContentType="application/json")
+
+    pii_subject_id = f"psub_{uuid.uuid4().hex}"
+    normalized = _normalize_email(email)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    aws["ddb"].Table(TABLE_FORM_SUBMISSIONS).put_item(Item={
+        "tenant_id": tenant_id,
+        "submission_id": submission_id,
+        "pii_subject_id": pii_subject_id,
+        "form_id": "smoke_fulfillment_cross_tenant",
+        "form_data_labeled": {"email": email},
+        "submitted_at": timestamp,
+        "fulfillment_path": forged_path,
+        "ttl": int(time.time()) + 3600,
+    })
+    aws["ddb"].Table(TABLE_SUBJECT_INDEX).put_item(Item={
+        "tenant_id": tenant_id,
+        "normalized_email": normalized,
+        "pii_subject_id": pii_subject_id,
+    })
+
+    try:
+        body, http_status = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="delete", dry_run=False,
+        ))
+        assert http_status == 200, body
+        fulfillment = (body.get("walker_results") or {}).get("fulfillment") or {}
+        # Cross-tenant rejection: skipped + zero objects_found
+        assert fulfillment.get("skipped_cross_tenant", 0) >= 1, \
+            f"expected skipped_cross_tenant >=1; got {fulfillment}"
+        assert fulfillment.get("objects_found", 0) == 0, \
+            f"expected objects_found=0 on cross-tenant rejection; got " \
+            f"{fulfillment}"
+
+        # Forged object survived
+        head = s3.head_object(Bucket=bucket, Key=forged_key)
+        assert head["ContentLength"] == len(b"forged")
+    finally:
+        _cleanup_fulfillment_seed(
+            aws, tenant_id, submission_id, email, bucket, forged_key,
+        )
