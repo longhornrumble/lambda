@@ -283,6 +283,12 @@ def _extract_details(audit_row):
 
 
 def _make_payload(tenant_id, email, dsar_id, request_type="delete", dry_run=True):
+    # lambda#162 added a validation that rejects dsar_ids starting with `smoke-`
+    # unless `smoke_test_marker=true` is set. ALL integration tests use the
+    # TEST_DSAR_PREFIX = "smoke-int-" prefix, so propagate the marker here
+    # rather than in each test. The marker also drives the `is_smoke_test`
+    # audit-row attribute so the operator's SLA-monitor scan can filter these
+    # rows out via `FilterExpression attribute_not_exists(is_smoke_test) OR is_smoke_test = :false`.
     return {
         "subject_identifier": email,
         "identifier_type": "email",
@@ -291,6 +297,7 @@ def _make_payload(tenant_id, email, dsar_id, request_type="delete", dry_run=True
         "operator": "smoke-int-tests@myrecruiter.ai",
         "dsar_id": dsar_id,
         "dry_run": dry_run,
+        "smoke_test_marker": True,
     }
 
 
@@ -903,10 +910,9 @@ def _cleanup_fulfillment_seed(aws, tenant_id, submission_id, email, bucket,
 def test_k_fulfillment_walker_dry_run_counts_object_without_delete(aws):
     """Sprint D walker — dry_run=True counts the S3 object but does NOT delete it.
 
-    Verifies: walker chains off form-submissions matched rows, parses
-    `fulfillment_path`, validates tenant-segment, returns
-    `objects_found:1 action:'dry_run_count'`. S3 object remains present
-    post-invocation.
+    Asserts against the handler's API response shape (the handler exposes
+    `rows_touched`, `manual_followups`, `audit_row_pks` — `walker_results`
+    is internal dispatcher state, not surfaced to the client).
     """
     tid = _gen_id("k")
     tenant_id = FULFILLMENT_TEST_TENANT_ID
@@ -921,13 +927,13 @@ def test_k_fulfillment_walker_dry_run_counts_object_without_delete(aws):
             tenant_id, email, dsar_id, request_type="delete", dry_run=True,
         ))
         assert http_status == 200, body
-        walker_results = body.get("walker_results") or {}
-        fulfillment = walker_results.get("fulfillment") or {}
-        assert fulfillment.get("action") == "dry_run_count", \
-            f"expected action=dry_run_count; got {fulfillment}; body={body}"
-        assert fulfillment.get("objects_found") == 1, \
-            f"expected objects_found=1; got {fulfillment}"
-        # Object still exists
+        rows_touched = body.get("rows_touched") or {}
+        assert rows_touched.get("fulfillment") == 1, \
+            f"expected rows_touched.fulfillment=1; got {rows_touched}; body={body}"
+        followups = body.get("manual_followups") or []
+        assert any("fulfillment: dry_run" in f for f in followups), \
+            f"expected fulfillment dry_run followup; got followups={followups}"
+        # Object still exists (dry_run did not delete)
         s3 = boto3.client("s3", region_name=REGION)
         head = s3.head_object(Bucket=bucket, Key=s3_key)
         assert head["ContentLength"] > 0
@@ -957,14 +963,9 @@ def test_l_fulfillment_walker_real_delete_removes_object_and_writes_audit(aws):
             tenant_id, email, dsar_id, request_type="delete", dry_run=False,
         ))
         assert http_status == 200, body
-        walker_results = body.get("walker_results") or {}
-        fulfillment = walker_results.get("fulfillment") or {}
-        assert fulfillment.get("action") == "deleted", \
-            f"expected action=deleted; got {fulfillment}; body={body}"
-        assert fulfillment.get("objects_found") == 1, \
-            f"expected objects_found=1; got {fulfillment}"
-        assert not fulfillment.get("failed_paths"), \
-            f"unexpected failed_paths: {fulfillment.get('failed_paths')}"
+        rows_touched = body.get("rows_touched") or {}
+        assert rows_touched.get("fulfillment") == 1, \
+            f"expected rows_touched.fulfillment=1; got {rows_touched}; body={body}"
 
         # S3 object gone
         s3 = boto3.client("s3", region_name=REGION)
@@ -976,7 +977,7 @@ def test_l_fulfillment_walker_real_delete_removes_object_and_writes_audit(aws):
                                                     "NotFound"), \
                 f"unexpected ClientError on head_object: {e}"
 
-        # Audit event present
+        # surface_walked:fulfillment audit event present
         audit_rows = _get_audit_rows(aws, dsar_id)
         fulfillment_events = [
             r for r in audit_rows
@@ -999,9 +1000,10 @@ def test_m_fulfillment_walker_rejects_cross_tenant_path(aws):
     `fulfillment_path` is forged to point at ANOTHER tenant's prefix MUST
     NOT delete the cross-tenant object.
 
-    Seed: walker invoked for tenant TEN-SMOKE-FULFILL, but the row's
-    fulfillment_path points at `submissions/TEN-OTHER/...`. Walker should
-    skip the row (cross-tenant rejection) and surface zero objects_found.
+    Asserts against the handler's API response shape: cross-tenant rejection
+    surfaces as `rows_touched.fulfillment == 0` (no in-tenant matches) and
+    a `fulfillment: ... skipped_cross_tenant` manual followup. The forged
+    object MUST survive.
     """
     tid = _gen_id("m")
     tenant_id = FULFILLMENT_TEST_TENANT_ID
@@ -1009,12 +1011,10 @@ def test_m_fulfillment_walker_rejects_cross_tenant_path(aws):
     dsar_id = f"{TEST_DSAR_PREFIX}{tid}"
     bucket = FULFILLMENT_TEST_BUCKET
 
-    # Seed a row whose fulfillment_path references DIFFERENT tenant segment
     submission_id = str(uuid.uuid4())
     forged_key = f"submissions/TEN-OTHER/forged/{submission_id}.json"
     forged_path = f"s3://{bucket}/{forged_key}"
 
-    # Write the forged-key object ourselves so we can verify it survives
     s3 = boto3.client("s3", region_name=REGION)
     s3.put_object(Bucket=bucket, Key=forged_key, Body=b"forged",
                   ContentType="application/json")
@@ -1043,13 +1043,13 @@ def test_m_fulfillment_walker_rejects_cross_tenant_path(aws):
             tenant_id, email, dsar_id, request_type="delete", dry_run=False,
         ))
         assert http_status == 200, body
-        fulfillment = (body.get("walker_results") or {}).get("fulfillment") or {}
-        # Cross-tenant rejection: skipped + zero objects_found
-        assert fulfillment.get("skipped_cross_tenant", 0) >= 1, \
-            f"expected skipped_cross_tenant >=1; got {fulfillment}"
-        assert fulfillment.get("objects_found", 0) == 0, \
-            f"expected objects_found=0 on cross-tenant rejection; got " \
-            f"{fulfillment}"
+        rows_touched = body.get("rows_touched") or {}
+        assert rows_touched.get("fulfillment") == 0, \
+            f"expected rows_touched.fulfillment=0 (no in-tenant matches); " \
+            f"got {rows_touched}; body={body}"
+        followups = body.get("manual_followups") or []
+        assert any("skipped_cross_tenant" in f or "cross-tenant" in f for f in followups), \
+            f"expected cross-tenant followup; got followups={followups}"
 
         # Forged object survived
         head = s3.head_object(Bucket=bucket, Key=forged_key)
