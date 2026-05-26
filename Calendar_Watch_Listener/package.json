@@ -1,0 +1,30 @@
+{
+  "name": "calendar-watch-listener",
+  "version": "1.0.0",
+  "description": "Calendar_Watch_Listener — scheduling sub-phase B Task B2. Receives Google Calendar push notifications, validates X-Goog-Channel-Token via SHA-256 hash compare, dispatches to picasso-calendar-watch-events-staging.fifo per scheduling/docs/listener_dispatch_interface.md (B0 spec).",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-sqs": "^3.600.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
