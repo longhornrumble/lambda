@@ -716,6 +716,120 @@ class TestFormHandler(unittest.TestCase):
         self.assertEqual(result['type'], 'unsupported_type')
         self.assertEqual(result['status'], 'unsupported')
 
+    # --- Sprint D writer extension: _persist_fulfillment_path ---
+    # Moto-independent (same pattern as test_store_submission_writes_ttl): the
+    # MagicMock approach captures update_item calls directly. This proves the
+    # writer half of the PII DSAR fulfillment walker contract — the walker
+    # already reads `fulfillment_path` per-row + this writer is what fills it.
+
+    def _patch_submissions_table(self, fh_module):
+        """Return (subs_table, update_calls) and patch fh_module.dynamodb."""
+        update_calls = []
+        subs_table = MagicMock()
+        subs_table.update_item.side_effect = (
+            lambda **kwargs: update_calls.append(kwargs))
+        patcher = patch.object(fh_module, 'dynamodb')
+        md = patcher.start()
+        self.addCleanup(patcher.stop)
+        md.Table.return_value = subs_table
+        return subs_table, update_calls
+
+    def test_persist_fulfillment_path_writes_s3_uri_on_stored_result(self):
+        """Sprint D writer extension: when fulfillment is type=s3 status=stored,
+        UpdateItem fires with the s3:// location on the composite key
+        (tenant_id, submission_id) under attribute `fulfillment_path`.
+        """
+        import form_handler as fh
+        _, update_calls = self._patch_submissions_table(fh)
+
+        handler = FormHandler(self.tenant_config)
+        handler._persist_fulfillment_path(
+            'sub_abc',
+            {'type': 's3', 'status': 'stored',
+             'location': 's3://bkt/submissions/test_tenant_123/f/sub_abc.json'},
+        )
+
+        self.assertEqual(len(update_calls), 1)
+        call_kwargs = update_calls[0]
+        self.assertEqual(call_kwargs['Key'],
+                         {'tenant_id': 'test_tenant_123',
+                          'submission_id': 'sub_abc'})
+        self.assertEqual(call_kwargs['UpdateExpression'],
+                         'SET fulfillment_path = :fp')
+        self.assertEqual(
+            call_kwargs['ExpressionAttributeValues'],
+            {':fp': 's3://bkt/submissions/test_tenant_123/f/sub_abc.json'})
+
+    def test_persist_fulfillment_path_skips_non_s3_fulfillment(self):
+        """email/lambda/webhook/no_config results MUST NOT trigger UpdateItem."""
+        import form_handler as fh
+        _, update_calls = self._patch_submissions_table(fh)
+
+        handler = FormHandler(self.tenant_config)
+        for result in [
+            None,
+            {},
+            {'status': 'no_fulfillment_configured'},
+            {'type': 'email', 'status': 'sent', 'recipient': 'a@b.com'},
+            {'type': 'lambda', 'status': 'invoked'},
+            {'type': 'unsupported_type', 'status': 'unsupported'},
+        ]:
+            handler._persist_fulfillment_path('sub_x', result)
+        self.assertEqual(update_calls, [])
+
+    def test_persist_fulfillment_path_skips_s3_error_result(self):
+        """type=s3 status=error MUST NOT persist (S3 PutObject failed → no key
+        exists; DSAR walker would chase a phantom path)."""
+        import form_handler as fh
+        _, update_calls = self._patch_submissions_table(fh)
+
+        handler = FormHandler(self.tenant_config)
+        handler._persist_fulfillment_path(
+            'sub_err',
+            {'type': 's3', 'status': 'error', 'error': 'AccessDenied'},
+        )
+        self.assertEqual(update_calls, [])
+
+    def test_persist_fulfillment_path_skips_s3_stored_without_location(self):
+        """Defensive: a stored result without a 'location' key MUST NOT
+        persist (avoid writing an empty fulfillment_path that would later
+        trigger a parse-failure in the DSAR walker)."""
+        import form_handler as fh
+        _, update_calls = self._patch_submissions_table(fh)
+
+        handler = FormHandler(self.tenant_config)
+        handler._persist_fulfillment_path(
+            'sub_noloc',
+            {'type': 's3', 'status': 'stored'},
+        )
+        self.assertEqual(update_calls, [])
+
+    def test_persist_fulfillment_path_swallows_client_error(self):
+        """UpdateItem ClientError MUST NOT raise (walker manual-followup
+        branch is the documented fallback)."""
+        import form_handler as fh
+        update_calls = []
+        subs_table = MagicMock()
+        def _raise(**kwargs):
+            update_calls.append(kwargs)
+            raise ClientError(
+                {'Error': {'Code': 'AccessDeniedException',
+                           'Message': 'no grant'}},
+                'UpdateItem')
+        subs_table.update_item.side_effect = _raise
+        with patch.object(fh, 'dynamodb') as md:
+            md.Table.return_value = subs_table
+            handler = FormHandler(self.tenant_config)
+            try:
+                handler._persist_fulfillment_path(
+                    'sub_err',
+                    {'type': 's3', 'status': 'stored',
+                     'location': 's3://bkt/submissions/t/f/sub_err.json'},
+                )
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"unexpected raise from _persist_fulfillment_path: {e}")
+        self.assertEqual(len(update_calls), 1)
+
     @mock_dynamodb
     def test_get_monthly_sms_usage(self):
         """Test getting monthly SMS usage from DynamoDB"""

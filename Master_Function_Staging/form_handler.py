@@ -583,6 +583,11 @@ class FormHandler:
                 submission_id=submission_id
             )
 
+            # Sprint D writer extension: persist S3 fulfillment URI on the row
+            # so the PII DSAR walker can delete the per-tenant S3 object on
+            # subject deletion. Best-effort, non-fatal.
+            self._persist_fulfillment_path(submission_id, fulfillment_result)
+
             # Audit log
             self._audit_submission(
                 submission_id=submission_id,
@@ -1007,6 +1012,44 @@ class FormHandler:
                 return {'type': 's3', 'status': 'error', 'error': str(e)}
 
         return {'type': fulfillment_type, 'status': 'unsupported'}
+
+    def _persist_fulfillment_path(self, submission_id: str,
+                                   fulfillment_result: Dict[str, Any]) -> None:
+        """If S3 fulfillment succeeded, persist the s3:// URI on the row.
+
+        Sprint D writer extension. The PII DSAR fulfillment walker
+        (picasso_pii_dsar_staging/lambda_function.py::_walk_fulfillment_s3)
+        reads `fulfillment_path` per-row to delete the per-tenant S3 object on
+        subject deletion. Walker is forward-compatible — rows without this
+        attribute surface as `rows_without_path` + manual followup.
+
+        Best-effort + non-fatal: a failed UpdateItem reverts to the walker's
+        manual-followup branch.
+        """
+        if not fulfillment_result:
+            return
+        if fulfillment_result.get('type') != 's3':
+            return
+        if fulfillment_result.get('status') != 'stored':
+            return
+        location = fulfillment_result.get('location')
+        if not location:
+            return
+        try:
+            table = dynamodb.Table(SUBMISSIONS_TABLE)
+            table.update_item(
+                Key={
+                    'tenant_id': self.tenant_id,
+                    'submission_id': submission_id,
+                },
+                UpdateExpression='SET fulfillment_path = :fp',
+                ExpressionAttributeValues={':fp': location},
+            )
+        except ClientError as e:
+            logger.warning(
+                f"fulfillment_path persistence failed for {submission_id} "
+                f"(non-fatal; DSAR walker will surface manual followup): {e}"
+            )
 
     def _get_monthly_sms_usage(self) -> int:
         """Get current month's SMS usage count"""
