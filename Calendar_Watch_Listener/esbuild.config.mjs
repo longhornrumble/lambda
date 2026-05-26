@@ -1,9 +1,11 @@
 import * as esbuild from 'esbuild';
 
-// Lambda Node.js 20.x ships @aws-sdk/* — don't bundle them
+// Lambda Node.js 20.x ships @aws-sdk/* — don't bundle them.
+// googleapis + google-auth-library are NOT in the runtime; they must bundle.
 const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
   '@aws-sdk/client-sqs',
+  '@aws-sdk/client-secrets-manager',
 ];
 
 await esbuild.build({
