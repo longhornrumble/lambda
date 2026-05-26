@@ -1025,6 +1025,14 @@ class FormHandler:
 
         Best-effort + non-fatal: a failed UpdateItem reverts to the walker's
         manual-followup branch.
+
+        Failure modes covered (audit closure 2026-05-26):
+          - missing tenant_id (audit #1): refuse the write rather than write
+            a ghost row whose Key would not match the original submission.
+          - ClientError (audit #6): log with stable `event=` token a
+            CloudWatch Logs metric filter can match.
+          - ParamValidationError (audit #14): the broader `Exception` catch
+            handles malformed Key values that ClientError alone would miss.
         """
         if not fulfillment_result:
             return
@@ -1034,6 +1042,17 @@ class FormHandler:
             return
         location = fulfillment_result.get('location')
         if not location:
+            return
+        # Audit #1/#14: refuse the write if tenant_id is missing/empty/non-str.
+        # A ghost row keyed by an unexpected tenant_id would silently lose the
+        # writeback because the real form-submission row was written under the
+        # real tenant_id from the put_item earlier in _store_submission.
+        if not self.tenant_id or not isinstance(self.tenant_id, str):
+            logger.warning(
+                "event=fulfillment_path_persist_skipped reason=missing_tenant_id "
+                f"submission_id={submission_id} "
+                "(DSAR walker will surface manual followup)"
+            )
             return
         try:
             table = dynamodb.Table(SUBMISSIONS_TABLE)
@@ -1045,10 +1064,14 @@ class FormHandler:
                 UpdateExpression='SET fulfillment_path = :fp',
                 ExpressionAttributeValues={':fp': location},
             )
-        except ClientError as e:
+        except Exception as e:  # noqa: BLE001 — never propagate; walker fallback
+            # Stable `event=` token for CloudWatch Logs metric filter.
             logger.warning(
-                f"fulfillment_path persistence failed for {submission_id} "
-                f"(non-fatal; DSAR walker will surface manual followup): {e}"
+                f"event=fulfillment_path_persist_failed "
+                f"submission_id={submission_id} "
+                f"error_class={type(e).__name__} "
+                f"error_message={str(e)} "
+                "(non-fatal; DSAR walker will surface manual followup)"
             )
 
     def _get_monthly_sms_usage(self) -> int:

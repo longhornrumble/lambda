@@ -308,8 +308,11 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
 
     // Sprint D writer extension: persist S3 fulfillment URI onto the row so
     // the PII DSAR walker can delete the per-tenant S3 object on subject
-    // deletion. Best-effort, non-fatal.
-    await persistFulfillmentPath(submissionId, config.tenant_id || 'unknown', fulfillmentResult);
+    // deletion. Best-effort, non-fatal. Pass `config.tenant_id` verbatim
+    // (no `'unknown'` fallback — audit row #1: a ghost row keyed by
+    // tenant_id='unknown' would silently lose the writeback because the
+    // real form-submission row was written under the real tenant_id).
+    await persistFulfillmentPath(submissionId, config.tenant_id, fulfillmentResult);
 
     // Applicant confirmation: per-form config takes precedence over tenant-level legacy flag.
     // - New config (notifications.applicant_confirmation): requires enabled === true (strict boolean)
@@ -648,6 +651,19 @@ async function persistFulfillmentPath(submissionId, tenantId, fulfillmentResults
   if (!Array.isArray(fulfillmentResults)) {
     return;
   }
+  // Audit row #1/#13 (code-reviewer 🔴): tenantId fallback `'unknown'` in the
+  // caller would create a ghost row keyed by `tenant_id='unknown'` because the
+  // form-submission was originally written under the real tenant_id. Guard
+  // against any falsy or non-real-tenant value to refuse the write rather
+  // than silently mis-targeting the row.
+  if (!tenantId || tenantId === 'unknown' || typeof tenantId !== 'string') {
+    console.warn(
+      `event=fulfillment_path_persist_skipped reason=missing_tenant_id `
+      + `submission_id=${submissionId} `
+      + `(DSAR walker will surface manual followup)`
+    );
+    return;
+  }
   const s3Hit = fulfillmentResults.find(r =>
     r
     && r.channel === 's3'
@@ -669,8 +685,12 @@ async function persistFulfillmentPath(submissionId, tenantId, fulfillmentResults
       ExpressionAttributeValues: { ':fp': s3Hit.location },
     }));
   } catch (err) {
+    // Audit row #6 (code-reviewer 🟡): emit structured key=value pairs the
+    // existing BSH CloudWatch Logs metric filters can match. The
+    // `event=fulfillment_path_persist_failed` token is stable so a metric
+    // filter can count failures by tenant_id without parsing free text.
     console.warn(
-      `⚠️ fulfillment_path persistence failed: tenant_id=${tenantId} `
+      `event=fulfillment_path_persist_failed tenant_id=${tenantId} `
       + `submission_id=${submissionId} `
       + `error_name=${err?.name || 'unknown'} `
       + `error_message=${err?.message || String(err)} `
