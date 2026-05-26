@@ -28,6 +28,7 @@ on:
           - Meta_Webhook_Handler
           - Meta_Response_Processor
           - Meta_OAuth_Handler
+          - Calendar_Watch_Listener
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -54,6 +55,7 @@ jobs:
       meta_webhook_handler: ${{ steps.filter.outputs.meta_webhook_handler }}
       meta_response_processor: ${{ steps.filter.outputs.meta_response_processor }}
       meta_oauth_handler: ${{ steps.filter.outputs.meta_oauth_handler }}
+      calendar_watch_listener: ${{ steps.filter.outputs.calendar_watch_listener }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -80,6 +82,8 @@ jobs:
               - 'Meta_Response_Processor/**'
             meta_oauth_handler:
               - 'Meta_OAuth_Handler/**'
+            calendar_watch_listener:
+              - 'Calendar_Watch_Listener/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -106,7 +110,8 @@ jobs:
       needs.detect-changes.outputs.sms_webhook_handler == 'true' ||
       needs.detect-changes.outputs.meta_webhook_handler == 'true' ||
       needs.detect-changes.outputs.meta_response_processor == 'true' ||
-      needs.detect-changes.outputs.meta_oauth_handler == 'true'
+      needs.detect-changes.outputs.meta_oauth_handler == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_listener == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -356,6 +361,23 @@ jobs:
             # Smoke skipped: routes are signed-state-JWT / Clerk-JWT gated;
             # a bare probe is non-deterministic. Real validation is Phase C1
             # (live OAuth connect of the operator test Page).
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Calendar_Watch_Listener
+            # Scheduling sub-phase B Task B2 — Node.js Lambda, esbuild bundle.
+            # Public Function URL; Google Calendar push receiver. Env vars
+            # Terraform-managed (lambda-calendar-watch-listener-staging module
+            # in picasso infra/). Same nodejs packaging path as Meta_Webhook.
+            staging_function: Calendar_Watch_Listener
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # Smoke: GET returns 200 (no challenge from Google for Calendar
+            # push channels; the handler responds 200 to any GET probe).
+            # POST smoke would need a valid X-Goog-Channel-Token + DDB row
+            # (Phase C5 integration test territory).
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
