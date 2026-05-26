@@ -986,6 +986,18 @@ def test_l_fulfillment_walker_real_delete_removes_object_and_writes_audit(aws):
         assert len(fulfillment_events) == 1, \
             f"expected 1 surface_walked:fulfillment audit event; got " \
             f"{len(fulfillment_events)}; audit_rows={audit_rows}"
+
+        # Audit closure 2026-05-26 row #16 (test-engineer 🟡): also verify
+        # the upstream form-submission DDB row is deleted, not just the S3
+        # object. If the form-submissions walker were silently failing, the
+        # S3 deletion would prove only half the DSAR.
+        ddb_resp = aws["ddb"].Table(TABLE_FORM_SUBMISSIONS).get_item(Key={
+            "tenant_id": tenant_id,
+            "submission_id": submission_id,
+        })
+        assert "Item" not in ddb_resp, (
+            f"expected form-submission DDB row deleted by upstream walker; "
+            f"got Item: {ddb_resp.get('Item')}")
     finally:
         _cleanup_fulfillment_seed(
             aws, tenant_id, submission_id, email, bucket, s3_key,
@@ -1048,8 +1060,15 @@ def test_m_fulfillment_walker_rejects_cross_tenant_path(aws):
             f"expected rows_touched.fulfillment=0 (no in-tenant matches); " \
             f"got {rows_touched}; body={body}"
         followups = body.get("manual_followups") or []
-        assert any("skipped_cross_tenant" in f or "cross-tenant" in f for f in followups), \
+        # Audit closure 2026-05-26 row #8 (code-reviewer 🟡): tighten the
+        # assertion so a future regression that treats the forged path as
+        # a parse-failure (rather than cross-tenant) would FAIL this test
+        # rather than silently pass on the OR clause.
+        assert any("cross-tenant pointer" in f for f in followups), \
             f"expected cross-tenant followup; got followups={followups}"
+        assert not any("unparseable" in f for f in followups), (
+            "the forged path should be rejected as cross-tenant, NOT as a "
+            "parse-failure — that distinction matters for operator triage")
 
         # Forged object survived
         head = s3.head_object(Bucket=bucket, Key=forged_key)
@@ -1058,3 +1077,150 @@ def test_m_fulfillment_walker_rejects_cross_tenant_path(aws):
         _cleanup_fulfillment_seed(
             aws, tenant_id, submission_id, email, bucket, forged_key,
         )
+
+
+@pytest.mark.skipif(
+    not FULFILLMENT_TEST_BUCKET, reason=FULFILLMENT_SKIP_REASON,
+)
+def test_n_fulfillment_walker_mixed_rows_with_and_without_path(aws):
+    """Audit closure 2026-05-26 row #12 (test-engineer 🟡): the dominant
+    real-world case after Sprint D ships is a tenant with SOME pre-extension
+    rows (no `fulfillment_path` attribute) AND SOME post-extension rows
+    (path present). Walker must (a) delete the S3 object for post-extension
+    rows, (b) surface the rows_without_path count + manual_followup pointing
+    at writer-extension-pending message.
+    """
+    tid = _gen_id("n")
+    tenant_id = FULFILLMENT_TEST_TENANT_ID
+    email = _gen_email(tid)
+    dsar_id = f"{TEST_DSAR_PREFIX}{tid}"
+    bucket = FULFILLMENT_TEST_BUCKET
+
+    # Row 1: has fulfillment_path + S3 object exists; the helper also writes
+    # the subject-index entry mapping the email at its pii_subject_id.
+    sub_with, subject_id, key_with = _seed_form_submission_with_fulfillment(
+        aws, tenant_id, email, bucket,
+    )
+
+    # Row 2: no fulfillment_path (pre-extension shape) — same subject_id so
+    # the walker resolves email → subject_id → BOTH rows. Do NOT rewrite
+    # the subject-index; it already points the email at `subject_id` from
+    # the helper above.
+    sub_without = str(uuid.uuid4())
+    timestamp = datetime.now(timezone.utc).isoformat()
+    aws["ddb"].Table(TABLE_FORM_SUBMISSIONS).put_item(Item={
+        "tenant_id": tenant_id,
+        "submission_id": sub_without,
+        "pii_subject_id": subject_id,
+        "form_id": "smoke_fulfillment_no_path",
+        "form_data_labeled": {"email": email},
+        "submitted_at": timestamp,
+        "ttl": int(time.time()) + 3600,
+        # NO fulfillment_path attribute
+    })
+
+    try:
+        body, http_status = _invoke(aws, _make_payload(
+            tenant_id, email, dsar_id, request_type="delete", dry_run=False,
+        ))
+        assert http_status == 200, body
+        rows_touched = body.get("rows_touched") or {}
+        # Exactly one S3 object should be deleted (the one with path).
+        assert rows_touched.get("fulfillment") == 1, \
+            f"expected fulfillment=1; got {rows_touched}; body={body}"
+        followups = body.get("manual_followups") or []
+        assert any("writer extension pending" in f.lower() or
+                   "fulfillment_path" in f
+                   for f in followups), \
+            f"expected writer-extension-pending followup; got {followups}"
+
+        # Object with path is GONE
+        s3 = boto3.client("s3", region_name=REGION)
+        try:
+            s3.head_object(Bucket=bucket, Key=key_with)
+            raise AssertionError(f"S3 object {key_with} still exists post-delete")
+        except ClientError as e:
+            assert e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound")
+    finally:
+        # Cleanup both rows
+        _cleanup_fulfillment_seed(
+            aws, tenant_id, sub_with, email, bucket, key_with,
+        )
+        _cleanup_ddb_row(aws, TABLE_FORM_SUBMISSIONS, {
+            "tenant_id": tenant_id, "submission_id": sub_without,
+        })
+
+
+@pytest.mark.skipif(
+    not FULFILLMENT_TEST_BUCKET, reason=FULFILLMENT_SKIP_REASON,
+)
+def test_o_fulfillment_walker_iam_level_blocks_cross_tenant_delete(aws):
+    """Audit closure 2026-05-26 row #2 (code-reviewer 🔴): test_m verifies
+    the code-level tenant-segment check — but the IAM grant on
+    `submissions/TEN-SMOKE-FULFILL/*` is the defense-in-depth layer. Verify
+    that even if the code-level check were bypassed, IAM denies deletion of
+    objects under a different tenant prefix in the same bucket.
+
+    Strategy: seed an object under `submissions/TEN-OTHER-IAM-TEST/` in the
+    fixture bucket. Use the AWS CLI directly (the DSAR Lambda IAM role
+    can't reach this object). Verify that the operator-attested check
+    `aws s3 delete-object` from the DSAR role (impersonated via assume-role
+    in this test) returns AccessDenied. This documents that IAM blocks
+    cross-tenant even at the API layer, not just at code.
+
+    NOTE: this test impersonates the DSAR role to perform the check. The
+    test only operates within the fixture bucket and only attempts to
+    delete a key under TEN-OTHER-IAM-TEST/ — it does NOT touch any real
+    tenant prefix.
+    """
+    bucket = FULFILLMENT_TEST_BUCKET
+    other_tenant = "TEN-OTHER-IAM-TEST"
+    other_key = f"submissions/{other_tenant}/iam-test/{uuid.uuid4().hex}.json"
+
+    s3 = boto3.client("s3", region_name=REGION)
+    s3.put_object(Bucket=bucket, Key=other_key, Body=b"iam-test",
+                  ContentType="application/json")
+    try:
+        # Assume the DSAR Lambda role and attempt to delete the cross-tenant key
+        sts = boto3.client("sts", region_name=REGION)
+        try:
+            assumed = sts.assume_role(
+                RoleArn=f"arn:aws:iam::{EXPECTED_ACCOUNT}:role/picasso-pii-dsar-staging-role",
+                RoleSessionName="audit-row-2-iam-check",
+                DurationSeconds=900,
+            )
+        except ClientError as e:
+            # Operator's own role may not be authorized to assume the DSAR
+            # role; this is acceptable — the IAM check itself proves the
+            # cross-tenant defense isn't bypassable, so the test logs and
+            # skips if the assume-role precondition isn't met.
+            pytest.skip(
+                f"could not assume DSAR role (operator may lack AssumeRole "
+                f"on the role's trust policy — that itself is part of the "
+                f"least-privilege design): {e}"
+            )
+            return
+        creds = assumed["Credentials"]
+        dsar_s3 = boto3.client(
+            "s3", region_name=REGION,
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+        try:
+            dsar_s3.delete_object(Bucket=bucket, Key=other_key)
+            raise AssertionError(
+                "DSAR role was able to delete a cross-tenant object — IAM "
+                "defense-in-depth is broken. Expected AccessDenied.")
+        except ClientError as e:
+            assert e.response["Error"]["Code"] == "AccessDenied", \
+                f"expected AccessDenied; got {e}"
+
+        # Object still exists when we re-check via the operator's main role
+        head = s3.head_object(Bucket=bucket, Key=other_key)
+        assert head["ContentLength"] == len(b"iam-test")
+    finally:
+        try:
+            s3.delete_object(Bucket=bucket, Key=other_key)
+        except Exception:
+            pass

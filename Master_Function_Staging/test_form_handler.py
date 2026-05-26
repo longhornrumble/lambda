@@ -830,6 +830,52 @@ class TestFormHandler(unittest.TestCase):
                 self.fail(f"unexpected raise from _persist_fulfillment_path: {e}")
         self.assertEqual(len(update_calls), 1)
 
+    def test_persist_fulfillment_path_swallows_param_validation_error(self):
+        """Audit row #14 (test-engineer 🟡): boto3 ParamValidationError on
+        malformed Key MUST NOT propagate. The pre-existing `except ClientError`
+        would have missed this and crashed the form submission.
+        """
+        import form_handler as fh
+        from botocore.exceptions import ParamValidationError
+        update_calls = []
+        subs_table = MagicMock()
+        def _raise(**kwargs):
+            update_calls.append(kwargs)
+            raise ParamValidationError(report="invalid Key value")
+        subs_table.update_item.side_effect = _raise
+        with patch.object(fh, 'dynamodb') as md:
+            md.Table.return_value = subs_table
+            handler = FormHandler(self.tenant_config)
+            try:
+                handler._persist_fulfillment_path(
+                    'sub_err',
+                    {'type': 's3', 'status': 'stored',
+                     'location': 's3://bkt/submissions/t/f/sub_err.json'},
+                )
+            except Exception as e:  # noqa: BLE001
+                self.fail(f"unexpected raise: {e}")
+        self.assertEqual(len(update_calls), 1)
+
+    def test_persist_fulfillment_path_refuses_write_on_missing_tenant_id(self):
+        """Audit row #1 (code-reviewer 🔴): a missing/empty/non-string
+        tenant_id MUST refuse the write rather than create a ghost row whose
+        Key doesn't match the original form-submission row (the original was
+        written under the real tenant_id from _store_submission's put_item).
+        """
+        import form_handler as fh
+        _, update_calls = self._patch_submissions_table(fh)
+
+        for bad_tid in (None, '', 0, [], {}):
+            cfg = {**self.tenant_config, 'tenant_id': bad_tid}
+            handler = FormHandler(cfg)
+            handler._persist_fulfillment_path(
+                'sub_x',
+                {'type': 's3', 'status': 'stored',
+                 'location': 's3://bkt/submissions/t/f/sub_x.json'},
+            )
+        self.assertEqual(update_calls, [],
+                         "no UpdateItem must fire when tenant_id is falsy/non-str")
+
     @mock_dynamodb
     def test_get_monthly_sms_usage(self):
         """Test getting monthly SMS usage from DynamoDB"""

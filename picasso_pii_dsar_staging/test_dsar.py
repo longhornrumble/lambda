@@ -225,6 +225,20 @@ def test_validate_accepts_smoke_prefix_dsar_id_with_explicit_marker(dsar):
     assert out["dsar_id"] == "smoke-sla-monitor-001"
 
 
+def test_validate_rejects_marker_true_on_non_smoke_dsar_id(dsar):
+    """Audit closure 2026-05-26 row #21 (Security-Reviewer 🟡): two-way gate.
+    Setting smoke_test_marker=true on a NON-smoke-prefixed dsar_id would tag
+    a real DSAR with is_smoke_test=true in the audit row, hiding it from the
+    SLA-monitor scan (`!is_smoke_test` filter in playbook §8). Reject the
+    inconsistent combination.
+    """
+    mod, _, _ = dsar
+    event = _valid_event(dsar_id="real-dsar-2026-001")
+    event["smoke_test_marker"] = True
+    with pytest.raises(mod.InvalidInput, match="audit closure 2026-05-26 row #21"):
+        mod._validate(event)
+
+
 # Sprint F1 / audit-of-audit finding 6: case-insensitive smoke-prefix check
 @pytest.mark.parametrize("dsar_id", [
     "Smoke-real-001",
@@ -1957,19 +1971,131 @@ def test_walk_fulfillment_rejects_cross_tenant_path(dsar):
 def test_walk_fulfillment_rejects_malformed_path(dsar):
     """Per-row defense: invalid URI (not s3://, missing key) = parse-failure
     counted in failed_paths; row's object not located but other rows
-    proceed."""
+    proceed.
+
+    Audit closure 2026-05-26 row #15: s3:/// (zero-length bucket / slash_idx==0)
+    edge case added explicitly.
+    """
     mod, _, _ = dsar
     rows = [
         _fs_row("s1", fulfillment_path="http://wrong-scheme/foo"),
         _fs_row("s2", fulfillment_path="s3://"),                    # no bucket+key
         _fs_row("s3", fulfillment_path="s3://no-slash-after-bucket"),  # no key
         _fs_row("s4", fulfillment_path=12345),                       # non-string
+        _fs_row("s6", fulfillment_path="s3:///no-bucket/key"),       # row #15: empty bucket
         _fs_row("s5", fulfillment_path="s3://bucket/submissions/TEN/f/s5.json"),
     ]
     result = mod._walk_fulfillment_s3("TEN", rows, "access", dry_run=True)
     assert result["objects_found"] == 1  # only s5 passed validation
-    assert result.get("failed_paths") == 4
+    assert result.get("failed_paths") == 5
     assert result["exported_keys"] == ["s3://bucket/submissions/TEN/f/s5.json"]
+
+
+def test_walk_fulfillment_rejects_path_traversal(dsar):
+    """Audit closure 2026-05-26 row #5 (Security-Reviewer 🔴): an attacker
+    who writes `submissions/{tenant_id}/../OTHER/x.json` as `fulfillment_path`
+    would pass the literal `startswith` prefix check, and S3 stores the
+    literal key (does NOT canonicalize `..`). Reject any key whose path
+    segments contain `..` or empty segments BEFORE the prefix check fires.
+    """
+    mod, _, _ = dsar
+    rows = [
+        # Path traversal: prefix is "submissions/TEN/" which DOES match
+        # startswith, but the `..` segment shifts the actual S3 object
+        # location to OTHER/...
+        _fs_row("t1", fulfillment_path="s3://bkt/submissions/TEN/../OTHER/x.json"),
+        # Empty segment: `submissions//x.json` parses oddly; treat as
+        # parse-failure not as cross-tenant.
+        _fs_row("t2", fulfillment_path="s3://bkt/submissions//x.json"),
+        # Triple-dot edge case (just an unusual filename, NOT traversal).
+        # Walker should accept this because `...` is not in the rejected
+        # segment set, only `..` is.
+        _fs_row(
+            "t3",
+            fulfillment_path="s3://bkt/submissions/TEN/f/.../s3.json",
+        ),
+    ]
+    result = mod._walk_fulfillment_s3("TEN", rows, "delete", dry_run=True)
+    # t1 + t2 = 2 failed_paths (path-traversal rejected pre-prefix-check)
+    # t3 = 1 valid path (objects_found=1)
+    assert result.get("failed_paths") == 2, f"got {result}"
+    assert result["objects_found"] == 1
+    assert result.get("skipped_cross_tenant", 0) == 0, (
+        "path-traversal must be rejected as failed_paths, NOT as "
+        "skipped_cross_tenant — the difference matters because operator "
+        "investigation paths diverge")
+
+
+def test_apply_fulfillment_walker_result_partial_delete_failure(dsar):
+    """Audit closure 2026-05-26 row #3 (test-engineer 🔴): the dispatcher's
+    `objects_delete_failed > 0` branch flips status to "errored" and emits
+    a manual_followup. Unit tests against the walker stop one layer short
+    of what callers observe; this test exercises the dispatcher directly.
+    """
+    mod, _, _ = dsar
+    rows_touched = {}
+    manual_followups = []
+    exported_rows = {}
+    walker_results = {}
+    # Stub the walker to return a partial-failure shape.
+    with patch.object(mod, "_walk_fulfillment_s3", return_value={
+        "objects_found": 2,
+        "action": "deleted",
+        "objects_deleted": 1,
+        "objects_delete_failed": 1,
+        "rows_with_path": 2,
+        "rows_without_path": 0,
+        "deleted_key_sha256_12": ["abc123"],
+        "failed_key_sha256_12": ["def456"],
+    }):
+        mod._apply_fulfillment_walker_result(
+            "TEN", [], "delete", False,
+            rows_touched, manual_followups, exported_rows, walker_results,
+        )
+    assert rows_touched["fulfillment"] == 2
+    assert walker_results["fulfillment"]["status"] == "errored"
+    assert walker_results["fulfillment"]["error"] == "objects_delete_failed"
+    assert walker_results["fulfillment"]["objects_deleted"] == 1
+    assert walker_results["fulfillment"]["objects_delete_failed"] == 1
+    assert walker_results["fulfillment"]["deleted_key_sha256_12"] == ["abc123"]
+    assert walker_results["fulfillment"]["failed_key_sha256_12"] == ["def456"]
+    assert any("failed to delete" in m for m in manual_followups), \
+        f"expected delete-failed manual_followup; got {manual_followups}"
+
+
+def test_apply_fulfillment_walker_result_access_populates_exported_rows(dsar):
+    """Audit closure 2026-05-26 row #4 (test-engineer 🔴): the access-path
+    branch in the dispatcher populates `exported_rows["fulfillment"]` with
+    the s3:// URIs from the walker. No prior test traced the access path
+    through the dispatcher.
+    """
+    mod, _, _ = dsar
+    rows_touched = {}
+    manual_followups = []
+    exported_rows = {}
+    walker_results = {}
+    expected_uris = [
+        "s3://bkt/submissions/TEN/f/a.json",
+        "s3://bkt/submissions/TEN/f/b.json",
+    ]
+    with patch.object(mod, "_walk_fulfillment_s3", return_value={
+        "objects_found": 2,
+        "action": "exported",
+        "exported_keys": expected_uris,
+        "key_sha256_12": ["hash_a_xxxxxx", "hash_b_xxxxxx"],
+        "rows_with_path": 2,
+        "rows_without_path": 0,
+    }):
+        mod._apply_fulfillment_walker_result(
+            "TEN", [], "access", True,
+            rows_touched, manual_followups, exported_rows, walker_results,
+        )
+    assert rows_touched["fulfillment"] == 2
+    assert exported_rows["fulfillment"] == expected_uris
+    assert walker_results["fulfillment"]["status"] == "completed"
+    assert walker_results["fulfillment"]["action"] == "exported"
+    assert walker_results["fulfillment"]["key_sha256_12"] == \
+        ["hash_a_xxxxxx", "hash_b_xxxxxx"]
 
 
 def test_walk_fulfillment_no_versioning_enumeration(dsar):
@@ -1977,11 +2103,24 @@ def test_walk_fulfillment_no_versioning_enumeration(dsar):
     does single put_object). Unlike _walk_archive_bucket, a plain
     delete_object is sufficient — walker MUST NOT call
     list_object_versions on fulfillment paths (different bucket posture
-    than picasso-archive-staging)."""
+    than picasso-archive-staging).
+
+    Audit closure 2026-05-26 row #17 (test-engineer 🟡): explicitly assert
+    `delete_object` WAS called in the same test so a typo/wrong-method-name
+    regression can't silently turn this test into a vacuous pass. With the
+    mock fixture's default S3 stub (no `spec=` constraint), assert_not_called
+    is real for known method names; the positive-call assertion on
+    delete_object is the load-bearing teeth that ensures the mock is
+    actually wired into the code path.
+    """
     mod, _, _ = dsar
     rows = [_fs_row("s1", fulfillment_path="s3://bucket/submissions/TEN/f/s1.json")]
     mod._walk_fulfillment_s3("TEN", rows, "delete", dry_run=False)
     mod.s3.list_object_versions.assert_not_called()
+    mod.s3.delete_object.assert_called_once_with(
+        Bucket="bucket",
+        Key="submissions/TEN/f/s1.json",
+    )
 
 
 # ───────────────────────────────────────────────────────────────────────────
