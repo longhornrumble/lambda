@@ -29,6 +29,7 @@ on:
           - Meta_Response_Processor
           - Meta_OAuth_Handler
           - Calendar_Watch_Listener
+          - Calendar_Watch_Onboarder
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -56,6 +57,7 @@ jobs:
       meta_response_processor: ${{ steps.filter.outputs.meta_response_processor }}
       meta_oauth_handler: ${{ steps.filter.outputs.meta_oauth_handler }}
       calendar_watch_listener: ${{ steps.filter.outputs.calendar_watch_listener }}
+      calendar_watch_onboarder: ${{ steps.filter.outputs.calendar_watch_onboarder }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -84,6 +86,8 @@ jobs:
               - 'Meta_OAuth_Handler/**'
             calendar_watch_listener:
               - 'Calendar_Watch_Listener/**'
+            calendar_watch_onboarder:
+              - 'Calendar_Watch_Onboarder/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -111,7 +115,8 @@ jobs:
       needs.detect-changes.outputs.meta_webhook_handler == 'true' ||
       needs.detect-changes.outputs.meta_response_processor == 'true' ||
       needs.detect-changes.outputs.meta_oauth_handler == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_listener == 'true'
+      needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_onboarder == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -378,6 +383,25 @@ jobs:
             # push channels; the handler responds 200 to any GET probe).
             # POST smoke would need a valid X-Goog-Channel-Token + DDB row
             # (Phase C5 integration test territory).
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Calendar_Watch_Onboarder
+            # Scheduling sub-phase B Task B5 — Node.js Lambda, esbuild bundle.
+            # Direct-invoke (no Function URL); registers an initial Google
+            # Calendar watch channel for (tenant_id, coordinator_id). Env vars
+            # Terraform-managed in picasso infra/ module
+            # lambda-calendar-watch-onboarder-staging. Same packaging path as
+            # Calendar_Watch_Listener.
+            staging_function: Calendar_Watch_Onboarder
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # No HTTP frontend; smoke is operator-driven via
+            #   aws lambda invoke --function-name Calendar_Watch_Onboarder
+            # against a live OAuth-provisioned coordinator. Automated smoke
+            # would require a stable test fixture (sub-phase E scope).
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
