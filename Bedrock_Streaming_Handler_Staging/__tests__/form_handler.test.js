@@ -753,6 +753,24 @@ describe('Form Handler - Phase 2: Advanced Fulfillment Routing', () => {
     expect(result.status).toBe('success');
   });
 
+  it('Sprint D: should NOT write fulfillment_path UpdateCommand when tenant_id is missing (no ghost row)', async () => {
+    // Audit row #1 (code-reviewer 🔴): a missing tenant_id MUST refuse the
+    // write rather than fall back to `tenant_id='unknown'` (which would create
+    // a ghost row whose Key doesn't match the original form-submission Key).
+    s3Mock.on(PutObjectCommand).resolves({});
+    dynamoMock.on(UpdateCommand).resolves({});
+
+    const tenantlessConfig = { ...mockTenantConfig };
+    delete tenantlessConfig.tenant_id;
+
+    const result = await submitForm('newsletter', mockFormData, tenantlessConfig);
+
+    // PutCommand from saveFormSubmission ran, but persistFulfillmentPath
+    // refused to write the ghost row.
+    expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    expect(result.status).toBe('success');
+  });
+
   // NOTE: Priority indicator is no longer embedded in the internal-notification
   // email HTML template. The current sendFormEmail() default-path template has
   // no "Priority: HIGH" marker anywhere, so this assertion is unreachable.

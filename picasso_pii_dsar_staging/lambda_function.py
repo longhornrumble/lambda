@@ -100,12 +100,20 @@ WHAT IT DOES NOT YET DO (follow-up PRs):
       trigger recommended, calendar backstop 2026-08-22)
     - picasso-audit-staging read for access-type DSARs (Art 17(3)(b)
       carve-out, D5 G-C — counsel-pending; UpdateItem deliberately omitted)
-    - Per-tenant S3 fulfillment writer extension (writes `fulfillment_path`
-      attribute onto form-submission row at write time; required for the
-      N3 stale-config defense in `PII_DELETE_PIPELINE_DESIGN.md` Arm 3).
-      Walker (this file, Sprint D) reads `fulfillment_path` per-row when
-      present — writer extension is a separate follow-up PR. Until the
-      writer ships, only post-extension rows have an enumerable path.
+    - Per-tenant S3 fulfillment writer extension SHIPPED 2026-05-26 in
+      lambda#166 (both Master_Function_Staging and BSH form_handlers).
+      KNOWN-ORPHAN race remains (audit closure 2026-05-26 row #7): the
+      writer issues `s3.put_object` BEFORE the DDB UpdateItem that records
+      `fulfillment_path`. If a DSAR walker runs between those two operations
+      (or if UpdateItem fails after a successful put), the S3 object is
+      stored but no row references it. The walker will surface this case
+      as `rows_without_path` (writer-extension-pending wording), but the
+      manual-followup is identical to the pre-extension wording — operators
+      cannot distinguish a real writer-pending row from a race-lost orphan.
+      Promotion trigger: first DSAR where `rows_without_path > 0` AND the
+      tenant has S3 fulfillment configured AND the submission post-dates
+      lambda#166 deploy (2026-05-26T15:37Z). Sprint E follow-up: tighten
+      the manual-followup wording to call out this race explicitly.
     - phone / name+address identifier_types — walker-NOT-supported per
       F-DSAR30 (Sprint A §3.3 decision); M3 playbook documents manual
       fallback procedures (Sprint E adds the entries)
@@ -392,6 +400,23 @@ def _validate(event):
             "SECURITY: smoke-prefix dsar_id accepted via explicit "
             "smoke_test_marker=true: dsar_id=%s operator=%s tenant_id=%s",
             dsar_id, event.get("operator"), event.get("tenant_id"),
+        )
+    # Audit closure 2026-05-26 row #21 (Security-Reviewer 🟡): the marker is a
+    # two-way gate. Setting smoke_test_marker=true on a NON-smoke-prefixed
+    # dsar_id would tag a real DSAR with is_smoke_test=true in the audit
+    # row, causing it to be filtered out of the SLA monitor scan
+    # (`!is_smoke_test` filter in `dsar-operator-playbook.md` §8). Reject
+    # the inconsistent combination so a real DSAR can never be silently
+    # hidden by a stale marker setting.
+    elif smoke_marker and not is_smoke_prefix:
+        raise InvalidInput(
+            "smoke_test_marker=true requires a 'smoke-' prefixed dsar_id "
+            "(audit closure 2026-05-26 row #21); the marker drives the "
+            "is_smoke_test audit attribute which SLA-monitor scans use to "
+            "filter out test rows — using it on a real dsar_id would hide "
+            "the DSAR from SLA tracking. Either prefix the dsar_id with "
+            "'smoke-' (for tests) or set smoke_test_marker=false (for real "
+            "DSARs)."
         )
 
     return {
@@ -1732,6 +1757,29 @@ def _walk_fulfillment_s3(tenant_id, form_submissions_rows, request_type, dry_run
         # form_handler writer. Reject any key whose tenant segment doesn't
         # match the requested tenant_id — defense against a stale or
         # tampered row pointing at another tenant's bucket prefix.
+        #
+        # Audit closure 2026-05-26 row #5 (Security-Reviewer 🔴): the prefix
+        # check `startswith` is a literal-string match — S3 does NOT
+        # canonicalize `..` in object keys, so a key like
+        # `submissions/{tenant_id}/../OTHER/x.json` passes the prefix check
+        # AND is the literal key S3 stores/deletes. Reject any key whose
+        # path segments contain `..` (or other obviously-malformed segments)
+        # before the prefix check. Also reject any non-ASCII-printable
+        # characters which could indicate URL-encoded bypass attempts
+        # (e.g., `%54EN-SMOKE-FULFILL` — note: S3 percent-DECODES the key on
+        # the wire but the Python string contains the literal `%XX` form
+        # which won't match the plain-ASCII expected_prefix; the literal
+        # match correctly rejects encoded variants. The `..` rejection is
+        # the load-bearing fix).
+        key_segments = key.split("/")
+        if ".." in key_segments or "" in key_segments[:-1]:
+            failed_paths += 1
+            logger.error(
+                "fulfillment_path_parse_failed: path_traversal_or_empty_segment "
+                "bucket=%s",
+                bucket,
+            )
+            continue
         expected_prefix = f"submissions/{tenant_id}/"
         if not key.startswith(expected_prefix):
             skipped_cross_tenant += 1
@@ -1757,6 +1805,16 @@ def _walk_fulfillment_s3(tenant_id, form_submissions_rows, request_type, dry_run
     if skipped_cross_tenant:
         progress_fields["skipped_cross_tenant"] = skipped_cross_tenant
 
+    # Audit closure 2026-05-26 row #18 (Security-Reviewer 🟡): record a
+    # per-object sha256[:12] hash so the audit trail can attest per-object
+    # deletion without exposing the raw submission_id (D1 redaction rule).
+    # Hash is computed over the full `bucket/key` tuple so cross-bucket
+    # collisions are not possible.
+    key_hashes = [
+        hashlib.sha256(f"{b}/{k}".encode("utf-8")).hexdigest()[:12]
+        for b, k in enumerated
+    ]
+
     if objects_found == 0:
         return {
             "objects_found": 0,
@@ -1771,6 +1829,7 @@ def _walk_fulfillment_s3(tenant_id, form_submissions_rows, request_type, dry_run
             "objects_found": objects_found,
             "action": "exported",
             "exported_keys": [f"s3://{b}/{k}" for b, k in enumerated],
+            "key_sha256_12": key_hashes,
             **progress_fields,
         }
 
@@ -1778,6 +1837,7 @@ def _walk_fulfillment_s3(tenant_id, form_submissions_rows, request_type, dry_run
         return {
             "objects_found": objects_found,
             "action": "dry_run_count",
+            "key_sha256_12": key_hashes,
             **progress_fields,
         }
 
@@ -1788,16 +1848,19 @@ def _walk_fulfillment_s3(tenant_id, form_submissions_rows, request_type, dry_run
     # versions because picasso-archive-staging has versioning=ENABLED.
     objects_deleted = 0
     objects_delete_failed = 0
-    for bucket, key in enumerated:
+    deleted_hashes = []
+    failed_hashes = []
+    for (bucket, key), key_hash in zip(enumerated, key_hashes):
         try:
             s3.delete_object(Bucket=bucket, Key=key)
             objects_deleted += 1
+            deleted_hashes.append(key_hash)
         except ClientError as exc:
             objects_delete_failed += 1
+            failed_hashes.append(key_hash)
             # Mask the key suffix per D1 redaction rule (submission_id is
             # operator-only); emit bucket + 12-char hash of the full key
             # for cross-reference in audit_row + manual_followup.
-            key_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
             logger.error(
                 "fulfillment_delete_failed: bucket=%s "
                 "key_prefix=submissions/<redacted> key_sha256_12=%s code=%s",
@@ -1810,6 +1873,8 @@ def _walk_fulfillment_s3(tenant_id, form_submissions_rows, request_type, dry_run
         "action": "deleted",
         "objects_deleted": objects_deleted,
         "objects_delete_failed": objects_delete_failed,
+        "deleted_key_sha256_12": deleted_hashes,
+        "failed_key_sha256_12": failed_hashes,
         **progress_fields,
     }
 
@@ -2708,6 +2773,9 @@ def _apply_fulfillment_walker_result(
             **base_result,
             "status": "completed",
             "action": "exported",
+            # Audit row #18: per-object sha256[:12] hashes propagated to the
+            # audit event for per-object deletion attestability.
+            "key_sha256_12": fr.get("key_sha256_12", []),
         }
         return
 
@@ -2720,6 +2788,7 @@ def _apply_fulfillment_walker_result(
             **base_result,
             "status": "completed",
             "action": "dry_run_count",
+            "key_sha256_12": fr.get("key_sha256_12", []),
         }
         return
 
@@ -2730,6 +2799,11 @@ def _apply_fulfillment_walker_result(
         "action": "deleted",
         "objects_deleted": fr.get("objects_deleted", 0),
         "objects_delete_failed": fr.get("objects_delete_failed", 0),
+        # Audit row #18: per-object hashes recorded in the audit row so an
+        # operator can attest "object X was deleted" without exposing the
+        # raw submission_id (D1 redaction).
+        "deleted_key_sha256_12": fr.get("deleted_key_sha256_12", []),
+        "failed_key_sha256_12": fr.get("failed_key_sha256_12", []),
     }
     if fr.get("objects_delete_failed", 0) > 0:
         # Per-design "hard partial-failure, never silent". Most common
