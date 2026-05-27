@@ -1,0 +1,32 @@
+{
+  "name": "calendar-watch-onboarder",
+  "version": "1.0.0",
+  "description": "Calendar_Watch_Onboarder — scheduling sub-phase B Task B5. Registers Google Calendar push-notification watch channels: seeds last_sync_token via events.list, creates a per-channel token secret in Secrets Manager, registers the watch via events.watch, writes the channel row to picasso-calendar-watch-channels-{env} with the SHA-256 hash of the token (channel_token encryption Option 2). v1 pilot direct-invoke; future DDB-stream trigger on picasso-employee-registry-v2-{env} when E13 UI / F2 onboarding populates scheduling_tags.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.1053.0",
+    "@googleapis/calendar": "^14.3.0",
+    "google-auth-library": "^10.6.2"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}

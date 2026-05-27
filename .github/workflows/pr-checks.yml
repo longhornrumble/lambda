@@ -38,6 +38,7 @@ jobs:
       meta_webhook:   ${{ steps.filter.outputs.meta_webhook }}
       meta_response:  ${{ steps.filter.outputs.meta_response }}
       calendar_watch_listener: ${{ steps.filter.outputs.calendar_watch_listener }}
+      calendar_watch_onboarder: ${{ steps.filter.outputs.calendar_watch_onboarder }}
       # Python Lambdas with tests
       meta_oauth:                ${{ steps.filter.outputs.meta_oauth }}
       master:                    ${{ steps.filter.outputs.master }}
@@ -73,6 +74,8 @@ jobs:
               - 'Meta_Response_Processor/**'
             calendar_watch_listener:
               - 'Calendar_Watch_Listener/**'
+            calendar_watch_onboarder:
+              - 'Calendar_Watch_Onboarder/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
             master:
@@ -121,7 +124,8 @@ jobs:
       needs.detect-changes.outputs.bedrock == 'true'  ||
       needs.detect-changes.outputs.meta_webhook == 'true' ||
       needs.detect-changes.outputs.meta_response == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_listener == 'true'
+      needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_onboarder == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -135,6 +139,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.meta_response }}
           - lambda: Calendar_Watch_Listener
             changed: ${{ needs.detect-changes.outputs.calendar_watch_listener }}
+          - lambda: Calendar_Watch_Onboarder
+            changed: ${{ needs.detect-changes.outputs.calendar_watch_onboarder }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -446,6 +452,7 @@ jobs:
           - lambda: kb_proposal_applier      # node:test covers logic; audit covers deps
           - lambda: notification_hub        # node:test covers logic; audit covers deps
           - lambda: Calendar_Watch_Listener # B2 scheduling listener — jest tests + deps
+          - lambda: Calendar_Watch_Onboarder # B5 onboarding hook — jest tests + deps
 
     steps:
       - name: Checkout
@@ -500,7 +507,8 @@ jobs:
       needs.detect-changes.outputs.bedrock == 'true'  ||
       needs.detect-changes.outputs.meta_webhook == 'true' ||
       needs.detect-changes.outputs.meta_response == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_listener == 'true'
+      needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_onboarder == 'true'
 
     strategy:
       fail-fast: false
@@ -514,6 +522,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.meta_response }}
           - lambda: Calendar_Watch_Listener
             changed: ${{ needs.detect-changes.outputs.calendar_watch_listener }}
+          - lambda: Calendar_Watch_Onboarder
+            changed: ${{ needs.detect-changes.outputs.calendar_watch_onboarder }}
 
     steps:
       - name: Skip unchanged Lambda
