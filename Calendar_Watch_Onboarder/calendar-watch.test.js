@@ -2,6 +2,7 @@
 
 const mockWatch = jest.fn();
 const mockList = jest.fn();
+const mockStop = jest.fn();
 
 jest.mock('@googleapis/calendar', () => ({
   calendar: () => ({
@@ -9,14 +10,18 @@ jest.mock('@googleapis/calendar', () => ({
       watch: mockWatch,
       list: mockList,
     },
+    channels: {
+      stop: mockStop,
+    },
   }),
 }));
 
-const { registerWatch, seedInitialSyncToken } = require('./calendar-watch');
+const { registerWatch, stopWatch, seedInitialSyncToken } = require('./calendar-watch');
 
 beforeEach(() => {
   mockWatch.mockReset();
   mockList.mockReset();
+  mockStop.mockReset();
 });
 
 describe('registerWatch', () => {
@@ -73,6 +78,35 @@ describe('registerWatch', () => {
   });
 });
 
+describe('stopWatch', () => {
+  const authClient = { _isAuthClient: true };
+
+  test.each([
+    [null, 'ch-1', 'res-1'],
+    [authClient, '', 'res-1'],
+    [authClient, 'ch-1', ''],
+  ])('throws when any required argument is missing', async (auth, id, res) => {
+    await expect(stopWatch(auth, id, res))
+      .rejects.toThrow('authClient, channelId, and resourceId are required');
+    expect(mockStop).not.toHaveBeenCalled();
+  });
+
+  test('calls channels.stop with id + resourceId', async () => {
+    mockStop.mockResolvedValueOnce({ status: 204 });
+    await stopWatch(authClient, 'ch-uuid', 'res-123');
+    expect(mockStop).toHaveBeenCalledWith({
+      auth: authClient,
+      requestBody: { id: 'ch-uuid', resourceId: 'res-123' },
+    });
+  });
+
+  test('propagates API errors', async () => {
+    mockStop.mockRejectedValueOnce(new Error('channel not found'));
+    await expect(stopWatch(authClient, 'ch-uuid', 'res-123'))
+      .rejects.toThrow('channel not found');
+  });
+});
+
 describe('seedInitialSyncToken', () => {
   const authClient = { _isAuthClient: true };
 
@@ -98,7 +132,7 @@ describe('seedInitialSyncToken', () => {
       auth: authClient,
       calendarId: 'cal-1',
       showDeleted: true,
-      singleEvents: true,
+      singleEvents: false,
     });
   });
 

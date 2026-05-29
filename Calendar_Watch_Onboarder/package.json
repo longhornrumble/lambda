@@ -22,6 +22,21 @@
   },
   "author": "",
   "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js",
+      "calendar-watch.js",
+      "oauth-client.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 90,
+        "functions": 100,
+        "lines": 95,
+        "statements": 95
+      }
+    }
+  },
   "devDependencies": {
     "@types/jest": "^30.0.0",
     "aws-sdk-client-mock": "^4.1.0",

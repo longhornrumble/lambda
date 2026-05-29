@@ -28,7 +28,6 @@ const smMock = mockClient(SecretsManagerClient);
 
 beforeEach(() => {
   smMock.reset();
-  oauthClient._resetCacheForTests();
   OAuth2Client._setCredentialsSpy.mockClear();
 });
 
@@ -77,6 +76,12 @@ describe('fetchOAuthSecret', () => {
       .rejects.toThrow('OAuth secret is not valid JSON');
   });
 
+  test('error messages do NOT leak the secret path (cross-tenant oracle)', async () => {
+    smMock.on(GetSecretValueCommand).resolves({});
+    await expect(oauthClient.fetchOAuthSecret('picasso/scheduling/oauth/SECRET-TENANT/coord'))
+      .rejects.not.toThrow(/SECRET-TENANT/);
+  });
+
   test.each([
     ['client_id'],
     ['client_secret'],
@@ -86,7 +91,19 @@ describe('fetchOAuthSecret', () => {
     delete payload[missingField];
     smMock.on(GetSecretValueCommand).resolves({ SecretString: JSON.stringify(payload) });
     await expect(oauthClient.fetchOAuthSecret('p/a/b/c'))
-      .rejects.toThrow(`OAuth secret missing required field "${missingField}"`);
+      .rejects.toThrow(`OAuth secret missing/empty required field "${missingField}"`);
+  });
+
+  test.each([
+    ['client_id'],
+    ['client_secret'],
+    ['refresh_token'],
+  ])('throws when %s is empty string', async (emptyField) => {
+    const payload = JSON.parse(VALID_PAYLOAD);
+    payload[emptyField] = '';
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: JSON.stringify(payload) });
+    await expect(oauthClient.fetchOAuthSecret('p/a/b/c'))
+      .rejects.toThrow(`OAuth secret missing/empty required field "${emptyField}"`);
   });
 });
 
@@ -108,30 +125,30 @@ describe('getOAuthClient', () => {
     });
   });
 
-  test('caches clients across calls for the same secret path', async () => {
+  test('fetches fresh on every call (NO cache — picks up rotated secrets)', async () => {
     smMock.on(GetSecretValueCommand).resolves({ SecretString: VALID_PAYLOAD });
-    const a = await oauthClient.getOAuthClient({ tenantId: 'T1', coordinatorId: 'c' });
-    const b = await oauthClient.getOAuthClient({ tenantId: 'T1', coordinatorId: 'c' });
-    expect(a).toBe(b);
-    expect(smMock.commandCalls(GetSecretValueCommand)).toHaveLength(1);
-  });
-
-  test('different (tenantId, coordinatorId) pairs are cached separately', async () => {
-    smMock.on(GetSecretValueCommand).resolves({ SecretString: VALID_PAYLOAD });
-    const a = await oauthClient.getOAuthClient({ tenantId: 'T1', coordinatorId: 'c' });
-    const b = await oauthClient.getOAuthClient({ tenantId: 'T2', coordinatorId: 'c' });
-    expect(a).not.toBe(b);
+    await oauthClient.getOAuthClient({ tenantId: 'T1', coordinatorId: 'c' });
+    await oauthClient.getOAuthClient({ tenantId: 'T1', coordinatorId: 'c' });
+    // Two fetches for two calls — a rotated refresh_token in Secrets Manager
+    // takes effect on the very next invocation, not after a cold-start.
     expect(smMock.commandCalls(GetSecretValueCommand)).toHaveLength(2);
   });
 
-  test('throws when secret fetch fails (no cache poisoning)', async () => {
+  test('a rotated refresh_token is reflected on the next call', async () => {
+    smMock.on(GetSecretValueCommand).resolvesOnce({ SecretString: VALID_PAYLOAD });
+    const first = await oauthClient.getOAuthClient({ tenantId: 'T', coordinatorId: 'c' });
+    expect(first.credentials).toEqual({ refresh_token: '1//refresh-token-abc' });
+
+    const rotated = JSON.parse(VALID_PAYLOAD);
+    rotated.refresh_token = '1//rotated-token-xyz';
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: JSON.stringify(rotated) });
+    const second = await oauthClient.getOAuthClient({ tenantId: 'T', coordinatorId: 'c' });
+    expect(second.credentials).toEqual({ refresh_token: '1//rotated-token-xyz' });
+  });
+
+  test('throws when secret fetch fails', async () => {
     smMock.on(GetSecretValueCommand).rejects(new Error('AccessDenied'));
     await expect(oauthClient.getOAuthClient({ tenantId: 'T', coordinatorId: 'c' }))
       .rejects.toThrow('AccessDenied');
-
-    smMock.reset();
-    smMock.on(GetSecretValueCommand).resolves({ SecretString: VALID_PAYLOAD });
-    const client = await oauthClient.getOAuthClient({ tenantId: 'T', coordinatorId: 'c' });
-    expect(client).toBeInstanceOf(OAuth2Client);
   });
 });

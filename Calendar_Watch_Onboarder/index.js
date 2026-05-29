@@ -10,53 +10,66 @@
  * UI / F2 onboarding flow populates `scheduling_tags`.
  *
  * Per-invocation flow:
- *   1. Validate input
+ *   1. Validate input (strict allowlist on tenant_id / coordinator_id)
  *   2. Fetch OAuth client (per tenant, per coordinator) from Secrets Manager
  *   3. events.list(calendarId) — seeds `last_sync_token` (Phase 2b precondition)
  *   4. Generate channel_id (UUID) + channel_token (256-bit random)
- *   5. CreateSecret picasso/scheduling/channel-token/{channel_id} (raw token)
- *   6. events.watch — register the push channel
- *   7. PutItem on picasso-calendar-watch-channels-{env} with the SHA-256 hash
- *      of the token (channel_token encryption Option 2)
+ *   5. events.watch — register the push channel
+ *   6. PutItem on picasso-calendar-watch-channels-{env} with the SHA-256 hash
+ *      of the token — and on ANY failure after the watch is live, revoke the
+ *      channel (events.stop) so we never strand an unrevokable Google channel.
  *
  * Return: { channel_id, expiration, last_sync_token_seeded }
  *
  * Security model:
  *   - channel_token entropy: crypto.randomBytes(32) → 64 hex chars (per B8).
- *   - Raw token stored in Secrets Manager; only the SHA-256 hash is in DDB.
- *   - Listener compares hashes via crypto.timingSafeEqual.
- *   - Onboarder writes to a NEW secret per channel; no overwrite semantics.
+ *   - Only the SHA-256 HASH of the token is persisted (in DDB). The raw token
+ *     is handed to Google in events.watch and never stored at rest — the
+ *     Listener authenticates inbound pushes by hashing X-Goog-Channel-Token
+ *     and constant-time-comparing against this stored hash. SHA-256 (no salt)
+ *     is sufficient here because the token is 256 bits of uniform randomness,
+ *     not a low-entropy password. This is a one-way commitment, not encryption.
  */
 
 const crypto = require('crypto');
-const {
-  SecretsManagerClient,
-  CreateSecretCommand,
-} = require('@aws-sdk/client-secrets-manager');
 const {
   DynamoDBClient,
   PutItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 
 const { getOAuthClient } = require('./oauth-client');
-const { registerWatch, seedInitialSyncToken } = require('./calendar-watch');
+const { registerWatch, seedInitialSyncToken, stopWatch } = require('./calendar-watch');
 
 // ─── AWS clients ────────────────────────────────────────────────────────────────
 
 const ddb = new DynamoDBClient({});
-const secrets = new SecretsManagerClient({});
 
 // ─── Environment ────────────────────────────────────────────────────────────────
+// CHANNELS_TABLE + LISTENER_URL are REQUIRED (no silent defaults): a missing
+// table name must not silently write to the staging table from another env,
+// and a missing listener URL must not register a watch pointing nowhere. Both
+// are validated at handler entry.
 
-const ENV                       = process.env.ENVIRONMENT || 'staging';
-const CHANNELS_TABLE            = process.env.CALENDAR_WATCH_CHANNELS_TABLE || `picasso-calendar-watch-channels-${ENV}`;
-const LISTENER_URL              = process.env.LISTENER_URL || '';
-const CHANNEL_TOKEN_SECRET_PREFIX = process.env.CHANNEL_TOKEN_SECRET_PREFIX || 'picasso/scheduling/channel-token';
+const CHANNELS_TABLE = process.env.CALENDAR_WATCH_CHANNELS_TABLE || '';
+const LISTENER_URL   = process.env.LISTENER_URL || '';
+
+// ─── Input format allowlists ────────────────────────────────────────────────────
+// tenant_id / coordinator_id flow into the OAuth Secrets Manager path
+// (picasso/scheduling/oauth/{tenantId}/{coordinatorId}) and into DDB keys.
+// Reject anything that could path-traverse or break the canonical schema. A
+// `/` in either value would silently produce a different secret path.
+
+const TENANT_ID_RE      = /^[A-Za-z0-9_-]{1,64}$/;
+const COORDINATOR_ID_RE = /^[A-Za-z0-9._@+-]{1,128}$/;
 
 // ─── Structured logging ─────────────────────────────────────────────────────────
 
 function log(event, fields) {
   console.log(JSON.stringify({ event, ...fields }));
+}
+
+function warn(event, fields) {
+  console.warn(JSON.stringify({ event, level: 'WARN', ...fields }));
 }
 
 // ─── Input validation ───────────────────────────────────────────────────────────
@@ -67,11 +80,11 @@ function validateInput(input) {
   }
   const tenantId = input.tenant_id;
   const coordinatorId = input.coordinator_id;
-  if (!tenantId || typeof tenantId !== 'string') {
-    throw new Error('tenant_id is required (string)');
+  if (!tenantId || typeof tenantId !== 'string' || !TENANT_ID_RE.test(tenantId)) {
+    throw new Error('tenant_id is required and must match /^[A-Za-z0-9_-]{1,64}$/');
   }
-  if (!coordinatorId || typeof coordinatorId !== 'string') {
-    throw new Error('coordinator_id is required (string)');
+  if (!coordinatorId || typeof coordinatorId !== 'string' || !COORDINATOR_ID_RE.test(coordinatorId)) {
+    throw new Error('coordinator_id is required and must match /^[A-Za-z0-9._@+-]{1,128}$/');
   }
   // calendarId defaults to 'primary' — Google interprets this as the
   // authenticated user's primary calendar.
@@ -93,33 +106,6 @@ function generateChannelToken() {
 
 function sha256Hex(value) {
   return crypto.createHash('sha256').update(value, 'utf8').digest('hex');
-}
-
-// ─── Secrets Manager write ──────────────────────────────────────────────────────
-// One new secret per channel. Path: picasso/scheduling/channel-token/{channel_id}.
-// Tagged so housekeeping (B6 offboarder) can delete by channel_id without lookup.
-
-async function storeChannelTokenSecret(channelId, channelToken, tenantId, coordinatorId) {
-  const secretId = `${CHANNEL_TOKEN_SECRET_PREFIX}/${channelId}`;
-  await secrets.send(
-    new CreateSecretCommand({
-      Name: secretId,
-      Description: `Google Calendar watch-channel token for channel ${channelId} (tenant ${tenantId}, coordinator ${coordinatorId}).`,
-      SecretString: JSON.stringify({
-        channel_token: channelToken,
-        channel_id: channelId,
-        tenant_id: tenantId,
-        coordinator_id: coordinatorId,
-        created_at: new Date().toISOString(),
-      }),
-      Tags: [
-        { Key: 'Subphase', Value: 'B5' },
-        { Key: 'tenant_id', Value: tenantId },
-        { Key: 'channel_id', Value: channelId },
-      ],
-    })
-  );
-  return secretId;
 }
 
 // ─── DDB row write ──────────────────────────────────────────────────────────────
@@ -160,8 +146,11 @@ async function writeChannelRow(row) {
 // ─── Main handler ───────────────────────────────────────────────────────────────
 
 exports.handler = async function handler(event) {
-  if (!LISTENER_URL) {
-    throw new Error('LISTENER_URL env var is required');
+  if (!CHANNELS_TABLE) {
+    throw new Error('CALENDAR_WATCH_CHANNELS_TABLE env var is required');
+  }
+  if (!LISTENER_URL || !LISTENER_URL.startsWith('https://')) {
+    throw new Error('LISTENER_URL env var is required and must be https://');
   }
 
   const { tenantId, coordinatorId, calendarId } = validateInput(event);
@@ -172,25 +161,31 @@ exports.handler = async function handler(event) {
 
   // 2. Seed last_sync_token via events.list (no syncToken)
   const seed = await seedInitialSyncToken(authClient, calendarId);
-  log('sync_token_seeded', {
-    tenant_id: tenantId,
-    coordinator_id: coordinatorId,
-    seed_pages: seed.pages,
-    seed_events_seen: seed.totalSeen,
-    seed_token_present: Boolean(seed.syncToken),
-  });
+  if (!seed.syncToken) {
+    // A channel with no sync baseline is nearly useless for Phase 2b
+    // delta-discovery. Surface loudly; the row is still written so the
+    // operator can re-seed, but this must not pass silently.
+    warn('sync_token_absent', {
+      tenant_id: tenantId,
+      coordinator_id: coordinatorId,
+      seed_pages: seed.pages,
+      seed_events_seen: seed.totalSeen,
+    });
+  } else {
+    log('sync_token_seeded', {
+      tenant_id: tenantId,
+      coordinator_id: coordinatorId,
+      seed_pages: seed.pages,
+      seed_events_seen: seed.totalSeen,
+    });
+  }
 
   // 3. Generate channel identifiers
   const channelId = generateChannelId();
   const channelToken = generateChannelToken();
   const channelTokenSha256 = sha256Hex(channelToken);
 
-  // 4. Store raw token in Secrets Manager (before events.watch so a failed
-  // watch leaves a recoverable artifact rather than a stranded channel_id).
-  const secretId = await storeChannelTokenSecret(channelId, channelToken, tenantId, coordinatorId);
-  log('channel_token_secret_created', { channel_id: channelId, secret_id: secretId });
-
-  // 5. Register the watch with Google
+  // 4. Register the watch with Google
   const watch = await registerWatch(authClient, calendarId, channelId, channelToken, LISTENER_URL);
   log('events_watch_registered', {
     channel_id: channelId,
@@ -198,26 +193,51 @@ exports.handler = async function handler(event) {
     expiration: watch.expiration,
   });
 
-  // 6. Write DDB row
-  await writeChannelRow({
-    channelId,
-    tenantId,
-    coordinatorId,
-    calendarId,
-    channelTokenSha256,
-    lastSyncToken: seed.syncToken,
-    expiration: watch.expiration,
-    resourceId: watch.resourceId,
-    resourceUri: watch.resourceUri,
-    createdAt: new Date().toISOString(),
-  });
+  // 5. Validate + persist. The watch is now LIVE; any failure here strands a
+  // Google channel pushing to a Listener that has no row to authenticate it.
+  // Compensate by revoking (events.stop) before re-throwing.
+  try {
+    if (watch.expiration === null || watch.expiration === undefined || !/^\d+$/.test(String(watch.expiration))) {
+      throw new Error(`events.watch returned a non-numeric expiration: ${watch.expiration}`);
+    }
+    await writeChannelRow({
+      channelId,
+      tenantId,
+      coordinatorId,
+      calendarId,
+      channelTokenSha256,
+      lastSyncToken: seed.syncToken,
+      expiration: watch.expiration,
+      resourceId: watch.resourceId,
+      resourceUri: watch.resourceUri,
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    warn('onboarder_compensating', {
+      channel_id: channelId,
+      resource_id: watch.resourceId,
+      reason: err.message,
+    });
+    try {
+      await stopWatch(authClient, channelId, watch.resourceId);
+      warn('onboarder_compensation_succeeded', { channel_id: channelId });
+    } catch (stopErr) {
+      // Compensation itself failed — the channel is orphaned. Log enough for
+      // an operator to manually events.stop with these identifiers.
+      warn('onboarder_compensation_failed', {
+        channel_id: channelId,
+        resource_id: watch.resourceId,
+        stop_error: stopErr.message,
+      });
+    }
+    throw err;
+  }
   log('channel_row_written', { channel_id: channelId, tenant_id: tenantId });
 
   return {
     channel_id: channelId,
     expiration: watch.expiration,
     last_sync_token_seeded: Boolean(seed.syncToken),
-    secret_id: secretId,
   };
 };
 
@@ -228,6 +248,5 @@ exports._test = {
   generateChannelId,
   generateChannelToken,
   sha256Hex,
-  storeChannelTokenSecret,
   writeChannelRow,
 };
