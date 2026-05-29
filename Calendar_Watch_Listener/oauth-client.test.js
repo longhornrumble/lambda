@@ -134,4 +134,67 @@ describe('getOAuthClient', () => {
     const client = await oauthClient.getOAuthClient({ tenantId: 'T', coordinatorId: 'c' });
     expect(client).toBeInstanceOf(OAuth2Client);
   });
+
+  // Y1: TTL-miss — an entry older than CACHE_TTL_MS is treated as a miss
+  test('Y1: cache entry older than CACHE_TTL_MS triggers re-fetch', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: VALID_PAYLOAD });
+    // First fetch populates the cache
+    const clientA = await oauthClient.getOAuthClient({ tenantId: 'T-ttl', coordinatorId: 'c' });
+    expect(smMock.commandCalls(GetSecretValueCommand)).toHaveLength(1);
+
+    // Advance time past the TTL by replacing Date.now for this test
+    const realNow = Date.now;
+    const originalCachedAt = Date.now();
+    Date.now = jest.fn(() => originalCachedAt + oauthClient._CACHE_TTL_MS + 1);
+
+    const clientB = await oauthClient.getOAuthClient({ tenantId: 'T-ttl', coordinatorId: 'c' });
+    // A second Secrets Manager call must have been made
+    expect(smMock.commandCalls(GetSecretValueCommand)).toHaveLength(2);
+    // clientB is a new instance (different cachedAt)
+    expect(clientB).toBeInstanceOf(OAuth2Client);
+
+    Date.now = realNow;
+  });
+
+  // Y1: within TTL — re-uses the cached entry
+  test('Y1: cache entry within CACHE_TTL_MS is reused without re-fetching', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: VALID_PAYLOAD });
+    const clientA = await oauthClient.getOAuthClient({ tenantId: 'T-fresh', coordinatorId: 'c' });
+    // Advance time to just UNDER the TTL
+    const realNow = Date.now;
+    const originalCachedAt = Date.now();
+    Date.now = jest.fn(() => originalCachedAt + oauthClient._CACHE_TTL_MS - 1000);
+
+    const clientB = await oauthClient.getOAuthClient({ tenantId: 'T-fresh', coordinatorId: 'c' });
+    expect(smMock.commandCalls(GetSecretValueCommand)).toHaveLength(1); // no second fetch
+    expect(clientA).toBe(clientB);
+
+    Date.now = realNow;
+  });
+});
+
+// Y1: clearCacheEntry
+describe('clearCacheEntry', () => {
+  test('evicting a cached entry causes re-fetch on next getOAuthClient call', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: VALID_PAYLOAD });
+    await oauthClient.getOAuthClient({ tenantId: 'T-evict', coordinatorId: 'c' });
+    expect(smMock.commandCalls(GetSecretValueCommand)).toHaveLength(1);
+
+    // Evict
+    oauthClient.clearCacheEntry({ tenantId: 'T-evict', coordinatorId: 'c' });
+
+    // Next call must re-fetch
+    await oauthClient.getOAuthClient({ tenantId: 'T-evict', coordinatorId: 'c' });
+    expect(smMock.commandCalls(GetSecretValueCommand)).toHaveLength(2);
+  });
+
+  test('clearCacheEntry with missing args does not throw', () => {
+    // Should swallow the buildSecretPath error gracefully
+    expect(() => oauthClient.clearCacheEntry({ tenantId: '', coordinatorId: '' })).not.toThrow();
+    expect(() => oauthClient.clearCacheEntry({})).not.toThrow();
+  });
+
+  test('clearCacheEntry for non-existent path is a no-op', () => {
+    expect(() => oauthClient.clearCacheEntry({ tenantId: 'T-nonexistent', coordinatorId: 'c' })).not.toThrow();
+  });
 });

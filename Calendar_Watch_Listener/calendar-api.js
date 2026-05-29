@@ -58,12 +58,21 @@ async function getEvent(authClient, calendarId, eventId) {
   }
 }
 
-async function listChangedEvents(authClient, calendarId, syncToken) {
+// pageToken is optional: when provided it continues a paginated incremental sync.
+// syncToken and pageToken are mutually exclusive in the Google API; when paging
+// through a large initial list the caller passes the nextPageToken from the
+// prior page and omits the syncToken on continuation calls.
+async function listChangedEvents(authClient, calendarId, syncToken, pageToken) {
   if (!authClient || !calendarId) {
     throw new Error('authClient and calendarId are required');
   }
   const params = { auth: authClient, calendarId };
-  if (syncToken) {
+  if (pageToken) {
+    // Continuation page — no syncToken; just carry the pageToken.
+    params.pageToken = pageToken;
+    params.showDeleted = true;
+    params.singleEvents = true;
+  } else if (syncToken) {
     params.syncToken = syncToken;
   } else {
     params.showDeleted = true;

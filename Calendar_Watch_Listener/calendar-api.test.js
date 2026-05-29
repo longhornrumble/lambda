@@ -135,4 +135,20 @@ describe('listChangedEvents', () => {
     await expect(listChangedEvents(FAKE_AUTH, null))
       .rejects.toThrow('authClient and calendarId are required');
   });
+
+  test('pageToken continuation: uses pageToken, sets showDeleted+singleEvents, omits syncToken', async () => {
+    mockEventsList.mockResolvedValue({
+      data: { items: [{ id: 'b' }], nextSyncToken: 'final-tok', nextPageToken: null },
+    });
+    const result = await listChangedEvents(FAKE_AUTH, 'cal', null, 'page-tok-2');
+    expect(mockEventsList).toHaveBeenCalledWith({
+      auth: FAKE_AUTH, calendarId: 'cal', pageToken: 'page-tok-2',
+      showDeleted: true, singleEvents: true,
+    });
+    expect(result).toEqual({
+      events: [{ id: 'b' }],
+      nextSyncToken: 'final-tok',
+      nextPageToken: null,
+    });
+  });
 });
