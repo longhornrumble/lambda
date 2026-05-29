@@ -39,6 +39,7 @@ jobs:
       meta_response:  ${{ steps.filter.outputs.meta_response }}
       calendar_watch_listener: ${{ steps.filter.outputs.calendar_watch_listener }}
       calendar_watch_onboarder: ${{ steps.filter.outputs.calendar_watch_onboarder }}
+      calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
       # Python Lambdas with tests
       meta_oauth:                ${{ steps.filter.outputs.meta_oauth }}
       master:                    ${{ steps.filter.outputs.master }}
@@ -76,6 +77,8 @@ jobs:
               - 'Calendar_Watch_Listener/**'
             calendar_watch_onboarder:
               - 'Calendar_Watch_Onboarder/**'
+            calendar_watch_renewer:
+              - 'Calendar_Watch_Renewer/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
             master:
@@ -125,7 +128,8 @@ jobs:
       needs.detect-changes.outputs.meta_webhook == 'true' ||
       needs.detect-changes.outputs.meta_response == 'true' ||
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_onboarder == 'true'
+      needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_renewer == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -141,6 +145,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_listener }}
           - lambda: Calendar_Watch_Onboarder
             changed: ${{ needs.detect-changes.outputs.calendar_watch_onboarder }}
+          - lambda: Calendar_Watch_Renewer
+            changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -453,6 +459,7 @@ jobs:
           - lambda: notification_hub        # node:test covers logic; audit covers deps
           - lambda: Calendar_Watch_Listener # B2 scheduling listener — jest tests + deps
           - lambda: Calendar_Watch_Onboarder # B5 onboarding hook — jest tests + deps
+          - lambda: Calendar_Watch_Renewer # B3 watch-channel renewer — jest tests + deps
 
     steps:
       - name: Checkout
@@ -508,7 +515,8 @@ jobs:
       needs.detect-changes.outputs.meta_webhook == 'true' ||
       needs.detect-changes.outputs.meta_response == 'true' ||
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_onboarder == 'true'
+      needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_renewer == 'true'
 
     strategy:
       fail-fast: false
@@ -524,6 +532,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_listener }}
           - lambda: Calendar_Watch_Onboarder
             changed: ${{ needs.detect-changes.outputs.calendar_watch_onboarder }}
+          - lambda: Calendar_Watch_Renewer
+            changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
 
     steps:
       - name: Skip unchanged Lambda
