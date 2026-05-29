@@ -12,10 +12,16 @@
  * (Google may pick less); B3 Renewer watches `tenant-expiration-index` GSI
  * and re-watches before expiry.
  *
+ * `stopWatch` wraps channels.stop — used by the Onboarder to revoke a channel
+ * it just created when a downstream step (DDB write) fails, so a live Google
+ * channel is never stranded without an authenticating DDB row.
+ *
  * `seedInitialSyncToken` pages events.list until `nextSyncToken` appears.
  * Google only emits `nextSyncToken` on the final page; for any calendar with
  * more than one page of events, pagination is required. Bounded by `maxPages`
- * so a runaway calendar can't OOM the Lambda.
+ * so a runaway calendar can't OOM the Lambda. `singleEvents` is left false:
+ * the sync token is returned regardless, and expanding recurring events into
+ * instances would needlessly multiply the page count on long-lived calendars.
  */
 
 const calendarApi = require('@googleapis/calendar');
@@ -43,6 +49,19 @@ async function registerWatch(authClient, calendarId, channelId, channelToken, li
   };
 }
 
+async function stopWatch(authClient, channelId, resourceId) {
+  if (!authClient || !channelId || !resourceId) {
+    throw new Error('authClient, channelId, and resourceId are required');
+  }
+  await calendar.channels.stop({
+    auth: authClient,
+    requestBody: {
+      id: channelId,
+      resourceId,
+    },
+  });
+}
+
 async function seedInitialSyncToken(authClient, calendarId, maxPages = 50) {
   if (!authClient || !calendarId) {
     throw new Error('authClient and calendarId are required');
@@ -55,7 +74,7 @@ async function seedInitialSyncToken(authClient, calendarId, maxPages = 50) {
       auth: authClient,
       calendarId,
       showDeleted: true,
-      singleEvents: true,
+      singleEvents: false,
     };
     if (pageToken) {
       params.pageToken = pageToken;
@@ -77,5 +96,6 @@ async function seedInitialSyncToken(authClient, calendarId, maxPages = 50) {
 
 module.exports = {
   registerWatch,
+  stopWatch,
   seedInitialSyncToken,
 };
