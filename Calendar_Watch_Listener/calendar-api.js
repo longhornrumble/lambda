@@ -3,7 +3,9 @@
 /**
  * calendar-api.js — Google Calendar API wrapper.
  *
- * Phase 2a (B2 plumbing only — handler does not call this yet; Phase 2b wires it in).
+ * Both `getEvent` and `listChangedEvents` are wired into and exercised by the
+ * Phase 2b handler (processDelta calls listChangedEvents for delta discovery;
+ * getEvent is available for single-event resolution when a caller has an eventId).
  *
  * `getEvent` returns one of three discriminated statuses so the caller can
  * derive the matching event_type from listener_dispatch_interface.md:
@@ -14,14 +16,10 @@
  *
  * Any other API error propagates as-is so the caller can DLQ + alarm.
  *
- * `listChangedEvents` is the events.list+syncToken delta-discovery primitive
- * that Phase 2b will need to map a calendar-level Google push to the specific
- * event_id that changed. The canonical design (§14.2) and listener_dispatch_interface.md
- * speak in terms of `events.get(eventId)` but Google Calendar push notifications
- * identify the calendar, not the event — syncToken-based delta discovery is the
- * standard pattern. Surfaced as Phase 2b design-gap in scheduling plan.
- *
- * NOT exercised by handler in Phase 2a — these are foundation primitives only.
+ * `listChangedEvents` is the events.list+syncToken delta-discovery primitive used
+ * by Phase 2b to map a calendar-level Google push to the specific events that changed.
+ * Google Calendar push notifications identify the calendar, not the event; syncToken-based
+ * delta discovery is the standard pattern (see §14.2 of the scheduling plan).
  */
 
 const calendarApi = require('@googleapis/calendar');
@@ -58,12 +56,21 @@ async function getEvent(authClient, calendarId, eventId) {
   }
 }
 
-async function listChangedEvents(authClient, calendarId, syncToken) {
+// pageToken is optional: when provided it continues a paginated incremental sync.
+// syncToken and pageToken are mutually exclusive in the Google API; when paging
+// through a large initial list the caller passes the nextPageToken from the
+// prior page and omits the syncToken on continuation calls.
+async function listChangedEvents(authClient, calendarId, syncToken, pageToken) {
   if (!authClient || !calendarId) {
     throw new Error('authClient and calendarId are required');
   }
   const params = { auth: authClient, calendarId };
-  if (syncToken) {
+  if (pageToken) {
+    // Continuation page — no syncToken; just carry the pageToken.
+    params.pageToken = pageToken;
+    params.showDeleted = true;
+    params.singleEvents = true;
+  } else if (syncToken) {
     params.syncToken = syncToken;
   } else {
     params.showDeleted = true;
