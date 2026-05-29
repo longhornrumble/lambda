@@ -299,8 +299,10 @@ describe('POST typed dispatch', () => {
 
     // Y2: dedup basis MUST include the platform-controlled channel_id so an
     // attacker cannot forge a dedup-collision by controlling booking_id + updated.
+    // Row 5: basis also includes event_type and attendee_email to discriminate
+    // per-envelope within a single calendar event.
     const body = JSON.parse(sentCall.args[0].input.MessageBody);
-    const expectedDedupBasis = `${CHANNEL_ID}:${BOOKING_ID}:${body.last_calendar_mutation_at}`;
+    const expectedDedupBasis = `${CHANNEL_ID}:${body.event_type}:${BOOKING_ID}:${body.attendee_email ?? ''}:${body.last_calendar_mutation_at}`;
     const expectedDedupId = crypto.createHash('sha256').update(expectedDedupBasis).digest('hex');
     expect(sentCall.args[0].input.MessageDeduplicationId).toBe(expectedDedupId);
     // channel_id must NOT appear in the message body
@@ -980,5 +982,378 @@ describe('R3: syncToken 410 expiry clears token and returns 200', () => {
     expect(response.statusCode).toBe(500);
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('list_changed_events_failed'));
     errSpy.mockRestore();
+  });
+});
+
+// ─── Row 7: revoked OAuth token mid-cache-lifetime ───────────────────────────────
+// 401/invalid_grant from listChangedEvents must evict the cache entry and return 500.
+
+describe('Row 7: listChangedEvents 401 → clearCacheEntry + 500', () => {
+  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+
+  test('401 code from listChangedEvents clears cache entry and returns 500', async () => {
+    ddbMock.on(GetItemCommand).resolves(makeChannelRow());
+    getOAuthClient.mockResolvedValue(FAKE_AUTH);
+    const err401 = new Error('Unauthorized');
+    err401.code = 401;
+    listChangedEvents.mockRejectedValue(err401);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const response = await handler(makePostEvent(validHeaders()));
+
+    expect(response.statusCode).toBe(500);
+    expect(clearCacheEntry).toHaveBeenCalledWith({ tenantId: TENANT_ID, coordinatorId: COORDINATOR_ID });
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('oauth_token_rejected_cache_cleared'));
+    // Must NOT dispatch any SQS message
+    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    warnSpy.mockRestore();
+  });
+
+  test('err.response.status 401 also triggers cache eviction', async () => {
+    ddbMock.on(GetItemCommand).resolves(makeChannelRow());
+    getOAuthClient.mockResolvedValue(FAKE_AUTH);
+    const err401 = new Error('Unauthorized');
+    err401.response = { status: 401 };
+    listChangedEvents.mockRejectedValue(err401);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const response = await handler(makePostEvent(validHeaders()));
+
+    expect(response.statusCode).toBe(500);
+    expect(clearCacheEntry).toHaveBeenCalledWith({ tenantId: TENANT_ID, coordinatorId: COORDINATOR_ID });
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('oauth_token_rejected_cache_cleared'));
+    warnSpy.mockRestore();
+  });
+
+  test('invalid_grant in message triggers cache eviction', async () => {
+    ddbMock.on(GetItemCommand).resolves(makeChannelRow());
+    getOAuthClient.mockResolvedValue(FAKE_AUTH);
+    const errGrant = new Error('invalid_grant: Token has been expired or revoked');
+    listChangedEvents.mockRejectedValue(errGrant);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const response = await handler(makePostEvent(validHeaders()));
+
+    expect(response.statusCode).toBe(500);
+    expect(clearCacheEntry).toHaveBeenCalledWith({ tenantId: TENANT_ID, coordinatorId: COORDINATOR_ID });
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('oauth_token_rejected_cache_cleared'));
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── Row 6: missing calendarId → 200 + warning, no dispatch ─────────────────────
+
+describe('Row 6: missing calendarId guard in processDelta', () => {
+  test('channel row with no calendar_id returns 200 with warning and no OAuth/SQS calls', async () => {
+    // calendar_id missing from the channel row
+    ddbMock.on(GetItemCommand).resolves(makeChannelRow({ calendar_id: undefined }));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const response = await handler(makePostEvent(validHeaders()));
+
+    expect(response.statusCode).toBe(200);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('delta_skipped_no_calendar_id'));
+    // No OAuth, no listChangedEvents, no SQS
+    expect(getOAuthClient).not.toHaveBeenCalled();
+    expect(listChangedEvents).not.toHaveBeenCalled();
+    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── Row 13: oauth_client_failed must assert clearCacheEntry called ───────────────
+
+describe('Row 13: oauth_client_failed path asserts clearCacheEntry called', () => {
+  test('getOAuthClient failure calls clearCacheEntry with tenantId + coordinatorId', async () => {
+    ddbMock.on(GetItemCommand).resolves(makeChannelRow());
+    getOAuthClient.mockRejectedValue(new Error('AccessDenied'));
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+    const response = await handler(makePostEvent(validHeaders()));
+
+    expect(response.statusCode).toBe(500);
+    // Row 13: deleting clearCacheEntry call must fail this test
+    expect(clearCacheEntry).toHaveBeenCalledWith({ tenantId: TENANT_ID, coordinatorId: COORDINATOR_ID });
+    expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('oauth_client_failed'));
+    errSpy.mockRestore();
+  });
+});
+
+// ─── Row 14: no last_sync_token → attribute_not_exists branch ────────────────────
+
+describe('Row 14: advanceSyncToken uses attribute_not_exists when no prior token', () => {
+  test('channel with no last_sync_token sets attribute_not_exists(last_sync_token) condition', async () => {
+    // Channel row has NO last_sync_token field (first push after sync handshake)
+    const channelRowNoToken = makeChannelRow({ last_sync_token: undefined });
+    ddbMock.on(GetItemCommand).resolves(channelRowNoToken);
+    ddbMock.on(UpdateItemCommand).resolves({});
+    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid' });
+    getOAuthClient.mockResolvedValue(FAKE_AUTH);
+    listChangedEvents.mockResolvedValue({
+      events: [],
+      nextSyncToken: 'first-sync-tok',
+      nextPageToken: null,
+    });
+
+    const response = await handler(makePostEvent(validHeaders()));
+    expect(response.statusCode).toBe(200);
+
+    // advanceSyncToken must have been called (nextSyncToken !== null)
+    expect(ddbMock).toHaveReceivedCommandTimes(UpdateItemCommand, 1);
+    const updateCall = ddbMock.commandCalls(UpdateItemCommand)[0];
+    // ConditionExpression must use the attribute_not_exists path (no prior token)
+    expect(updateCall.args[0].input.ConditionExpression).toBe('attribute_not_exists(last_sync_token)');
+    // ExpressionAttributeValues must NOT contain an :old key
+    expect(updateCall.args[0].input.ExpressionAttributeValues).not.toHaveProperty(':old');
+  });
+});
+
+// ─── Row 15: CLAUDE.md forward-compat — Booking row missing tenant_id ────────────
+// Old-shape pre-C8 Booking rows lack tenant_id. Reader must tolerate null and
+// proceed (cross-tenant guard treats null tenantId as same-tenant).
+
+describe('Row 15: forward-compat — Booking row with missing tenant_id proceeds', () => {
+  test('booking.tenantId null (old-shape row) skips cross-tenant guard and derives events', async () => {
+    // Old-shape row: tenant_id attribute absent → lookupBooking returns tenantId: null
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        booking_id:  { S: BOOKING_ID },
+        // tenant_id intentionally absent — old-shape pre-C8 row
+        resource_id: { S: 'original@x.com' },
+        start_at:    { S: '2026-05-30T09:00:00Z' },
+        end_at:      { S: '2026-05-30T10:00:00Z' },
+        status:      { S: 'booked' },
+      },
+    });
+
+    const evt = {
+      id: 'google-evt-old',
+      status: 'confirmed',
+      updated: '2026-05-29T12:00:00Z',
+      extendedProperties: { private: { booking_id: BOOKING_ID } },
+      start: { dateTime: '2026-05-30T11:00:00Z' }, // different start → calendar_moved
+      organizer: { email: 'original@x.com' },       // same resource_id → no reassigned
+    };
+    const envelopes = await _test.deriveTypedEnvelopes(evt, TENANT_ID, COORDINATOR_ID, 'google');
+
+    // Cross-tenant guard must NOT have fired (no warn('cross_tenant_booking_id_detected'))
+    // Move event must be derived (old-shape row is fully usable)
+    const moved = envelopes.find(e => e.event_type === 'booking.calendar_moved');
+    expect(moved).toBeDefined();
+    expect(moved.previous_start_at).toBe('2026-05-30T09:00:00Z');
+    expect(moved.new_start_at).toBe('2026-05-30T11:00:00Z');
+  });
+});
+
+// ─── Row 12: workingLocation runs the OOO path ───────────────────────────────────
+// workingLocation events must run identically to outOfOffice so a string
+// typo in the eventType check would fail CI.
+
+describe('Row 12: workingLocation runs OOO overlap path', () => {
+  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+
+  test('eventType=workingLocation with overlapping bookings → booking.ooo_overlap_detected', async () => {
+    ddbMock.on(QueryCommand).resolves({
+      Items: [{ booking_id: { S: 'bk-wl-1' } }],
+    });
+    const wlEvent = {
+      id: 'wl-evt',
+      eventType: 'workingLocation',
+      updated: '2026-05-29T12:00:00Z',
+      start: { dateTime: '2026-05-30T09:00:00Z' },
+      end:   { dateTime: '2026-05-30T17:00:00Z' },
+    };
+    const envelopes = await _test.deriveTypedEnvelopes(wlEvent, TENANT_ID, COORDINATOR_ID, 'google');
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].event_type).toBe('booking.ooo_overlap_detected');
+    expect(envelopes[0].booking_id).toBe('bk-wl-1');
+    expect(envelopes[0].ooo_start_at).toBe('2026-05-30T09:00:00Z');
+    expect(envelopes[0].overlapping_booking_ids).toEqual(['bk-wl-1']);
+  });
+
+  test('eventType=workingLocation with NO overlapping bookings → empty array', async () => {
+    ddbMock.on(QueryCommand).resolves({ Items: [] });
+    const wlEvent = {
+      id: 'wl-evt',
+      eventType: 'workingLocation',
+      updated: '2026-05-29T12:00:00Z',
+      start: { dateTime: '2026-05-30T09:00:00Z' },
+      end:   { dateTime: '2026-05-30T17:00:00Z' },
+    };
+    const envelopes = await _test.deriveTypedEnvelopes(wlEvent, TENANT_ID, COORDINATOR_ID, 'google');
+    expect(envelopes).toHaveLength(0);
+  });
+});
+
+// ─── Row 4: cross-tenant guard before cancelled/private branches ──────────────────
+// A status=cancelled event whose booking_id resolves to a booking under a DIFFERENT
+// tenant must return [] (no calendar_deleted envelope).
+
+describe('Row 4: cross-tenant guard fires before cancelled/private branches', () => {
+  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+
+  test('cancelled event with foreign-tenant booking → no calendar_deleted envelope', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        booking_id:  { S: BOOKING_ID },
+        tenant_id:   { S: 'FOREIGN_TENANT' },  // different from TENANT_ID
+        resource_id: { S: 'r@x.com' },
+        start_at:    { S: '2026-05-30T09:00:00Z' },
+        end_at:      { S: '2026-05-30T10:00:00Z' },
+        status:      { S: 'booked' },
+      },
+    });
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const calEvent = {
+      id: 'google-evt-cancelled-foreign',
+      status: 'cancelled',
+      updated: '2026-05-29T12:00:00Z',
+      extendedProperties: { private: { booking_id: BOOKING_ID } },
+    };
+    const envelopes = await _test.deriveTypedEnvelopes(calEvent, TENANT_ID, COORDINATOR_ID, 'google');
+
+    // Guard must have triggered
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('cross_tenant_booking_id_detected'));
+    // No envelopes — not even calendar_deleted
+    expect(envelopes).toHaveLength(0);
+    expect(envelopes.find(e => e.event_type === 'booking.calendar_deleted')).toBeUndefined();
+    warnSpy.mockRestore();
+  });
+
+  test('private event with foreign-tenant booking → no event_made_private envelope', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        booking_id: { S: BOOKING_ID },
+        tenant_id:  { S: 'FOREIGN_TENANT' },
+        status:     { S: 'booked' },
+      },
+    });
+
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const calEvent = {
+      id: 'google-evt-private-foreign',
+      status: 'confirmed',
+      visibility: 'private',
+      updated: '2026-05-29T12:00:00Z',
+      extendedProperties: { private: { booking_id: BOOKING_ID } },
+    };
+    const envelopes = await _test.deriveTypedEnvelopes(calEvent, TENANT_ID, COORDINATOR_ID, 'google');
+
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('cross_tenant_booking_id_detected'));
+    expect(envelopes).toHaveLength(0);
+    expect(envelopes.find(e => e.event_type === 'booking.event_made_private')).toBeUndefined();
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── Row 5: attendee dedup formula discriminates per-envelope ────────────────────
+// Same calendar event with N attendees must produce N distinct MessageDeduplicationIds.
+
+describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee_email)', () => {
+  test('two attendees accepting produce two distinct MessageDeduplicationIds', async () => {
+    ddbMock.on(GetItemCommand).resolves({}); // no booking record
+    ddbMock.on(UpdateItemCommand).resolves({});
+    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid' });
+    getOAuthClient.mockResolvedValue(FAKE_AUTH);
+
+    const mutatedAt = '2026-05-29T12:00:00Z';
+    const multiAttendeeEvent = {
+      id: 'google-evt-attendees',
+      status: 'confirmed',
+      updated: mutatedAt,
+      extendedProperties: { private: { booking_id: BOOKING_ID } },
+      attendees: [
+        { email: 'alice@x.com', responseStatus: 'accepted' },
+        { email: 'bob@x.com',   responseStatus: 'accepted' },
+      ],
+    };
+
+    listChangedEvents.mockResolvedValue({
+      events: [multiAttendeeEvent],
+      nextSyncToken: 'sync-tok-2',
+      nextPageToken: null,
+    });
+
+    // We need the full channel lookup to reach processDelta
+    ddbMock.on(GetItemCommand).resolves(makeChannelRow());
+    const response = await handler(makePostEvent(validHeaders()));
+    expect(response.statusCode).toBe(200);
+
+    // Two attendee_accepted envelopes must have been dispatched
+    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 2);
+
+    const calls = sqsMock.commandCalls(SendMessageCommand);
+    const dedupId1 = calls[0].args[0].input.MessageDeduplicationId;
+    const dedupId2 = calls[1].args[0].input.MessageDeduplicationId;
+
+    // The two dedup IDs must be distinct
+    expect(dedupId1).not.toBe(dedupId2);
+
+    // Verify the formula: channel_id:event_type:event_id:attendee_email:last_mutation_at
+    const body1 = JSON.parse(calls[0].args[0].input.MessageBody);
+    const body2 = JSON.parse(calls[1].args[0].input.MessageBody);
+    const basis1 = `${CHANNEL_ID}:${body1.event_type}:${BOOKING_ID}:${body1.attendee_email ?? ''}:${mutatedAt}`;
+    const basis2 = `${CHANNEL_ID}:${body2.event_type}:${BOOKING_ID}:${body2.attendee_email ?? ''}:${mutatedAt}`;
+    expect(dedupId1).toBe(crypto.createHash('sha256').update(basis1).digest('hex'));
+    expect(dedupId2).toBe(crypto.createHash('sha256').update(basis2).digest('hex'));
+  });
+
+  test('calendar_moved and attendee_accepted on the same event produce distinct dedup IDs', async () => {
+    // Booking record: different start → calendar_moved; attendee accepted → attendee_accepted
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        booking_id:  { S: BOOKING_ID },
+        tenant_id:   { S: TENANT_ID },
+        resource_id: { S: 'org@x.com' },
+        start_at:    { S: '2026-05-30T09:00:00Z' },
+        end_at:      { S: '2026-05-30T10:00:00Z' },
+        status:      { S: 'booked' },
+      },
+    });
+    ddbMock.on(UpdateItemCommand).resolves({});
+    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid' });
+    getOAuthClient.mockResolvedValue(FAKE_AUTH);
+
+    // Re-resolve makeChannelRow for the handler-level GetItemCommand
+    ddbMock.on(GetItemCommand)
+      .resolvesOnce(makeChannelRow())
+      .resolves({
+        Item: {
+          booking_id:  { S: BOOKING_ID },
+          tenant_id:   { S: TENANT_ID },
+          resource_id: { S: 'org@x.com' },
+          start_at:    { S: '2026-05-30T09:00:00Z' },
+          end_at:      { S: '2026-05-30T10:00:00Z' },
+          status:      { S: 'booked' },
+        },
+      });
+
+    const mixedEvent = {
+      id: 'google-evt-mixed',
+      status: 'confirmed',
+      updated: '2026-05-29T12:00:00Z',
+      extendedProperties: { private: { booking_id: BOOKING_ID } },
+      start: { dateTime: '2026-05-30T11:00:00Z' }, // different from booking → calendar_moved
+      organizer: { email: 'org@x.com' },             // same resource_id → no reassigned
+      attendees: [{ email: 'acc@x.com', responseStatus: 'accepted' }],
+    };
+
+    listChangedEvents.mockResolvedValue({
+      events: [mixedEvent],
+      nextSyncToken: 'sync-tok-2',
+      nextPageToken: null,
+    });
+
+    const response = await handler(makePostEvent(validHeaders()));
+    expect(response.statusCode).toBe(200);
+
+    // calendar_moved + attendee_accepted = 2 envelopes
+    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 2);
+
+    const calls = sqsMock.commandCalls(SendMessageCommand);
+    const dedupId1 = calls[0].args[0].input.MessageDeduplicationId;
+    const dedupId2 = calls[1].args[0].input.MessageDeduplicationId;
+    expect(dedupId1).not.toBe(dedupId2);
   });
 });

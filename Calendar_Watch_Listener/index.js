@@ -160,7 +160,11 @@ async function dispatchTypedEvent(envelope, channelId) {
     warn('dispatch_skipped_no_queue_url', { envelope_event_type: envelope.event_type });
     return;
   }
-  const dedupBasis = `${channelId}:${envelope.event_id}:${envelope.last_calendar_mutation_at}`;
+  // Row 5: dedup basis includes event_type (separates calendar_moved + attendee_accepted
+  // on the same event) and attendee_email (separates N attendees with same updated timestamp).
+  // attendee_email ?? '' makes the formula stable for non-attendee envelopes.
+  // These fields are added to the dedup basis only — NOT to the message body.
+  const dedupBasis = `${channelId}:${envelope.event_type}:${envelope.event_id}:${envelope.attendee_email ?? ''}:${envelope.last_calendar_mutation_at}`;
   await sqs.send(
     new SendMessageCommand({
       QueueUrl: EVENTS_QUEUE_URL,
@@ -329,19 +333,12 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
     calendar_provider:         calendarProvider,
   };
 
-  // ── Deleted ──
-  if (calEvent.status === 'cancelled') {
-    envelopes.push({ event_type: 'booking.calendar_deleted', ...commonFields });
-    return envelopes;
-  }
-
-  // ── Private ──
-  if (calEvent.visibility === 'private' || calEvent.visibility === 'confidential') {
-    envelopes.push({ event_type: 'booking.event_made_private', ...commonFields });
-    return envelopes;
-  }
-
-  // ── Moved / Reassigned (require Booking record for comparison) ──
+  // R1: cross-tenant booking guard — run ONCE up front, before any branch.
+  // booking_id comes from attacker-influenceable extendedProperties.private.booking_id.
+  // If the Booking record belongs to a different tenant, emit nothing and return.
+  // For a legitimately-deleted booking, lookupBooking returns null → we cannot
+  // verify tenant → proceed (consumer no-ops on a phantom foreign booking_id; the
+  // leak we're closing is emitting a *real* foreign-tenant booking's event).
   let booking = null;
   try {
     booking = await lookupBooking(bookingId);
@@ -353,17 +350,25 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
     });
   }
 
-  // R1: cross-tenant booking guard.
-  // booking_id comes from attacker-influenceable extendedProperties.private.booking_id.
-  // If the Booking record belongs to a different tenant, treat it as absent so
-  // moved/reassigned derivations (which compare against booking fields) are skipped.
   if (booking !== null && booking.tenantId !== null && booking.tenantId !== tenantId) {
     warn('cross_tenant_booking_id_detected', {
       booking_id:        bookingId,
       booking_tenant_id: booking.tenantId,
       channel_tenant_id: tenantId,
     });
-    booking = null;
+    return [];
+  }
+
+  // ── Deleted ──
+  if (calEvent.status === 'cancelled') {
+    envelopes.push({ event_type: 'booking.calendar_deleted', ...commonFields });
+    return envelopes;
+  }
+
+  // ── Private ──
+  if (calEvent.visibility === 'private' || calEvent.visibility === 'confidential') {
+    envelopes.push({ event_type: 'booking.event_made_private', ...commonFields });
+    return envelopes;
   }
 
   if (!booking) {
@@ -438,6 +443,13 @@ function resolveResourceId(calEvent) {
 async function processDelta(channel, channelId) {
   const { tenantId, calendarId, calendarProvider, coordinatorId, lastSyncToken } = channel;
 
+  // ── Config guards (missing calendarId or coordinatorId is a config problem,
+  //    not a transient error — return 200 so Google does not retry forever) ──
+  if (!calendarId) {
+    warn('delta_skipped_no_calendar_id', { channel_id: channelId, tenant_id: tenantId });
+    return { statusCode: 200, body: '' };
+  }
+
   // ── Build OAuth client ──
   if (!coordinatorId) {
     // Y3: coordinator_id is the coordinator's email (PII) — omit from logs.
@@ -511,6 +523,20 @@ async function processDelta(channel, channelId) {
       }
       warn('sync_token_expired_cleared', { channel_id: channelId, tenant_id: tenantId });
       return { statusCode: 200, body: '' };
+    }
+    // Row 7: revoked or expired OAuth token detected mid-cache-lifetime.
+    // Evict the cache entry so the next invocation re-fetches from Secrets Manager
+    // instead of replaying the stale/revoked credential.  Return 500 so Google
+    // retries; the next attempt will re-fetch + re-authenticate.
+    const isAuthError =
+      err.code === 401 ||
+      err.response?.status === 401 ||
+      err.code === 'invalid_grant' ||
+      /invalid_grant/i.test(err.message || '');
+    if (isAuthError) {
+      clearCacheEntry({ tenantId, coordinatorId });
+      warn('oauth_token_rejected_cache_cleared', { channel_id: channelId, tenant_id: tenantId });
+      return { statusCode: 500, body: 'Internal Server Error' };
     }
     console.error(JSON.stringify({
       event: 'list_changed_events_failed',
