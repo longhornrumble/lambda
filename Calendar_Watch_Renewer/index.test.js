@@ -70,7 +70,7 @@ function setUpRenewHappy(items = [channelItem()]) {
   mockRegisterWatch.mockResolvedValue({
     resourceId: 'new-res',
     resourceUri: 'https://www.googleapis.com/calendar/v3/calendars/primary/events',
-    expiration: '1780000000000',
+    expiration: '1850000000000',
   });
   mockStopWatch.mockResolvedValue(undefined);
   ddbMock.on(QueryCommand).resolves({ Items: items });
@@ -157,9 +157,9 @@ describe('resolveBufferMs', () => {
     expect(() => _test.resolveBufferMs({})).toThrow('positive integer');
   });
 
-  test('defaults to 7 days when neither provided', () => {
+  test('defaults to 2 days when neither provided (G2 — must be < ~7d channel lifetime)', () => {
     delete process.env.RENEWAL_BUFFER_MS;
-    expect(_test.resolveBufferMs({})).toBe(7 * 24 * 60 * 60 * 1000);
+    expect(_test.resolveBufferMs({})).toBe(2 * 24 * 60 * 60 * 1000);
   });
 });
 
@@ -238,7 +238,7 @@ describe('handler — renewal happy path', () => {
     expect(result.renewed).toHaveLength(1);
     expect(result.renewed[0].old_channel_id).toBe('old-ch-1');
     expect(result.renewed[0].new_channel_id).toMatch(/^[0-9a-f-]{36}$/);
-    expect(result.renewed[0].expiration).toBe('1780000000000');
+    expect(result.renewed[0].expiration).toBe('1850000000000');
 
     // OAuth fetched per (tenant, coordinator)
     expect(mockOauth).toHaveBeenCalledWith({ tenantId: 'MYR384719', coordinatorId: 'test-coordinator' });
@@ -258,7 +258,7 @@ describe('handler — renewal happy path', () => {
     expect(put.ConditionExpression).toBe('attribute_not_exists(channel_id)');
     expect(put.Item.channel_id.S).toBe(newChannelId);
     expect(put.Item.status.S).toBe('active');
-    expect(put.Item.expiration.N).toBe('1780000000000');
+    expect(put.Item.expiration.N).toBe('1850000000000');
     expect(put.Item.last_sync_token.S).toBe('sync-tok-old');
     expect(put.Item.renewed_from.S).toBe('old-ch-1');
     expect(put.Item.resource_id.S).toBe('new-res');
@@ -289,7 +289,7 @@ describe('handler — renewal happy path', () => {
 
   test('new row omits resource_id / resource_uri when the watch response lacks them', async () => {
     setUpRenewHappy();
-    mockRegisterWatch.mockResolvedValue({ resourceId: null, resourceUri: null, expiration: '1780000000000' });
+    mockRegisterWatch.mockResolvedValue({ resourceId: null, resourceUri: null, expiration: '1850000000000' });
     const result = await handler({});
     expect(result.renewed).toHaveLength(1);
     const put = ddbMock.commandCalls(PutItemCommand)[0].args[0].input;
@@ -310,7 +310,7 @@ describe('handler — renewal happy path', () => {
 
   test('processes multiple tenants; a per-tenant query failure does not abort the others', async () => {
     mockOauth.mockResolvedValue({ _authClient: 'mock' });
-    mockRegisterWatch.mockResolvedValue({ resourceId: 'r', resourceUri: 'u', expiration: '1780000000000' });
+    mockRegisterWatch.mockResolvedValue({ resourceId: 'r', resourceUri: 'u', expiration: '1850000000000' });
     mockStopWatch.mockResolvedValue(undefined);
     ddbMock.on(PutItemCommand).resolves({});
     ddbMock.on(DeleteItemCommand).resolves({});
@@ -355,8 +355,9 @@ describe('handler — renewal failure & self-healing', () => {
     const updates = ddbMock.commandCalls(UpdateItemCommand);
     expect(updates).toHaveLength(1);
     expect(updates[0].args[0].input.Key.channel_id.S).toBe('old-ch-1');
-    expect(updates[0].args[0].input.ConditionExpression).toBe('attribute_exists(channel_id)');
+    expect(updates[0].args[0].input.ConditionExpression).toBe('attribute_exists(channel_id) AND tenant_id = :t');
     expect(updates[0].args[0].input.ExpressionAttributeValues[':failed'].S).toBe('unwatched_renewal_failed');
+    expect(updates[0].args[0].input.ExpressionAttributeValues[':t'].S).toBe('MYR384719');
 
     // SELF-HEALING: old row is NOT deleted, so the next run re-queries + retries it
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(0);
@@ -409,7 +410,7 @@ describe('handler — renewal failure & self-healing', () => {
     mockRegisterWatch.mockResolvedValue({ resourceId: 'res-x', resourceUri: 'u', expiration: null });
 
     const result = await handler({});
-    expect(result.failed[0].error).toContain('non-numeric expiration');
+    expect(result.failed[0].error).toContain('non-future expiration');
     expect(ddbMock.commandCalls(PutItemCommand)).toHaveLength(0);
     expect(mockStopWatch).toHaveBeenCalledTimes(1);
     expect(mockStopWatch.mock.calls[0][2]).toBe('res-x');
@@ -419,16 +420,16 @@ describe('handler — renewal failure & self-healing', () => {
     setUpRenewHappy();
     mockRegisterWatch.mockResolvedValue({ resourceId: 'res-u', resourceUri: 'u' }); // expiration undefined
     const result = await handler({});
-    expect(result.failed[0].error).toContain('non-numeric expiration');
+    expect(result.failed[0].error).toContain('non-future expiration');
     expect(ddbMock.commandCalls(PutItemCommand)).toHaveLength(0);
     expect(mockStopWatch).toHaveBeenCalledTimes(1);
   });
 
-  test('non-numeric expiration string from watch → throws + compensates', async () => {
+  test('non-future expiration string from watch → throws + compensates', async () => {
     setUpRenewHappy();
     mockRegisterWatch.mockResolvedValue({ resourceId: 'res-s', resourceUri: 'u', expiration: 'soon' });
     const result = await handler({});
-    expect(result.failed[0].error).toContain('non-numeric expiration');
+    expect(result.failed[0].error).toContain('non-future expiration');
     expect(mockStopWatch).toHaveBeenCalledTimes(1);
   });
 
@@ -479,6 +480,79 @@ describe('handler — renewal failure & self-healing', () => {
 });
 
 // ─── handler — env requirements ─────────────────────────────────────────────────
+
+describe('handler — audit remediation (G3/G4/G5/G6/G12)', () => {
+  test('G3: row with invalid coordinator_id → fails before any Google call', async () => {
+    setUpRenewHappy([channelItem({ coordinator_id: 'bad/../traversal' })]);
+    const result = await handler({});
+    expect(result.renewed).toHaveLength(0);
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0].error).toMatch(/invalid coordinator_id/);
+    expect(mockOauth).not.toHaveBeenCalled();
+    expect(mockRegisterWatch).not.toHaveBeenCalled();
+    expect(ddbMock.commandCalls(UpdateItemCommand)).toHaveLength(1); // old row flipped to failed
+  });
+
+  test('G3: row with invalid tenant_id → fails before any Google call', async () => {
+    setUpRenewHappy([channelItem({ tenant_id: 'bad tenant!' })]);
+    const result = await handler({ tenant_ids: ['MYR384719'] });
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0].error).toMatch(/invalid tenant_id/);
+    expect(mockRegisterWatch).not.toHaveBeenCalled();
+  });
+
+  test('G4: resourceId null + new-row write fails → compensation SKIPPED (no stopWatch), old row preserved', async () => {
+    setUpRenewHappy();
+    mockRegisterWatch.mockResolvedValue({ resourceId: null, resourceUri: null, expiration: '1850000000000' });
+    ddbMock.on(PutItemCommand).rejects(new Error('ddb throttled'));
+    const result = await handler({});
+    expect(result.failed).toHaveLength(1);
+    expect(mockStopWatch).not.toHaveBeenCalled(); // cannot revoke without a resourceId
+    expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(0); // self-healing: old row stays
+  });
+
+  test('G5: past/near-zero expiration from watch → rejected + compensates (no row write)', async () => {
+    setUpRenewHappy();
+    mockRegisterWatch.mockResolvedValue({ resourceId: 'res-past', resourceUri: 'u', expiration: '1' });
+    const result = await handler({});
+    expect(result.failed[0].error).toMatch(/non-future expiration/);
+    expect(ddbMock.commandCalls(PutItemCommand)).toHaveLength(0);
+    expect(mockStopWatch).toHaveBeenCalledTimes(1);
+    expect(mockStopWatch.mock.calls[0][2]).toBe('res-past');
+  });
+
+  test('G6: deleteOldRow + markRenewalFailed carry a tenant-ownership ConditionExpression', async () => {
+    setUpRenewHappy();
+    await handler({});
+    const del = ddbMock.commandCalls(DeleteItemCommand)[0].args[0].input;
+    expect(del.ConditionExpression).toBe('tenant_id = :t');
+    expect(del.ExpressionAttributeValues[':t'].S).toBe('MYR384719');
+  });
+
+  test('G12: partial batch — channel 1 renews, channel 2 watch fails; handled independently', async () => {
+    mockOauth.mockResolvedValue({ _authClient: 'mock' });
+    mockStopWatch.mockResolvedValue(undefined);
+    ddbMock.on(QueryCommand).resolves({ Items: [
+      channelItem({ channel_id: 'ch-1', coordinator_id: 'c1' }),
+      channelItem({ channel_id: 'ch-2', coordinator_id: 'c2' }),
+    ] });
+    ddbMock.on(PutItemCommand).resolves({});
+    ddbMock.on(UpdateItemCommand).resolves({});
+    ddbMock.on(DeleteItemCommand).resolves({});
+    cwMock.on(PutMetricDataCommand).resolves({});
+    mockRegisterWatch
+      .mockResolvedValueOnce({ resourceId: 'r1', resourceUri: 'u', expiration: '1850000000000' })
+      .mockRejectedValueOnce(new Error('quota exceeded on ch-2'));
+
+    const result = await handler({});
+    expect(result.scanned).toBe(2);
+    expect(result.renewed).toHaveLength(1);
+    expect(result.renewed[0].old_channel_id).toBe('ch-1');
+    expect(result.failed).toHaveLength(1);
+    expect(result.failed[0].channel_id).toBe('ch-2');
+    expect(result.failed[0].error).toMatch(/quota exceeded on ch-2/);
+  });
+});
 
 describe('handler — env requirements', () => {
   function withEnv(overrides, fn) {

@@ -69,7 +69,16 @@ const METRIC_NAMESPACE = process.env.METRIC_NAMESPACE || 'Picasso/Scheduling';
 const EXPIRATION_INDEX = 'tenant-expiration-index';
 
 const TENANT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
-const DEFAULT_RENEWAL_BUFFER_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+// coordinator_id flows from the DDB row into the OAuth Secrets Manager path
+// (picasso/scheduling/oauth/{tenantId}/{coordinatorId}); allowlist it before use
+// so a corrupted/crafted row can't path-traverse to another coordinator's secret
+// (audit G3). Same charset as the Onboarder's input validation.
+const COORDINATOR_ID_RE = /^[A-Za-z0-9._@+-]{1,128}$/;
+// 2 days. MUST be < the ~7d Google channel lifetime, else every live channel
+// matches expiration<=now+buffer on every 6h run = renew-every-run churn. The
+// deployed env var RENEWAL_BUFFER_MS is authoritative and set to 2d in IaC;
+// this fallback only applies if that env is ever dropped.
+const DEFAULT_RENEWAL_BUFFER_MS = 2 * 24 * 60 * 60 * 1000;
 
 // ─── Structured logging ─────────────────────────────────────────────────────────
 
@@ -221,27 +230,34 @@ async function writeNewRow(row) {
 
 // Flip the OLD row to unwatched_renewal_failed so ops can see a lapsing watch.
 // attribute_exists guard prevents resurrecting a row that was already deleted.
-async function markRenewalFailed(channelId) {
+async function markRenewalFailed(channelId, tenantId) {
+  // G6: tenant-ownership guard; attribute_exists prevents resurrecting a row
+  // that was already deleted by a successful prior renewal.
   await ddb.send(
     new UpdateItemCommand({
       TableName: CHANNELS_TABLE,
       Key: { channel_id: { S: channelId } },
       UpdateExpression: 'SET #s = :failed, last_renewal_attempt_at = :now',
-      ConditionExpression: 'attribute_exists(channel_id)',
+      ConditionExpression: 'attribute_exists(channel_id) AND tenant_id = :t',
       ExpressionAttributeNames: { '#s': 'status' },
       ExpressionAttributeValues: {
         ':failed': { S: 'unwatched_renewal_failed' },
         ':now':    { S: new Date().toISOString() },
+        ':t':      { S: tenantId },
       },
     })
   );
 }
 
-async function deleteOldRow(channelId) {
+async function deleteOldRow(channelId, tenantId) {
+  // G6: guard the delete by tenant ownership so a corrupted row's channel_id
+  // can never delete a different tenant's row.
   await ddb.send(
     new DeleteItemCommand({
       TableName: CHANNELS_TABLE,
       Key: { channel_id: { S: channelId } },
+      ConditionExpression: 'tenant_id = :t',
+      ExpressionAttributeValues: { ':t': { S: tenantId } },
     })
   );
 }
@@ -264,6 +280,16 @@ async function emitMetric(metricName, dimsObj) {
 // ─── Single-channel renewal ───────────────────────────────────────────────────────
 
 async function renewChannel(oldRow) {
+  // G3: validate identifiers read from the DDB row before they flow into the
+  // OAuth secret path / DDB keys. A corrupted or crafted row must not be able to
+  // reach another tenant/coordinator's secret.
+  if (typeof oldRow.tenantId !== 'string' || !TENANT_ID_RE.test(oldRow.tenantId)) {
+    throw new Error(`channel row has an invalid tenant_id for channel ${oldRow.channelId}`);
+  }
+  if (typeof oldRow.coordinatorId !== 'string' || !COORDINATOR_ID_RE.test(oldRow.coordinatorId)) {
+    throw new Error(`channel row has an invalid coordinator_id for channel ${oldRow.channelId}`);
+  }
+
   const authClient = await getOAuthClient({ tenantId: oldRow.tenantId, coordinatorId: oldRow.coordinatorId });
 
   const newChannelId = generateChannelId();
@@ -271,6 +297,15 @@ async function renewChannel(oldRow) {
   const newHash = sha256Hex(newToken);
 
   // Register the replacement channel FIRST (zero-gap renewal).
+  //
+  // NOTE (audit G1 — residual, accepted at v1 pilot scale): if this process dies
+  // between this events.watch and the DDB writes below, the next run re-queries
+  // the still-present old row and mints ANOTHER channel. That orphan is
+  // unrecoverable here (channels.stop needs a resourceId we never persisted) but
+  // self-limits — Google auto-expires it within ~7d. reserved_concurrent_executions=1
+  // prevents CONCURRENT duplicates; this crash-window orphan is accepted for v1.
+  // Full orphan-recovery (persist the pending channel before watch) lands with
+  // the G7 tuple-idempotency work pre-tenant-2.
   const watch = await registerWatch(authClient, oldRow.calendarId, newChannelId, newToken, LISTENER_URL);
   log('renewer_watch_registered', {
     old_channel_id: oldRow.channelId,
@@ -284,8 +319,15 @@ async function renewChannel(oldRow) {
   // row, so revoke the new channel before re-throwing. The OLD row + channel
   // remain intact for the next run to retry.
   try {
-    if (watch.expiration === null || watch.expiration === undefined || !/^\d+$/.test(String(watch.expiration))) {
-      throw new Error(`events.watch returned a non-numeric expiration: ${watch.expiration}`);
+    // G5: reject null/undefined/non-numeric AND a non-future expiration. A "0"
+    // or past epoch would make the new row satisfy expiration<=now+buffer on
+    // every subsequent run (infinite renewal).
+    if (
+      watch.expiration === null || watch.expiration === undefined ||
+      !/^\d+$/.test(String(watch.expiration)) ||
+      Number(watch.expiration) <= Date.now()
+    ) {
+      throw new Error(`events.watch returned an invalid or non-future expiration: ${watch.expiration}`);
     }
     await writeNewRow({
       channelId: newChannelId,
@@ -307,9 +349,19 @@ async function renewChannel(oldRow) {
       resource_id: watch.resourceId,
       reason: err.message,
     });
+    // G4: only attempt revocation if Google returned a resourceId; stopWatch
+    // throws without one, which would otherwise mask the original error and
+    // leave the new channel live + unrevoked.
     try {
-      await stopWatch(authClient, newChannelId, watch.resourceId);
-      warn('renewer_compensation_succeeded', { new_channel_id: newChannelId });
+      if (watch.resourceId) {
+        await stopWatch(authClient, newChannelId, watch.resourceId);
+        warn('renewer_compensation_succeeded', { new_channel_id: newChannelId });
+      } else {
+        warn('renewer_compensation_skipped_no_resource_id', {
+          new_channel_id: newChannelId,
+          note: 'new channel may be a self-limiting orphan (auto-expires ~7d)',
+        });
+      }
     } catch (stopErr) {
       warn('renewer_compensation_failed', {
         new_channel_id: newChannelId,
@@ -336,7 +388,7 @@ async function renewChannel(oldRow) {
     });
   }
   try {
-    await deleteOldRow(oldRow.channelId);
+    await deleteOldRow(oldRow.channelId, oldRow.tenantId);
   } catch (delErr) {
     warn('renewer_old_row_delete_failed', {
       old_channel_id: oldRow.channelId,
@@ -394,7 +446,7 @@ exports.handler = async function handler(event) {
         });
       } catch (err) {
         warn('channel_renewal_failed', { channel_id: ch.channelId, tenant_id: ch.tenantId, error: err.message });
-        await markRenewalFailed(ch.channelId)
+        await markRenewalFailed(ch.channelId, ch.tenantId)
           .catch((mErr) => warn('renewer_mark_failed_error', { channel_id: ch.channelId, error: mErr.message }));
         await emitMetric('CalendarWatchRenewalFailed', { Provider: ch.calendarProvider })
           .catch((mErr) => warn('renewer_metric_failed', { channel_id: ch.channelId, error: mErr.message }));
