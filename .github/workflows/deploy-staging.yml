@@ -30,6 +30,7 @@ on:
           - Meta_OAuth_Handler
           - Calendar_Watch_Listener
           - Calendar_Watch_Onboarder
+          - Calendar_Watch_Renewer
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -58,6 +59,7 @@ jobs:
       meta_oauth_handler: ${{ steps.filter.outputs.meta_oauth_handler }}
       calendar_watch_listener: ${{ steps.filter.outputs.calendar_watch_listener }}
       calendar_watch_onboarder: ${{ steps.filter.outputs.calendar_watch_onboarder }}
+      calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -88,6 +90,8 @@ jobs:
               - 'Calendar_Watch_Listener/**'
             calendar_watch_onboarder:
               - 'Calendar_Watch_Onboarder/**'
+            calendar_watch_renewer:
+              - 'Calendar_Watch_Renewer/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -116,7 +120,8 @@ jobs:
       needs.detect-changes.outputs.meta_response_processor == 'true' ||
       needs.detect-changes.outputs.meta_oauth_handler == 'true' ||
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_onboarder == 'true'
+      needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_renewer == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -402,6 +407,25 @@ jobs:
             #   aws lambda invoke --function-name Calendar_Watch_Onboarder
             # against a live OAuth-provisioned coordinator. Automated smoke
             # would require a stable test fixture (sub-phase E scope).
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Calendar_Watch_Renewer
+            # Scheduling sub-phase B Task B3 — Node.js Lambda, esbuild bundle.
+            # EventBridge-Scheduler-driven (every ~6h, B4); re-watches Google
+            # Calendar push channels approaching expiry. No Function URL. Env
+            # vars Terraform-managed in picasso infra/ module
+            # lambda-calendar-watch-renewer-staging. Same packaging path as
+            # Calendar_Watch_Onboarder.
+            staging_function: Calendar_Watch_Renewer
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # No HTTP frontend; smoke is operator-driven via
+            #   aws lambda invoke --function-name Calendar_Watch_Renewer
+            # after seeding a near-expiry channel. Automated smoke would
+            # require a stable test fixture (sub-phase E scope).
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''

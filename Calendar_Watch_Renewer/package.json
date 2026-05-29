@@ -1,0 +1,48 @@
+{
+  "name": "calendar-watch-renewer",
+  "version": "1.0.0",
+  "description": "Calendar_Watch_Renewer — scheduling sub-phase B Task B3. EventBridge-Scheduler-driven (every ~6h, B4) re-watch of Google Calendar push channels approaching expiry: queries the tenant-expiration-index GSI, registers a fresh events.watch channel (new UUID id + 256-bit token, SHA-256 hash to DDB per channel_token encryption Option 2), stops the old channel + deletes the old row, and on failure flips the row to unwatched_renewal_failed + emits the CalendarWatchRenewalFailed metric (B7). Per-tenant OAuth scope (G2), no channel-token store (G6), no OAuth process cache (G5).",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.1053.0",
+    "@googleapis/calendar": "^14.3.0",
+    "google-auth-library": "^10.6.2"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js",
+      "calendar-watch.js",
+      "oauth-client.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 90,
+        "functions": 100,
+        "lines": 95,
+        "statements": 95
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
