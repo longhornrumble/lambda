@@ -154,7 +154,10 @@ exports.handler = async function handler(event) {
   }
 
   const { tenantId, coordinatorId, calendarId } = validateInput(event);
-  log('onboarder_invoked', { tenant_id: tenantId, coordinator_id: coordinatorId, calendar_id: calendarId });
+  // Log a hash prefix of coordinator_id, never the raw value (it can be an email);
+  // calendar_id as a primary/non-primary flag (a non-primary id can be an email).
+  // PII-in-logs hygiene matching the Listener's Y3 discipline (sub-phase B audit SR-2).
+  log('onboarder_invoked', { tenant_id: tenantId, coordinator_id_hash: sha256Hex(coordinatorId).slice(0, 12), calendar_id_primary: calendarId === 'primary' });
 
   // 1. OAuth client (per-tenant secret)
   const authClient = await getOAuthClient({ tenantId, coordinatorId });
@@ -167,14 +170,14 @@ exports.handler = async function handler(event) {
     // operator can re-seed, but this must not pass silently.
     warn('sync_token_absent', {
       tenant_id: tenantId,
-      coordinator_id: coordinatorId,
+      coordinator_id_hash: sha256Hex(coordinatorId).slice(0, 12),
       seed_pages: seed.pages,
       seed_events_seen: seed.totalSeen,
     });
   } else {
     log('sync_token_seeded', {
       tenant_id: tenantId,
-      coordinator_id: coordinatorId,
+      coordinator_id_hash: sha256Hex(coordinatorId).slice(0, 12),
       seed_pages: seed.pages,
       seed_events_seen: seed.totalSeen,
     });

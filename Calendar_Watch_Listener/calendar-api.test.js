@@ -102,8 +102,9 @@ describe('listChangedEvents', () => {
       data: { items: [{ id: 'a' }], nextSyncToken: 'next-tok', nextPageToken: null },
     });
     const result = await listChangedEvents(FAKE_AUTH, 'cal', 'sync-1');
+    // singleEvents:false on EVERY path (code#2) — matches the Onboarder seed mode
     expect(mockEventsList).toHaveBeenCalledWith({
-      auth: FAKE_AUTH, calendarId: 'cal', syncToken: 'sync-1',
+      auth: FAKE_AUTH, calendarId: 'cal', syncToken: 'sync-1', singleEvents: false,
     });
     expect(result).toEqual({
       events: [{ id: 'a' }],
@@ -112,11 +113,11 @@ describe('listChangedEvents', () => {
     });
   });
 
-  test('initial pull (no syncToken) sets showDeleted + singleEvents', async () => {
+  test('initial pull (no syncToken) sets showDeleted + singleEvents:false', async () => {
     mockEventsList.mockResolvedValue({ data: { items: [], nextSyncToken: 'tok' } });
     await listChangedEvents(FAKE_AUTH, 'cal', null);
     expect(mockEventsList).toHaveBeenCalledWith({
-      auth: FAKE_AUTH, calendarId: 'cal', showDeleted: true, singleEvents: true,
+      auth: FAKE_AUTH, calendarId: 'cal', showDeleted: true, singleEvents: false,
     });
   });
 
@@ -136,14 +137,15 @@ describe('listChangedEvents', () => {
       .rejects.toThrow('authClient and calendarId are required');
   });
 
-  test('pageToken continuation: uses pageToken, sets showDeleted+singleEvents, omits syncToken', async () => {
+  test('pageToken continuation: uses pageToken, sets showDeleted+singleEvents:false, omits syncToken', async () => {
     mockEventsList.mockResolvedValue({
       data: { items: [{ id: 'b' }], nextSyncToken: 'final-tok', nextPageToken: null },
     });
     const result = await listChangedEvents(FAKE_AUTH, 'cal', null, 'page-tok-2');
+    // continuation MUST be the same singleEvents mode as the syncToken it pages (false) — code#2
     expect(mockEventsList).toHaveBeenCalledWith({
       auth: FAKE_AUTH, calendarId: 'cal', pageToken: 'page-tok-2',
-      showDeleted: true, singleEvents: true,
+      showDeleted: true, singleEvents: false,
     });
     expect(result).toEqual({
       events: [{ id: 'b' }],

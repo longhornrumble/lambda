@@ -85,8 +85,17 @@ describe('fetchOAuthSecret', () => {
     const payload = JSON.parse(VALID_PAYLOAD);
     delete payload[missingField];
     smMock.on(GetSecretValueCommand).resolves({ SecretString: JSON.stringify(payload) });
+    // new message (code#3 stronger validation) + must NOT echo the secret path (code#1)
     await expect(oauthClient.fetchOAuthSecret('p/a/b/c'))
-      .rejects.toThrow(`OAuth secret missing required field "${missingField}"`);
+      .rejects.toThrow(`OAuth secret missing/empty required field "${missingField}" for the requested coordinator`);
+  });
+
+  test('error messages never echo the secret path (code#1)', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: '' });
+    await expect(oauthClient.fetchOAuthSecret('picasso/scheduling/oauth/MYR384719/jane@x.org'))
+      .rejects.toThrow(/no SecretString for the requested coordinator/);
+    await expect(oauthClient.fetchOAuthSecret('picasso/scheduling/oauth/MYR384719/jane@x.org'))
+      .rejects.not.toThrow(/jane@x\.org|MYR384719/);
   });
 });
 
