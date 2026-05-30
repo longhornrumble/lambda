@@ -64,17 +64,24 @@ async function listChangedEvents(authClient, calendarId, syncToken, pageToken) {
   if (!authClient || !calendarId) {
     throw new Error('authClient and calendarId are required');
   }
-  const params = { auth: authClient, calendarId };
+  // singleEvents MUST be false on EVERY path (sub-phase B audit row code#2,
+  // 2026-05-30). The Onboarder's seedInitialSyncToken mints the token with
+  // singleEvents:false (recurring masters, not expanded instances — a deliberate
+  // page-count choice). A syncToken can only be continued/refreshed in the SAME
+  // singleEvents mode it was created in; mixing true here (the prior code on the
+  // pageToken + full-list paths) against a false-mode token makes Google return a
+  // permanent 410 on any calendar with paginated recurring-event history. Keep all
+  // three branches false so the seed, the incremental sync, its continuation pages,
+  // and the 410-recovery re-seed are all the same mode.
+  const params = { auth: authClient, calendarId, singleEvents: false };
   if (pageToken) {
     // Continuation page — no syncToken; just carry the pageToken.
     params.pageToken = pageToken;
     params.showDeleted = true;
-    params.singleEvents = true;
   } else if (syncToken) {
     params.syncToken = syncToken;
   } else {
     params.showDeleted = true;
-    params.singleEvents = true;
   }
   const response = await calendar.events.list(params);
   return {

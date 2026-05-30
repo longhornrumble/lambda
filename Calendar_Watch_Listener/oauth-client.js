@@ -45,18 +45,24 @@ function buildSecretPath(tenantId, coordinatorId) {
 
 async function fetchOAuthSecret(secretPath) {
   const result = await secrets.send(new GetSecretValueCommand({ SecretId: secretPath }));
+  // Error messages omit the secret path (sub-phase B audit row code#1, 2026-05-30):
+  // the path encodes tenantId + coordinatorId (an email), so logging it on a fetch
+  // failure turns CloudWatch into a cross-tenant existence oracle. Matches the
+  // Onboarder/Renewer/Offboarder copies, which already stripped it.
   if (!result.SecretString) {
-    throw new Error(`OAuth secret has no SecretString: ${secretPath}`);
+    throw new Error('OAuth secret has no SecretString for the requested coordinator');
   }
   let parsed;
   try {
     parsed = JSON.parse(result.SecretString);
   } catch (err) {
-    throw new Error(`OAuth secret is not valid JSON: ${secretPath}`);
+    throw new Error('OAuth secret is not valid JSON for the requested coordinator');
   }
+  // typeof/length check (code#3) rejects non-string/empty values that `!parsed[x]`
+  // would also catch but with weaker intent; aligns with the sibling copies.
   for (const required of ['client_id', 'client_secret', 'refresh_token']) {
-    if (!parsed[required]) {
-      throw new Error(`OAuth secret missing required field "${required}": ${secretPath}`);
+    if (typeof parsed[required] !== 'string' || parsed[required].length === 0) {
+      throw new Error(`OAuth secret missing/empty required field "${required}" for the requested coordinator`);
     }
   }
   return parsed;

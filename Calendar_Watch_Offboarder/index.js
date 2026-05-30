@@ -51,9 +51,16 @@ const {
   QueryCommand,
   DeleteItemCommand,
 } = require('@aws-sdk/client-dynamodb');
+const crypto = require('crypto');
 
 const { getOAuthClient } = require('./oauth-client');
 const { stopWatch } = require('./calendar-watch');
+
+// Hash prefix for PII-in-logs hygiene (sub-phase B audit SR-2): coordinator_id
+// can be an email; log a stable hash prefix, never the raw value.
+function sha256Hex(value) {
+  return crypto.createHash('sha256').update(String(value), 'utf8').digest('hex');
+}
 
 // ─── AWS clients ────────────────────────────────────────────────────────────────
 
@@ -339,7 +346,7 @@ exports.handler = async function handler(event) {
   const { tenantId, coordinatorId, channelId } = validateInput(event);
   log('offboarder_invoked', {
     tenant_id: tenantId,
-    coordinator_id: coordinatorId,
+    coordinator_id_hash: coordinatorId ? sha256Hex(coordinatorId).slice(0, 12) : null,
     channel_id: channelId,
   });
 
