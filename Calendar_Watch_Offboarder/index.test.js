@@ -518,3 +518,49 @@ describe('offboardChannel — corrupted-row guards (G3)', () => {
     expect(mockOauth).not.toHaveBeenCalled();
   });
 });
+
+// ─── error-message redaction (phase-audit row GF) ────────────────────────────────
+
+describe('sanitizeErrorMessage (GF)', () => {
+  const { sanitizeErrorMessage } = _test;
+
+  test.each(['AccessDeniedException', 'ResourceNotFoundException', 'UnrecognizedClientException'])(
+    'redacts %s (by name) to the type only',
+    (name) => {
+      const err = new Error('arn:aws:secretsmanager:us-east-1:525409062831:secret:picasso/scheduling/oauth/MYR384719/jane@x.org-AbCdEf');
+      err.name = name;
+      const out = sanitizeErrorMessage(err);
+      expect(out).toMatch(/redacted/);
+      expect(out).not.toMatch(/arn:aws|jane@x\.org/);
+    }
+  );
+
+  test('redacts when the type is on err.code (not err.name)', () => {
+    const out = sanitizeErrorMessage({ code: 'AccessDeniedException', message: 'arn:aws:...:MYR384719/jane@x.org' });
+    expect(out).toMatch(/redacted/);
+    expect(out).not.toMatch(/jane@x\.org/);
+  });
+
+  test('passes through an ordinary error message', () => {
+    expect(sanitizeErrorMessage(new Error('plain network blip'))).toBe('plain network blip');
+  });
+
+  test('stringifies a throwable with no message', () => {
+    expect(sanitizeErrorMessage({ foo: 'bar' })).toBe('[object Object]');
+  });
+});
+
+describe('handler does not leak the OAuth secret ARN on AccessDenied (GF)', () => {
+  test('getOAuthClient AccessDenied → failed error is redacted (no ARN / email)', async () => {
+    const denied = new Error(
+      'not authorized to perform secretsmanager:GetSecretValue on arn:aws:secretsmanager:us-east-1:525409062831:secret:picasso/scheduling/oauth/MYR384719/jane@x.org-AbCdEf'
+    );
+    denied.name = 'AccessDeniedException';
+    mockOauth.mockRejectedValue(denied);
+    ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
+    const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0].error).not.toMatch(/arn:aws|jane@x\.org/);
+    expect(res.failed[0].error).toMatch(/redacted/);
+  });
+});

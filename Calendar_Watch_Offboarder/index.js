@@ -85,6 +85,22 @@ function warn(event, fields) {
   console.warn(JSON.stringify({ event, level: 'WARN', ...fields }));
 }
 
+// AWS SDK errors (notably Secrets Manager / STS) can embed the full resource ARN
+// in `.message` — and the OAuth secret ARN contains the coordinator_id (an email).
+// Logging that verbatim would turn CloudWatch into a cross-tenant existence oracle
+// (phase-audit row GF). Redact the known ARN-bearing error types to their name only.
+function sanitizeErrorMessage(err) {
+  const name = err?.name ?? err?.code;
+  if (
+    name === 'AccessDeniedException' ||
+    name === 'ResourceNotFoundException' ||
+    name === 'UnrecognizedClientException'
+  ) {
+    return `${name} (details redacted — check IAM grant / secret path)`;
+  }
+  return err?.message ?? String(err);
+}
+
 // ─── Input validation ───────────────────────────────────────────────────────────
 // Exactly one of coordinator_id / channel_id selects the teardown target; both
 // require tenant_id so every stop + delete is tenant-ownership-guarded.
@@ -299,8 +315,11 @@ async function offboardChannel(row) {
           note: 'OAuth grant revoked (account suspended / access removed); deleting row',
         });
       } else {
-        // Transient — keep the row so a re-invoke retries the stop.
-        throw new Error(`channels.stop failed (transient): ${err.message}`);
+        // Transient — keep the row so a re-invoke retries the stop. Sanitize the
+        // cause here too (GF): getOAuthClient now runs inside this try, so a
+        // Secrets-Manager AccessDenied (ARN in message) could otherwise be
+        // wrapped into this message verbatim and bypass the handler-level redaction.
+        throw new Error(`offboard stop step failed (transient): ${sanitizeErrorMessage(err)}`);
       }
     }
   }
@@ -340,12 +359,13 @@ exports.handler = async function handler(event) {
       }
       summary.deleted.push(row.channelId);
     } catch (err) {
+      const safeError = sanitizeErrorMessage(err);
       warn('offboarder_channel_failed', {
         channel_id: row.channelId,
         tenant_id: row.tenantId,
-        error: err.message,
+        error: safeError,
       });
-      summary.failed.push({ channel_id: row.channelId, error: err.message });
+      summary.failed.push({ channel_id: row.channelId, error: safeError });
     }
   }
 
@@ -365,6 +385,7 @@ exports._test = {
   parseChannelRow,
   isAlreadyGone,
   isAuthRevoked,
+  sanitizeErrorMessage,
   getRowByChannelId,
   getRowsByCoordinator,
   deleteRow,

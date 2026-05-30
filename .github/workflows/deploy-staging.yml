@@ -40,7 +40,7 @@ concurrency:
 env:
   AWS_REGION: us-east-1
   PYTHON_VERSION: '3.13'
-  NODE_VERSION: '22.x'
+  NODE_VERSION: '20.x'   # Match the Lambda nodejs20.x runtime (phase-audit row GM; was 22.x — pr-checks already builds/tests on 20)
 
 jobs:
   detect-changes:
