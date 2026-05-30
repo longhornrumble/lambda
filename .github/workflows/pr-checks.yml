@@ -79,6 +79,8 @@ jobs:
               - 'Calendar_Watch_Onboarder/**'
             calendar_watch_renewer:
               - 'Calendar_Watch_Renewer/**'
+            calendar_watch_offboarder:
+              - 'Calendar_Watch_Offboarder/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
             master:
@@ -129,7 +131,8 @@ jobs:
       needs.detect-changes.outputs.meta_response == 'true' ||
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_renewer == 'true'
+      needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_offboarder == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -147,6 +150,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_onboarder }}
           - lambda: Calendar_Watch_Renewer
             changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
+          - lambda: Calendar_Watch_Offboarder
+            changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -460,6 +465,7 @@ jobs:
           - lambda: Calendar_Watch_Listener # B2 scheduling listener — jest tests + deps
           - lambda: Calendar_Watch_Onboarder # B5 onboarding hook — jest tests + deps
           - lambda: Calendar_Watch_Renewer # B3 watch-channel renewer — jest tests + deps
+          - lambda: Calendar_Watch_Offboarder # B6 offboarding hook — jest tests + deps
 
     steps:
       - name: Checkout
@@ -516,7 +522,8 @@ jobs:
       needs.detect-changes.outputs.meta_response == 'true' ||
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_renewer == 'true'
+      needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_offboarder == 'true'
 
     strategy:
       fail-fast: false
@@ -534,6 +541,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_onboarder }}
           - lambda: Calendar_Watch_Renewer
             changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
+          - lambda: Calendar_Watch_Offboarder
+            changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
 
     steps:
       - name: Skip unchanged Lambda

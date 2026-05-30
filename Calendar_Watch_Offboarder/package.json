@@ -1,0 +1,47 @@
+{
+  "name": "calendar-watch-offboarder",
+  "version": "1.0.0",
+  "description": "Calendar_Watch_Offboarder — scheduling sub-phase B Task B6. Direct-invoke teardown of Google Calendar push channels when a coordinator is no longer bookable (scheduling_tags cleared or Workspace account suspended): resolves the coordinator's channel row(s) (or one channel by id), channels.stop the Google watch, and deletes the DDB row guarded by tenant ownership. Per-tenant OAuth scope (G2), no OAuth process cache (G5), never reads/stores the channel token (G6). Idempotent / at-least-once safe.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@googleapis/calendar": "^14.3.0",
+    "google-auth-library": "^10.6.2"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js",
+      "calendar-watch.js",
+      "oauth-client.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 90,
+        "functions": 100,
+        "lines": 95,
+        "statements": 95
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
