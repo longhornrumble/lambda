@@ -212,12 +212,12 @@ describe('select — §10.2 empty/single/multiple branching', () => {
     expect(res.slots[1].start).toBe('2026-06-03T08:00:00Z');
   });
 
-  it('passes the normalized appointmentType + alreadyRejected through to C7', async () => {
+  it('hands C7 the SHIMMED appointmentType + resourceId; does NOT forward alreadyRejected (different namespace)', async () => {
     availability.getBusyIntervals.mockResolvedValue(fb());
     routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
     slots.generateSlots.mockReturnValue([]);
 
-    await pool.select({
+    const res = await pool.select({
       tenantId: TENANT,
       appointmentType: APPT,
       routingPolicy: POLICY,
@@ -230,13 +230,74 @@ describe('select — §10.2 empty/single/multiple branching', () => {
     const call = slots.generateSlots.mock.calls[0][0];
     expect(call.appointmentType.buffer_minutes).toBe(10); // shimmed, not raw before/after
     expect(call.appointmentType.min_lead_minutes).toBe(60);
-    expect(call.alreadyRejected).toEqual(['slot#x']);
+    expect(call.appointmentType.id).toBeUndefined(); // allowlist — no `...config` leak
+    expect(call.alreadyRejected).toBeUndefined(); // pool dedups in its OWN namespace, not C7's
     expect(call.resourceId).toBe('maya');
+    // generateSlots → [] for a non-empty pool → no chips → SLOT_UNAVAILABLE (assert it).
+    expect(res.status).toBe('SLOT_UNAVAILABLE');
+    expect(res.slots).toEqual([]);
+    expect(res.poolBranch).toBe('single'); // pool was non-empty; the times were
+  });
+
+  it('dedups re-offered times at the pool layer by `slot#${start}` (§10.2 re-offer)', async () => {
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    slots.generateSlots.mockReturnValue([
+      { slotId: 'maya|t1', start: '2026-06-03T19:00:00Z', end: '2026-06-03T19:20:00Z', label: 'L1', resourceId: 'maya' },
+      { slotId: 'maya|t2', start: '2026-06-03T20:00:00Z', end: '2026-06-03T20:20:00Z', label: 'L2', resourceId: 'maya' },
+    ]);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      alreadyRejected: ['slot#2026-06-03T19:00:00Z'], // user already rejected 19:00
+      now: '2026-06-02T12:00:00Z',
+    });
+
+    expect(res.slots).toHaveLength(1);
+    expect(res.slots[0].start).toBe('2026-06-03T20:00:00Z'); // rejected 19:00 dropped
   });
 
   it('validates required inputs', async () => {
     await expect(pool.select({ userTimeZone: TZ })).rejects.toThrow(/tenantId is required/);
     await expect(pool.select({ tenantId: TENANT })).rejects.toThrow(/userTimeZone is required/);
+  });
+
+  it('tolerates candidates: null (no candidates → empty pool)', async () => {
+    routing.evaluatePool.mockResolvedValue({ ordered: [], tieBreaker: 'round_robin', roundRobinCursor: null });
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: null,
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+    });
+
+    expect(res.poolBranch).toBe('empty');
+    expect(availability.getBusyIntervals).not.toHaveBeenCalled();
+  });
+
+  it('omitting `now` uses the current time (no throw; queries a forward window)', async () => {
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: [], tieBreaker: 'round_robin', roundRobinCursor: null });
+
+    await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      // now omitted
+    });
+
+    const fbCall = availability.getBusyIntervals.mock.calls[0][0];
+    expect(typeof fbCall.windowStart).toBe('string');
+    expect(Date.parse(fbCall.windowEnd)).toBeGreaterThan(Date.parse(fbCall.windowStart));
   });
 });
 
@@ -316,12 +377,12 @@ describe('select — circuit-breaker (3 freeBusy failures in 5 min → degraded)
     expect(availability.getBusyIntervals).not.toHaveBeenCalled();
   });
 
-  it('a successful freeBusy clears the failure count', async () => {
-    expect(pool.recordFreeBusyFailure(TENANT, 'maya')).toBe(false);
-    expect(pool.recordFreeBusyFailure(TENANT, 'maya')).toBe(false);
-    pool.recordFreeBusySuccess(TENANT, 'maya');
-    expect(pool.recordFreeBusyFailure(TENANT, 'maya')).toBe(false); // count reset → still under threshold
-    expect(pool.isResourceDegraded(TENANT, 'maya')).toBe(false);
+  it('a success does NOT clear in-window failures → a flapping resource still trips', async () => {
+    expect(pool.recordFreeBusyFailure(TENANT, 'maya')).toBe(false); // 1
+    expect(pool.recordFreeBusyFailure(TENANT, 'maya')).toBe(false); // 2
+    pool.recordFreeBusySuccess(TENANT, 'maya'); // success between failures must NOT reset
+    expect(pool.recordFreeBusyFailure(TENANT, 'maya')).toBe(true); // 3rd in window → trips
+    expect(pool.isResourceDegraded(TENANT, 'maya')).toBe(true);
   });
 
   it('prunes only the stale failures, keeping ones still inside the window', () => {
@@ -380,7 +441,8 @@ describe('lockSlot — conditional-write lock', () => {
     expect(res.resourceId).toBe('maya');
     expect(res.lockKey).toBe('slot_lock#one_to_one#maya#2026-06-03T19:00:00Z#2026-06-03T19:20:00Z');
     const put = ddbMock.commandCalls(PutItemCommand)[0].args[0].input;
-    expect(put.ConditionExpression).toBe('attribute_not_exists(tenantId)');
+    expect(put.TableName).toBe(pool._BOOKING_TABLE); // a wrong table silently mis-routes every lock
+    expect(put.ConditionExpression).toBe('attribute_not_exists(booking_id)'); // condition on the SK
     expect(put.Item.booking_id.S).toBe(res.lockKey);
     expect(put.Item.item_type.S).toBe('slot_lock');
     // lock item stays OUT of the Booking GSIs (no start_at / coordinator_email attrs).
@@ -429,12 +491,41 @@ describe('lockSlot — conditional-write lock', () => {
     ).rejects.toThrow(/throttled/);
   });
 
-  it('validates inputs', async () => {
-    await expect(pool.lockSlot({ start: 's', end: 'e', candidateResourceIds: ['x'] })).rejects.toThrow(/tenantId/);
-    await expect(pool.lockSlot({ tenantId: TENANT, end: 'e', candidateResourceIds: ['x'] })).rejects.toThrow(/start and end/);
-    await expect(pool.lockSlot({ tenantId: TENANT, start: 's', end: 'e', candidateResourceIds: [] })).rejects.toThrow(/non-empty/);
+  it('validates inputs (incl. required poolSize — no candidate-count fallback)', async () => {
+    await expect(pool.lockSlot({ start: 's', end: 'e', candidateResourceIds: ['x'], poolSize: 1 })).rejects.toThrow(/tenantId/);
+    await expect(pool.lockSlot({ tenantId: TENANT, end: 'e', candidateResourceIds: ['x'], poolSize: 1 })).rejects.toThrow(/start and end/);
+    await expect(pool.lockSlot({ tenantId: TENANT, start: 's', end: 'e', candidateResourceIds: [], poolSize: 1 })).rejects.toThrow(/non-empty/);
+    await expect(pool.lockSlot({ tenantId: TENANT, start: 's', end: 'e', candidateResourceIds: ['x'] })).rejects.toThrow(/poolSize/);
+    await expect(pool.lockSlot({ tenantId: TENANT, start: 's', end: 'e', candidateResourceIds: ['x'], poolSize: 0 })).rejects.toThrow(/poolSize/);
+  });
+
+  it('lock keys are tenant-scoped: the same slot in tenant B does not collide with tenant A', async () => {
+    installAtomicLockModelFor(); // shared atomic model across both tenants
+    const argsA = { tenantId: 'TENANT-A', ...SLOT, candidateResourceIds: ['maya'], poolSize: 1 };
+    const argsB = { tenantId: 'TENANT-B', ...SLOT, candidateResourceIds: ['maya'], poolSize: 1 };
+
+    const a = await pool.lockSlot(argsA);
+    const b = await pool.lockSlot(argsB); // same resource+slot, different tenant → different PK
+    const aAgain = await pool.lockSlot(argsA); // same tenant+slot → taken
+
+    expect(a.status).toBe('LOCKED');
+    expect(b.status).toBe('LOCKED');
+    expect(aAgain.status).toBe('SLOT_UNAVAILABLE');
   });
 });
+
+// Atomic-lock model keyed on the FULL (tenantId, booking_id) item identity so a
+// cross-tenant test exercises real PK isolation, not just the SK.
+function installAtomicLockModelFor() {
+  const taken = new Set();
+  ddbMock.on(PutItemCommand).callsFake((input) => {
+    const key = `${input.Item.tenantId.S}|${input.Item.booking_id.S}`;
+    if (taken.has(key)) throw conditionalFail();
+    taken.add(key);
+    return {};
+  });
+  return taken;
+}
 
 // ─── lockSlot: solo-pool 3-retry → reoffer (§5.5 row / done-bar) ─────────────────────
 
@@ -455,6 +546,7 @@ describe('lockSlot — solo-pool backoff (size 1, 3 attempts → reoffer to prop
     expect(res.status).toBe('SLOT_UNAVAILABLE');
     expect(res.action).toBe('reoffer');
     expect(res.soloExhausted).toBe(false);
+    expect(res.nextAttempt).toBe(2); // C8 feeds this back so the 3-attempt cap counts
   });
 
   it('solo lock taken on the 3rd attempt → reoffer from proposing (exhausted)', async () => {
@@ -472,17 +564,20 @@ describe('lockSlot — solo-pool backoff (size 1, 3 attempts → reoffer to prop
     expect(res.state).toBe('proposing');
   });
 
-  it('poolSize defaults to candidate count → single candidate counts as solo', async () => {
+  it('a single servable candidate in a MULTI-member pool is NOT treated as solo', async () => {
     ddbMock.on(PutItemCommand).rejects(conditionalFail());
 
+    // Only maya is free for this time, but the routing pool has 3 members → pool branch.
     const res = await pool.lockSlot({
       tenantId: TENANT,
       ...SLOT,
-      candidateResourceIds: ['maya'], // no poolSize passed
-      attempt: 3,
+      candidateResourceIds: ['maya'],
+      poolSize: 3,
+      attempt: 1,
     });
 
-    expect(res.soloExhausted).toBe(true);
+    expect(res.poolExhausted).toBe(true); // pool branch, not solo
+    expect(res.soloExhausted).toBeUndefined();
   });
 });
 
@@ -491,10 +586,11 @@ describe('lockSlot — solo-pool backoff (size 1, 3 attempts → reoffer to prop
 describe('lockSlot — race + duplicate (§10.2 slot-lock race resolution / §5.4 layer 5)', () => {
   const SLOT = { start: '2026-06-03T19:00:00Z', end: '2026-06-03T19:20:00Z' };
 
-  // A model of DynamoDB's atomic conditional PutItem: a shared Set of taken lock
-  // keys. The synchronous check-and-add is the atomic primitive (JS is single
-  // threaded; Promise.all interleaves only at awaits) — exactly the (resource,
-  // start, end, format) uniqueness the conditional write provides.
+  // HONESTY NOTE: this exercises the pool-WALK logic (taken → next member → reoffer),
+  // NOT live DynamoDB concurrency. Live conditional-write atomicity is a DDB property
+  // verified at C8 integration (the DDB integration test is waived at this lib layer).
+  // Here the shared Set + synchronous check-and-add stands in for a single item's
+  // conditional uniqueness so the walk/backoff branches are driven deterministically.
   function installAtomicLockModel() {
     const taken = new Set();
     ddbMock.on(PutItemCommand).callsFake((input) => {

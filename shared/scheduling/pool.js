@@ -57,7 +57,8 @@
  *    FROZEN_CONTRACTS §C; none redefine a contract) ──
  *   • candidate shape: { resourceId, scheduling_tags[], coordinatorId? }. C4's
  *     `getBusyIntervals` needs `coordinatorId` (the calendar identity); in v1 the
- *     routing resource IS the coordinator, so `coordinatorId ?? resourceId`.
+ *     routing resource IS the coordinator, so `coordinatorId || resourceId` (the
+ *     `||` falls back on an empty-string coordinatorId too, which is meaningless).
  *   • field-shim (this module OWNS it, §B3 note): the config `appointmentType`
  *     schema field names are mapped to the normalized names C7 reads —
  *     `buffer_before_minutes`/`buffer_after_minutes` → `buffer_minutes`
@@ -126,9 +127,12 @@ function recordFreeBusyFailure(tenantId, resourceId) {
   return live.length >= CB_THRESHOLD;
 }
 
-// A successful freeBusy clears the failure count (health restored for this attempt).
+// A successful freeBusy only AGES OUT stale failures (prune the rolling window); it
+// does NOT clear in-window failures. Otherwise a flapping resource
+// (fail,fail,success,fail,fail,…) would never reach 3-in-5-min and the breaker
+// would never trip — defeating the §10.2 "repeated coordinator failures" intent.
 function recordFreeBusySuccess(tenantId, resourceId) {
-  _breaker.delete(cbKey(tenantId, resourceId));
+  liveFailures(tenantId, resourceId);
 }
 
 function isResourceDegraded(tenantId, resourceId) {
@@ -147,9 +151,11 @@ function normalizeAppointmentType(config) {
   }
   const bufferBefore = Number(config.buffer_before_minutes) || 0;
   const bufferAfter = Number(config.buffer_after_minutes) || 0;
+  // Explicit allowlist — NO `...config` spread. Only the fields C7 reads are handed
+  // on, so unrelated caller fields (id, location_mode, raw before/after, etc.) can
+  // never leak into the object C5/C7 receive.
   return {
     // pass-through fields C7 reads under the same name
-    ...config,
     duration_minutes: config.duration_minutes,
     timezone: config.timezone,
     availability_windows: config.availability_windows,
@@ -265,6 +271,11 @@ async function select({
 
   // Per-resource slot generation (§B3: call generateSlots once per candidate
   // resource, supplying resourceId), merged into generic time chips.
+  //
+  // alreadyRejected is NOT forwarded to C7: pool chips live in the `slot#${start}`
+  // namespace, whereas C7 dedups on its own `${resourceId}|${startISO}` slotIds —
+  // forwarding would silently never match. Re-offer dedup happens at the pool layer
+  // below (against `slot#${start}`), which is the namespace the volunteer rejected in.
   const byStart = new Map(); // startISO → { start, end, label, resources: Set }
   for (const resourceId of ordered) {
     const fb = freeBusyByResource[resourceId];
@@ -272,7 +283,6 @@ async function select({
       busyIntervals: (fb && fb.busy) || [],
       appointmentType: normalized,
       userTimeZone,
-      alreadyRejected,
       resourceId,
       now,
       searchDays,
@@ -293,11 +303,14 @@ async function select({
     }
   }
 
-  // Earliest-first, capped at maxSlots. candidateResourceIds preserves the
-  // tie-broken `ordered` priority (who C8 locks against first for that time).
-  const merged = [...byStart.values()].sort((a, b) =>
-    a.start < b.start ? -1 : a.start > b.start ? 1 : 0
-  );
+  // Re-offer dedup (§10.2): drop times the volunteer already rejected, by the pool's
+  // own `slot#${start}` chip id. Then earliest-first, capped at maxSlots.
+  // candidateResourceIds preserves the tie-broken `ordered` priority (who C8 locks
+  // against first for that time).
+  const rejected = new Set(Array.isArray(alreadyRejected) ? alreadyRejected : []);
+  const merged = [...byStart.values()]
+    .filter((m) => !rejected.has(`slot#${m.start}`))
+    .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
   const chips = merged.slice(0, maxSlots).map((m) => ({
     slotId: `slot#${m.start}`,
     start: m.start,
@@ -319,18 +332,25 @@ async function select({
 // ─── lockSlot (§5.4 layer 5 / §10.2 conditional-write slot lock + backoff) ───────────
 
 /**
- * lockSlot({ tenantId, format?, start, end, candidateResourceIds, poolSize?,
+ * lockSlot({ tenantId, format?, start, end, candidateResourceIds, poolSize,
  *            attempt?, maxSoloAttempts? })
  *   → LOCKED:        { status:'LOCKED', resourceId, lockKey, format, start, end, lockedAt }
  *   → all taken:     { status:'SLOT_UNAVAILABLE', action:'reoffer', ... }
+ *
+ * `poolSize` is the ROUTING pool size — `select`'s `orderedPool.length`, NOT the
+ * per-slot `candidateResourceIds.length` (a single coordinator being the only one
+ * free for THIS time inside a multi-member pool is NOT a solo program). REQUIRED so
+ * the §5.5 solo-vs-pool branch can't be mis-flagged.
  *
  * Walks `candidateResourceIds` (tie-broken order) doing one `attribute_not_exists`
  * conditional PutItem per resource. The first success wins; `ConditionalCheckFailed`
  * means the slot is taken for that resource → try the next pool member silently
  * (§10.2). All taken:
  *   - pool (poolSize > 1)  → reoffer fresh slots (poolExhausted).
- *   - solo (poolSize == 1) → reoffer; after `maxSoloAttempts` (3) failed attempts
- *                            return to `proposing` (§5.5 row, §10.2). Never silent-drop.
+ *   - solo (poolSize == 1) → reoffer; the result carries `nextAttempt` (= attempt+1)
+ *                            so C8 feeds it back; at `maxSoloAttempts` (3) failed
+ *                            attempts → return to `proposing` (§5.5 row, §10.2).
+ *                            Never silent-drop.
  * Non-`ConditionalCheckFailed` errors (throttle, network) propagate — a transient
  * write error must NOT be mistaken for "slot taken".
  */
@@ -348,6 +368,10 @@ async function lockSlot({
   if (!start || !end) throw new Error('start and end are required');
   if (!Array.isArray(candidateResourceIds) || candidateResourceIds.length === 0) {
     throw new Error('candidateResourceIds must be a non-empty array');
+  }
+  // Required (no candidate-count fallback): the routing pool size decides solo vs pool.
+  if (typeof poolSize !== 'number' || !Number.isInteger(poolSize) || poolSize < 1) {
+    throw new Error('poolSize (the routing pool size, >= 1) is required');
   }
 
   for (const resourceId of candidateResourceIds) {
@@ -369,7 +393,9 @@ async function lockSlot({
             appointment_format: { S: format },
             locked_at: { N: String(lockedAt) },
           },
-          ConditionExpression: 'attribute_not_exists(tenantId)',
+          // Condition on the SK (booking_id = the deterministic lock key) — idiomatic
+          // "this exact item does not yet exist" and refactor-proof if the PK changes.
+          ConditionExpression: 'attribute_not_exists(booking_id)',
         })
       );
       return { status: 'LOCKED', resourceId, lockKey, format, start, end, lockedAt };
@@ -381,9 +407,8 @@ async function lockSlot({
     }
   }
 
-  // Every candidate's lock is taken.
-  const solo = (poolSize != null ? poolSize : candidateResourceIds.length) === 1;
-  if (!solo) {
+  // Every candidate's lock is taken. solo vs pool is the ROUTING pool size.
+  if (poolSize > 1) {
     return { status: 'SLOT_UNAVAILABLE', action: 'reoffer', poolExhausted: true };
   }
   if (attempt >= maxSoloAttempts) {
@@ -395,11 +420,13 @@ async function lockSlot({
       attempt,
     };
   }
+  // C8 feeds nextAttempt back on the solo re-pick so the 3-attempt cap actually counts.
   return {
     status: 'SLOT_UNAVAILABLE',
     action: 'reoffer',
     soloExhausted: false,
     attempt,
+    nextAttempt: attempt + 1,
   };
 }
 
