@@ -177,7 +177,10 @@ describe('isAuthRevoked', () => {
     [{ code: '401' }, true],
     [authRevoked('invalid_grant'), true],
     [{ response: { data: { error: 'unauthorized_client' } } }, true],
-    [authRevoked('message'), true],
+    // message-only "invalid_grant" (no structured 401 / response.data.error) is
+    // NOT classified as revoked (phase-audit row 4) — it stays transient so an
+    // ambiguous error can't wrongly delete a valid row.
+    [authRevoked('message'), false],
     [gone(403), false],   // 403 = Google rate/quota overload — transient, NOT revoked
     [gone(503), false],
     [gone(404), false],
@@ -242,7 +245,7 @@ describe('handler — channel_id selector', () => {
     expect(res.requested).toBe(0);
   });
 
-  test('already-gone (404) channel is still deleted', async () => {
+  test('already-gone (404) channel is still deleted but NOT counted as stopped', async () => {
     mockOauth.mockResolvedValue({ _auth: true });
     mockStopWatch.mockRejectedValue(gone(404));
     ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
@@ -251,10 +254,11 @@ describe('handler — channel_id selector', () => {
     const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(1);
     expect(res.deleted).toEqual(['ch-1']);
+    expect(res.stopped).toEqual([]);   // we did NOT channels.stop it (row 3)
     expect(res.failed).toEqual([]);
   });
 
-  test('account suspended (401) → channel cannot be stopped but the row is deleted', async () => {
+  test('account suspended (401, from stopWatch) → row deleted, not counted as stopped', async () => {
     mockOauth.mockResolvedValue({ _auth: true });
     mockStopWatch.mockRejectedValue(authRevoked('status401'));
     ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
@@ -263,19 +267,62 @@ describe('handler — channel_id selector', () => {
     const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(1);
     expect(res.deleted).toEqual(['ch-1']);
+    expect(res.stopped).toEqual([]);
     expect(res.failed).toEqual([]);
   });
 
-  test('grant revoked (invalid_grant) → row is deleted', async () => {
+  test('account suspended (revoked grant surfaces from getOAuthClient) → row deleted', async () => {
+    // Row 1: getOAuthClient is inside the try, so a revoked-grant error thrown
+    // at client-build/token-refresh time is classified by isAuthRevoked too.
+    mockOauth.mockRejectedValue(authRevoked('invalid_grant'));
+    ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
+    ddbMock.on(DeleteItemCommand).resolves({});
+
+    const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
+    expect(mockStopWatch).not.toHaveBeenCalled();   // never reached stopWatch
+    expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(1);
+    expect(res.deleted).toEqual(['ch-1']);
+    expect(res.stopped).toEqual([]);
+    expect(res.failed).toEqual([]);
+  });
+
+  test('getOAuthClient transient failure (Secrets Manager down) → row left, failed', async () => {
+    // Row 1: a NON-auth error from getOAuthClient stays transient (row retained).
+    mockOauth.mockRejectedValue(gone(503));
+    ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
+    ddbMock.on(DeleteItemCommand).resolves({});
+
+    const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
+    expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(0);
+    expect(res.deleted).toEqual([]);
+    expect(res.failed).toHaveLength(1);
+  });
+
+  test('grant revoked (unauthorized_client) → row deleted, not counted as stopped', async () => {
     mockOauth.mockResolvedValue({ _auth: true });
-    mockStopWatch.mockRejectedValue(authRevoked('invalid_grant'));
+    mockStopWatch.mockRejectedValue({ response: { data: { error: 'unauthorized_client' } } });
     ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
     ddbMock.on(DeleteItemCommand).resolves({});
 
     const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(1);
     expect(res.deleted).toEqual(['ch-1']);
+    expect(res.stopped).toEqual([]);
     expect(res.failed).toEqual([]);
+  });
+
+  test('message-only invalid_grant is transient (not revoked) → row left, failed', async () => {
+    // Row 4: removing the message-substring match means an ambiguous error whose
+    // message merely contains "invalid_grant" no longer wrongly deletes the row.
+    mockOauth.mockResolvedValue({ _auth: true });
+    mockStopWatch.mockRejectedValue(authRevoked('message'));
+    ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
+    ddbMock.on(DeleteItemCommand).resolves({});
+
+    const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
+    expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(0);
+    expect(res.deleted).toEqual([]);
+    expect(res.failed).toHaveLength(1);
   });
 
   test('rate-limit (403) is transient — row is left for retry', async () => {
@@ -313,6 +360,7 @@ describe('handler — channel_id selector', () => {
     expect(mockStopWatch).not.toHaveBeenCalled();
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(1);
     expect(res.deleted).toEqual(['ch-1']);
+    expect(res.stopped).toEqual([]);   // no resourceId → nothing stopped (row 3)
   });
 
   test('delete ConditionalCheckFailed reports the channel as failed', async () => {
@@ -332,7 +380,9 @@ describe('handler — channel_id selector', () => {
 // ─── handler: coordinator_id selector ──────────────────────────────────────────
 
 describe('handler — coordinator_id selector', () => {
-  test('offboards every channel for the coordinator', async () => {
+  test('scheduling_tags-cleared trigger: stops + deletes every channel for the coordinator', async () => {
+    // The first B6 trigger path (canonical §4.5) — coordinator no longer bookable
+    // with a still-valid OAuth grant: every channel is channels.stop'd + deleted.
     mockOauth.mockResolvedValue({ _auth: true });
     mockStopWatch.mockResolvedValue(undefined);
     ddbMock.on(QueryCommand).resolves({
@@ -347,6 +397,7 @@ describe('handler — coordinator_id selector', () => {
     expect(mockStopWatch).toHaveBeenCalledTimes(2);
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(2);
     expect(res.deleted.sort()).toEqual(['ch-a', 'ch-b']);
+    expect(res.stopped.sort()).toEqual(['ch-a', 'ch-b']);   // both actually stopped
   });
 
   test('filters out rows for a different coordinator', async () => {
@@ -387,7 +438,12 @@ describe('handler — coordinator_id selector', () => {
     ddbMock.on(DeleteItemCommand).resolves({});
 
     const res = await handler({ tenant_id: 'MYR384719', coordinator_id: 'test-coordinator' });
-    expect(ddbMock.commandCalls(QueryCommand)).toHaveLength(2);
+    const queryCalls = ddbMock.commandCalls(QueryCommand);
+    expect(queryCalls).toHaveLength(2);
+    // Row 8: the second page MUST forward the first page's LastEvaluatedKey as
+    // ExclusiveStartKey — else a broken cursor would silently re-query from start.
+    expect(queryCalls[0].args[0].input.ExclusiveStartKey).toBeUndefined();
+    expect(queryCalls[1].args[0].input.ExclusiveStartKey).toEqual({ k: { S: '1' } });
     expect(res.deleted.sort()).toEqual(['ch-a', 'ch-b']);
   });
 
@@ -445,6 +501,20 @@ describe('offboardChannel — corrupted-row guards (G3)', () => {
   test('throws on an invalid coordinator_id read off the row', async () => {
     await expect(offboardChannel({ channelId: 'ch-1', tenantId: 'MYR384719', coordinatorId: 'bad/slash', resourceId: 'r' }))
       .rejects.toThrow('invalid coordinator_id');
+    expect(mockOauth).not.toHaveBeenCalled();
+  });
+
+  test('throws on an invalid channel_id read off the row (row 2)', async () => {
+    // On the coordinator path channelId comes from the DDB row, not caller input;
+    // a corrupted value must be rejected before it becomes a DDB key / Google id.
+    await expect(offboardChannel({ channelId: 'bad/slash', tenantId: 'MYR384719', coordinatorId: 'c', resourceId: 'r' }))
+      .rejects.toThrow('invalid channel_id');
+    expect(mockOauth).not.toHaveBeenCalled();
+  });
+
+  test('throws on a null channel_id read off the row (row 2)', async () => {
+    await expect(offboardChannel({ channelId: null, tenantId: 'MYR384719', coordinatorId: 'c', resourceId: 'r' }))
+      .rejects.toThrow('invalid channel_id');
     expect(mockOauth).not.toHaveBeenCalled();
   });
 });
