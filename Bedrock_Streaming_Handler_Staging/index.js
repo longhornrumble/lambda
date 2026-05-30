@@ -29,6 +29,9 @@ const {
   sanitizeTonePromptV4,
 } = require('./prompt_v4');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
+// WS-C2 (scheduling §5.6): same-session form-data injection. Read-only fetch +
+// sanitize + <user_application_context> block. Prompt-injection surface.
+const { injectFormContext } = require('./scheduling/formInjection');
 const { corsHeaders } = require('./cors-helper');
 const { validateCfOriginHeader } = require('./cf-origin-validator');
 
@@ -460,7 +463,11 @@ const streamingHandler = async (event, responseStream, context) => {
     }
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-    const prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
+    // <user_application_context> block so the LLM can skip re-qualification.
+    // Non-fatal — returns basePrompt unchanged when there's no form data.
+    const prompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
     const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
@@ -893,7 +900,11 @@ const bufferedHandler = async (event, context) => {
     const kbContext = await retrieveKB(sanitizedInput, config);
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-    const prompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
+    // <user_application_context> block so the LLM can skip re-qualification.
+    // Non-fatal — returns basePrompt unchanged when there's no form data.
+    const prompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
     const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
