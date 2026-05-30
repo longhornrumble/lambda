@@ -235,6 +235,64 @@ jobs:
           retention-days: 7
 
   # ---------------------------------------------------------------------------
+  # Job 1b: shared/scheduling library tests
+  #
+  # The shared/scheduling/ pure-logic modules (C4 availability, C5 routing,
+  # C9 state machine, D1a tokens, …) ship their OWN jest suite + coverage gate.
+  # The per-Lambda node-tests job runs jest inside each Lambda dir, so it never
+  # executes shared/scheduling/__tests__/* — those tests were not gating. This
+  # job runs that suite directly. Triggers on any shared/** change (the existing
+  # `shared` filter), same trigger the Lambda suites use.
+  #
+  shared-scheduling-tests:
+    name: Node Tests — shared/scheduling
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.shared == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: shared/scheduling/package-lock.json
+
+      - name: Install dependencies
+        working-directory: shared/scheduling
+        run: npm install
+
+      - name: Run Jest tests (with coverage gate)
+        working-directory: shared/scheduling
+        # Mirror the node-tests job: --json output is authoritative because
+        # Jest 30 can exit 1 on open SDK-mock handles even when tests pass.
+        shell: bash {0}
+        run: |
+          npx jest --no-cache --forceExit --json --outputFile=/tmp/jest-sched.json \
+            --coverage --coverageReporters=text --coverageReporters=lcov 2>&1 || true
+          python3 -c "
+          import sys, json
+          d = json.load(open('/tmp/jest-sched.json'))
+          passed = d.get('numPassedTests', 0)
+          failed = d.get('numFailedTests', 0)
+          suites = d.get('numPassedTestSuites', 0)
+          total_suites = d.get('numTotalTestSuites', 0)
+          print(f'Test Suites: {suites}/{total_suites} passed')
+          print(f'Tests: {passed} passed, {failed} failed')
+          sys.exit(0 if d.get('success') else 1)
+          "
+
+      - name: Upload coverage
+        if: always() && needs.detect-changes.outputs.shared == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-shared-scheduling
+          path: shared/scheduling/coverage/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
   # Job 2: Python Lambda Tests
   #
   # Matrix: one runner per Python Lambda that has tests.
