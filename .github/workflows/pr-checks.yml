@@ -81,6 +81,11 @@ jobs:
               - 'Calendar_Watch_Renewer/**'
             calendar_watch_offboarder:
               - 'Calendar_Watch_Offboarder/**'
+              # The CI-3c Booking.status vocabulary contract test lives in the
+              # Offboarder suite and imports ../shared/booking-status.js. Include
+              # shared/** so a vocabulary drift there trips this Lambda's test job
+              # (phase-audit row GD — the tripwire was inert without this).
+              - 'shared/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
             master:
