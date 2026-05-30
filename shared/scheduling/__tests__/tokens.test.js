@@ -23,13 +23,10 @@ const {
   DynamoDBClient,
   PutItemCommand,
 } = require('@aws-sdk/client-dynamodb');
-const {
-  SecretsManagerClient,
-  GetSecretValueCommand,
-} = require('@aws-sdk/client-secrets-manager');
 
 const ddbMock = mockClient(DynamoDBClient);
-const smMock = mockClient(SecretsManagerClient);
+// Secrets Manager is exercised in the isolated `getSigningKey` block below
+// (each test loads a fresh module so the key cache starts cold).
 
 const {
   TOKEN_PURPOSES,
@@ -66,8 +63,23 @@ const claimsFor = (purpose) => {
 
 beforeEach(() => {
   ddbMock.reset();
-  smMock.reset();
 });
+
+// Re-sign a base 'cancel' token after mutating its payload — yields a token with
+// a VALID signature (KEY matches opts()) but targeted-malformed claims. Used to
+// reach the post-signature validation guards (jti, purpose) that a random
+// garbage token can't reach.
+async function forge(mutate) {
+  const token = await sign('cancel', claimsFor('cancel'), opts());
+  const [h, p] = token.split('.');
+  const payload = JSON.parse(Buffer.from(p, 'base64url').toString('utf8'));
+  mutate(payload);
+  const b64url = (s) =>
+    Buffer.from(s).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const encP = b64url(JSON.stringify(payload));
+  const sig = b64url(crypto.createHmac('sha256', KEY).update(`${h}.${encP}`).digest());
+  return `${h}.${encP}.${sig}`;
+}
 
 // ─── CI-3d: frozen-enum contract (issuer ⇄ verifier can't drift) ────────────────────
 
@@ -368,30 +380,133 @@ describe('redeem — one-time-use (§13.7)', () => {
     const token = await sign('cancel', claimsFor('cancel'), opts());
     await expect(redeem(token, opts())).rejects.toThrow('throttled');
   });
+
+  it('a mismatched expectedPurpose → 403, action does NOT run (no jti consumed)', async () => {
+    ddbMock.on(PutItemCommand).resolves({});
+    const token = await sign('cancel', claimsFor('cancel'), opts());
+    await expect(redeem(token, opts({ expectedPurpose: 'reschedule' }))).rejects.toMatchObject({
+      code: 'purpose_mismatch',
+      status: 403,
+    });
+    expect(ddbMock).toHaveReceivedCommandTimes(PutItemCommand, 0);
+  });
 });
 
-// ─── Signing-key resolver (§13.2 — Secrets Manager, mirrors Master_Function) ─────────
+// ─── verify: jti guard + §13.8 context binding (defense in depth) ────────────────────
 
-describe('getSigningKey — Secrets Manager resolver (§13.2)', () => {
-  // These call sign/verify WITHOUT an injected key → exercise the SM path.
-  it('JSON secret → uses the signingKey field; caches (single fetch)', async () => {
-    smMock.on(GetSecretValueCommand).resolves({
-      SecretString: JSON.stringify({ signingKey: KEY }),
+describe('verify — jti guard + §13.8 expected purpose/tenant', () => {
+  it('rejects a (validly-signed) token with no jti → malformed', async () => {
+    const t = await forge((p) => {
+      delete p.jti;
     });
-    const token = await sign('cancel', claimsFor('cancel'), { now: NOW });
-    const claims = await verify(token, { now: NOW }); // same cached key → valid
-    expect(claims.purpose).toBe('cancel');
-    // Cached: sign + verify together fetch the secret at most once.
-    expect(smMock).toHaveReceivedCommandTimes(GetSecretValueCommand, 1);
+    await expect(verify(t, opts())).rejects.toMatchObject({ code: 'malformed' });
+  });
+
+  it('rejects a token whose jti is not a string → malformed', async () => {
+    const t = await forge((p) => {
+      p.jti = 12345;
+    });
+    await expect(verify(t, opts())).rejects.toMatchObject({ code: 'malformed' });
+  });
+
+  it('expectedPurpose: match passes, mismatch → purpose_mismatch (403)', async () => {
+    const token = await sign('cancel', claimsFor('cancel'), opts());
+    expect((await verify(token, opts({ expectedPurpose: 'cancel' }))).purpose).toBe('cancel');
+    await expect(verify(token, opts({ expectedPurpose: 'reschedule' }))).rejects.toMatchObject({
+      code: 'purpose_mismatch',
+      status: 403,
+    });
+  });
+
+  it('expectedTenantId: match passes, mismatch → tenant_mismatch (403)', async () => {
+    const token = await sign('cancel', claimsFor('cancel'), opts());
+    expect((await verify(token, opts({ expectedTenantId: TENANT }))).tenant_id).toBe(TENANT);
+    await expect(verify(token, opts({ expectedTenantId: 'OTHER' }))).rejects.toMatchObject({
+      code: 'tenant_mismatch',
+      status: 403,
+    });
+  });
+});
+
+// ─── Signing-key resolver (§13.2) + FAIL-CLOSED key handling ─────────────────────────
+//
+// Each test loads a FRESH copy of the module inside jest.isolateModules() so the
+// module-level key cache starts cold and the Secrets-Manager mock binds to the
+// freshly-required client class (resetModules-style isolation — no cross-test
+// cache bleed).
+
+describe('getSigningKey — Secrets Manager resolver + fail-closed (§13.2)', () => {
+  // Load a fresh module + fresh SM mock with the given GetSecretValue behaviour.
+  function loadIsolated(behavior) {
+    let api;
+    jest.isolateModules(() => {
+      const sm = require('@aws-sdk/client-secrets-manager');
+      const localMock = mockClient(sm.SecretsManagerClient);
+      behavior(localMock, sm.GetSecretValueCommand);
+      api = {
+        tokens: require('../tokens'),
+        smMock: localMock,
+        Cmd: sm.GetSecretValueCommand,
+      };
+    });
+    return api;
+  }
+
+  const noKey = { now: NOW }; // no signingKey → forces the SM path
+
+  it('JSON secret → uses the signingKey field; caches (single fetch)', async () => {
+    const { tokens, smMock: m, Cmd } = loadIsolated((mock, GetCmd) =>
+      mock.on(GetCmd).resolves({ SecretString: JSON.stringify({ signingKey: KEY }) })
+    );
+    const token = await tokens.sign('cancel', claimsFor('cancel'), noKey);
+    expect((await tokens.verify(token, noKey)).purpose).toBe('cancel');
+    expect(m).toHaveReceivedCommandTimes(Cmd, 1); // cached across sign + verify
   });
 
   it('plain-string secret → used as the raw HMAC key', async () => {
-    // Module-level cache persists across tests; assert behaviour via round-trip
-    // rather than fetch count (the JSON test above may have warmed the cache).
-    smMock.on(GetSecretValueCommand).resolves({ SecretString: KEY });
-    const token = await sign('no_show', { tenant_id: TENANT, event_end: EVENT_END }, { now: NOW });
-    const claims = await verify(token, { now: NOW });
-    expect(claims.purpose).toBe('no_show');
+    const { tokens } = loadIsolated((mock, GetCmd) =>
+      mock.on(GetCmd).resolves({ SecretString: KEY })
+    );
+    const token = await tokens.sign('no_show', { tenant_id: TENANT, event_end: EVENT_END }, noKey);
+    expect((await tokens.verify(token, noKey)).purpose).toBe('no_show');
+  });
+
+  it('FAIL CLOSED: empty secret → signing_key_unavailable (500), NOT cached', async () => {
+    const { tokens, smMock: m, Cmd } = loadIsolated((mock, GetCmd) =>
+      mock.on(GetCmd).resolves({ SecretString: '' })
+    );
+    await expect(tokens.sign('cancel', claimsFor('cancel'), noKey)).rejects.toMatchObject({
+      code: 'signing_key_unavailable',
+      status: 500,
+    });
+    // not cached → second attempt fetches again (a fixed secret takes effect)
+    await expect(tokens.sign('cancel', claimsFor('cancel'), noKey)).rejects.toMatchObject({
+      code: 'signing_key_unavailable',
+    });
+    expect(m).toHaveReceivedCommandTimes(Cmd, 2);
+  });
+
+  it('FAIL CLOSED: too-short secret → signing_key_unavailable', async () => {
+    const { tokens } = loadIsolated((mock, GetCmd) =>
+      mock.on(GetCmd).resolves({ SecretString: 'short' })
+    );
+    await expect(tokens.sign('cancel', claimsFor('cancel'), noKey)).rejects.toMatchObject({
+      code: 'signing_key_unavailable',
+    });
+  });
+
+  it('FAIL CLOSED: Secrets Manager throws → deny (no sign), NOT cached', async () => {
+    const { tokens, smMock: m, Cmd } = loadIsolated((mock, GetCmd) =>
+      mock.on(GetCmd).rejects(new Error('SM down'))
+    );
+    await expect(tokens.sign('cancel', claimsFor('cancel'), noKey)).rejects.toMatchObject({
+      code: 'signing_key_unavailable',
+      status: 500,
+    });
+    await expect(tokens.sign('cancel', claimsFor('cancel'), noKey)).rejects.toMatchObject({
+      code: 'signing_key_unavailable',
+    });
+    expect(m).toHaveReceivedCommandTimes(Cmd, 2); // never cached on failure
   });
 });
 

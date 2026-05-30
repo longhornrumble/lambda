@@ -41,9 +41,18 @@
  *
  * ── Interpretations layered on the frozen §B4 contract (flagged in the PR for
  *    integrator confirmation; none redefine a frozen contract) ──
- *   • sign/verify/redeem take an optional 3rd `opts` arg ({ signingKey, now })
- *     used by tests + key-injection. Consumers still call sign(purpose, claims)
- *     / verify(token) exactly per §B4 — the arg is additive, not a redefinition.
+ *   • sign/verify/redeem take an optional 3rd `opts` arg used by tests +
+ *     key-injection + the §13.8 context check:
+ *       { signingKey, now, expectedPurpose, expectedTenantId }.
+ *     Consumers still call sign(purpose, claims) / verify(token) exactly per §B4
+ *     — the arg is additive, not a redefinition. The §13.8 endpoint handler
+ *     passes expectedPurpose (the URL's purpose) so a valid token can't be
+ *     replayed against the wrong action; expectedTenantId binds it to the
+ *     tenant when known. Omitted ⇒ not checked (backward-compatible).
+ *   • Fail-closed key handling: getSigningKey() throws (never caches) on a
+ *     Secrets-Manager error OR an empty/too-short secret — we never HMAC with
+ *     unusable key material. verify() also rejects a missing/non-string jti
+ *     (it is redeem()'s table sort key — must never reach DDB blank).
  *   • `claims` to sign() carries the PERSISTED custom claims (booking_id,
  *     tenant_id, form_submission_id — §13.3) PLUS the expiry-driver inputs
  *     (start_at, cancellation_window_hours, event_end). The drivers are consumed
@@ -101,21 +110,36 @@ class TokenError extends Error {
   constructor(code, status, message) {
     super(message || code);
     this.name = 'TokenError';
-    this.code = code; // 'malformed' | 'invalid_signature' | 'invalid_issuer' | 'unknown_purpose' | 'expired' | 'reused'
+    // 'malformed' | 'invalid_signature' | 'invalid_issuer' | 'unknown_purpose'
+    // | 'expired' | 'reused' | 'purpose_mismatch' | 'tenant_mismatch'
+    // | 'signing_key_unavailable'
+    this.code = code;
     this.status = status; // HTTP status the endpoint handler maps to
   }
 }
 
 // ─── Signing-key resolver (§13.2 — mirrors Master_Function get_jwt_signing_key) ─────
 
+// Reject an empty / obviously-unusable key rather than silently HMAC-ing with it.
+// HS256 needs real key material; a blank or trivially-short secret is a
+// misconfiguration we must FAIL CLOSED on, never sign/verify against.
+const MIN_SIGNING_KEY_LENGTH = 16;
+
 let _cachedKey = null;
 
 async function getSigningKey() {
   if (_cachedKey) return _cachedKey;
-  const res = await secrets.send(
-    new GetSecretValueCommand({ SecretId: JWT_SECRET_KEY_NAME })
-  );
-  const secretString = res.SecretString || '';
+  let res;
+  try {
+    res = await secrets.send(
+      new GetSecretValueCommand({ SecretId: JWT_SECRET_KEY_NAME })
+    );
+  } catch (_) {
+    // Secrets Manager unavailable → fail closed; do NOT cache (a transient
+    // outage must not poison every later call).
+    throw new TokenError('signing_key_unavailable', 500, 'signing key unavailable');
+  }
+  const secretString = (res && res.SecretString) || '';
   let key = secretString;
   try {
     const parsed = JSON.parse(secretString);
@@ -125,6 +149,11 @@ async function getSigningKey() {
     }
   } catch (_) {
     // Plain-string secret — use as-is.
+  }
+  if (typeof key !== 'string' || key.length < MIN_SIGNING_KEY_LENGTH) {
+    // Empty / too-short → deny and do NOT cache, so fixing the secret takes
+    // effect without a cold restart.
+    throw new TokenError('signing_key_unavailable', 500, 'signing key empty or too short');
   }
   _cachedKey = key;
   return key;
@@ -285,6 +314,11 @@ async function verify(token, opts) {
   if (payload.iss !== ISSUER) {
     throw new TokenError('invalid_issuer', 400, 'unexpected issuer');
   }
+  // jti must be a non-empty string — it is the one-time-use key material redeem()
+  // writes as the table sort key; a missing/non-string jti must never reach DDB.
+  if (typeof payload.jti !== 'string' || payload.jti.length === 0) {
+    throw new TokenError('malformed', 400, 'missing or invalid jti');
+  }
   // Purpose — verifier side of the CI-3d enum lock.
   if (!PURPOSE_SET.has(payload.purpose)) {
     throw new TokenError('unknown_purpose', 400, `unknown purpose: ${payload.purpose}`);
@@ -292,6 +326,16 @@ async function verify(token, opts) {
   // Expiry (§13.6) — exp is epoch seconds; expired groups with reused (§13.9).
   if (typeof payload.exp !== 'number' || nowSeconds(opts) >= payload.exp) {
     throw new TokenError('expired', 410, 'token expired');
+  }
+
+  // §13.8 defense-in-depth: the endpoint handler passes the URL's expected
+  // purpose (and, when known, the bound tenant) so a valid token can't be
+  // replayed against the wrong action/tenant. Optional — omitted ⇒ not checked.
+  if (opts && opts.expectedPurpose != null && payload.purpose !== opts.expectedPurpose) {
+    throw new TokenError('purpose_mismatch', 403, 'purpose does not match expected');
+  }
+  if (opts && opts.expectedTenantId != null && payload.tenant_id !== opts.expectedTenantId) {
+    throw new TokenError('tenant_mismatch', 403, 'tenant does not match expected');
   }
 
   // Forward-compatible read: tolerate missing optional fields (schema discipline).
