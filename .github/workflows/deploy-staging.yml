@@ -124,7 +124,8 @@ jobs:
       needs.detect-changes.outputs.meta_oauth_handler == 'true' ||
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_renewer == 'true'
+      needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
+      needs.detect-changes.outputs.calendar_watch_offboarder == 'true'
     strategy:
       fail-fast: false
       matrix:
