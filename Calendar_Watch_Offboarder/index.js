@@ -147,16 +147,22 @@ function isAlreadyGone(err) {
 // leaving it would make the Renewer renew a departed coordinator's channel
 // forever and trip a false CalendarWatchRenewalFailed alarm. 403 is deliberately
 // NOT included — Google overloads it for rate/quota limits, which are transient.
+//
+// Classification is on STRUCTURED signals only (HTTP 401, or the OAuth
+// `error` field from the token endpoint). The earlier `message.includes(...)`
+// substring fallback was removed (phase-audit row 4, 2026-05-29): an unrelated
+// transient error whose message merely contained "invalid_grant" would be
+// misclassified as revoked → wrongly DELETE a still-valid row. google-auth-library
+// populates `response.data.error` on a genuine revocation, so the structured
+// checks catch the real case; an ambiguous error now stays transient (row left
+// for retry) — the safer default (a stale row that churns beats a wrongful delete).
 function isAuthRevoked(err) {
   const status = err?.response?.status ?? err?.code;
   if (status === 401 || status === '401') {
     return true;
   }
   const oauthError = err?.response?.data?.error;
-  if (oauthError === 'invalid_grant' || oauthError === 'unauthorized_client') {
-    return true;
-  }
-  return typeof err?.message === 'string' && err.message.includes('invalid_grant');
+  return oauthError === 'invalid_grant' || oauthError === 'unauthorized_client';
 }
 
 // ─── Target resolution ──────────────────────────────────────────────────────────
@@ -200,6 +206,11 @@ async function getRowsByCoordinator(coordinatorId, tenantId) {
         IndexName: EXPIRATION_INDEX,
         KeyConditionExpression: 'tenant_id = :t',
         ExpressionAttributeValues: { ':t': { S: tenantId } },
+        // Project only the fields we consume — matches the GetItem path's posture
+        // (phase-audit row 6). Avoids fetching whatever attributes the row gains
+        // later and bounds the PII surface to these five fields.
+        ProjectionExpression:
+          'channel_id, tenant_id, coordinator_id, calendar_provider, resource_id',
         ExclusiveStartKey: lastKey,
       })
     );
@@ -231,19 +242,32 @@ async function deleteRow(channelId, tenantId) {
 
 // ─── Single-channel offboard ──────────────────────────────────────────────────────
 
+// Returns { stopped } — true ONLY when channels.stop returned success (2xx) this
+// invoke. already-gone / auth-revoked / no-resourceId all still delete the row
+// but report stopped=false, so the handler's `stopped[]` summary never claims we
+// API-stopped a channel we didn't (phase-audit row 3).
 async function offboardChannel(row) {
   // G3: validate identifiers read off the DDB row before they flow into the
-  // OAuth secret path / DDB keys.
+  // OAuth secret path / DDB keys. channel_id is included (phase-audit row 2):
+  // it is the DDB delete key + the Google channels.stop id, and on the
+  // coordinator path it comes from the row (not caller input), so a corrupted
+  // value must be rejected here rather than stranding an un-deletable row.
   if (typeof row.tenantId !== 'string' || !TENANT_ID_RE.test(row.tenantId)) {
     throw new Error(`channel row has an invalid tenant_id for channel ${row.channelId}`);
   }
   if (typeof row.coordinatorId !== 'string' || !COORDINATOR_ID_RE.test(row.coordinatorId)) {
     throw new Error(`channel row has an invalid coordinator_id for channel ${row.channelId}`);
   }
+  if (typeof row.channelId !== 'string' || !CHANNEL_ID_RE.test(row.channelId)) {
+    throw new Error('channel row has an invalid channel_id');
+  }
 
   // Stop the Google channel. Best-effort with a meaningful distinction:
-  //   - success / already-gone (404|410) → delete the row
-  //   - transient failure                → leave the row for the next invoke
+  //   - success                 → stopped=true, delete the row
+  //   - already-gone (404|410)  → stopped=false (it was already gone), delete row
+  //   - auth-revoked (account suspended) → stopped=false, delete row
+  //   - transient failure       → throw → leave the row for the next invoke
+  let stopped = false;
   if (!row.resourceId) {
     // No resourceId means channels.stop can't target the channel (Google needs
     // both id + resourceId). The channel self-limits (auto-expires ~7d); delete
@@ -253,9 +277,13 @@ async function offboardChannel(row) {
       note: 'cannot channels.stop without resourceId; channel auto-expires ~7d',
     });
   } else {
-    const authClient = await getOAuthClient({ tenantId: row.tenantId, coordinatorId: row.coordinatorId });
     try {
+      // getOAuthClient is INSIDE the try (phase-audit row 1) so a revoked-grant
+      // error surfacing at client-build/token-refresh time is classified by
+      // isAuthRevoked too — not just an error thrown by stopWatch itself.
+      const authClient = await getOAuthClient({ tenantId: row.tenantId, coordinatorId: row.coordinatorId });
       await stopWatch(authClient, row.channelId, row.resourceId);
+      stopped = true;
       log('offboarder_watch_stopped', { channel_id: row.channelId, tenant_id: row.tenantId });
     } catch (err) {
       if (isAlreadyGone(err)) {
@@ -279,6 +307,7 @@ async function offboardChannel(row) {
 
   await deleteRow(row.channelId, row.tenantId);
   log('offboarder_row_deleted', { channel_id: row.channelId, tenant_id: row.tenantId });
+  return { stopped };
 }
 
 // ─── Main handler ───────────────────────────────────────────────────────────────
@@ -303,8 +332,12 @@ exports.handler = async function handler(event) {
 
   for (const row of rows) {
     try {
-      await offboardChannel(row);
-      summary.stopped.push(row.channelId);
+      const { stopped } = await offboardChannel(row);
+      // stopped[] = channels we actually channels.stop'd (2xx) this invoke;
+      // already-gone / revoked / no-resourceId are deleted but NOT stopped here.
+      if (stopped) {
+        summary.stopped.push(row.channelId);
+      }
       summary.deleted.push(row.channelId);
     } catch (err) {
       warn('offboarder_channel_failed', {

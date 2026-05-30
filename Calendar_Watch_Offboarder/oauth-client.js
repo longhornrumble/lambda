@@ -1,10 +1,10 @@
 'use strict';
 
 /**
- * oauth-client.js — Per-tenant Google OAuth2 client factory (Renewer copy).
+ * oauth-client.js — Per-tenant Google OAuth2 client factory (Offboarder copy).
  *
- * Scheduling sub-phase B Task B3. Byte-for-byte the Onboarder's no-cache copy
- * (see the Layer-extraction note in calendar-watch.js — this is the 3rd copy).
+ * Scheduling sub-phase B Task B6. Byte-for-byte the Renewer/Onboarder no-cache
+ * copy (see the Layer-extraction note in calendar-watch.js — this is the 4th copy).
  *
  * Canonical secret path per `subphase_b_oauth_provisioning_runbook_2026-05-25.md`:
  *   picasso/scheduling/oauth/{tenantId}/{coordinatorId}
@@ -12,12 +12,12 @@
  * Expected SecretString JSON shape (canonical schema per runbook line 244 & 198):
  *   { client_id, client_secret, refresh_token, scopes, coordinator_email }
  *
- * IAM grant is on THIS Lambda's own role `Calendar_Watch_Renewer-exec-staging`
+ * IAM grant is on THIS Lambda's own role `Calendar_Watch_Offboarder-exec-staging`
  * (dedicated per CLAUDE.md never-share-roles rule): secretsmanager:GetSecretValue
  * + DescribeSecret, scoped per-tenant to picasso/scheduling/oauth/{tenant}/*.
  *
  * NO process-level cache (G5 lesson; intentional divergence from the Listener's
- * copy). The Renewer is invoked every ~6h, so a warm container is the exception.
+ * copy). The Offboarder is direct-invoke (rare), so a warm container is the exception.
  * Caching the OAuth2Client buys almost nothing and creates a real footgun: after
  * an operator rotates the OAuth secret, a cached client keeps the stale
  * refresh_token and fails `invalid_client` until a forced cold-start (observed
