@@ -32,6 +32,7 @@ on:
           - Calendar_Watch_Onboarder
           - Calendar_Watch_Renewer
           - Calendar_Watch_Offboarder
+          - Booking_Commit_Handler
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -62,6 +63,7 @@ jobs:
       calendar_watch_onboarder: ${{ steps.filter.outputs.calendar_watch_onboarder }}
       calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
       calendar_watch_offboarder: ${{ steps.filter.outputs.calendar_watch_offboarder }}
+      booking_commit_handler: ${{ steps.filter.outputs.booking_commit_handler }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -96,6 +98,15 @@ jobs:
               - 'Calendar_Watch_Renewer/**'
             calendar_watch_offboarder:
               - 'Calendar_Watch_Offboarder/**'
+            booking_commit_handler:
+              # C8 commit keystone. Dir-only, matching the sibling calendar
+              # Lambdas' deploy filters. NOTE: C8 is the first Lambda that
+              # *bundles* shared/scheduling/* at esbuild time, so a
+              # shared/scheduling change WITHOUT a Booking_Commit_Handler/**
+              # change will NOT auto-redeploy a fresh bundle — redeploy manually
+              # after such a change:
+              #   gh workflow run "Deploy Lambda — Staging" -f lambda=Booking_Commit_Handler
+              - 'Booking_Commit_Handler/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -126,7 +137,8 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_offboarder == 'true'
+      needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
+      needs.detect-changes.outputs.booking_commit_handler == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -452,6 +464,28 @@ jobs:
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
+          - source_dir: Booking_Commit_Handler
+            # Scheduling sub-phase C Task C8 — the booking-commit keystone.
+            # Node.js Lambda, esbuild bundle (npm run package = node
+            # esbuild.config.mjs + zip -j deployment.zip dist/index.js). UNIQUE
+            # vs the sibling scheduling Lambdas: C8 bundles ../shared/scheduling/*
+            # (pool/routing/availability/tokens), so esbuild needs those deps
+            # installed first — see the "Install shared/scheduling deps" step
+            # below (gated on this source_dir). Env vars Terraform-managed in
+            # picasso infra/ module lambda-booking-commit-staging.
+            staging_function: Booking_Commit_Handler
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # No HTTP frontend (invoked by the conversational flow, not a public
+            # URL). Live smoke is operator-supervised via the integrator's
+            # phase-completion-audit (Calendar / Zoom / SES / DDB / Secrets), not
+            # an automated probe — a synthetic invoke would attempt real Google
+            # Calendar + SES + DDB writes. Zoom path additionally secret-gated.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
 
     steps:
       - uses: actions/checkout@v4
@@ -498,6 +532,16 @@ jobs:
           zip -q -r9 /tmp/deploy.zip .
           echo "size=$(stat -c%s /tmp/deploy.zip)" >> "$GITHUB_OUTPUT"
           echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
+
+      # C8 (Booking_Commit_Handler) bundles ../shared/scheduling/* at esbuild
+      # time. esbuild resolves those modules' own deps (@googleapis/calendar,
+      # google-auth-library, @aws-sdk/*) from shared/scheduling/node_modules, so
+      # install them before `npm run package` below. Mirrors the equivalent
+      # pr-checks.yml step. Gated on the source_dir so no other Lambda pays it.
+      - name: Install shared/scheduling deps (Booking_Commit_Handler bundles them)
+        if: matrix.lambda.source_dir == 'Booking_Commit_Handler'
+        working-directory: shared/scheduling
+        run: npm install
 
       - name: Package function (Node.js)
         if: matrix.lambda.runtime == 'nodejs'
