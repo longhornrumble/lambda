@@ -94,6 +94,13 @@ const ALG = 'HS256';
 
 const DAY_SECONDS = 24 * 60 * 60;
 
+// Min-lifetime floor (§B4): a freshly-minted action link is ALWAYS usable for at
+// least this long, even when its natural deadline (cancel→start_at,
+// reschedule→start_at−window) has already passed or is imminent. Without the
+// floor a reschedule token for a soon/large-window booking can be signed already
+// expired (start_at−window < iat) — a dead-on-arrival link in the user's email.
+const MIN_TOKEN_LIFETIME_SECONDS = 15 * 60; // 900s
+
 const ENV = process.env.ENVIRONMENT || 'staging';
 const JTI_BLACKLIST_TABLE =
   process.env.JTI_BLACKLIST_TABLE || `picasso-token-jti-blacklist-${ENV}`;
@@ -202,23 +209,30 @@ function toEpochSeconds(value, field) {
 }
 
 function computeExpiry(purpose, claims, iat) {
+  let raw;
   switch (purpose) {
     case 'cancel':
-      return toEpochSeconds(claims.start_at, 'start_at');
+      raw = toEpochSeconds(claims.start_at, 'start_at');
+      break;
     case 'reschedule': {
       const windowHours = claims.cancellation_window_hours || 0;
-      return toEpochSeconds(claims.start_at, 'start_at') - windowHours * 60 * 60;
+      raw = toEpochSeconds(claims.start_at, 'start_at') - windowHours * 60 * 60;
+      break;
     }
     case 'attended_yes':
     case 'no_show':
     case 'didnt_connect':
-      return toEpochSeconds(claims.event_end, 'event_end') + DAY_SECONDS;
+      raw = toEpochSeconds(claims.event_end, 'event_end') + DAY_SECONDS;
+      break;
     case 'post_application_recovery':
-      return iat + 14 * DAY_SECONDS;
+      raw = iat + 14 * DAY_SECONDS;
+      break;
     default:
       // Unreachable — caller validates purpose first; kept for defense in depth.
       throw new TokenError('unknown_purpose', 400, `unknown purpose: ${purpose}`);
   }
+  // §B4 min-lifetime floor — never mint an already-expired / near-expired link.
+  return Math.max(raw, iat + MIN_TOKEN_LIFETIME_SECONDS);
 }
 
 // ─── sign (§13.1/§13.3/§13.6) ───────────────────────────────────────────────────────

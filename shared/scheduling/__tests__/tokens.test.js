@@ -183,6 +183,49 @@ describe('per-purpose expiry (§13.6)', () => {
   });
 });
 
+// ─── Min-lifetime floor (§B4) — exp = max(computed, iat + 900) ────────────────────────
+
+describe('min-lifetime floor (§B4 — exp >= iat + 15m)', () => {
+  const FLOOR = 15 * 60; // 900s
+  const expOf = async (purpose, claims) =>
+    (await verify(await sign(purpose, claims, opts()), opts())).exp;
+
+  it('cancel for an imminent booking (5m out) is floored to iat + 15m', async () => {
+    const start = NOW + 5 * 60; // computed exp would be NOW + 300 (< floor)
+    const exp = await expOf('cancel', { tenant_id: TENANT, start_at: start });
+    expect(exp).toBe(NOW + FLOOR);
+  });
+
+  it('reschedule whose window pushes exp before iat is floored (not signed already-expired)', async () => {
+    // start 1h out, 2h cancellation window → computed = NOW + 3600 − 7200 = NOW − 3600.
+    const exp = await expOf('reschedule', {
+      tenant_id: TENANT,
+      start_at: NOW + 3600,
+      cancellation_window_hours: 2,
+    });
+    expect(exp).toBe(NOW + FLOOR);
+  });
+
+  it('a floored token VERIFIES (is not dead-on-arrival)', async () => {
+    // Without the floor this reschedule token would be exp < iat and verify() would
+    // reject it immediately as expired. The floor guarantees it is usable.
+    const token = await sign(
+      'reschedule',
+      { tenant_id: TENANT, start_at: NOW + 600, cancellation_window_hours: 5 },
+      opts()
+    );
+    const claims = await verify(token, opts());
+    expect(claims.exp).toBe(NOW + FLOOR);
+  });
+
+  it('does NOT shorten a far-future deadline (floor is a no-op when computed > iat + 15m)', async () => {
+    // START_AT is 2 days out → well past the floor; exp stays at the natural deadline.
+    const exp = await expOf('cancel', { tenant_id: TENANT, start_at: START_AT });
+    expect(exp).toBe(START_AT_S);
+    expect(exp).toBeGreaterThan(NOW + FLOOR);
+  });
+});
+
 // ─── sign: payload shape + input validation (§13.3) ──────────────────────────────────
 
 describe('sign — payload + validation (§13.3)', () => {
