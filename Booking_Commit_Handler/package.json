@@ -1,0 +1,53 @@
+{
+  "name": "booking-commit-handler",
+  "version": "1.0.0",
+  "description": "Booking_Commit_Handler — scheduling sub-phase C Task C8 (the booking-commit keystone). The single transactional commit path: live freeBusy re-check → C6 pool.lockSlot → ConferenceProvider.createConference (GoogleMeet | Zoom | Null) → Google Calendar events.insert (with extendedProperties.private.booking_id ownership tag) → Booking record write (status=booked) → C5 routing.advanceRoundRobin → confirmation email (.ics + signed-token cancel/reschedule links) within the 60s SLA. Compensating transactions on every failure path: unconditional slot-lock release, calendar/conference rollback, round-robin revert, OAuth-401 transient-refresh / permanent-degrade-and-re-pool. Consumes the frozen shared/scheduling/* contracts (availability/routing/pool/tokens) + shared/booking-status; never modifies them.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.1053.0",
+    "@aws-sdk/client-ses": "^3.600.0",
+    "@aws-sdk/client-sns": "^3.600.0",
+    "@googleapis/calendar": "^14.3.0",
+    "google-auth-library": "^10.6.2"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js",
+      "conference-providers.js",
+      "zoom-client.js",
+      "calendar-events.js",
+      "confirmation-email.js",
+      "booking-store.js",
+      "oauth-client.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 90,
+        "functions": 100,
+        "lines": 90,
+        "statements": 90
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}

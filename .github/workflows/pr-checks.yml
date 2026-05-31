@@ -40,6 +40,8 @@ jobs:
       calendar_watch_listener: ${{ steps.filter.outputs.calendar_watch_listener }}
       calendar_watch_onboarder: ${{ steps.filter.outputs.calendar_watch_onboarder }}
       calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
+      calendar_watch_offboarder: ${{ steps.filter.outputs.calendar_watch_offboarder }}
+      booking_commit_handler: ${{ steps.filter.outputs.booking_commit_handler }}
       # Python Lambdas with tests
       meta_oauth:                ${{ steps.filter.outputs.meta_oauth }}
       master:                    ${{ steps.filter.outputs.master }}
@@ -85,6 +87,12 @@ jobs:
               # Offboarder suite and imports ../shared/booking-status.js. Include
               # shared/** so a vocabulary drift there trips this Lambda's test job
               # (phase-audit row GD — the tripwire was inert without this).
+              - 'shared/**'
+            booking_commit_handler:
+              # C8 commit keystone. Imports shared/scheduling/* (pool/routing/
+              # availability/tokens) + shared/booking-status, so a shared/** change
+              # must trip this Lambda's test job.
+              - 'Booking_Commit_Handler/**'
               - 'shared/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
@@ -137,7 +145,8 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_offboarder == 'true'
+      needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
+      needs.detect-changes.outputs.booking_commit_handler == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -157,6 +166,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
           - lambda: Calendar_Watch_Offboarder
             changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
+          - lambda: Booking_Commit_Handler
+            changed: ${{ needs.detect-changes.outputs.booking_commit_handler }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -189,6 +200,13 @@ jobs:
           matrix.changed == 'true' ||
           needs.detect-changes.outputs.shared == 'true'
         working-directory: shared
+        run: npm install
+
+      - name: Install shared/scheduling deps (Booking_Commit_Handler consumes them)
+        if: |
+          matrix.lambda == 'Booking_Commit_Handler' &&
+          (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
+        working-directory: shared/scheduling
         run: npm install
 
       - name: Install dependencies
@@ -586,7 +604,8 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_listener == 'true' ||
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
-      needs.detect-changes.outputs.calendar_watch_offboarder == 'true'
+      needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
+      needs.detect-changes.outputs.booking_commit_handler == 'true'
 
     strategy:
       fail-fast: false
@@ -606,6 +625,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
           - lambda: Calendar_Watch_Offboarder
             changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
+          - lambda: Booking_Commit_Handler
+            changed: ${{ needs.detect-changes.outputs.booking_commit_handler }}
 
     steps:
       - name: Skip unchanged Lambda
@@ -630,6 +651,13 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
           cache-dependency-path: ${{ matrix.lambda }}/package-lock.json
+
+      - name: Install shared/scheduling deps (Booking_Commit_Handler bundles them)
+        if: |
+          matrix.lambda == 'Booking_Commit_Handler' &&
+          (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
+        working-directory: shared/scheduling
+        run: npm install
 
       - name: Install dependencies
         if: |
