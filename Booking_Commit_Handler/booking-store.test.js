@@ -78,6 +78,15 @@ describe('buildBookingItem — GSI keys + status discipline', () => {
     expect(withPhone.attendee_phone.S).toBe('+15125551234');
     expect(withPhone.attendee_name.S).toBe('Sam Patel');
   });
+
+  it('sets all optional fields when present (conference id, join url, reschedule link)', () => {
+    const item = store.buildBookingItem({
+      ...fields, conferenceId: 'z-1', joinUrl: 'https://zoom.us/j/z-1', rescheduleOfBookingId: 'booking#old',
+    });
+    expect(item.conference_id.S).toBe('z-1');
+    expect(item.channel_details.S).toBe('https://zoom.us/j/z-1');
+    expect(item.reschedule_of_booking_id.S).toBe('booking#old');
+  });
 });
 
 describe('getBookingById — idempotency gate', () => {
@@ -126,6 +135,15 @@ describe('slot-lock lifecycle (C6→C8 deferral)', () => {
     await store.recordConferenceOnLock('AUS123957', 'slot_lock#x', { conferenceId: '99', provider: 'zoom' });
     const input = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
     expect(input.ExpressionAttributeValues[':c'].S).toBe('99');
+  });
+
+  it('setLockTtl stamps lock_expires_at (epoch seconds, now + TTL)', async () => {
+    ddbMock.on(UpdateItemCommand).resolves({});
+    const exp = await store.setLockTtl('AUS123957', 'slot_lock#x', 1_700_000_000_000);
+    expect(exp).toBe(1_700_000_000 + 600); // default 600s TTL
+    const input = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
+    expect(input.UpdateExpression).toContain('lock_expires_at');
+    expect(input.ExpressionAttributeValues[':e'].N).toBe(String(1_700_000_000 + 600));
   });
 
   it('recordConferenceOnLock is a no-op without a conference id', async () => {

@@ -34,6 +34,11 @@ describe('NullConferenceProvider — interface-seam verification', () => {
     expect(conf.deferToCalendarInsert).toBe(false);
     expect(conf.joinUrl).toContain('conference.invalid');
   });
+
+  it('falls back to "unknown" bookingId when ctx is empty', async () => {
+    const conf = await new NullConferenceProvider().createConference({});
+    expect(conf.conferenceId).toBe('null-conf-unknown');
+  });
 });
 
 describe('GoogleMeetProvider — defers to events.insert with a deterministic requestId', () => {

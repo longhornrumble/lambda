@@ -94,6 +94,21 @@ describe('buildEventBody — §5.7 PII boundary + ownership tag', () => {
     expect(body.conferenceData.conferenceSolution.name).toBe('Zoom');
   });
 
+  it('minimal event: no attendee email, no deep link, no names → empty attendees + bare description', () => {
+    const body = ce.buildEventBody({
+      bookingId: 'booking#m', appointmentTypeName: '', start: base.start, end: base.end, conference: {},
+    });
+    expect(body.attendees).toEqual([]);
+    expect(body.description).toBe('');
+    expect(body.summary).toBe('Appointment'); // type fallback, no first name
+  });
+
+  it('Zoom/Null without a conferenceId: conferenceData omits conferenceId', () => {
+    const body = ce.buildEventBody({ ...base, conference: { provider: 'null', joinUrl: 'https://conf.invalid/x' } });
+    expect(body.conferenceData.conferenceId).toBeUndefined();
+    expect(body.conferenceData.conferenceSolution.name).toBe('Conference');
+  });
+
   it('sanitizes a CRLF/Bcc injection in the name field', () => {
     const body = ce.buildEventBody({
       ...base,
@@ -120,6 +135,16 @@ describe('insertEvent', () => {
     mockInsert.mockResolvedValue({ data: { id: 'evt-9', htmlLink: 'x' } });
     const ev = await ce.insertEvent({}, 'cal@x', { summary: 's' });
     expect(ev.id).toBe('evt-9');
+  });
+
+  it('throws on missing args', async () => {
+    await expect(ce.insertEvent(null, 'cal', {})).rejects.toThrow(/required/);
+  });
+});
+
+describe('deleteEvent guards', () => {
+  it('throws on missing args', async () => {
+    await expect(ce.deleteEvent({}, 'cal', null)).rejects.toThrow(/required/);
   });
 });
 

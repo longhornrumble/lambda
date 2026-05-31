@@ -35,11 +35,18 @@ const {
 } = require('@aws-sdk/client-dynamodb');
 
 const { isBookingStatus } = require('../shared/booking-status');
+const { sdkConfig } = require('./aws-client-config');
 
-const ddb = new DynamoDBClient({});
+const ddb = new DynamoDBClient(sdkConfig());
 
 const ENV = process.env.ENVIRONMENT || 'staging';
 const BOOKING_TABLE = process.env.BOOKING_TABLE || `picasso-booking-${ENV}`;
+// Slot locks self-expire as a backstop to the explicit release, so a crash between
+// lock acquisition and release can never strand a slot forever. Far longer than the
+// 60s commit SLA, so it never fires on a live commit. Requires DDB TTL enabled on
+// `lock_expires_at` (integrator IaC — real Booking rows never carry this attr, so
+// they never expire).
+const SLOT_LOCK_TTL_SECONDS = Number(process.env.SLOT_LOCK_TTL_SECONDS || 600);
 
 // ─── deterministic booking id (the idempotency key) ──────────────────────────────────
 
@@ -157,6 +164,21 @@ async function recordConferenceOnLock(tenantId, lockKey, { conferenceId, provide
   }));
 }
 
+// Stamp a TTL on the lock item right after acquisition (the lock is created by C6
+// pool.lockSlot, which this module must not modify — so C8 adds the TTL attribute
+// via UpdateItem). DynamoDB TTL then garbage-collects any lock orphaned by a crash
+// between acquisition and release.
+async function setLockTtl(tenantId, lockKey, nowMs = Date.now()) {
+  const expiresAt = Math.floor(nowMs / 1000) + SLOT_LOCK_TTL_SECONDS;
+  await ddb.send(new UpdateItemCommand({
+    TableName: BOOKING_TABLE,
+    Key: BOOKING_KEY(tenantId, lockKey),
+    UpdateExpression: 'SET lock_expires_at = :e',
+    ExpressionAttributeValues: { ':e': { N: String(expiresAt) } },
+  }));
+  return expiresAt;
+}
+
 // Unconditional release — called on BOTH success and every failure path. Idempotent
 // (a missing item is a no-op). This is the C6→C8 lock-release deferral.
 async function releaseLock(tenantId, lockKey) {
@@ -210,6 +232,7 @@ module.exports = {
   writeBooking,
   readLock,
   recordConferenceOnLock,
+  setLockTtl,
   releaseLock,
   flagLockForReconciliation,
   writeDegradedMarker,

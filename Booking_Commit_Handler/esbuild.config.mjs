@@ -7,6 +7,9 @@ const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-secrets-manager',
   '@aws-sdk/client-ses',
   '@aws-sdk/client-sns',
+  // Ships in the Node 20 runtime as an @aws-sdk/* transitive dep — use the
+  // runtime copy so the request handler matches the SDK clients' expected version.
+  '@smithy/node-http-handler',
 ];
 
 await esbuild.build({

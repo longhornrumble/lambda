@@ -12,6 +12,10 @@
  * real (buildEventBody / buildBookingId / classifyAuthError).
  */
 
+// Set BEFORE requiring ./index — OPS_ALERTS_TOPIC_ARN is read at module load, and
+// these tests exercise the SNS admin-alert paths.
+process.env.OPS_ALERTS_TOPIC_ARN = 'arn:aws:sns:us-east-1:525409062831:picasso-ops-alerts-staging';
+
 jest.mock('../shared/scheduling/pool', () => ({
   lockSlot: jest.fn(),
   recordFreeBusySuccess: jest.fn(),
@@ -44,6 +48,7 @@ jest.mock('./booking-store', () => {
     writeBooking: jest.fn(),
     readLock: jest.fn(async () => null),
     recordConferenceOnLock: jest.fn(async () => {}),
+    setLockTtl: jest.fn(async () => 0),
     releaseLock: jest.fn(async () => {}),
     flagLockForReconciliation: jest.fn(async () => {}),
     writeDegradedMarker: jest.fn(async () => {}),
@@ -52,6 +57,11 @@ jest.mock('./booking-store', () => {
 jest.mock('./confirmation-email', () => ({
   sendConfirmationEmail: jest.fn(async () => ({ messageId: 'msg-1', rescheduleUrl: 'r', cancelUrl: 'c' })),
 }));
+
+const { mockClient } = require('aws-sdk-client-mock');
+require('aws-sdk-client-mock-jest');
+const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
+const snsMock = mockClient(SNSClient);
 
 const pool = require('../shared/scheduling/pool');
 const routing = require('../shared/scheduling/routing');
@@ -91,6 +101,8 @@ function nullInjection() {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  snsMock.reset();
+  snsMock.on(PublishCommand).resolves({ MessageId: 'sns-1' });
   availability.getBusyIntervals.mockResolvedValue(FREE);
   bookingStore.getBookingById.mockResolvedValue(null);
   bookingStore.readLock.mockResolvedValue(null);
@@ -351,6 +363,142 @@ describe('unconditional lock release', () => {
     const res = await handler(baseEvent(), {}, nullInjection());
     expect(res.status).toBe('COMMIT_FAILED');
     expect(bookingStore.flagLockForReconciliation).toHaveBeenCalled();
+  });
+});
+
+// ─── audit fix-now: compensation + alert branch coverage ────────────────────────────────
+
+describe('audit fixes — compensation + alert branches', () => {
+  function zoomProvider(meetingId) {
+    return { providerOverrides: { zoom: { createConference: async () => ({ provider: 'zoom', conferenceId: meetingId, joinUrl: 'https://zoom.us/j/' + meetingId, deferToCalendarInsert: false }) } } };
+  }
+
+  it('Fix 2: stamps a lock TTL right after acquisition', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    await handler(baseEvent(), {}, nullInjection());
+    expect(bookingStore.setLockTtl).toHaveBeenCalledWith('AUS123957', 'lk1');
+  });
+
+  it('Fix 3: lock is released BEFORE the email step', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    const order = [];
+    bookingStore.releaseLock.mockImplementation(async () => { order.push('release'); });
+    confirmationEmail.sendConfirmationEmail.mockImplementation(async () => { order.push('email'); return { messageId: 'm' }; });
+    await handler(baseEvent(), {}, nullInjection());
+    expect(order).toEqual(['release', 'email']);
+  });
+
+  it('Fix 4: BOOKED response carries no coordinatorEmail (PII boundary)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res).not.toHaveProperty('coordinatorEmail');
+    expect(res.resourceId).toBe('res-a');
+  });
+
+  it('Zoom-meeting rollback: writeBooking fails → deleteMeeting fires', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    bookingStore.writeBooking.mockRejectedValue(new Error('DDB throttle'));
+    const res = await handler(baseEvent({ conference_type: 'zoom' }), {}, zoomProvider('z-9'));
+    expect(res.status).toBe('COMMIT_FAILED');
+    expect(require('./zoom-client').deleteMeeting).toHaveBeenCalledWith('AUS123957', 'z-9');
+  });
+
+  it('race-loser WITH round-robin advanced → reverts RR and returns ALREADY_CONFIRMED', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    const condErr = new Error('cond'); condErr.name = 'ConditionalCheckFailedException';
+    bookingStore.writeBooking.mockRejectedValue(condErr);
+    bookingStore.getBookingById.mockResolvedValueOnce(null).mockResolvedValueOnce({ status: { S: 'booked' } });
+    const ev = baseEvent({ tie_breaker: 'round_robin', round_robin_cursor: { routingPolicyId: 'rp', previousResourceId: 'res-z', previousAt: 7 } });
+    const res = await handler(ev, {}, nullInjection());
+    expect(res.status).toBe('ALREADY_CONFIRMED');
+    expect(routing.revertRoundRobin).toHaveBeenCalledWith({ tenantId: 'AUS123957', routingPolicyId: 'rp', previousResourceId: 'res-z', previousAt: 7 });
+  });
+
+  it('transient 401 then a NON-auth retry error → rethrow (not degrade)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    calendarEvents.insertEvent
+      .mockRejectedValueOnce({ code: 401 })            // transient
+      .mockRejectedValueOnce(new Error('calendar 500')); // retry → non-auth error
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res.status).toBe('COMMIT_FAILED');
+    expect(bookingStore.writeDegradedMarker).not.toHaveBeenCalled(); // NOT a degrade
+    expect(oauth.clearCacheEntry).toHaveBeenCalledTimes(1);
+  });
+
+  it('safeRevertRR swallows a revert failure (still COMMIT_FAILED, no throw)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    bookingStore.writeBooking.mockRejectedValue(new Error('DDB throttle'));
+    routing.revertRoundRobin.mockRejectedValue(new Error('revert failed'));
+    const ev = baseEvent({ tie_breaker: 'round_robin', round_robin_cursor: { routingPolicyId: 'rp', previousResourceId: 'res-z', previousAt: 7 } });
+    const res = await handler(ev, {}, nullInjection());
+    expect(res.status).toBe('COMMIT_FAILED');
+    expect(routing.revertRoundRobin).toHaveBeenCalled();
+  });
+
+  it('writeDegradedMarker failure is swallowed (still reoffers all_degraded)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    calendarEvents.insertEvent.mockRejectedValue({ response: { data: { error: 'invalid_grant' } } });
+    bookingStore.writeDegradedMarker.mockRejectedValue(new Error('DDB down'));
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res).toMatchObject({ status: 'SLOT_UNAVAILABLE', reason: 'all_candidates_degraded' });
+  });
+
+  it('SNS degrade alert is published (and never logs the raw coordinator email)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    calendarEvents.insertEvent.mockRejectedValue({ response: { data: { error: 'invalid_grant' } } });
+    await handler(baseEvent(), {}, nullInjection());
+    const degradeAlert = snsMock.commandCalls(PublishCommand).find((c) => /degraded/i.test(c.args[0].input.Subject));
+    expect(degradeAlert).toBeDefined();
+    expect(degradeAlert.args[0].input.Message).not.toContain('maya@org.org'); // hashed, not raw
+  });
+
+  it('calendar-event rollback failure is swallowed (still COMMIT_FAILED)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    calendarEvents.insertEvent.mockResolvedValue(EVENT);
+    bookingStore.writeBooking.mockRejectedValue(new Error('DDB throttle'));
+    calendarEvents.deleteEvent.mockRejectedValue(new Error('calendar delete 500')); // rollback fails
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res.status).toBe('COMMIT_FAILED');
+    expect(calendarEvents.deleteEvent).toHaveBeenCalled();
+  });
+
+  it('Zoom-meeting rollback failure is swallowed (orphan-meeting alert)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    bookingStore.writeBooking.mockRejectedValue(new Error('DDB throttle'));
+    require('./zoom-client').deleteMeeting.mockRejectedValue(new Error('zoom delete 500'));
+    const res = await handler(baseEvent({ conference_type: 'zoom' }), {}, zoomProvider('z-1'));
+    expect(res.status).toBe('COMMIT_FAILED');
+    expect(require('./zoom-client').deleteMeeting).toHaveBeenCalled();
+  });
+
+  it('setLockTtl failure is best-effort (commit still succeeds)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    bookingStore.setLockTtl.mockRejectedValue(new Error('DDB down'));
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res.status).toBe('BOOKED');
+  });
+
+  it('readLock failure is swallowed (no prior conference recovered)', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    bookingStore.readLock.mockRejectedValue(new Error('DDB down'));
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res.status).toBe('BOOKED');
+  });
+
+  it('SLA-exceeded → publishes the SLA alert', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1' });
+    const realNow = Date.now;
+    const t0 = realNow();
+    // handler start → t0; the elapsed check after the email → t0 + 61s
+    jest.spyOn(Date, 'now').mockReturnValueOnce(t0).mockReturnValue(t0 + 61 * 1000);
+    try {
+      const res = await handler(baseEvent(), {}, nullInjection());
+      expect(res.status).toBe('BOOKED'); // booking still valid; SLA is an alert, not a failure
+      const slaAlert = snsMock.commandCalls(PublishCommand).find((c) => /SLA/i.test(c.args[0].input.Subject));
+      expect(slaAlert).toBeDefined();
+    } finally {
+      Date.now.mockRestore();
+    }
   });
 });
 

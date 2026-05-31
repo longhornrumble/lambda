@@ -29,8 +29,10 @@
  * modifies them (FROZEN §C: a wrong contract is FLAGGED to the integrator, not forked).
  */
 
+const crypto = require('crypto');
 const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 
+const { sdkConfig } = require('./aws-client-config');
 const pool = require('../shared/scheduling/pool'); // C6
 const routing = require('../shared/scheduling/routing'); // C5
 const availability = require('../shared/scheduling/availability'); // C4
@@ -43,7 +45,7 @@ const { sendConfirmationEmail } = require('./confirmation-email');
 
 const CONFIRMATION_SLA_MS = 60 * 1000; // AC #7
 const OPS_ALERTS_TOPIC_ARN = process.env.OPS_ALERTS_TOPIC_ARN || '';
-const sns = new SNSClient({});
+const sns = new SNSClient(sdkConfig());
 
 // ─── structured logging ──────────────────────────────────────────────────────────────
 
@@ -71,6 +73,13 @@ class DegradeCoordinator extends Error {
 
 function resolveCoordinatorId(resourceId, coordinatorEmails) {
   return (coordinatorEmails && coordinatorEmails[resourceId]) || resourceId;
+}
+
+// §5.7 PII-log hygiene: coordinatorId can be an email. Never write it raw to a log
+// or an ops alert — hash to a short stable fingerprint (matches the Onboarder's
+// coordinator_id_hash discipline, sub-phase B audit SR-2).
+function hashId(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex').slice(0, 12);
 }
 
 function intervalsOverlap(busy, start, end) {
@@ -166,6 +175,14 @@ async function commitAgainstResource({
 }) {
   const coordinatorId = resolveCoordinatorId(resourceId, ctx.coordinatorEmails);
   const provider = resolveProvider(ctx.conferenceType, ctx.providerOverrides);
+
+  // Stamp a TTL on the just-acquired lock (best-effort) so a crash before the
+  // explicit release can't strand the slot — DynamoDB TTL garbage-collects it.
+  try {
+    await bookingStore.setLockTtl(tenantId, lockKey);
+  } catch (ttlErr) {
+    warn('lock_ttl_set_failed', { lock_key: lockKey, error: ttlErr.message });
+  }
 
   // Recover a conference id a prior partial attempt recorded on the lock (Zoom
   // read-before-write → no duplicate meeting on retry).
@@ -266,6 +283,11 @@ async function commitAgainstResource({
       throw writeErr;
     }
 
+    // The Booking row now IS the source of truth — release the slot lock immediately
+    // (BEFORE the email step), so a slow/failing email never holds the lock and the
+    // slot frees up the instant the booking is durable.
+    await safeReleaseLock(tenantId, lockKey);
+
     // step 6: confirmation email within the 60s SLA (AC #7). Email failure does NOT
     // roll back a committed booking (coordinator already sees the event; "never
     // half-book / fail forward", §5.5) — it alerts for async retry.
@@ -298,11 +320,12 @@ async function commitAgainstResource({
       });
     }
 
-    // success → release the lock (the Booking row is the source of truth now).
-    await safeReleaseLock(tenantId, lockKey);
+    // (lock already released above, right after the Booking write.)
     return {
+      // No coordinatorEmail in the response (§5.7 PII boundary): the caller has
+      // resourceId; the coordinator identity is revealed in-conversation (C12), and
+      // the email/identity live on the durable Booking row, not in this payload.
       status: 'BOOKED', bookingId, resourceId,
-      coordinatorEmail: coordinatorId,
       externalEventId: event.id, joinUrl,
       conferenceProvider: conference.provider,
       booking: bookingItem,
@@ -314,10 +337,10 @@ async function commitAgainstResource({
       try {
         await bookingStore.writeDegradedMarker(tenantId, coordinatorId, 'oauth_revoked');
       } catch (markErr) {
-        warn('degraded_marker_failed', { coordinator_id: coordinatorId, error: markErr.message });
+        warn('degraded_marker_failed', { coordinator_id_hash: hashId(coordinatorId), error: markErr.message });
       }
       await alertAdmin('Scheduling: coordinator OAuth revoked (degraded)', {
-        tenantId, resourceId, coordinatorId,
+        tenantId, resourceId, coordinator_id_hash: hashId(coordinatorId),
       });
       if (rrAdvanced) await safeRevertRR(tenantId, resourceId, ctx);
       await rollbackCalendarAndConference({ tenantId, coordinatorId, event, conference });

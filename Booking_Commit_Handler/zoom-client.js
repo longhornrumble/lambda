@@ -11,33 +11,48 @@
  * meetings` call is identical, so this module branches ONLY on which fields the
  * secret carries and the meeting calls don't change.
  *
- * Built on Node 20's global `fetch` (no new HTTP dependency — "concrete-first").
+ * Built on Node 20's global `fetch`; EVERY call is bounded by AbortSignal.timeout
+ * (an unbounded Zoom hang on the 60s commit path would strand a slot lock).
  *
  * ── Read-before-write idempotency (§3.1 / C8) ──
- *   Zoom has NO client-supplied idempotency key. createMeeting() therefore accepts
- *   `existingMeetingId`: when the caller (index.js) has already recorded a Zoom
- *   meeting id for this booking (slot-lock item, prior partial attempt), it is
- *   passed in and we RETURN it WITHOUT calling Zoom — no duplicate meeting on retry.
+ *   Zoom has NO client-supplied idempotency key. createMeeting() accepts
+ *   `existingMeetingId`: a prior partial attempt's meeting is RE-READ and reused
+ *   (no duplicate). If that meeting is GONE (404 — compensation already deleted it),
+ *   we fall through and create a fresh one rather than throwing.
  *
- * Token cache: per-container, keyed by tenantId, TTL = expires_in - 60s (refresh a
- * minute early to avoid edge-of-window 401s, per §6.2). Acceptable at v1 scale.
+ * ── Token cache ──  per-container, keyed by tenantId, raw expiry stored once;
+ *   the early-refresh margin (refresh ~60s before expiry, §6.2) is applied ONLY at
+ *   the read check (no double-subtract). A 401 evicts the cached token and retries
+ *   once. For the OAuth refresh-token shape, a rotated refresh_token returned by
+ *   Zoom is written back to Secrets Manager so the next cold start isn't wedged.
  */
 
-const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+const {
+  SecretsManagerClient,
+  GetSecretValueCommand,
+  PutSecretValueCommand,
+} = require('@aws-sdk/client-secrets-manager');
+const { sdkConfig } = require('./aws-client-config');
 
 const ZOOM_SECRET_PATH_PREFIX = process.env.ZOOM_SECRET_PATH_PREFIX || 'picasso/scheduling/zoom';
 const ZOOM_OAUTH_URL = process.env.ZOOM_OAUTH_URL || 'https://zoom.us/oauth/token';
 const ZOOM_API_BASE = process.env.ZOOM_API_BASE || 'https://api.zoom.us/v2';
 const TOKEN_EARLY_REFRESH_MS = 60 * 1000;
+const ZOOM_FETCH_TIMEOUT_MS = Number(process.env.ZOOM_FETCH_TIMEOUT_MS || 5000);
 
-const secrets = new SecretsManagerClient({});
+const secrets = new SecretsManagerClient(sdkConfig());
 
-// tenantId → { accessToken, expiresAtMs }
+// tenantId → { accessToken, expiresAtMs }  (expiresAtMs = RAW now+expires_in)
 const _tokenCache = new Map();
 
 function buildSecretPath(tenantId) {
   if (!tenantId) throw new Error('tenantId is required');
   return `${ZOOM_SECRET_PATH_PREFIX}/${tenantId}`;
+}
+
+// AbortSignal.timeout bounds every Zoom HTTP call (Fix 1).
+function timeoutSignal() {
+  return AbortSignal.timeout(ZOOM_FETCH_TIMEOUT_MS);
 }
 
 async function fetchZoomSecret(tenantId) {
@@ -57,41 +72,30 @@ async function fetchZoomSecret(tenantId) {
       typeof parsed.client_secret !== 'string' || parsed.client_secret.length === 0) {
     throw new Error('Zoom secret missing client_id/client_secret for the requested tenant');
   }
-  // S2S needs account_id; published-OAuth needs refresh_token. Exactly one shape.
   const isS2S = typeof parsed.account_id === 'string' && parsed.account_id.length > 0;
   const isRefresh = typeof parsed.refresh_token === 'string' && parsed.refresh_token.length > 0;
   if (!isS2S && !isRefresh) {
     throw new Error('Zoom secret must carry account_id (S2S) or refresh_token (OAuth)');
   }
-  return parsed;
+  return { parsed, secretPath };
 }
 
-// Build the OAuth token request body per secret shape (runbook Model).
 function buildTokenForm(secret) {
   if (typeof secret.account_id === 'string' && secret.account_id.length > 0) {
-    return new URLSearchParams({
-      grant_type: 'account_credentials',
-      account_id: secret.account_id,
-    });
+    return new URLSearchParams({ grant_type: 'account_credentials', account_id: secret.account_id });
   }
-  return new URLSearchParams({
-    grant_type: 'refresh_token',
-    refresh_token: secret.refresh_token,
-  });
+  return new URLSearchParams({ grant_type: 'refresh_token', refresh_token: secret.refresh_token });
 }
 
 async function fetchAccessToken(secret) {
   const basic = Buffer.from(`${secret.client_id}:${secret.client_secret}`).toString('base64');
   const res = await fetch(ZOOM_OAUTH_URL, {
     method: 'POST',
-    headers: {
-      Authorization: `Basic ${basic}`,
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
+    headers: { Authorization: `Basic ${basic}`, 'Content-Type': 'application/x-www-form-urlencoded' },
     body: buildTokenForm(secret).toString(),
+    signal: timeoutSignal(),
   });
   if (!res.ok) {
-    // Do not echo the body (may include error detail tied to credentials).
     throw new Error(`Zoom OAuth token request failed: ${res.status}`);
   }
   const json = await res.json();
@@ -99,49 +103,87 @@ async function fetchAccessToken(secret) {
     throw new Error('Zoom OAuth response missing access_token');
   }
   const expiresInMs = (Number(json.expires_in) || 3600) * 1000;
-  return { accessToken: json.access_token, expiresAtMs: Date.now() + expiresInMs };
+  return {
+    accessToken: json.access_token,
+    expiresAtMs: Date.now() + expiresInMs, // RAW expiry; early-refresh applied at read
+    refreshToken: json.refresh_token || null,
+  };
+}
+
+// (5a) Persist a rotated refresh_token back to Secrets Manager so a later cold
+// start doesn't replay a stale token. Only for the OAuth refresh shape, and only
+// when Zoom actually returned a NEW value. Best-effort: a writeback failure must
+// not fail the booking (the in-memory token is already valid).
+async function maybePersistRotatedToken(secretPath, secret, newRefreshToken) {
+  if (!newRefreshToken || !secret.refresh_token || newRefreshToken === secret.refresh_token) {
+    return;
+  }
+  try {
+    await secrets.send(new PutSecretValueCommand({
+      SecretId: secretPath,
+      SecretString: JSON.stringify({ ...secret, refresh_token: newRefreshToken }),
+    }));
+  } catch (err) {
+    console.warn(JSON.stringify({ event: 'zoom_refresh_token_writeback_failed', level: 'WARN', error: err.message }));
+  }
 }
 
 async function getAccessToken(tenantId) {
   const cached = _tokenCache.get(tenantId);
+  // (5b) early-refresh margin applied ONCE, here at the read (no double-subtract).
   if (cached && cached.expiresAtMs - TOKEN_EARLY_REFRESH_MS > Date.now()) {
     return cached.accessToken;
   }
-  const secret = await fetchZoomSecret(tenantId);
+  const { parsed: secret, secretPath } = await fetchZoomSecret(tenantId);
   const token = await fetchAccessToken(secret);
-  _tokenCache.set(tenantId, {
-    accessToken: token.accessToken,
-    expiresAtMs: token.expiresAtMs - TOKEN_EARLY_REFRESH_MS,
-  });
+  await maybePersistRotatedToken(secretPath, secret, token.refreshToken);
+  _tokenCache.set(tenantId, { accessToken: token.accessToken, expiresAtMs: token.expiresAtMs });
   return token.accessToken;
+}
+
+function evictToken(tenantId) {
+  _tokenCache.delete(tenantId);
+}
+
+// (5d) Authed Zoom fetch with a 401 classifier: a 401 evicts the cached token,
+// re-fetches, and retries ONCE. Returns the Response (callers handle 404/!ok).
+async function zoomFetch(tenantId, url, opts = {}) {
+  const token = await getAccessToken(tenantId);
+  const doFetch = (t) => fetch(url, {
+    ...opts,
+    headers: { ...(opts.headers || {}), Authorization: `Bearer ${t}` },
+    signal: timeoutSignal(),
+  });
+  let res = await doFetch(token);
+  if (res.status === 401) {
+    evictToken(tenantId);
+    const fresh = await getAccessToken(tenantId);
+    res = await doFetch(fresh);
+  }
+  return res;
 }
 
 /**
  * createMeeting({ tenantId, coordinatorId, topic, start, end, timezone, existingMeetingId? })
  *   → { meetingId, joinUrl }
- *
- * read-before-write: if existingMeetingId is supplied (prior partial attempt
- * recorded one), reuse it and make NO Zoom API call.
  */
 async function createMeeting({ tenantId, coordinatorId, topic, start, end, timezone, existingMeetingId }) {
   if (!tenantId || !coordinatorId || !start || !end) {
     throw new Error('tenantId, coordinatorId, start, and end are required');
   }
   if (existingMeetingId) {
-    // Idempotent retry — recover the meeting without creating a duplicate.
-    return getMeeting(tenantId, coordinatorId, existingMeetingId);
+    // read-before-write: reuse the prior meeting unless it's GONE (404) — in which
+    // case (5c) fall through and create a fresh one rather than throwing.
+    const existing = await getMeeting(tenantId, coordinatorId, existingMeetingId);
+    if (existing) return existing;
   }
-  const token = await getAccessToken(tenantId);
   const durationMin = Math.max(1, Math.round((Date.parse(end) - Date.parse(start)) / 60000));
-  const res = await fetch(`${ZOOM_API_BASE}/users/${encodeURIComponent(coordinatorId)}/meetings`, {
+  const res = await zoomFetch(tenantId, `${ZOOM_API_BASE}/users/${encodeURIComponent(coordinatorId)}/meetings`, {
     method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       topic: (topic || 'Appointment').slice(0, 200),
-      type: 2, // scheduled meeting
+      type: 2,
       start_time: start,
       duration: durationMin,
       timezone: timezone || 'UTC',
@@ -157,11 +199,11 @@ async function createMeeting({ tenantId, coordinatorId, topic, start, end, timez
   return { meetingId: String(json.id), joinUrl: json.join_url };
 }
 
+// (5c) Returns null on 404 (meeting gone) so createMeeting can re-create instead of
+// throwing on a retry whose prior meeting was already compensated away.
 async function getMeeting(tenantId, coordinatorId, meetingId) {
-  const token = await getAccessToken(tenantId);
-  const res = await fetch(`${ZOOM_API_BASE}/meetings/${encodeURIComponent(meetingId)}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const res = await zoomFetch(tenantId, `${ZOOM_API_BASE}/meetings/${encodeURIComponent(meetingId)}`);
+  if (res.status === 404) return null;
   if (!res.ok) {
     throw new Error(`Zoom get-meeting failed: ${res.status}`);
   }
@@ -169,17 +211,12 @@ async function getMeeting(tenantId, coordinatorId, meetingId) {
   return { meetingId: String(json.id || meetingId), joinUrl: json.join_url };
 }
 
-// Compensating delete (§4.5 / §6.2): orphan-Zoom cleanup when a later commit step
-// fails. A 404 is treated as success (already gone) so compensation is idempotent.
+// Compensating delete (§4.5 / §6.2). 404 ⇒ already gone ⇒ success (idempotent).
 async function deleteMeeting(tenantId, meetingId) {
   if (!tenantId || !meetingId) {
     throw new Error('tenantId and meetingId are required');
   }
-  const token = await getAccessToken(tenantId);
-  const res = await fetch(`${ZOOM_API_BASE}/meetings/${encodeURIComponent(meetingId)}`, {
-    method: 'DELETE',
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  const res = await zoomFetch(tenantId, `${ZOOM_API_BASE}/meetings/${encodeURIComponent(meetingId)}`, { method: 'DELETE' });
   if (!res.ok && res.status !== 404) {
     throw new Error(`Zoom delete-meeting failed: ${res.status}`);
   }
@@ -196,5 +233,6 @@ module.exports = {
   getAccessToken,
   fetchZoomSecret,
   buildSecretPath,
+  evictToken,
   _resetForTests,
 };

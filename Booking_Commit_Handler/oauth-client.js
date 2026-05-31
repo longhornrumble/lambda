@@ -23,12 +23,13 @@
 
 const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const { OAuth2Client } = require('google-auth-library');
+const { sdkConfig } = require('./aws-client-config');
 
 const OAUTH_SECRET_PATH_PREFIX = process.env.OAUTH_SECRET_PATH_PREFIX || 'picasso/scheduling/oauth';
 
 const CACHE_TTL_MS = Number(process.env.OAUTH_CACHE_TTL_MS || String(50 * 60 * 1000));
 
-const secrets = new SecretsManagerClient({});
+const secrets = new SecretsManagerClient(sdkConfig());
 
 // Cache stores { client, cachedAt } so TTL can be checked on each access.
 const _clientCache = new Map();

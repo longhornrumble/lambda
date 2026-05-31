@@ -22,9 +22,10 @@ const crypto = require('crypto');
 const { SESClient, SendRawEmailCommand } = require('@aws-sdk/client-ses');
 
 const { sign } = require('../shared/scheduling/tokens');
+const { sdkConfig } = require('./aws-client-config');
 
 const SES_REGION = process.env.AWS_REGION || 'us-east-1';
-const ses = new SESClient({ region: SES_REGION });
+const ses = new SESClient(sdkConfig({ region: SES_REGION }));
 
 const FROM_EMAIL = process.env.SES_FROM_EMAIL || 'notify@myrecruiter.ai';
 const CONFIG_SET = process.env.SES_CONFIGURATION_SET || 'picasso-emails';
@@ -76,9 +77,13 @@ function buildIcs({ bookingId, summary, description, location, start, end, organ
     'METHOD:REQUEST',
     'BEGIN:VEVENT',
     `UID:${escapeIcsText(bookingId)}@myrecruiter.ai`,
-    `DTSTAMP:${toIcsUtc(dtstamp || start)}`,
+    // RFC 5545 §3.8.7.2: DTSTAMP is when the iCalendar object was CREATED (now),
+    // NOT the event start. SEQUENCE:0 is the initial revision (future
+    // reschedule/cancel .ics for the same UID increment it so clients update).
+    `DTSTAMP:${toIcsUtc(dtstamp || new Date().toISOString())}`,
     `DTSTART:${toIcsUtc(start)}`,
     `DTEND:${toIcsUtc(end)}`,
+    `SEQUENCE:0`,
     `SUMMARY:${escapeIcsText(summary)}`,
   ];
   if (description) lines.push(`DESCRIPTION:${escapeIcsText(description)}`);
@@ -227,7 +232,7 @@ async function sendConfirmationEmail(args, opts = {}) {
     end,
     organizerEmail: coordinatorEmail,
     attendeeEmail,
-    dtstamp: start,
+    // dtstamp defaults to now() inside buildIcs (RFC 5545 — not the event start).
   });
 
   const { textBody, htmlBody } = buildBodies({

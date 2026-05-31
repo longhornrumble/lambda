@@ -8,7 +8,8 @@
  */
 
 const { mockClient } = require('aws-sdk-client-mock');
-const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+require('aws-sdk-client-mock-jest');
+const { SecretsManagerClient, GetSecretValueCommand, PutSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 
 const smMock = mockClient(SecretsManagerClient);
 const zoom = require('./zoom-client');
@@ -156,12 +157,19 @@ describe('error/edge branches', () => {
   it('createMeeting throws on missing required args', async () => {
     await expect(zoom.createMeeting({ tenantId: 'T' })).rejects.toThrow(/required/);
   });
-  it('getMeeting throws on a failed read', async () => {
+  it('getMeeting returns null on 404 (meeting gone — caller re-creates)', async () => {
     smMock.on(GetSecretValueCommand).resolves({ SecretString: S2S_SECRET });
     global.fetch
       .mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600 }))
       .mockResolvedValueOnce(jsonResponse({}, false, 404));
-    await expect(zoom.getMeeting('MYR384719', 'maya@org.org', '55')).rejects.toThrow(/get-meeting failed/);
+    await expect(zoom.getMeeting('MYR384719', 'maya@org.org', '55')).resolves.toBeNull();
+  });
+  it('getMeeting throws on a non-404 failure', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: S2S_SECRET });
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600 }))
+      .mockResolvedValueOnce(jsonResponse({}, false, 500));
+    await expect(zoom.getMeeting('MYR384719', 'maya@org.org', '55')).rejects.toThrow(/get-meeting failed: 500/);
   });
   it('createMeeting throws when the create response lacks id/join_url', async () => {
     smMock.on(GetSecretValueCommand).resolves({ SecretString: S2S_SECRET });
@@ -171,5 +179,62 @@ describe('error/edge branches', () => {
     await expect(zoom.createMeeting({
       tenantId: 'MYR384719', coordinatorId: 'm', start: '2026-06-03T18:00:00Z', end: '2026-06-03T18:30:00Z',
     })).rejects.toThrow(/missing id\/join_url/);
+  });
+});
+
+describe('Fix 5 hardening', () => {
+  it('(5c) existingMeetingId that 404s → falls through and creates a fresh meeting', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: S2S_SECRET });
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600 })) // token
+      .mockResolvedValueOnce(jsonResponse({}, false, 404)) // GET existing → gone
+      .mockResolvedValueOnce(jsonResponse({ id: 99, join_url: 'https://zoom.us/j/99' })); // POST fresh
+    const m = await zoom.createMeeting({
+      tenantId: 'MYR384719', coordinatorId: 'maya@org.org',
+      start: '2026-06-03T18:00:00Z', end: '2026-06-03T18:30:00Z', existingMeetingId: 'gone-1',
+    });
+    expect(m).toEqual({ meetingId: '99', joinUrl: 'https://zoom.us/j/99' });
+    const posts = global.fetch.mock.calls.filter((c) => c[1] && c[1].method === 'POST' && String(c[0]).includes('/meetings'));
+    expect(posts.length).toBe(1); // re-created exactly once
+  });
+
+  it('(5d) a 401 evicts the token and retries once', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: S2S_SECRET });
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok1', expires_in: 3600 })) // first token
+      .mockResolvedValueOnce(jsonResponse({}, false, 401)) // create → 401
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok2', expires_in: 3600 })) // re-token
+      .mockResolvedValueOnce(jsonResponse({ id: 7, join_url: 'https://zoom.us/j/7' })); // retry create OK
+    const m = await zoom.createMeeting({
+      tenantId: 'MYR384719', coordinatorId: 'maya@org.org', start: '2026-06-03T18:00:00Z', end: '2026-06-03T18:30:00Z',
+    });
+    expect(m.meetingId).toBe('7');
+    // the retry used the fresh token
+    const retryCreate = global.fetch.mock.calls[3];
+    expect(retryCreate[1].headers.Authorization).toBe('Bearer tok2');
+  });
+
+  it('(5a) a rotated refresh_token is written back to Secrets Manager (OAuth shape)', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: OAUTH_SECRET });
+    smMock.on(PutSecretValueCommand).resolves({});
+    global.fetch.mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600, refresh_token: 'rotated-new' }));
+    await zoom.getAccessToken('MYR384719');
+    expect(smMock).toHaveReceivedCommandTimes(PutSecretValueCommand, 1);
+    const put = smMock.commandCalls(PutSecretValueCommand)[0].args[0].input;
+    expect(JSON.parse(put.SecretString).refresh_token).toBe('rotated-new');
+  });
+
+  it('(5a) does NOT write back when the refresh_token is unchanged', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: OAUTH_SECRET });
+    global.fetch.mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600, refresh_token: 'rtok' })); // same as OAUTH_SECRET
+    await zoom.getAccessToken('MYR384719');
+    expect(smMock).toHaveReceivedCommandTimes(PutSecretValueCommand, 0);
+  });
+
+  it('(5a) a writeback failure does not fail token acquisition', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: OAUTH_SECRET });
+    smMock.on(PutSecretValueCommand).rejects(new Error('SM down'));
+    global.fetch.mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600, refresh_token: 'rotated' }));
+    await expect(zoom.getAccessToken('MYR384719')).resolves.toBe('tok');
   });
 });
