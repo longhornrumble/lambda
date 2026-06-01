@@ -12,9 +12,9 @@
  *   - cancelOnCoordinatorDelete (calendar_deleted, §14.2) — transition `status
  *     booked → canceled` + stamp `canceled_at` / `cancel_reason='coordinator_deleted'`.
  *   - cancelOnCoordinatorMove   (calendar_moved,   §14.2 v1 SCOPE) — transition `status
- *     booked → canceled` + `cancel_reason='coordinator_moved'` + set
- *     `rescheduleOfBookingId` (see the semantic note below). Does NOT auto-create the
- *     replacement booking (deferred — that is C8 + a re-pool).
+ *     booked → canceled` + `cancel_reason='coordinator_moved'` (which marks the
+ *     moved-not-rebooked row). Does NOT auto-create the replacement booking (deferred —
+ *     that is C8 + a re-pool) and does NOT write `rescheduleOfBookingId` (F2).
  *   - reassignCoordinator       (calendar_reassigned, §14.2) — point `resource_id` /
  *     `coordinator_email` at the new organizer. NO status change, NO notification
  *     (agent-of-CoR §5.1: Google's attendee-update email already covers it).
@@ -23,16 +23,8 @@
  * create a ghost Booking row (an UpdateItem against an absent key would otherwise insert
  * one). ConditionalCheckFailed is translated to a `false` return (idempotent no-op); any
  * other DDB error propagates so the SQS record redrives. New attributes are additive
- * non-key (`canceled_at` / `cancel_reason` / `rescheduleOfBookingId` / `reassigned_at`) —
- * schema discipline: every reader tolerates their absence.
- *
- * `rescheduleOfBookingId` SEMANTIC (v1, PRODUCED here — see PR report-back for §A
- * codification): on a coordinator-MOVED cancellation, v1 does NOT create the replacement
- * booking, so the only row that exists is the canceled original. It is stamped
- * `rescheduleOfBookingId = <its own booking_id>` as a self-anchor sentinel marking it as a
- * reschedule source awaiting rebook. When the replacement IS later created (a future
- * wave), the canonical chain is the NEW booking carrying `rescheduleOfBookingId =
- * <original booking_id>`. FLAGGED to the integrator for confirmation.
+ * non-key (`canceled_at` / `cancel_reason` / `reassigned_at`) — schema discipline: every
+ * reader tolerates their absence.
  *
  * Consumes `shared/booking-status` (CI-3c SoT) so the status literals can never drift from
  * the canonical vocabulary — a drift trips at module load, not in production.
@@ -64,6 +56,12 @@ for (const v of [STATUS_BOOKED, STATUS_CANCELED]) {
 
 const CANCEL_REASON_DELETED = 'coordinator_deleted';
 const CANCEL_REASON_MOVED = 'coordinator_moved';
+
+// Basic email shape (F6). `new_resource_id` is the new organizer's email and lands in the
+// GSI-indexed `coordinator_email` — reject a non-email so a bad payload can't pollute the
+// tenantId-coordinator_email-index. Deliberately permissive (one @, a dotted domain); full
+// RFC validation is neither needed nor wanted here.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function s(value) {
   return { S: String(value) };
@@ -114,13 +112,14 @@ async function cancelOnCoordinatorDelete({ tenantId, bookingId, now = nowIso() }
   }
 }
 
-// ─── calendar_moved (v1 SCOPE): coordinator changed the time → cancel + self-anchor ──────
+// ─── calendar_moved (v1 SCOPE): coordinator changed the time → cancel ────────────────────
 //
 // Returns true iff THIS call performed the booked→canceled transition; false on a
-// re-delivery / already-canceled row. v1 does NOT auto-create the replacement booking; it
-// records `cancel_reason='coordinator_moved'` + a self-anchor `rescheduleOfBookingId` so
-// the (stubbed) reschedule path / a future rebook wave can find moved bookings awaiting
-// rebook. See the module-header semantic note.
+// re-delivery / already-canceled row. v1 does NOT auto-create the replacement booking;
+// `cancel_reason='coordinator_moved'` already marks moved-not-rebooked rows for the
+// (stubbed) reschedule path / a future rebook wave. (No `rescheduleOfBookingId` write —
+// integrator decision F2: that attribute means NEW→original, and self-anchoring the
+// original inverts it; the canonical link is set when the replacement booking is created.)
 async function cancelOnCoordinatorMove({ tenantId, bookingId, now = nowIso() }) {
   if (!tenantId || !bookingId) {
     throw new Error('cancelOnCoordinatorMove requires tenantId, bookingId');
@@ -129,8 +128,7 @@ async function cancelOnCoordinatorMove({ tenantId, bookingId, now = nowIso() }) 
     await ddb.send(new UpdateItemCommand({
       TableName: BOOKING_TABLE,
       Key: BOOKING_KEY(tenantId, bookingId),
-      UpdateExpression:
-        'SET #st = :canceled, canceled_at = :at, cancel_reason = :r, rescheduleOfBookingId = :self',
+      UpdateExpression: 'SET #st = :canceled, canceled_at = :at, cancel_reason = :r',
       ConditionExpression: 'attribute_exists(booking_id) AND #st = :booked',
       ExpressionAttributeNames: { '#st': 'status' },
       ExpressionAttributeValues: {
@@ -138,7 +136,6 @@ async function cancelOnCoordinatorMove({ tenantId, bookingId, now = nowIso() }) 
         ':booked': s(STATUS_BOOKED),
         ':at': s(now),
         ':r': s(CANCEL_REASON_MOVED),
-        ':self': s(bookingId),
       },
     }));
     return true;
@@ -159,6 +156,13 @@ async function cancelOnCoordinatorMove({ tenantId, bookingId, now = nowIso() }) 
 async function reassignCoordinator({ tenantId, bookingId, previousResourceId, newResourceId, now = nowIso() }) {
   if (!tenantId || !bookingId || !previousResourceId || !newResourceId) {
     throw new Error('reassignCoordinator requires tenantId, bookingId, previousResourceId, newResourceId');
+  }
+  if (!EMAIL_RE.test(newResourceId)) {
+    // A non-email new organizer can never validate on a redrive — tag malformed so index.js
+    // routes it to the DLQ instead of retry-storming, and never writes it to the GSI field.
+    const err = new Error(`reassignCoordinator: newResourceId is not an email: rejected`);
+    err.malformed = true;
+    throw err;
   }
   try {
     await ddb.send(new UpdateItemCommand({

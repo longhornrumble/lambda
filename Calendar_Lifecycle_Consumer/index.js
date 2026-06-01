@@ -136,7 +136,9 @@ async function handler(event) {
       if (err && err.malformed) {
         warn('event_malformed', { message_id: record.messageId, error: err.message, body: redactBody(record.body) });
       } else {
-        warn('event_processing_failed', { message_id: record.messageId, error: err && err.message });
+        // Log err.name, NOT err.message — an AccessDenied / DDB error message can embed the
+        // table/account ARN (F4). The error contract only needs the failure class for triage.
+        warn('event_processing_failed', { message_id: record.messageId, error: (err && err.name) || 'Error' });
       }
       batchItemFailures.push({ itemIdentifier: record.messageId });
     }

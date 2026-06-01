@@ -63,7 +63,7 @@ describe('cancelOnCoordinatorDelete — calendar_deleted booked→canceled (idem
 describe('cancelOnCoordinatorMove — calendar_moved cancel + self-anchor (idempotent)', () => {
   const base = { tenantId: 'AUS123957', bookingId: 'booking#abc', now: '2026-06-01T00:00:00.000Z' };
 
-  it('returns true, cancels with coordinator_moved, and self-anchors rescheduleOfBookingId', async () => {
+  it('returns true and cancels with coordinator_moved, WITHOUT writing rescheduleOfBookingId (F2)', async () => {
     ddbMock.on(UpdateItemCommand).resolves({});
     const result = await store.cancelOnCoordinatorMove(base);
 
@@ -72,9 +72,9 @@ describe('cancelOnCoordinatorMove — calendar_moved cancel + self-anchor (idemp
     expect(call.ConditionExpression).toBe('attribute_exists(booking_id) AND #st = :booked');
     expect(call.ExpressionAttributeValues[':canceled']).toEqual({ S: 'canceled' });
     expect(call.ExpressionAttributeValues[':r']).toEqual({ S: 'coordinator_moved' });
-    // self-anchor: rescheduleOfBookingId == its own booking_id (v1 sentinel).
-    expect(call.UpdateExpression).toContain('rescheduleOfBookingId = :self');
-    expect(call.ExpressionAttributeValues[':self']).toEqual({ S: 'booking#abc' });
+    // F2: no self-anchor — the attribute means NEW→original; self-anchoring inverts it.
+    expect(call.UpdateExpression).not.toContain('rescheduleOfBookingId');
+    expect(call.ExpressionAttributeValues[':self']).toBeUndefined();
   });
 
   it('returns false on ConditionalCheckFailed', async () => {
@@ -130,6 +130,20 @@ describe('reassignCoordinator — calendar_reassigned repoint organizer (idempot
   it('throws on any missing required arg', async () => {
     await expect(store.reassignCoordinator({ ...base, newResourceId: undefined })).rejects.toThrow(/requires/);
     await expect(store.reassignCoordinator({ ...base, previousResourceId: '' })).rejects.toThrow(/requires/);
+  });
+
+  it('rejects a non-email newResourceId (F6) — malformed, never written to the GSI field', async () => {
+    ddbMock.on(UpdateItemCommand).resolves({});
+    await expect(store.reassignCoordinator({ ...base, newResourceId: 'not-an-email' }))
+      .rejects.toMatchObject({ malformed: true });
+    // never reached the write — the bad value cannot pollute tenantId-coordinator_email-index.
+    expect(ddbMock).toHaveReceivedCommandTimes(UpdateItemCommand, 0);
+  });
+
+  it('accepts a well-formed email newResourceId (F6 happy path)', async () => {
+    ddbMock.on(UpdateItemCommand).resolves({});
+    await expect(store.reassignCoordinator({ ...base, newResourceId: 'a.b+x@sub.org.example' }))
+      .resolves.toBe(true);
   });
 });
 

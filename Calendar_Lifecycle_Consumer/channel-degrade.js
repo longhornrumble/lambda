@@ -66,12 +66,26 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+// Require non-empty string fields (mirrors booking-reconcile.requireStrings). A miss throws
+// a `malformed`-tagged error so index.js routes the record to the DLQ rather than silently
+// processing an event with undefined identity fields.
+function requireStrings(env, fields) {
+  const missing = fields.filter((f) => typeof env[f] !== 'string' || env[f].length === 0);
+  if (missing.length) {
+    const err = new Error(`envelope missing required field(s): ${missing.join(', ')}`);
+    err.malformed = true;
+    throw err;
+  }
+}
+
 // Conditional UpdateItem keyed on channel_id. Returns true iff THIS call newly degraded an
-// active channel (→ caller fires the admin alert); false when the channel is absent, not
-// `active` (already private — dedupe — or renewal-failed — not clobbered).
-async function degradeChannel({ channelId, now = nowIso() }) {
-  if (!channelId) {
-    throw new Error('degradeChannel requires channelId');
+// active channel (→ caller fires the admin alert); false when the channel is absent, owned
+// by a different tenant, or not `active` (already private — dedupe — or renewal-failed —
+// not clobbered). The `tenant_id = :tid` guard is forward-safe: once channel_id enters the
+// envelope, a cross-tenant channel_id cannot degrade another tenant's row (no extra GetItem).
+async function degradeChannel({ channelId, tenantId, now = nowIso() }) {
+  if (!channelId || !tenantId) {
+    throw new Error('degradeChannel requires channelId, tenantId');
   }
   try {
     await ddb.send(new UpdateItemCommand({
@@ -79,11 +93,12 @@ async function degradeChannel({ channelId, now = nowIso() }) {
       Key: { channel_id: s(channelId) },
       UpdateExpression: 'SET #st = :private, event_body_private_at = :at',
       ConditionExpression:
-        'attribute_exists(channel_id) AND (attribute_not_exists(#st) OR #st = :active)',
+        'attribute_exists(channel_id) AND tenant_id = :tid AND (attribute_not_exists(#st) OR #st = :active)',
       ExpressionAttributeNames: { '#st': 'status' },
       ExpressionAttributeValues: {
         ':private': s(STATUS_EVENT_BODY_PRIVATE),
         ':active': s(STATUS_ACTIVE),
+        ':tid': s(tenantId),
         ':at': s(now),
       },
     }));
@@ -117,13 +132,14 @@ async function alertAdmin(detail) {
 // required (the admin alert always fires from them); `channel_id` is the forward-compatible
 // field the channel UpdateItem needs (see the CONTRACT GAP note above).
 async function degradeOnEventPrivate(env) {
+  requireStrings(env, ['tenant_id', 'booking_id']);
   const tenantId = env.tenant_id;
   const bookingId = env.booking_id;
   const channelId = env.channel_id; // forward-compatible — see CONTRACT GAP note.
 
   let channelDegraded = false;
   if (channelId) {
-    channelDegraded = await degradeChannel({ channelId });
+    channelDegraded = await degradeChannel({ channelId, tenantId });
   } else {
     // The channel cannot be degraded without channel_id, and it will never appear on a
     // redrive — escalate loudly + still alert; do NOT DLQ.

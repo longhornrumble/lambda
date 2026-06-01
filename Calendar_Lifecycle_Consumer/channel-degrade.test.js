@@ -17,6 +17,9 @@ const ddbMock = mockClient(DynamoDBClient);
 const snsMock = mockClient(SNSClient);
 
 const degrade = require('./channel-degrade');
+// Nothing is jest.mock'd in this file, so requiring index here gives a genuine
+// end-to-end path (index → channel-degrade → DDB/SNS mocks) for the F5a redelivery test.
+const idx = require('./index');
 
 function conditionalFail() {
   const e = new Error('The conditional request failed');
@@ -37,33 +40,50 @@ afterEach(() => {
 });
 
 describe('degradeChannel — conditional channels-table UpdateItem', () => {
-  it('returns true and issues an active-guarded UpdateItem keyed on channel_id', async () => {
+  it('returns true and issues a tenant-guarded, active-guarded UpdateItem keyed on channel_id', async () => {
     ddbMock.on(UpdateItemCommand).resolves({});
-    const result = await degrade.degradeChannel({ channelId: 'chan-123', now: '2026-06-01T00:00:00.000Z' });
+    const result = await degrade.degradeChannel({ channelId: 'chan-123', tenantId: 'AUS123957', now: '2026-06-01T00:00:00.000Z' });
 
     expect(result).toBe(true);
     const call = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
     expect(call.TableName).toBe(degrade._CHANNELS_TABLE);
     expect(call.Key).toEqual({ channel_id: { S: 'chan-123' } });
-    expect(call.ConditionExpression).toBe('attribute_exists(channel_id) AND (attribute_not_exists(#st) OR #st = :active)');
+    // F3: tenant guard prevents a cross-tenant channel_id degrading another tenant's row.
+    expect(call.ConditionExpression).toBe('attribute_exists(channel_id) AND tenant_id = :tid AND (attribute_not_exists(#st) OR #st = :active)');
     expect(call.ExpressionAttributeNames).toEqual({ '#st': 'status' });
     expect(call.ExpressionAttributeValues[':private']).toEqual({ S: 'event_body_private' });
     expect(call.ExpressionAttributeValues[':active']).toEqual({ S: 'active' });
+    expect(call.ExpressionAttributeValues[':tid']).toEqual({ S: 'AUS123957' });
     expect(call.UpdateExpression).toContain('event_body_private_at = :at');
   });
 
-  it('returns false on ConditionalCheckFailed (absent / already private / renewal-failed)', async () => {
+  it('returns false on ConditionalCheckFailed (absent / wrong tenant / already private / renewal-failed)', async () => {
     ddbMock.on(UpdateItemCommand).rejects(conditionalFail());
-    await expect(degrade.degradeChannel({ channelId: 'chan-123' })).resolves.toBe(false);
+    await expect(degrade.degradeChannel({ channelId: 'chan-123', tenantId: 'AUS123957' })).resolves.toBe(false);
+  });
+
+  it('does NOT clobber an unwatched_renewal_failed channel (F5b — guard is #st = :active only)', async () => {
+    // The condition admits only attribute_not_exists(#st) OR #st='active'; a
+    // renewal-failed row matches neither → DDB rejects ConditionalCheckFailed → false, no
+    // status overwrite. (The mock cannot evaluate the expression, so we assert BOTH the
+    // active-only guard string AND the false return on the conditional failure.)
+    ddbMock.on(UpdateItemCommand).rejects(conditionalFail());
+    const result = await degrade.degradeChannel({ channelId: 'chan-rf', tenantId: 'AUS123957' });
+    expect(result).toBe(false);
+    const call = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
+    expect(call.ConditionExpression).toContain('#st = :active');
+    expect(call.ConditionExpression).not.toContain('unwatched_renewal_failed'); // never widened
+    expect(call.ExpressionAttributeValues[':active']).toEqual({ S: 'active' });
   });
 
   it('propagates a non-conditional DDB error so SQS redrives', async () => {
     ddbMock.on(UpdateItemCommand).rejects(new Error('Throttled'));
-    await expect(degrade.degradeChannel({ channelId: 'chan-123' })).rejects.toThrow('Throttled');
+    await expect(degrade.degradeChannel({ channelId: 'chan-123', tenantId: 'AUS123957' })).rejects.toThrow('Throttled');
   });
 
-  it('throws when channelId is missing', async () => {
-    await expect(degrade.degradeChannel({})).rejects.toThrow(/requires channelId/);
+  it('throws when channelId or tenantId is missing', async () => {
+    await expect(degrade.degradeChannel({ tenantId: 'AUS123957' })).rejects.toThrow(/requires channelId, tenantId/);
+    await expect(degrade.degradeChannel({ channelId: 'chan-123' })).rejects.toThrow(/requires channelId, tenantId/);
   });
 });
 
@@ -107,6 +127,49 @@ describe('degradeOnEventPrivate — channel_id ABSENT (contract gap, escalated)'
     expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);    // gap surfaced to admin
     const detail = JSON.parse(snsMock.commandCalls(PublishCommand)[0].args[0].input.Message);
     expect(detail).toMatchObject({ channel_degraded: false, channel_id_present: false });
+  });
+});
+
+describe('degradeOnEventPrivate — malformed envelope (F1)', () => {
+  it('throws malformed when tenant_id is missing (→ index DLQs, no silent process)', async () => {
+    await expect(degrade.degradeOnEventPrivate({ booking_id: 'b1', channel_id: 'chan-1' }))
+      .rejects.toMatchObject({ malformed: true });
+    expect(ddbMock).toHaveReceivedCommandTimes(UpdateItemCommand, 0);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 0);
+  });
+
+  it('throws malformed when booking_id is missing', async () => {
+    await expect(degrade.degradeOnEventPrivate({ tenant_id: 'AUS123957', channel_id: 'chan-1' }))
+      .rejects.toMatchObject({ malformed: true });
+  });
+});
+
+describe('end-to-end via index.handler — SQS redelivery dedupe (F5a)', () => {
+  function privateRecord() {
+    return {
+      messageId: 'm-priv',
+      body: JSON.stringify({
+        event_type: 'booking.event_made_private',
+        tenant_id: 'AUS123957', booking_id: 'b1', channel_id: 'chan-123',
+        last_calendar_mutation_at: '2026-06-03T18:00:00.000Z',
+      }),
+    };
+  }
+
+  it('same envelope twice → batchItemFailures=[] both times, exactly one write + one alert', async () => {
+    // 1st delivery degrades (write succeeds); 2nd delivery hits the conditional (already
+    // private) → no write effect, no duplicate alert. Neither delivery fails the record.
+    ddbMock.on(UpdateItemCommand).resolvesOnce({}).rejects(conditionalFail());
+    const rec = privateRecord();
+
+    const res1 = await idx.handler({ Records: [rec] });
+    expect(res1.batchItemFailures).toEqual([]);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);
+
+    const res2 = await idx.handler({ Records: [rec] });
+    expect(res2.batchItemFailures).toEqual([]);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1); // still 1 — no double-alert
+    expect(ddbMock).toHaveReceivedCommandTimes(UpdateItemCommand, 2); // attempted twice, effective once
   });
 });
 

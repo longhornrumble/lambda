@@ -46,28 +46,36 @@ beforeEach(() => {
 afterEach(() => jest.restoreAllMocks());
 
 describe('routing — the four owned event types', () => {
-  it('routes booking.calendar_deleted → reconcileDeleted', async () => {
+  it('routes booking.calendar_deleted → reconcileDeleted with the parsed envelope', async () => {
     const res = await idx.handler({ Records: [rec('m', envOf('booking.calendar_deleted'))] });
     expect(res.batchItemFailures).toEqual([]);
-    expect(mockDeleted).toHaveBeenCalledTimes(1);
+    expect(mockDeleted).toHaveBeenCalledWith(expect.objectContaining({
+      event_type: 'booking.calendar_deleted', booking_id: 'b1',
+    }));
     expect(mockMoved).not.toHaveBeenCalled();
   });
 
-  it('routes booking.calendar_moved → reconcileMoved', async () => {
+  it('routes booking.calendar_moved → reconcileMoved with the parsed envelope', async () => {
     await idx.handler({ Records: [rec('m', envOf('booking.calendar_moved'))] });
-    expect(mockMoved).toHaveBeenCalledTimes(1);
+    expect(mockMoved).toHaveBeenCalledWith(expect.objectContaining({
+      event_type: 'booking.calendar_moved', booking_id: 'b1',
+    }));
   });
 
-  it('routes booking.calendar_reassigned → reconcileReassigned', async () => {
+  it('routes booking.calendar_reassigned → reconcileReassigned with the parsed envelope', async () => {
     await idx.handler({ Records: [rec('m', envOf('booking.calendar_reassigned', {
       previous_resource_id: 'old@org.example', new_resource_id: 'new@org.example',
     }))] });
-    expect(mockReassigned).toHaveBeenCalledTimes(1);
+    expect(mockReassigned).toHaveBeenCalledWith(expect.objectContaining({
+      event_type: 'booking.calendar_reassigned', booking_id: 'b1', new_resource_id: 'new@org.example',
+    }));
   });
 
-  it('routes booking.event_made_private → degradeOnEventPrivate', async () => {
+  it('routes booking.event_made_private → degradeOnEventPrivate with the parsed envelope', async () => {
     await idx.handler({ Records: [rec('m', envOf('booking.event_made_private', { channel_id: 'chan-1' }))] });
-    expect(mockDegrade).toHaveBeenCalledTimes(1);
+    expect(mockDegrade).toHaveBeenCalledWith(expect.objectContaining({
+      event_type: 'booking.event_made_private', booking_id: 'b1', channel_id: 'chan-1',
+    }));
   });
 });
 
@@ -111,6 +119,19 @@ describe('downstream failures → redrive', () => {
     mockMoved.mockRejectedValue(new Error('DDB throttled'));
     const res = await idx.handler({ Records: [rec('m', envOf('booking.calendar_moved'))] });
     expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'm' }]);
+  });
+
+  it('logs err.name, NOT the raw message (F4 — AccessDenied message embeds the table ARN)', async () => {
+    const e = new Error('User: arn:aws:sts::525409062831:assumed-role/x is not authorized to perform dynamodb:UpdateItem on arn:aws:dynamodb:us-east-1:525409062831:table/picasso-booking-staging');
+    e.name = 'AccessDeniedException';
+    mockDeleted.mockRejectedValue(e);
+    const res = await idx.handler({ Records: [rec('m', envOf('booking.calendar_deleted'))] });
+
+    expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'm' }]);
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join(' ');
+    expect(logged).toContain('event_processing_failed');
+    expect(logged).toContain('AccessDeniedException');
+    expect(logged).not.toContain('arn:aws:dynamodb'); // ARN must not leak into logs
   });
 });
 
