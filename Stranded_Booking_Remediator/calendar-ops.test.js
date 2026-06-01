@@ -42,11 +42,24 @@ describe('transferEvent (reassign)', () => {
       .rejects.toThrow('required');
   });
 
-  test('a vanished source event surfaces the error (caller cascades to cancel)', async () => {
-    const gone = Object.assign(new Error('not found'), { code: 404 });
+  test('a 404 vanished source event throws a REDACTED error preserving code (caller cascades)', async () => {
+    const gone = Object.assign(new Error('Not Found: maya@org.com calendar'), { code: 404 });
     mockMove.mockRejectedValue(gone);
-    await expect(transferEvent('AUTH', { eventId: 'e', fromCalendarId: 'a', toCalendarId: 'b' }))
-      .rejects.toThrow('not found');
+    let caught;
+    await transferEvent('AUTH', { eventId: 'e', fromCalendarId: 'maya@org.com', toCalendarId: 'b' })
+      .catch((e) => { caught = e; });
+    expect(caught.code).toBe(404); // preserved so reassign() can classify
+    expect(caught.message).toBe('calendar move failed (code=404)');
+    expect(caught.message).not.toContain('maya@org.com'); // PII never leaks
+  });
+
+  test('a 401 (revoked/denied) throws a REDACTED error preserving code 401 (caller propagates)', async () => {
+    mockMove.mockRejectedValue({ response: { status: 401, data: { error: 'invalid_grant' } } });
+    let caught;
+    await transferEvent('AUTH', { eventId: 'e', fromCalendarId: 'maya@org.com', toCalendarId: 'b' })
+      .catch((e) => { caught = e; });
+    expect(caught.code).toBe(401);
+    expect(caught.message).toBe('calendar move failed (code=401)');
   });
 });
 
@@ -69,9 +82,13 @@ describe('deleteEvent (cancel)', () => {
     await expect(deleteEvent('AUTH', { eventId: 'e', calendarId: 'c' })).resolves.toBeUndefined();
   });
 
-  test('a non-gone error propagates', async () => {
-    mockDelete.mockRejectedValue(Object.assign(new Error('boom'), { code: 500 }));
-    await expect(deleteEvent('AUTH', { eventId: 'e', calendarId: 'c' })).rejects.toThrow('boom');
+  test('a non-gone error propagates REDACTED (code preserved, no raw message/calendarId)', async () => {
+    mockDelete.mockRejectedValue(Object.assign(new Error('boom: maya@org.com'), { code: 500 }));
+    let caught;
+    await deleteEvent('AUTH', { eventId: 'e', calendarId: 'maya@org.com' }).catch((e) => { caught = e; });
+    expect(caught.code).toBe(500);
+    expect(caught.message).toBe('calendar delete failed (code=500)');
+    expect(caught.message).not.toContain('maya@org.com');
   });
 
   test('missing args throw', async () => {

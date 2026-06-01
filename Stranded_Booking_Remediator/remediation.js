@@ -62,11 +62,23 @@ async function reassign(booking, deps) {
     tenantId: booking.tenantId,
     coordinatorId: booking.coordinatorEmail,
   });
-  await deps.calendarOps.transferEvent(authClient, {
-    eventId: booking.externalEventId,
-    fromCalendarId: booking.coordinatorEmail,
-    toCalendarId: alternate.coordinatorEmail,
-  });
+  try {
+    await deps.calendarOps.transferEvent(authClient, {
+      eventId: booking.externalEventId,
+      fromCalendarId: booking.coordinatorEmail,
+      toCalendarId: alternate.coordinatorEmail,
+    });
+  } catch (err) {
+    // The source event vanished (404/410) between detection and transfer — it can't
+    // be reassigned, so fall through to the cancel handling (NO_ELIGIBLE drives the
+    // default cascade to (b)). A genuine 401/403 (revoked/denied token) is NOT
+    // already-gone → propagate so the booking lands in failed[] for admin attention.
+    if (deps.calendarOps.isAlreadyGone(err)) {
+      deps.warn('reassign_event_already_gone', { booking_id: booking.bookingId });
+      return { outcome: OUTCOMES.NO_ELIGIBLE };
+    }
+    throw err;
+  }
 
   // Repoint the Booking row. Conditional (still booked + still the departed resource);
   // a ConditionalCheckFailed means newer state already won — treat as already-handled,

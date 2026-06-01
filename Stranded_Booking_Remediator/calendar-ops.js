@@ -39,27 +39,43 @@ function isAlreadyGone(err) {
   return code === 404 || code === 410 || code === '404' || code === '410';
 }
 
+// Normalize a raw Google API error to a {code}-only Error. Raw google-auth /
+// @googleapis errors embed the calendarId (= a coordinator's email) in `.message`,
+// and that flows to warn() + the handler's failed[] — a PII leak. We re-throw a
+// redacted Error that keeps ONLY the HTTP status code on `.code`, so callers can
+// still classify (already-gone vs 401/403) without the email ever reaching a log.
+function redactCalendarError(operation, err) {
+  const code = err?.code ?? err?.response?.status ?? 'unknown';
+  const redacted = new Error(`calendar ${operation} failed (code=${code})`);
+  redacted.code = code;
+  return redacted;
+}
+
 /**
  * Move the event to a different coordinator's calendar (handling (a) reassign).
  *   { eventId, fromCalendarId, toCalendarId } — calendar ids are the coordinators'
  *   calendar emails (C8 inserts with calendarId = coordinator email).
- * Returns the moved event resource. A 404/410 on the source means the event is
- * already gone — surfaced as an error here (NOT swallowed): a vanished event can't
- * be reassigned, so the caller must fall through to the cancel handling, not record
- * a phantom success.
+ * Returns the moved event resource. Errors are re-thrown REDACTED (code-only): a
+ * 404/410 means the source event is already gone — reassign() classifies that via
+ * isAlreadyGone and falls through to the cancel handling; a 401/403 (revoked/denied
+ * token) keeps its code so reassign() propagates it to failed[].
  */
 async function transferEvent(authClient, { eventId, fromCalendarId, toCalendarId }) {
   if (!authClient || !eventId || !fromCalendarId || !toCalendarId) {
     throw new Error('authClient, eventId, fromCalendarId, and toCalendarId are required');
   }
-  const response = await calendar.events.move({
-    auth: authClient,
-    calendarId: fromCalendarId,
-    eventId,
-    destination: toCalendarId,
-    sendUpdates: 'all',
-  });
-  return response.data;
+  try {
+    const response = await calendar.events.move({
+      auth: authClient,
+      calendarId: fromCalendarId,
+      eventId,
+      destination: toCalendarId,
+      sendUpdates: 'all',
+    });
+    return response.data;
+  } catch (err) {
+    throw redactCalendarError('move', err);
+  }
 }
 
 /**
@@ -80,7 +96,7 @@ async function deleteEvent(authClient, { eventId, calendarId }) {
     });
   } catch (err) {
     if (isAlreadyGone(err)) return; // already gone — the end state we want
-    throw err;
+    throw redactCalendarError('delete', err); // redact: raw error embeds calendarId (PII)
   }
 }
 
@@ -88,4 +104,5 @@ module.exports = {
   transferEvent,
   deleteEvent,
   isAlreadyGone,
+  redactCalendarError,
 };

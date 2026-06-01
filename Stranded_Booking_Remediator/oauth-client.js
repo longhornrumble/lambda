@@ -30,9 +30,11 @@
 const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const { OAuth2Client } = require('google-auth-library');
 
+const { sdkConfig } = require('./aws-client-config');
+
 const OAUTH_SECRET_PATH_PREFIX = process.env.OAUTH_SECRET_PATH_PREFIX || 'picasso/scheduling/oauth';
 
-const secrets = new SecretsManagerClient({});
+const secrets = new SecretsManagerClient(sdkConfig());
 
 function buildSecretPath(tenantId, coordinatorId) {
   if (!tenantId || !coordinatorId) {
@@ -42,7 +44,16 @@ function buildSecretPath(tenantId, coordinatorId) {
 }
 
 async function fetchOAuthSecret(secretPath) {
-  const result = await secrets.send(new GetSecretValueCommand({ SecretId: secretPath }));
+  // A raw GetSecretValue SDK error embeds the SecretId (= tenant + coordinator email)
+  // in `.message`; logging it would make CloudWatch a cross-tenant existence oracle.
+  // Re-throw a redacted error carrying only the SDK error name/code — never the path.
+  let result;
+  try {
+    result = await secrets.send(new GetSecretValueCommand({ SecretId: secretPath }));
+  } catch (err) {
+    const code = err?.name ?? err?.code ?? 'SecretsManagerError';
+    throw new Error(`OAuth secret fetch failed (${code})`);
+  }
   if (!result.SecretString) {
     throw new Error('OAuth secret has no SecretString for the requested coordinator');
   }

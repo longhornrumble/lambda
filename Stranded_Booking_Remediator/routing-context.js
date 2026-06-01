@@ -43,13 +43,15 @@ const {
   GetItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 
+const { sdkConfig } = require('./aws-client-config');
+
 const ENV = process.env.ENVIRONMENT || 'staging';
 const APPOINTMENT_TYPE_TABLE =
   process.env.APPOINTMENT_TYPE_TABLE || `picasso-appointment-type-${ENV}`;
 const ROUTING_POLICY_TABLE =
   process.env.ROUTING_POLICY_TABLE || `picasso-routing-policy-${ENV}`;
 
-const ddb = new DynamoDBClient({});
+const ddb = new DynamoDBClient(sdkConfig());
 
 function log(event, fields) {
   console.log(JSON.stringify({ event, ...fields }));

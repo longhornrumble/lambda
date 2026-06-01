@@ -25,6 +25,7 @@
   "jest": {
     "collectCoverageFrom": [
       "index.js",
+      "aws-client-config.js",
       "booking-store.js",
       "calendar-ops.js",
       "remediation.js",

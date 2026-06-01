@@ -166,10 +166,22 @@ describe('reassignBookingResource', () => {
       mutationAt: '2026-05-15T01:00:00Z',
     });
     const input = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
-    expect(input.ConditionExpression).toBe('#st = :booked AND resource_id = :old');
+    expect(input.ConditionExpression).toBe('attribute_exists(booking_id) AND #st = :booked AND resource_id = :old');
     expect(input.ExpressionAttributeValues[':new']).toEqual({ S: 'res-diego' });
     expect(input.ExpressionAttributeValues[':email']).toEqual({ S: 'diego@org.com' });
     expect(input.ExpressionAttributeValues[':old']).toEqual({ S: 'res-maya' });
+  });
+
+  test('propagates a ConditionalCheckFailedException (newer state won → caller treats as already-handled)', async () => {
+    ddbMock.on(UpdateItemCommand).rejects(
+      Object.assign(new Error('conditional check failed'), { name: 'ConditionalCheckFailedException' })
+    );
+    const p = reassignBookingResource({
+      tenantId: 'TEN1', bookingId: 'booking#abc', fromResourceId: 'res-maya',
+      newResourceId: 'res-diego', newCoordinatorEmail: 'diego@org.com', mutationAt: '2026-05-15T01:00:00Z',
+    });
+    await expect(p).rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
+    expect(isConditionalCheckFailed(await p.catch((e) => e))).toBe(true);
   });
 });
 

@@ -36,11 +36,13 @@ const {
   UpdateItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 
+const { sdkConfig } = require('./aws-client-config');
+
 const ENV = process.env.ENVIRONMENT || 'staging';
 const BOOKING_TABLE = process.env.BOOKING_TABLE || `picasso-booking-${ENV}`;
 const COORDINATOR_INDEX = 'tenantId-coordinator_email-index';
 
-const ddb = new DynamoDBClient({});
+const ddb = new DynamoDBClient(sdkConfig());
 
 function s(value) {
   return { S: String(value) };
@@ -132,10 +134,12 @@ async function reassignBookingResource({
       Key: { tenantId: s(tenantId), booking_id: s(bookingId) },
       UpdateExpression:
         'SET resource_id = :new, coordinator_email = :email, last_calendar_mutation_at = :at',
-      // Optimistic guard: only repoint a still-booked row that still belongs to the
-      // departed coordinator. A ConditionalCheckFailed means newer state won — the
-      // caller treats it as "already handled", not an error.
-      ConditionExpression: '#st = :booked AND resource_id = :old',
+      // Optimistic guard: only repoint a row that (still) exists, is still booked, and
+      // still belongs to the departed coordinator. attribute_exists(booking_id) gives
+      // parity with the B9B10 writes (never resurrect a deleted row via UpdateItem). A
+      // ConditionalCheckFailed means newer state won — the caller treats it as
+      // "already handled", not an error.
+      ConditionExpression: 'attribute_exists(booking_id) AND #st = :booked AND resource_id = :old',
       ExpressionAttributeNames: { '#st': 'status' },
       ExpressionAttributeValues: {
         ':new': s(newResourceId),

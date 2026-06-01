@@ -86,6 +86,19 @@ describe('handler orchestration', () => {
     expect(out.results[0]).toMatchObject({ booking_id: 'booking#1', outcome: 'reassigned' });
   });
 
+  test('a reassigned result hashes newCoordinatorEmail in the return payload (no PII leak)', async () => {
+    mockFindStranded.mockResolvedValue([{ bookingId: 'booking#1' }]);
+    mockRemediate.mockResolvedValue({
+      outcome: 'reassigned', newResourceId: 'res-diego', newCoordinatorEmail: 'diego@org.com',
+    });
+    const out = await handler(VALID);
+    const row = out.results[0];
+    expect(row.newCoordinatorEmail).toBeUndefined();
+    expect(row.newCoordinatorEmailHash).toHaveLength(12);
+    expect(JSON.stringify(out)).not.toContain('diego@org.com');
+    expect(row.newResourceId).toBe('res-diego'); // internal id retained
+  });
+
   test('a per-booking failure is captured in failed[] without aborting the run', async () => {
     mockFindStranded.mockResolvedValue([{ bookingId: 'booking#1' }, { bookingId: 'booking#2' }]);
     mockRemediate

@@ -143,7 +143,15 @@ exports.handler = async function handler(event) {
   for (const booking of stranded) {
     try {
       const result = await remediate(booking, choice, deps);
-      results.push({ booking_id: booking.bookingId, ...result });
+      // Redact PII before it enters the return payload (which may be logged by the
+      // caller): a 'reassigned' result carries the new coordinator's email — hash it.
+      // The DDB write (booking-store) keeps the real value; only this summary is hashed.
+      const safeResult = { ...result };
+      if (safeResult.newCoordinatorEmail) {
+        safeResult.newCoordinatorEmailHash = hashId(safeResult.newCoordinatorEmail);
+        delete safeResult.newCoordinatorEmail;
+      }
+      results.push({ booking_id: booking.bookingId, ...safeResult });
       log('remediator_booking_handled', {
         booking_id: booking.bookingId,
         outcome: result.outcome,

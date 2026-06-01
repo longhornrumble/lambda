@@ -7,6 +7,9 @@ import * as esbuild from 'esbuild';
 const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
   '@aws-sdk/client-secrets-manager',
+  // Ships in the Node 20 runtime as an @aws-sdk/* transitive dep — use the runtime
+  // copy so the bounded request handler matches the SDK clients' expected version.
+  '@smithy/node-http-handler',
 ];
 
 await esbuild.build({

@@ -82,6 +82,18 @@ describe('fetchOAuthSecret', () => {
       .rejects.not.toThrow(/SECRET-TENANT/);
   });
 
+  test('a raw SDK fetch error is REDACTED to the error name only (no SecretId path leak)', async () => {
+    const sdkErr = Object.assign(
+      new Error("can't find secret picasso/scheduling/oauth/SECRET-TENANT/coord@org.com"),
+      { name: 'AccessDeniedException' }
+    );
+    smMock.on(GetSecretValueCommand).rejects(sdkErr);
+    await expect(oauthClient.fetchOAuthSecret('picasso/scheduling/oauth/SECRET-TENANT/coord@org.com'))
+      .rejects.toThrow('OAuth secret fetch failed (AccessDeniedException)');
+    await expect(oauthClient.fetchOAuthSecret('picasso/scheduling/oauth/SECRET-TENANT/coord@org.com'))
+      .rejects.not.toThrow(/SECRET-TENANT|coord@org.com/);
+  });
+
   test.each([
     ['client_id'],
     ['client_secret'],
@@ -146,9 +158,11 @@ describe('getOAuthClient', () => {
     expect(second.credentials).toEqual({ refresh_token: '1//rotated-token-xyz' });
   });
 
-  test('throws when secret fetch fails', async () => {
-    smMock.on(GetSecretValueCommand).rejects(new Error('AccessDenied'));
+  test('throws a redacted error when secret fetch fails', async () => {
+    smMock.on(GetSecretValueCommand).rejects(
+      Object.assign(new Error('AccessDenied: picasso/scheduling/oauth/T/c'), { name: 'AccessDeniedException' })
+    );
     await expect(oauthClient.getOAuthClient({ tenantId: 'T', coordinatorId: 'c' }))
-      .rejects.toThrow('AccessDenied');
+      .rejects.toThrow('OAuth secret fetch failed (AccessDeniedException)');
   });
 });

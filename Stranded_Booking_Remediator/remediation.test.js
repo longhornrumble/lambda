@@ -1,6 +1,7 @@
 'use strict';
 
 const { reassign, cancel, leave, remediate, OUTCOMES } = require('./remediation');
+const { isAlreadyGone } = require('./calendar-ops'); // real classifier for the cascade branch
 
 function booking(over = {}) {
   return {
@@ -23,6 +24,7 @@ function makeDeps(over = {}) {
     calendarOps: over.calendarOps || {
       transferEvent: jest.fn().mockResolvedValue({ id: 'evt-1' }),
       deleteEvent: jest.fn().mockResolvedValue(undefined),
+      isAlreadyGone,
     },
     bookingStore: over.bookingStore || {
       reassignBookingResource: jest.fn().mockResolvedValue(undefined),
@@ -95,6 +97,33 @@ describe('reassign (handling a)', () => {
     expect(deps.warn).toHaveBeenCalledWith('reassign_booking_row_already_changed', expect.any(Object));
   });
 
+  test('a 404/410 from transferEvent (vanished event) → no_eligible so the cascade cancels', async () => {
+    const deps = makeDeps({
+      resolveAlternate: jest.fn().mockResolvedValue({ resourceId: 'res-diego', coordinatorEmail: 'diego@org.com' }),
+      calendarOps: {
+        transferEvent: jest.fn().mockRejectedValue(Object.assign(new Error('calendar move failed (code=404)'), { code: 404 })),
+        deleteEvent: jest.fn(),
+        isAlreadyGone,
+      },
+    });
+    const result = await reassign(booking(), deps);
+    expect(result).toEqual({ outcome: OUTCOMES.NO_ELIGIBLE });
+    expect(deps.warn).toHaveBeenCalledWith('reassign_event_already_gone', expect.any(Object));
+    expect(deps.bookingStore.reassignBookingResource).not.toHaveBeenCalled();
+  });
+
+  test('a 401 from transferEvent (revoked token) propagates → failed[]', async () => {
+    const deps = makeDeps({
+      resolveAlternate: jest.fn().mockResolvedValue({ resourceId: 'res-diego', coordinatorEmail: 'diego@org.com' }),
+      calendarOps: {
+        transferEvent: jest.fn().mockRejectedValue(Object.assign(new Error('calendar move failed (code=401)'), { code: 401 })),
+        deleteEvent: jest.fn(),
+        isAlreadyGone,
+      },
+    });
+    await expect(reassign(booking(), deps)).rejects.toThrow('code=401');
+  });
+
   test('a non-conditional repoint error propagates', async () => {
     const boom = new Error('ddb down');
     const deps = makeDeps({
@@ -118,6 +147,17 @@ describe('cancel (handling b)', () => {
     });
     expect(deps.bookingStore.reassignBookingResource).not.toHaveBeenCalled();
     expect(result).toEqual({ outcome: OUTCOMES.CANCELED });
+  });
+
+  test('a non-404/410 deleteEvent error propagates (caller routes it to failed[])', async () => {
+    const deps = makeDeps({
+      calendarOps: {
+        transferEvent: jest.fn(),
+        deleteEvent: jest.fn().mockRejectedValue(Object.assign(new Error('calendar delete failed (code=500)'), { code: 500 })),
+        isAlreadyGone,
+      },
+    });
+    await expect(cancel(booking(), deps)).rejects.toThrow('code=500');
   });
 
   test('no calendar event → canceled-equivalent with note, no delete call', async () => {
