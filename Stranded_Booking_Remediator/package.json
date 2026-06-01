@@ -1,0 +1,50 @@
+{
+  "name": "stranded-booking-remediator",
+  "version": "1.0.0",
+  "description": "Stranded_Booking_Remediator — scheduling sub-phase B Task B11. Coordinator-offboarding stranded-booking remediation (canonical §7.3): detects bookings left stranded when a coordinator departs (status='booked' AND coordinator_email=departed AND last_calendar_mutation_at<offboarding_time, via the tenantId-coordinator_email-index GSI) and applies one of three handlings — (a) reassign via re-run routing, (b) treat as coordinator-side cancel, (c) leave — or the default cascade (a)->(b). Backend callable operations; admin UI deferred. Trigger wiring + IaC are the integrator's.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@googleapis/calendar": "14.3.0",
+    "google-auth-library": "^10.6.2"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js",
+      "booking-store.js",
+      "calendar-ops.js",
+      "remediation.js",
+      "routing-context.js",
+      "oauth-client.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 85,
+        "functions": 100,
+        "lines": 90,
+        "statements": 90
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
