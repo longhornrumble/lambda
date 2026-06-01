@@ -257,6 +257,20 @@ describe('resolveCandidates — appointmentType hop (§A)', () => {
     ).rejects.toThrow('at-missing not found or has no routing_policy_id');
   });
 
+  test('throws when the appointment type is found but has no routing_policy_id', async () => {
+    await expect(
+      resolveCandidates(
+        { tenantId: TENANT, appointmentTypeId: 'at-nopolicy' },
+        {
+          getAppointmentType: jest.fn().mockResolvedValue({ appointment_type_id: 'at-nopolicy' }),
+          getRoutingPolicy: jest.fn(),
+          queryEmployees: jest.fn(),
+          log: quietLog,
+        }
+      )
+    ).rejects.toThrow('at-nopolicy not found or has no routing_policy_id');
+  });
+
   test('prefers an explicit routingPolicyId over the appointmentType hop', async () => {
     const getAppointmentType = jest.fn();
     await resolveCandidates(
@@ -279,6 +293,10 @@ describe('isEligible', () => {
   });
   test('handles a condition with no values array', () => {
     expect(isEligible(['a'], [{ tag: 'x' }])).toBe(true); // [].every → true
+  });
+  test('in_any: empty tag list → false; at least one match → true', () => {
+    expect(isEligible([], [{ operator: 'in_any', values: ['a', 'b'] }])).toBe(false);
+    expect(isEligible(['b'], [{ operator: 'in_any', values: ['a', 'b'] }])).toBe(true);
   });
 });
 
@@ -364,7 +382,19 @@ describe('default implementations — DynamoDB', () => {
     expect(out).toHaveLength(2);
     expect(out[0].scheduling_tags).toEqual(['mentoring']);
     expect(out[1].scheduling_tags).toEqual(['donations']); // SS round-trips to a list
-    expect(ddbMock.commandCalls(QueryCommand)).toHaveLength(2);
+    const calls = ddbMock.commandCalls(QueryCommand);
+    expect(calls).toHaveLength(2);
+    // page 1 has no ExclusiveStartKey; page 2 forwards page 1's LastEvaluatedKey.
+    expect(calls[0].args[0].input.ExclusiveStartKey).toBeUndefined();
+    expect(calls[1].args[0].input.ExclusiveStartKey).toEqual({
+      tenantId: { S: TENANT },
+      employeeId: { S: 'u1' },
+    });
+    // projects only the three fields the resolver reads (cost + PII minimisation).
+    expect(calls[0].args[0].input.ProjectionExpression).toBe(
+      'employeeId, #email, scheduling_tags'
+    );
+    expect(calls[0].args[0].input.ExpressionAttributeNames).toEqual({ '#email': 'email' });
   });
 
   test('defaultQueryEmployees tolerates an empty partition', async () => {

@@ -151,6 +151,11 @@ async function defaultQueryEmployees({ tenantId }) {
         TableName: EMPLOYEE_REGISTRY_TABLE,
         KeyConditionExpression: 'tenantId = :t',
         ExpressionAttributeValues: { ':t': { S: tenantId } },
+        // Pull ONLY the three fields the resolver reads — not the whole registry row
+        // (cost + avoids dragging unrelated PII into this query). `email` is a DDB
+        // reserved word, so it is aliased via ExpressionAttributeNames.
+        ProjectionExpression: 'employeeId, #email, scheduling_tags',
+        ExpressionAttributeNames: { '#email': 'email' },
         ExclusiveStartKey,
       })
     );

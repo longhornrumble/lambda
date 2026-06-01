@@ -102,6 +102,14 @@ function firstNameOf(fullName) {
   return fullName.trim().split(/\s+/)[0] || '';
 }
 
+// Action links land in an email href — only https is allowed through. A
+// javascript:/data:/mailto: (etc.) scheme is dropped to '' so a malformed or
+// hostile link can never become an executable href. Tokenised reschedule/reoffer
+// links are always https, so this is a no-op for the real path.
+function safeUrl(url) {
+  return typeof url === 'string' && /^https:\/\//i.test(url.trim()) ? url.trim() : '';
+}
+
 // ─── templates ({{var}} — mirrors notification_templates.json; see header) ────────────
 
 const STOP_LINE_TEXT = '\n\nTo stop receiving these emails, reply STOP.';
@@ -165,8 +173,11 @@ function buildEmailPayload({ kind, booking }) {
   const apptType =
     pick(booking, 'appointmentTypeName', 'appointment_type_name') || 'appointment';
   const whenLabel = pick(booking, 'whenLabel', 'when_label');
-  const rescheduleUrl = pick(booking, 'rescheduleUrl', 'reschedule_url');
-  const reofferUrl = pick(booking, 'reofferUrl', 'reoffer_url');
+  // https-only: a non-https (javascript:/data:/…) link is dropped to '' → it is then
+  // treated as a MISSING link (throws for the kinds that require one, omitted for the
+  // optional cancel-notice rebook). No hostile scheme can reach an href.
+  const rescheduleUrl = safeUrl(pick(booking, 'rescheduleUrl', 'reschedule_url'));
+  const reofferUrl = safeUrl(pick(booking, 'reofferUrl', 'reoffer_url'));
 
   let actionUrl;
   if (kind === 'reschedule_link') {
@@ -294,10 +305,14 @@ async function dispatchVolunteerNotice(
 
   const bookingId = pick(booking, 'bookingId', 'booking_id') || 'unknown';
   // Default channels per kind; an explicit `channels` overrides which to attempt.
+  // An SMS-native kind sends UNLESS `channels.sms:false` (mirrors the email guard,
+  // so `channels.sms:false` actually suppresses); an email kind sends SMS ONLY when
+  // `channels.sms:true` is opted in.
   const attemptEmail =
     isEmailKind && (channels ? channels.email !== false : true);
   const attemptSms =
-    isSmsKind || (channels ? channels.sms === true : false);
+    (isSmsKind && (channels ? channels.sms !== false : true)) ||
+    (isEmailKind && !!channels && channels.sms === true);
 
   const dispatched = {};
 

@@ -125,6 +125,35 @@ describe('buildEmailPayload', () => {
     expect(p.text_body).toContain('<b>Eve</b>'); // raw in text body
   });
 
+  test('prefers explicit attendeeFirstName over deriving from attendeeName (camelCase)', () => {
+    const p = buildEmailPayload({
+      kind: 'cancel_notice',
+      booking: { attendeeEmail: 'a@b.com', attendeeFirstName: 'Alex', attendeeName: 'Sam Patel' },
+    });
+    expect(p.text_body).toContain('Hi Alex,'); // explicit first name wins
+    expect(p.text_body).not.toContain('Sam');
+  });
+
+  test('drops a non-https reschedule link (javascript: scheme never reaches an href)', () => {
+    // reschedule_link requires a link → a hostile scheme is treated as missing → throws.
+    expect(() =>
+      buildEmailPayload({
+        kind: 'reschedule_link',
+        booking: { ...baseBooking, rescheduleUrl: 'javascript:alert(1)' },
+      })
+    ).toThrow('reschedule_link requires booking.rescheduleUrl');
+
+    // cancel_notice's rebook link is optional → a hostile scheme is silently dropped,
+    // and the body/href must NOT contain it.
+    const p = buildEmailPayload({
+      kind: 'cancel_notice',
+      booking: { ...baseBooking, rescheduleUrl: 'javascript:alert(1)' },
+    });
+    expect(p.html_body).not.toContain('javascript:');
+    expect(p.text_body).not.toContain('javascript:');
+    expect(p.text_body).not.toContain('Want to rebook?');
+  });
+
   test('falls back to generic copy when org/apptType/name absent', () => {
     const p = buildEmailPayload({
       kind: 'cancel_notice',
@@ -194,6 +223,26 @@ describe('dispatchVolunteerNotice — email dispatch', () => {
     );
   });
 
+  test('reoffer dispatches email (sent)', async () => {
+    const invokeEmail = jest.fn().mockResolvedValue(undefined);
+    const res = await dispatchVolunteerNotice(
+      { kind: 'reoffer', tenantId: TENANT, booking: baseBooking },
+      { invokeEmail, log: quietLog() }
+    );
+    expect(res).toEqual({ kind: 'reoffer', suppressed: false, dispatched: { email: 'sent' } });
+    expect(invokeEmail).toHaveBeenCalledTimes(1);
+  });
+
+  test('cancel_notice dispatches email (sent)', async () => {
+    const invokeEmail = jest.fn().mockResolvedValue(undefined);
+    const res = await dispatchVolunteerNotice(
+      { kind: 'cancel_notice', tenantId: TENANT, booking: baseBooking },
+      { invokeEmail, log: quietLog() }
+    );
+    expect(res).toEqual({ kind: 'cancel_notice', suppressed: false, dispatched: { email: 'sent' } });
+    expect(invokeEmail).toHaveBeenCalledTimes(1);
+  });
+
   test('skips when there is no recipient email', async () => {
     const invokeEmail = jest.fn();
     const log = quietLog();
@@ -255,6 +304,32 @@ describe('dispatchVolunteerNotice — SMS path (TODO SMS-E stub)', () => {
     expect(invokeSms).toHaveBeenCalledWith(
       expect.objectContaining({ kind: 'move_optin_sms', tenantId: TENANT })
     );
+  });
+
+  test('move_optin_sms is SMS-only — never invokes the email path', async () => {
+    const invokeEmail = jest.fn();
+    const invokeSms = jest.fn().mockResolvedValue({ stub: true });
+    const res = await dispatchVolunteerNotice(
+      { kind: 'move_optin_sms', tenantId: TENANT, booking: baseBooking },
+      { invokeEmail, invokeSms, log: quietLog() }
+    );
+    expect(res.dispatched).toEqual({ sms: 'stubbed_todo_sms_e' });
+    expect(invokeEmail).not.toHaveBeenCalled();
+  });
+
+  test('channels.sms:false suppresses an SMS-native kind (mirrors the email guard)', async () => {
+    const invokeSms = jest.fn();
+    const res = await dispatchVolunteerNotice(
+      {
+        kind: 'move_optin_sms',
+        tenantId: TENANT,
+        booking: baseBooking,
+        channels: { sms: false },
+      },
+      { invokeSms, log: quietLog() }
+    );
+    expect(invokeSms).not.toHaveBeenCalled();
+    expect(res.dispatched).toEqual({});
   });
 
   test('an email kind with channels.sms:true also fires the SMS stub', async () => {
