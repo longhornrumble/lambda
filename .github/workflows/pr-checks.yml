@@ -94,6 +94,20 @@ jobs:
               # must trip this Lambda's test job.
               - 'Booking_Commit_Handler/**'
               - 'shared/**'
+            calendar_event_consumer:
+              # B9/B10 SQS consumer. Imports ../shared/booking-status (status
+              # vocabulary), so shared/** drift must trip its test job.
+              - 'Calendar_Event_Consumer/**'
+              - 'shared/**'
+            stranded_booking_remediator:
+              # B11. Imports ../shared/scheduling/{availability,routing} +
+              # ../shared/booking-status, so shared/** drift must trip it.
+              - 'Stranded_Booking_Remediator/**'
+              - 'shared/**'
+            calendar_lifecycle_consumer:
+              # WS-CAL-LIFECYCLE §14.2 consumer. Imports ../shared/booking-status.
+              - 'Calendar_Lifecycle_Consumer/**'
+              - 'shared/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
             master:
@@ -146,7 +160,10 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
       needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
-      needs.detect-changes.outputs.booking_commit_handler == 'true'
+      needs.detect-changes.outputs.booking_commit_handler == 'true' ||
+      needs.detect-changes.outputs.calendar_event_consumer == 'true' ||
+      needs.detect-changes.outputs.stranded_booking_remediator == 'true' ||
+      needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -168,6 +185,12 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
           - lambda: Booking_Commit_Handler
             changed: ${{ needs.detect-changes.outputs.booking_commit_handler }}
+          - lambda: Calendar_Event_Consumer
+            changed: ${{ needs.detect-changes.outputs.calendar_event_consumer }}
+          - lambda: Stranded_Booking_Remediator
+            changed: ${{ needs.detect-changes.outputs.stranded_booking_remediator }}
+          - lambda: Calendar_Lifecycle_Consumer
+            changed: ${{ needs.detect-changes.outputs.calendar_lifecycle_consumer }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -202,9 +225,9 @@ jobs:
         working-directory: shared
         run: npm install
 
-      - name: Install shared/scheduling deps (Booking_Commit_Handler consumes them)
+      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator consume them)
         if: |
-          matrix.lambda == 'Booking_Commit_Handler' &&
+          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator') &&
           (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
         working-directory: shared/scheduling
         run: npm install
@@ -547,6 +570,9 @@ jobs:
           - lambda: Calendar_Watch_Onboarder # B5 onboarding hook — jest tests + deps
           - lambda: Calendar_Watch_Renewer # B3 watch-channel renewer — jest tests + deps
           - lambda: Calendar_Watch_Offboarder # B6 offboarding hook — jest tests + deps
+          - lambda: Calendar_Event_Consumer # B9/B10 booking-event consumer — jest tests + deps
+          - lambda: Stranded_Booking_Remediator # B11 stranded-booking remediator — jest tests + deps
+          - lambda: Calendar_Lifecycle_Consumer # WS-CAL-LIFECYCLE §14.2 consumer — jest tests + deps
 
     steps:
       - name: Checkout
@@ -605,7 +631,10 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
       needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
-      needs.detect-changes.outputs.booking_commit_handler == 'true'
+      needs.detect-changes.outputs.booking_commit_handler == 'true' ||
+      needs.detect-changes.outputs.calendar_event_consumer == 'true' ||
+      needs.detect-changes.outputs.stranded_booking_remediator == 'true' ||
+      needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true'
 
     strategy:
       fail-fast: false
@@ -627,6 +656,12 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
           - lambda: Booking_Commit_Handler
             changed: ${{ needs.detect-changes.outputs.booking_commit_handler }}
+          - lambda: Calendar_Event_Consumer
+            changed: ${{ needs.detect-changes.outputs.calendar_event_consumer }}
+          - lambda: Stranded_Booking_Remediator
+            changed: ${{ needs.detect-changes.outputs.stranded_booking_remediator }}
+          - lambda: Calendar_Lifecycle_Consumer
+            changed: ${{ needs.detect-changes.outputs.calendar_lifecycle_consumer }}
 
     steps:
       - name: Skip unchanged Lambda
@@ -652,9 +687,9 @@ jobs:
           cache: 'npm'
           cache-dependency-path: ${{ matrix.lambda }}/package-lock.json
 
-      - name: Install shared/scheduling deps (Booking_Commit_Handler bundles them)
+      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator bundle them)
         if: |
-          matrix.lambda == 'Booking_Commit_Handler' &&
+          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator') &&
           (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
         working-directory: shared/scheduling
         run: npm install
