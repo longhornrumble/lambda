@@ -1,0 +1,44 @@
+{
+  "name": "calendar-event-consumer",
+  "version": "1.0.0",
+  "description": "Calendar_Event_Consumer — scheduling sub-phase B Tasks B9 + B10. SQS consumer of the typed booking.* events the Calendar_Watch_Listener (B2) dispatches. Owns two event types: booking.ooo_overlap_detected (B9 §14.2 — flag the conflict on every booking in overlapping_booking_ids + fire an admin alert) and booking.attendee_declined (B10 §14.2 — transition Booking.status booked→canceled). All other event types are logged and discarded (another consumer owns them). Idempotency via conditional Booking-row writes (no separate dedupe table). B9 volunteer reoffer + B10 reminder-suppression/defensive-poll are out of scope and escalated/stubbed. Consumes the frozen shared/booking-status SoT; never modifies it.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-sns": "^3.600.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js",
+      "booking-updates.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 90,
+        "functions": 100,
+        "lines": 90,
+        "statements": 90
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
