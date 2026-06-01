@@ -55,13 +55,15 @@ function declinedRecord(bookingId, extra = {}) {
   });
 }
 
+let warnSpy;
+
 beforeEach(() => {
   snsMock.reset();
   snsMock.on(PublishCommand).resolves({ MessageId: 'sns-1' });
   mockFlag.mockReset().mockResolvedValue(true);
   mockCancel.mockReset().mockResolvedValue(true);
   jest.spyOn(console, 'log').mockImplementation(() => {});
-  jest.spyOn(console, 'warn').mockImplementation(() => {});
+  warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
 
 afterEach(() => {
@@ -138,6 +140,33 @@ describe('B9 — booking.ooo_overlap_detected', () => {
     mockFlag.mockRejectedValue(new Error('DDB throttled'));
     const res = await idx.handler({ Records: [oooRecord(['b1'])] });
     expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'm-ooo' }]);
+  });
+
+  it('multi-booking partial failure redrives the whole record, leaving later bookings for the redrive', async () => {
+    // b1 flags ok, b2 throws → the record fails mid-array. b3 is NOT reached this delivery;
+    // the redrive re-processes the record and b1's flag is then a dedupe no-op (no 2nd alert).
+    mockFlag.mockResolvedValueOnce(true).mockRejectedValueOnce(new Error('DDB throttled'));
+    const res = await idx.handler({ Records: [oooRecord(['b1', 'b2', 'b3'])] });
+
+    expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'm-ooo' }]);
+    expect(mockFlag.mock.calls.map((c) => c[0].bookingId)).toEqual(['b1', 'b2']); // b3 not processed
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1); // only b1 alerted
+  });
+
+  it('SQS at-least-once redelivery — the 2nd identical delivery is a pure no-op (no duplicate alert)', async () => {
+    // The conditional Booking-row write (booking-updates) returns false on the redelivery
+    // once the conflict is already flagged for this calendar-mutation. Modeled here at the
+    // index layer: 1st delivery flags (alert), 2nd delivery dedupes (no alert).
+    mockFlag.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    const r = oooRecord(['b1']);
+
+    const res1 = await idx.handler({ Records: [r] });
+    expect(res1.batchItemFailures).toEqual([]);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);
+
+    const res2 = await idx.handler({ Records: [r] });
+    expect(res2.batchItemFailures).toEqual([]);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1); // still 1 — no duplicate
   });
 
   it('a best-effort admin-alert failure does NOT fail the record', async () => {
@@ -221,6 +250,25 @@ describe('malformed payloads → DLQ (error contract)', () => {
     const res = await idx.handler({ Records: [rec('not', { event_type: 'booking.attendee_declined', booking_id: 'b1' })] });
     expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'not' }]);
     expect(mockCancel).not.toHaveBeenCalled();
+  });
+
+  it('redacts attendee_email from the malformed-event log (SR-2 PII hygiene)', async () => {
+    // Valid JSON but missing tenant_id → malformed; still carries PII.
+    const r = rec('pii', { event_type: 'booking.attendee_declined', booking_id: 'b1', attendee_email: 'volunteer@example.org' });
+    const res = await idx.handler({ Records: [r] });
+
+    expect(res.batchItemFailures).toEqual([{ itemIdentifier: 'pii' }]);
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join(' ');
+    expect(logged).toContain('event_malformed');
+    expect(logged).not.toContain('volunteer@example.org'); // PII stripped before logging
+    expect(logged).toContain('"booking_id":"b1"'); // non-PII fields preserved
+  });
+
+  it('logs [unparseable] (not the raw body) for non-JSON malformed bodies', async () => {
+    await idx.handler({ Records: [{ messageId: 'np', body: 'not json{ attendee_email: leak@example.org' }] });
+    const logged = warnSpy.mock.calls.map((c) => String(c[0])).join(' ');
+    expect(logged).toContain('[unparseable]');
+    expect(logged).not.toContain('leak@example.org');
   });
 });
 

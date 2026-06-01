@@ -104,6 +104,23 @@ function requireStrings(env, fields) {
   }
 }
 
+// SR-2 PII-log hygiene (sub-phase B audit): a malformed envelope may still be valid JSON
+// carrying `attendee_email` (declined/accepted events do). NEVER log the raw body — strip
+// the PII-bearing fields before logging, or mark it unparseable when it is not JSON.
+function redactBody(body) {
+  let obj;
+  try {
+    obj = JSON.parse(body);
+  } catch (_) {
+    return '[unparseable]';
+  }
+  if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+    const { attendee_email, coordinator_email, ...rest } = obj;
+    return rest;
+  }
+  return obj; // primitive / array — no named PII fields to strip
+}
+
 // ─── admin alert (mirrors C8 alertAdmin — best-effort, never fails the record) ────────
 //
 // The durable conflict flag on the Booking row is the source of truth; the SNS alert is
@@ -244,8 +261,8 @@ async function handler(event) {
       await processRecord(record);
     } catch (err) {
       if (err && err.malformed) {
-        // Log the full payload + validation error (error contract) before redriving.
-        warn('event_malformed', { message_id: record.messageId, error: err.message, body: record.body });
+        // Log the (PII-redacted) payload + validation error (error contract) before redriving.
+        warn('event_malformed', { message_id: record.messageId, error: err.message, body: redactBody(record.body) });
       } else {
         warn('event_processing_failed', { message_id: record.messageId, error: err && err.message });
       }
