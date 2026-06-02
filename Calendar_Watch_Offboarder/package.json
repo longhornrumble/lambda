@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-lambda": "^3.600.0",
     "@aws-sdk/client-secrets-manager": "^3.600.0",
     "@googleapis/calendar": "^14.3.0",
     "google-auth-library": "^10.6.2"
