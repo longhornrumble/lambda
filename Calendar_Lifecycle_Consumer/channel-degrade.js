@@ -12,18 +12,18 @@
  * `event_body_private`) and fire a best-effort admin alert so a human can ask the
  * coordinator to un-private or use the manual email-based attendance prompt.
  *
- * ⚠️ CONTRACT GAP (ESCALATED to the integrator — see PR report-back). The
- * `listener_dispatch_interface.md` common envelope does NOT carry `channel_id`, and the
- * listener deliberately excludes `channel_id` from the SQS message body (it is used only
- * in the FIFO MessageDeduplicationId hash). A keyed UpdateItem on the channels table needs
+ * CONTRACT GAP — RESOLVED (lambda#199 / I2-A cutover). The listener now includes
+ * `channel_id` in the `event_made_private` envelope body ONLY (the one-line integrator
+ * change this module anticipated). A keyed UpdateItem on the channels table needs
  * `channel_id`, and the channels table has no GSI on `tenant_id`/`coordinator_id`/`booking_id`
- * to resolve it. This module is therefore built FORWARD-COMPATIBLY: it reads `channel_id`
- * from the envelope and degrades the channel the moment the listener includes it (a
- * one-line integrator change to the `event_made_private` envelope, or a `coordinator_id` +
- * channels GSI). Until then, `event_made_private` STILL fires the admin alert (which needs
- * only `tenant_id`/`booking_id`) so the degradation is never silently dropped; the record
- * is NOT sent to the DLQ (a missing `channel_id` will never appear on a redrive — DLQ would
- * retry-storm). The escalation log line surfaces the gap in CloudWatch.
+ * to resolve it — so the listener passes it through (it is the validated X-Goog-Channel-ID;
+ * the degrade below is `tenant_id`-guarded so a mismatched channel_id cannot cross-tenant
+ * degrade). The `if (channelId)` branch below is now the LIVE happy path (the channel is
+ * degraded), NOT dead code — do not remove it. The version-skew fallback (old Listener,
+ * new Consumer → `channel_id` absent) STILL fires the admin alert from `tenant_id`/`booking_id`
+ * so degradation is never silently dropped; the record is NOT sent to the DLQ (a missing
+ * `channel_id` will never appear on a redrive — DLQ would retry-storm). The
+ * `event_made_private_channel_id_absent` log line surfaces any such skew in CloudWatch.
  *
  * Idempotency: the channel UpdateItem is conditional — it degrades only an `active` (or
  * status-absent) channel, so a re-delivery (already `event_body_private`) is a no-op and a

@@ -6,8 +6,10 @@
  * Receives Google Calendar push notifications, validates the channel token
  * via SHA-256 hash comparison (channel_token encryption Option 2 per
  * subphase_b1_calendar_watch_channels_runbook.md), enforces a replay window
- * on X-Goog-Message-Number, and dispatches to the SQS FIFO queue keyed by
- * channel_id so events for the same channel are processed in order.
+ * on X-Goog-Message-Number, and PUBLISHES typed events to the SNS FIFO fan-out
+ * topic (I2-A cutover) keyed by event_id (= booking_id) so events for the same
+ * booking are processed in order. The topic fans out to per-consumer FIFO queues
+ * by event_type filter policy (infra/modules/sns-calendar-watch-fanout-staging).
  *
  * Phase 2b adds delta-discovery (syncToken-based listChangedEvents loop),
  * Booking record lookup, typed-event derivation for all 7 event_types from
@@ -32,7 +34,7 @@ const {
   UpdateItemCommand,
   QueryCommand,
 } = require('@aws-sdk/client-dynamodb');
-const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 const { getOAuthClient, clearCacheEntry } = require('./oauth-client');
 const { listChangedEvents } = require('./calendar-api');
 
@@ -40,7 +42,7 @@ const { listChangedEvents } = require('./calendar-api');
 // Created once at module load; reused across warm invocations.
 
 const ddb = new DynamoDBClient({});
-const sqs = new SQSClient({});
+const sns = new SNSClient({});
 
 // ─── Environment ────────────────────────────────────────────────────────────────
 
@@ -48,7 +50,7 @@ const ENV                            = process.env.ENVIRONMENT || 'staging';
 const CHANNELS_TABLE                 = process.env.CALENDAR_WATCH_CHANNELS_TABLE || `picasso-calendar-watch-channels-${ENV}`;
 const BOOKING_TABLE                  = process.env.BOOKING_TABLE || `picasso-booking-${ENV}`;
 const BOOKING_TENANT_START_INDEX     = process.env.BOOKING_TENANT_START_INDEX || 'tenantId-start_at-index';
-const EVENTS_QUEUE_URL               = process.env.EVENTS_QUEUE_URL || '';
+const EVENTS_TOPIC_ARN               = process.env.EVENTS_TOPIC_ARN || '';
 const REPLAY_WINDOW_SECONDS          = Number(process.env.REPLAY_WINDOW_SECONDS || '300');
 // Y5: safety cap on Google Calendar list-pages loop (pilot calendars are tiny;
 // this is a runaway-protection backstop, not a correctness limit).
@@ -144,20 +146,26 @@ function isWithinReplayWindow(receiptTimeMs, dispatchedAtIsoMs) {
   return ageMs <= REPLAY_WINDOW_SECONDS * 1000;
 }
 
-// ─── SQS dispatch ───────────────────────────────────────────────────────────────
-// Phase 2b typed dispatch.
+// ─── SNS fan-out publish (I2-A cutover) ──────────────────────────────────────────
+// Phase 2b typed dispatch, now PUBLISHED to the SNS FIFO fan-out topic instead of
+// SendMessage'd directly to a single SQS queue. The topic fans out to per-consumer
+// FIFO queues by an event_type filter policy (FilterPolicyScope=MessageBody,
+// raw_message_delivery=true), so the consumer's record.body is this bare envelope
+// JSON. The filter reads the envelope's top-level `event_type` — unchanged here.
 //
 // MessageGroupId  == event_id (== booking_id) so events for the same booking
-//                    process in order; different bookings are concurrent.
-// MessageDeduplicationId == sha256(channel_id + ":" + event_id + ":" + last_calendar_mutation_at)
-//                    — channel_id is platform-controlled, so an attacker who
-//                    controls booking_id + event.updated cannot forge a
-//                    dedup-collision against a legitimate event on a different
-//                    channel.  channel_id is NOT added to the message body.
+//                    process in order; different bookings are concurrent. (SNS FIFO
+//                    propagates MessageGroupId to each subscribed FIFO queue.)
+// MessageDeduplicationId == sha256(channel_id + ":" + ... ) — the topic has
+//                    content_based_deduplication=false, so we supply it explicitly
+//                    (propagated to each subscribed queue). channel_id is
+//                    platform-controlled, so an attacker who controls booking_id +
+//                    event.updated cannot forge a dedup-collision against a
+//                    legitimate event on a different channel.
 
 async function dispatchTypedEvent(envelope, channelId) {
-  if (!EVENTS_QUEUE_URL) {
-    warn('dispatch_skipped_no_queue_url', { envelope_event_type: envelope.event_type });
+  if (!EVENTS_TOPIC_ARN) {
+    warn('dispatch_skipped_no_topic_arn', { envelope_event_type: envelope.event_type });
     return;
   }
   // Row 5: dedup basis includes event_type (separates calendar_moved + attendee_accepted
@@ -165,10 +173,10 @@ async function dispatchTypedEvent(envelope, channelId) {
   // attendee_email ?? '' makes the formula stable for non-attendee envelopes.
   // These fields are added to the dedup basis only — NOT to the message body.
   const dedupBasis = `${channelId}:${envelope.event_type}:${envelope.event_id}:${envelope.attendee_email ?? ''}:${envelope.last_calendar_mutation_at}`;
-  await sqs.send(
-    new SendMessageCommand({
-      QueueUrl: EVENTS_QUEUE_URL,
-      MessageBody: JSON.stringify(envelope),
+  await sns.send(
+    new PublishCommand({
+      TopicArn: EVENTS_TOPIC_ARN,
+      Message: JSON.stringify(envelope),
       MessageGroupId: envelope.event_id,
       MessageDeduplicationId: sha256Hex(dedupBasis),
     })
@@ -273,13 +281,17 @@ async function advanceSyncToken(channelId, oldToken, newToken) {
 // A single changed event can produce at most one envelope per distinct event_type,
 // but the OOO path can produce an envelope independent of any booking_id on the event.
 
-async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarProvider) {
+async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarProvider, channelId) {
   const envelopes = [];
   const mutatedAt = calEvent.updated ?? new Date().toISOString();
 
   // ── OOO-overlap path (does NOT require a platform booking_id on the event) ──
-  // eventType 'outOfOffice' or working-location events are treated as OOO.
-  const isOoo = calEvent.eventType === 'outOfOffice' || calEvent.eventType === 'workingLocation';
+  // ONLY eventType 'outOfOffice' is a real absence. 'workingLocation' (WFH/office/
+  // travel) is NOT absence — treating it as OOO would false-positive-reoffer/cancel
+  // valid bookings, so it is EXCLUDED (dispatch-interface audit row 12, RESOLVED
+  // 2026-05-31 operator decision). B9 consumers therefore treat every
+  // ooo_overlap_detected envelope as a genuine absence with no subtype filtering.
+  const isOoo = calEvent.eventType === 'outOfOffice';
   if (isOoo) {
     const oooStart = calEvent.start?.dateTime ?? calEvent.start?.date ?? null;
     const oooEnd   = calEvent.end?.dateTime   ?? calEvent.end?.date   ?? null;
@@ -366,8 +378,15 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
   }
 
   // ── Private ──
+  // channel_id is added to THIS envelope only (not commonFields): the lifecycle
+  // consumer's event_made_private handler degrades the watch-channel row, which is
+  // keyed by channel_id, and the channels table has no GSI to resolve it from
+  // tenant_id/booking_id (Calendar_Lifecycle_Consumer/channel-degrade.js CONTRACT
+  // GAP). channel_id is platform-controlled (the validated X-Goog-Channel-ID) and
+  // the consumer's degrade is tenant_id-guarded, so this cannot cross-tenant degrade.
+  // No other event type's consumer needs channel_id, so it stays out of commonFields.
   if (calEvent.visibility === 'private' || calEvent.visibility === 'confidential') {
-    envelopes.push({ event_type: 'booking.event_made_private', ...commonFields });
+    envelopes.push({ event_type: 'booking.event_made_private', ...commonFields, channel_id: channelId });
     return envelopes;
   }
 
@@ -437,7 +456,7 @@ function resolveResourceId(calEvent) {
 
 // ─── Delta-discovery + typed dispatch ───────────────────────────────────────────
 // Called after token validation succeeds.  Returns 200 on success, 500 on
-// infrastructure failure (so Google retries — idempotent at SQS dedup level).
+// infrastructure failure (so Google retries — idempotent at SNS FIFO dedup level).
 // Individual changed-event errors are logged + continued, not propagated.
 
 async function processDelta(channel, channelId) {
@@ -551,11 +570,11 @@ async function processDelta(channel, channelId) {
   // R2: dispatch first, then advance the token.  Advancing first and then
   // failing dispatch silently loses events (Google retried, token already moved).
   // If any dispatch throws we stop the loop and return 500 — Google retries the
-  // push; SQS FIFO dedup + idempotent consumers make re-dispatch safe.
+  // push; SNS FIFO dedup (MessageDeduplicationId propagated to subscribed queues) + idempotent consumers make re-dispatch safe.
   for (const calEvent of allEvents) {
     let envelopes;
     try {
-      envelopes = await deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarProvider ?? 'google');
+      envelopes = await deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarProvider ?? 'google', channelId);
     } catch (err) {
       console.error(JSON.stringify({
         event: 'derive_typed_envelopes_failed',
@@ -586,7 +605,7 @@ async function processDelta(channel, channelId) {
           error:           err.message,
         }));
         // R2: stop the loop and return 500 — do NOT advance the token.
-        // Google will retry; SQS FIFO dedup prevents double-processing of the
+        // Google will retry; SNS FIFO dedup (MessageDeduplicationId propagated to subscribed queues) prevents double-processing of the
         // events we already dispatched successfully in this invocation.
         return { statusCode: 500, body: 'Internal Server Error' };
       }
@@ -601,7 +620,7 @@ async function processDelta(channel, channelId) {
       if (err.name === 'ConditionalCheckFailedException') {
         // R2: a concurrent invocation already advanced the token; our dispatches
         // above already succeeded.  The concurrent double-dispatch is handled by
-        // SQS FIFO dedup + idempotent consumers.  Return 200.
+        // SNS FIFO dedup (MessageDeduplicationId propagated to subscribed queues) + idempotent consumers.  Return 200.
         log('sync_token_race_lost', {
           channel_id: channelId,
           tenant_id: tenantId,
