@@ -456,7 +456,7 @@ function resolveResourceId(calEvent) {
 
 // ─── Delta-discovery + typed dispatch ───────────────────────────────────────────
 // Called after token validation succeeds.  Returns 200 on success, 500 on
-// infrastructure failure (so Google retries — idempotent at SQS dedup level).
+// infrastructure failure (so Google retries — idempotent at SNS FIFO dedup level).
 // Individual changed-event errors are logged + continued, not propagated.
 
 async function processDelta(channel, channelId) {
@@ -570,7 +570,7 @@ async function processDelta(channel, channelId) {
   // R2: dispatch first, then advance the token.  Advancing first and then
   // failing dispatch silently loses events (Google retried, token already moved).
   // If any dispatch throws we stop the loop and return 500 — Google retries the
-  // push; SQS FIFO dedup + idempotent consumers make re-dispatch safe.
+  // push; SNS FIFO dedup (MessageDeduplicationId propagated to subscribed queues) + idempotent consumers make re-dispatch safe.
   for (const calEvent of allEvents) {
     let envelopes;
     try {
@@ -605,7 +605,7 @@ async function processDelta(channel, channelId) {
           error:           err.message,
         }));
         // R2: stop the loop and return 500 — do NOT advance the token.
-        // Google will retry; SQS FIFO dedup prevents double-processing of the
+        // Google will retry; SNS FIFO dedup (MessageDeduplicationId propagated to subscribed queues) prevents double-processing of the
         // events we already dispatched successfully in this invocation.
         return { statusCode: 500, body: 'Internal Server Error' };
       }
@@ -620,7 +620,7 @@ async function processDelta(channel, channelId) {
       if (err.name === 'ConditionalCheckFailedException') {
         // R2: a concurrent invocation already advanced the token; our dispatches
         // above already succeeded.  The concurrent double-dispatch is handled by
-        // SQS FIFO dedup + idempotent consumers.  Return 200.
+        // SNS FIFO dedup (MessageDeduplicationId propagated to subscribed queues) + idempotent consumers.  Return 200.
         log('sync_token_race_lost', {
           channel_id: channelId,
           tenant_id: tenantId,

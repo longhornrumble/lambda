@@ -11,7 +11,7 @@
  *  - POST sync handshake returns 200, no dispatch
  *  - POST happy path: channel lookup OK, hash match, replay window OK,
  *    OAuth client built, listChangedEvents called, typed event dispatched to
- *    SQS FIFO with MessageGroupId=booking_id (NOT channel_id)
+ *    SNS FIFO topic with MessageGroupId=booking_id (NOT channel_id)
  *  - Unsupported HTTP method returns 405
  *  - Pure-helper tests: sha256Hex, validateToken, isWithinReplayWindow,
  *    getHeader case-insensitivity
@@ -19,7 +19,7 @@
  *  - Phase 2b integration tests: processDelta scenarios
  *  - CI-3b contract test: all 7 event_types have a derivation branch
  *
- * Uses aws-sdk-client-mock to intercept DDB + SQS without hitting AWS.
+ * Uses aws-sdk-client-mock to intercept DDB + SNS without hitting AWS.
  * Mocks oauth-client and calendar-api for handler integration tests.
  */
 
@@ -275,7 +275,7 @@ describe('POST typed dispatch', () => {
     };
   }
 
-  test('happy path: lookup + hash match + typed SQS dispatch with MessageGroupId=booking_id', async () => {
+  test('happy path: lookup + hash match + SNS FIFO publish with MessageGroupId=booking_id', async () => {
     ddbMock.on(GetItemCommand).resolves(makeChannelRow());
     // advanceSyncToken UpdateItem succeeds
     ddbMock.on(UpdateItemCommand).resolves({});
@@ -294,6 +294,9 @@ describe('POST typed dispatch', () => {
     expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);
 
     const sentCall = snsMock.commandCalls(PublishCommand)[0];
+    // The publish MUST target the SNS FIFO fan-out topic (the core of the I2-A flip —
+    // without this assertion the mock intercepts any PublishCommand regardless of target).
+    expect(sentCall.args[0].input.TopicArn).toBe(process.env.EVENTS_TOPIC_ARN);
     // MessageGroupId MUST be booking_id, not channel_id (Phase 2b contract change)
     expect(sentCall.args[0].input.MessageGroupId).toBe(BOOKING_ID);
 
@@ -315,7 +318,36 @@ describe('POST typed dispatch', () => {
     expect(body.calendar_provider).toBe('google');
   });
 
-  test('no changed events → 200, no SQS dispatch', async () => {
+  test('event_made_private: channel_id present in the SNS Message body (full handler path)', async () => {
+    // Integration-level guard: a future refactor that strips channel_id at the
+    // dispatchTypedEvent call site would pass the derive-level unit test but break
+    // channel degradation silently. Assert it survives end-to-end into the publish.
+    ddbMock.on(GetItemCommand).resolves(makeChannelRow());
+    ddbMock.on(UpdateItemCommand).resolves({});
+    snsMock.on(PublishCommand).resolves({ MessageId: 'mid-private' });
+    getOAuthClient.mockResolvedValue(FAKE_AUTH);
+    listChangedEvents.mockResolvedValue({
+      events: [{
+        id: 'g-evt-private',
+        status: 'confirmed',
+        visibility: 'private',
+        updated: '2026-05-29T12:00:00Z',
+        extendedProperties: { private: { booking_id: BOOKING_ID } },
+      }],
+      nextSyncToken: 'sync-tok-2',
+      nextPageToken: null,
+    });
+
+    const response = await handler(makePostEvent(validHeaders()));
+    expect(response.statusCode).toBe(200);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);
+    const body = JSON.parse(snsMock.commandCalls(PublishCommand)[0].args[0].input.Message);
+    expect(body.event_type).toBe('booking.event_made_private');
+    // CHANNEL_ID is the handler's validated X-Goog-Channel-ID, threaded through to the envelope.
+    expect(body.channel_id).toBe(CHANNEL_ID);
+  });
+
+  test('no changed events → 200, no SNS publish', async () => {
     ddbMock.on(GetItemCommand).resolves(makeChannelRow());
     ddbMock.on(UpdateItemCommand).resolves({});
     getOAuthClient.mockResolvedValue(FAKE_AUTH);
@@ -439,7 +471,7 @@ describe('POST typed dispatch', () => {
     expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 2);
   });
 
-  test('R2: SQS dispatch failure → 500 and stops the loop (syncToken NOT advanced)', async () => {
+  test('R2: SNS publish failure → 500 and stops the loop (syncToken NOT advanced)', async () => {
     // R2: if any dispatchTypedEvent throws, the loop must stop and return 500
     // WITHOUT advancing the syncToken. Google retries; SQS FIFO dedup prevents
     // double-dispatch of the events that were already sent.
@@ -454,7 +486,7 @@ describe('POST typed dispatch', () => {
       nextPageToken: null,
     });
     snsMock.on(PublishCommand)
-      .rejectsOnce(new Error('SQS throttled'))
+      .rejectsOnce(new Error('SNS:Publish rate exceeded'))
       .resolves({ MessageId: 'mid-ok' });
 
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
@@ -591,12 +623,25 @@ describe('deriveTypedEnvelopes', () => {
     expect(envelopes[0].channel_id).toBeUndefined();
   });
 
-  test('confidential event → booking.event_made_private', async () => {
+  test('confidential event → booking.event_made_private (also carries channel_id)', async () => {
     const envelopes = await _test.deriveTypedEnvelopes(
-      makeCalEvent({ visibility: 'confidential' }), TENANT_ID, COORDINATOR_ID, PROVIDER
+      makeCalEvent({ visibility: 'confidential' }), TENANT_ID, COORDINATOR_ID, PROVIDER, CHANNEL_ID
     );
     expect(envelopes).toHaveLength(1);
     expect(envelopes[0].event_type).toBe('booking.event_made_private');
+    // 'confidential' hits the same branch as 'private' — channel_id must be present here too.
+    expect(envelopes[0].channel_id).toBe(CHANNEL_ID);
+  });
+
+  test('event_made_private with channelId undefined → channel_id absent (forward-compat: consumer tolerates it)', async () => {
+    const envelopes = await _test.deriveTypedEnvelopes(
+      makeCalEvent({ visibility: 'private' }), TENANT_ID, COORDINATOR_ID, PROVIDER // no channelId
+    );
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].event_type).toBe('booking.event_made_private');
+    // Key present with undefined value is fine: the lifecycle consumer guards `if (channelId)`
+    // and falls back to alert-without-degrade. Assert it does not carry a real channel_id.
+    expect(envelopes[0].channel_id).toBeUndefined();
   });
 
   test('event with no booking_id → skipped (empty array)', async () => {
@@ -1056,7 +1101,7 @@ describe('Row 7: listChangedEvents 401 → clearCacheEntry + 500', () => {
 // ─── Row 6: missing calendarId → 200 + warning, no dispatch ─────────────────────
 
 describe('Row 6: missing calendarId guard in processDelta', () => {
-  test('channel row with no calendar_id returns 200 with warning and no OAuth/SQS calls', async () => {
+  test('channel row with no calendar_id returns 200 with warning and no OAuth/SNS calls', async () => {
     // calendar_id missing from the channel row
     ddbMock.on(GetItemCommand).resolves(makeChannelRow({ calendar_id: undefined }));
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
