@@ -1,0 +1,48 @@
+{
+  "name": "scheduling-redemption-handler",
+  "version": "1.0.0",
+  "description": "Scheduling_Redemption_Handler — scheduling sub-phase D Task D4. The one-tap action-token redemption endpoint behind the WS-D3 schedule.myrecruiter.ai CloudFront distribution (Function URL origin). Maps the six §13.8 URL slugs to token purposes, validates + atomically one-time-redeems via shared/scheduling/tokens.js (§13.7), then either writes the §B10 session-context binding row + redirects the volunteer into chat (cancel/reschedule/recovery — token authenticates ENTRY only; the calendar op runs in-chat after confirm, WS-D6/D7) or renders a thin attendance acknowledgement (interviewer dispositions are TODO(E6)). Function URL + IAM + Terraform are the integrator's glue.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@smithy/node-http-handler": "^4.0.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js"
+    ],
+    "moduleNameMapper": {
+      "^@aws-sdk/client-dynamodb$": "<rootDir>/node_modules/@aws-sdk/client-dynamodb",
+      "^@aws-sdk/client-secrets-manager$": "<rootDir>/node_modules/@aws-sdk/client-secrets-manager"
+    },
+    "coverageThreshold": {
+      "global": {
+        "branches": 85,
+        "functions": 100,
+        "lines": 90,
+        "statements": 90
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
