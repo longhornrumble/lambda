@@ -13,7 +13,7 @@ const ddb = new DynamoDBClient({ region: REGION });
 const SESSION_ID_RE = /^[a-zA-Z0-9_-]{1,128}$/;
 const TENANT_HASH_RE = /^[a-zA-Z0-9]{10,20}$/;
 const FIRST_QUESTION_MAX_CHARS = 50;
-const TTL_DAYS = 90;
+const TTL_DAYS = 365; // 12-month pseudonymized-summary retention (data-retention-strategy.md §2/§9; DDB-only)
 
 const REASON_ENUM = new Set([
   'invalid_session_id_format',

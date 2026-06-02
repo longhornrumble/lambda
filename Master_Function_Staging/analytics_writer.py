@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 SESSION_ID_RE = re.compile(r'^[a-zA-Z0-9_-]{1,128}$')
 TENANT_HASH_RE = re.compile(r'^[a-zA-Z0-9]{10,20}$')
 FIRST_QUESTION_MAX_CHARS = 50
-TTL_DAYS = 90
+TTL_DAYS = 365  # 12-month pseudonymized-summary retention (data-retention-strategy.md §2/§9; DDB-only)
 
 REASON_ENUM = frozenset({
     'invalid_session_id_format',

@@ -22,7 +22,7 @@ const {
 const { redactPII } = require('../redactPII');
 const contract = require('../analytics_writer_contract.json');
 
-const TTL_DAYS = 90;
+const TTL_DAYS = 365; // mirrors analytics_writer.js (12-month summary retention)
 const expectedTtl = (iso) => Math.floor(Date.parse(iso) / 1000) + TTL_DAYS * 86400;
 
 const baseInput = {
