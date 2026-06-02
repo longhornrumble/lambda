@@ -4,7 +4,7 @@ import * as esbuild from 'esbuild';
 // googleapis + google-auth-library are NOT in the runtime; they must bundle.
 const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
-  '@aws-sdk/client-sqs',
+  '@aws-sdk/client-sns',
   '@aws-sdk/client-secrets-manager',
 ];
 

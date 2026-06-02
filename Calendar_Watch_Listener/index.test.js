@@ -28,7 +28,7 @@ const { mockClient } = require('aws-sdk-client-mock');
 require('aws-sdk-client-mock-jest');
 
 const { DynamoDBClient, GetItemCommand, UpdateItemCommand, QueryCommand } = require('@aws-sdk/client-dynamodb');
-const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 
 // ─── Mock oauth-client and calendar-api before requiring index ──────────────────
 // These are module-level mocks; jest.mock() is hoisted above all requires.
@@ -47,13 +47,13 @@ const { getOAuthClient, clearCacheEntry } = require('./oauth-client');
 const { listChangedEvents } = require('./calendar-api');
 
 const ddbMock = mockClient(DynamoDBClient);
-const sqsMock = mockClient(SQSClient);
+const snsMock = mockClient(SNSClient);
 
 // ─── Env setup ──────────────────────────────────────────────────────────────────
 
 process.env.ENVIRONMENT                   = 'staging';
 process.env.CALENDAR_WATCH_CHANNELS_TABLE = 'picasso-calendar-watch-channels-staging';
-process.env.EVENTS_QUEUE_URL              = 'https://sqs.us-east-1.amazonaws.com/525409062831/picasso-calendar-watch-events-staging.fifo';
+process.env.EVENTS_TOPIC_ARN              = 'arn:aws:sns:us-east-1:525409062831:picasso-calendar-watch-events-staging.fifo';
 process.env.REPLAY_WINDOW_SECONDS         = '300';
 
 // Lazy-require after env so module-load reads our test values
@@ -120,7 +120,7 @@ function validHeaders(overrides = {}) {
 
 beforeEach(() => {
   ddbMock.reset();
-  sqsMock.reset();
+  snsMock.reset();
   getOAuthClient.mockReset();
   clearCacheEntry.mockReset();
   listChangedEvents.mockReset();
@@ -204,7 +204,7 @@ describe('POST malformed_payload', () => {
     const response = await handler(makePostEvent(headers));
     expect(response.statusCode).toBe(400);
     expect(ddbMock.calls()).toHaveLength(0);
-    expect(sqsMock.calls()).toHaveLength(0);
+    expect(snsMock.calls()).toHaveLength(0);
   });
 
   test('missing channel-token returns 400', async () => {
@@ -236,14 +236,14 @@ describe('POST auth_rejected', () => {
     ddbMock.on(GetItemCommand).resolves({}); // empty Item
     const response = await handler(makePostEvent(validHeaders()));
     expect(response.statusCode).toBe(403);
-    expect(sqsMock.calls()).toHaveLength(0);
+    expect(snsMock.calls()).toHaveLength(0);
   });
 
   test('channel-token hash mismatch returns 403', async () => {
     ddbMock.on(GetItemCommand).resolves(makeChannelRow());
     const response = await handler(makePostEvent(validHeaders({ 'x-goog-channel-token': 'wrong-token' })));
     expect(response.statusCode).toBe(403);
-    expect(sqsMock.calls()).toHaveLength(0);
+    expect(snsMock.calls()).toHaveLength(0);
   });
 });
 
@@ -255,7 +255,7 @@ describe('POST sync', () => {
     const response = await handler(makePostEvent(validHeaders({ 'x-goog-resource-state': 'sync' })));
     expect(response.statusCode).toBe(200);
     expect(ddbMock.calls()).toHaveLength(0);
-    expect(sqsMock.calls()).toHaveLength(0);
+    expect(snsMock.calls()).toHaveLength(0);
   });
 });
 
@@ -279,7 +279,7 @@ describe('POST typed dispatch', () => {
     ddbMock.on(GetItemCommand).resolves(makeChannelRow());
     // advanceSyncToken UpdateItem succeeds
     ddbMock.on(UpdateItemCommand).resolves({});
-    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid-typed' });
+    snsMock.on(PublishCommand).resolves({ MessageId: 'mid-typed' });
     getOAuthClient.mockResolvedValue(FAKE_AUTH);
     listChangedEvents.mockResolvedValue({
       events: [makeCancelledCalEvent(BOOKING_ID)],
@@ -291,9 +291,9 @@ describe('POST typed dispatch', () => {
     expect(response.statusCode).toBe(200);
     expect(getOAuthClient).toHaveBeenCalledWith({ tenantId: TENANT_ID, coordinatorId: COORDINATOR_ID });
     expect(listChangedEvents).toHaveBeenCalledWith(FAKE_AUTH, CALENDAR_ID, 'sync-tok-1', null);
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 1);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);
 
-    const sentCall = sqsMock.commandCalls(SendMessageCommand)[0];
+    const sentCall = snsMock.commandCalls(PublishCommand)[0];
     // MessageGroupId MUST be booking_id, not channel_id (Phase 2b contract change)
     expect(sentCall.args[0].input.MessageGroupId).toBe(BOOKING_ID);
 
@@ -301,7 +301,7 @@ describe('POST typed dispatch', () => {
     // attacker cannot forge a dedup-collision by controlling booking_id + updated.
     // Row 5: basis also includes event_type and attendee_email to discriminate
     // per-envelope within a single calendar event.
-    const body = JSON.parse(sentCall.args[0].input.MessageBody);
+    const body = JSON.parse(sentCall.args[0].input.Message);
     const expectedDedupBasis = `${CHANNEL_ID}:${body.event_type}:${BOOKING_ID}:${body.attendee_email ?? ''}:${body.last_calendar_mutation_at}`;
     const expectedDedupId = crypto.createHash('sha256').update(expectedDedupBasis).digest('hex');
     expect(sentCall.args[0].input.MessageDeduplicationId).toBe(expectedDedupId);
@@ -323,7 +323,7 @@ describe('POST typed dispatch', () => {
 
     const response = await handler(makePostEvent(validHeaders()));
     expect(response.statusCode).toBe(200);
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 0);
   });
 
   test('non-platform event (no booking_id) is skipped, 200 returned', async () => {
@@ -339,7 +339,7 @@ describe('POST typed dispatch', () => {
     const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
     const response = await handler(makePostEvent(validHeaders()));
     expect(response.statusCode).toBe(200);
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 0);
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('skipped_non_platform_event'));
     logSpy.mockRestore();
   });
@@ -366,7 +366,7 @@ describe('POST typed dispatch', () => {
     const condErr = new Error('ConditionalCheckFailed');
     condErr.name = 'ConditionalCheckFailedException';
     ddbMock.on(UpdateItemCommand).rejects(condErr);
-    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid-race' });
+    snsMock.on(PublishCommand).resolves({ MessageId: 'mid-race' });
     getOAuthClient.mockResolvedValue(FAKE_AUTH);
     listChangedEvents.mockResolvedValue({
       events: [makeCancelledCalEvent(BOOKING_ID)],
@@ -378,7 +378,7 @@ describe('POST typed dispatch', () => {
     const response = await handler(makePostEvent(validHeaders()));
     expect(response.statusCode).toBe(200);
     // R2: SQS dispatch succeeded before the race was detected
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 1);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);
     expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('sync_token_race_lost'));
     logSpy.mockRestore();
   });
@@ -413,14 +413,14 @@ describe('POST typed dispatch', () => {
     const response = await handler(makePostEvent(validHeaders()));
     expect(response.statusCode).toBe(200);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('delta_skipped_no_coordinator_id'));
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 0);
     warnSpy.mockRestore();
   });
 
   test('pagination: loops until nextPageToken exhausted, dispatches all events', async () => {
     ddbMock.on(GetItemCommand).resolves(makeChannelRow());
     ddbMock.on(UpdateItemCommand).resolves({});
-    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid' });
+    snsMock.on(PublishCommand).resolves({ MessageId: 'mid' });
     getOAuthClient.mockResolvedValue(FAKE_AUTH);
 
     // First call (syncToken) returns nextPageToken
@@ -436,7 +436,7 @@ describe('POST typed dispatch', () => {
     expect(listChangedEvents.mock.calls[0]).toEqual([FAKE_AUTH, CALENDAR_ID, 'sync-tok-1', null]);
     // Second call: no syncToken, pageToken from first page
     expect(listChangedEvents.mock.calls[1]).toEqual([FAKE_AUTH, CALENDAR_ID, null, 'page-2']);
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 2);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 2);
   });
 
   test('R2: SQS dispatch failure → 500 and stops the loop (syncToken NOT advanced)', async () => {
@@ -453,7 +453,7 @@ describe('POST typed dispatch', () => {
       nextSyncToken: 'sync-tok-2',
       nextPageToken: null,
     });
-    sqsMock.on(SendMessageCommand)
+    snsMock.on(PublishCommand)
       .rejectsOnce(new Error('SQS throttled'))
       .resolves({ MessageId: 'mid-ok' });
 
@@ -462,7 +462,7 @@ describe('POST typed dispatch', () => {
     // R2: must return 500 so Google retries
     expect(response.statusCode).toBe(500);
     // Only one SQS attempt was made before the loop stopped
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 1);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 1);
     expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('dispatch_typed_event_failed'));
     // syncToken must NOT have been advanced
     expect(ddbMock).not.toHaveReceivedCommand(UpdateItemCommand);
@@ -547,7 +547,7 @@ describe('deriveTypedEnvelopes', () => {
   // Booking lookup mock: default returns null (no booking record)
   beforeEach(() => {
     ddbMock.reset();
-    sqsMock.reset();
+    snsMock.reset();
   });
 
   function makeCalEvent(overrides = {}) {
@@ -571,12 +571,24 @@ describe('deriveTypedEnvelopes', () => {
     expect(envelopes[0].calendar_provider).toBe('google');
   });
 
-  test('private event → booking.event_made_private', async () => {
+  test('private event → booking.event_made_private (carries channel_id for the lifecycle consumer)', async () => {
     const envelopes = await _test.deriveTypedEnvelopes(
-      makeCalEvent({ visibility: 'private' }), TENANT_ID, COORDINATOR_ID, PROVIDER
+      makeCalEvent({ visibility: 'private' }), TENANT_ID, COORDINATOR_ID, PROVIDER, CHANNEL_ID
     );
     expect(envelopes).toHaveLength(1);
     expect(envelopes[0].event_type).toBe('booking.event_made_private');
+    // channel_id is REQUIRED on THIS envelope so the lifecycle consumer can degrade
+    // the channels-table row (keyed by channel_id; no GSI to resolve it otherwise).
+    expect(envelopes[0].channel_id).toBe(CHANNEL_ID);
+  });
+
+  test('channel_id is added ONLY to event_made_private (calendar_deleted omits it even when channelId passed)', async () => {
+    const envelopes = await _test.deriveTypedEnvelopes(
+      makeCalEvent({ status: 'cancelled' }), TENANT_ID, COORDINATOR_ID, PROVIDER, CHANNEL_ID
+    );
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].event_type).toBe('booking.calendar_deleted');
+    expect(envelopes[0].channel_id).toBeUndefined();
   });
 
   test('confidential event → booking.event_made_private', async () => {
@@ -838,7 +850,7 @@ describe('CI-3b: every exported event_type has a reachable derivation branch', (
 // ─── Error-path coverage for catch blocks ───────────────────────────────────────
 
 describe('deriveTypedEnvelopes error paths', () => {
-  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+  beforeEach(() => { ddbMock.reset(); snsMock.reset(); });
 
   test('booking_lookup_failed: DDB error is warned, attendee events still emitted', async () => {
     ddbMock.on(GetItemCommand).rejects(new Error('DDB read error'));
@@ -890,7 +902,7 @@ describe('handler edge cases', () => {
 // ─── R1: cross-tenant booking guard ─────────────────────────────────────────────
 
 describe('R1: cross-tenant booking guard', () => {
-  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+  beforeEach(() => { ddbMock.reset(); snsMock.reset(); });
 
   test('booking whose tenantId differs from channel tenantId yields no calendar_moved or calendar_reassigned', async () => {
     // booking_id on the calendar event belongs to a DIFFERENT tenant
@@ -951,7 +963,7 @@ describe('R3: syncToken 410 expiry clears token and returns 200', () => {
     // Warning emitted
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('sync_token_expired_cleared'));
     // No SQS dispatch
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 0);
     warnSpy.mockRestore();
   });
 
@@ -989,7 +1001,7 @@ describe('R3: syncToken 410 expiry clears token and returns 200', () => {
 // 401/invalid_grant from listChangedEvents must evict the cache entry and return 500.
 
 describe('Row 7: listChangedEvents 401 → clearCacheEntry + 500', () => {
-  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+  beforeEach(() => { ddbMock.reset(); snsMock.reset(); });
 
   test('401 code from listChangedEvents clears cache entry and returns 500', async () => {
     ddbMock.on(GetItemCommand).resolves(makeChannelRow());
@@ -1005,7 +1017,7 @@ describe('Row 7: listChangedEvents 401 → clearCacheEntry + 500', () => {
     expect(clearCacheEntry).toHaveBeenCalledWith({ tenantId: TENANT_ID, coordinatorId: COORDINATOR_ID });
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('oauth_token_rejected_cache_cleared'));
     // Must NOT dispatch any SQS message
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 0);
     warnSpy.mockRestore();
   });
 
@@ -1056,7 +1068,7 @@ describe('Row 6: missing calendarId guard in processDelta', () => {
     // No OAuth, no listChangedEvents, no SQS
     expect(getOAuthClient).not.toHaveBeenCalled();
     expect(listChangedEvents).not.toHaveBeenCalled();
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 0);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 0);
     warnSpy.mockRestore();
   });
 });
@@ -1087,7 +1099,7 @@ describe('Row 14: advanceSyncToken uses attribute_not_exists when no prior token
     const channelRowNoToken = makeChannelRow({ last_sync_token: undefined });
     ddbMock.on(GetItemCommand).resolves(channelRowNoToken);
     ddbMock.on(UpdateItemCommand).resolves({});
-    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid' });
+    snsMock.on(PublishCommand).resolves({ MessageId: 'mid' });
     getOAuthClient.mockResolvedValue(FAKE_AUTH);
     listChangedEvents.mockResolvedValue({
       events: [],
@@ -1145,34 +1157,22 @@ describe('Row 15: forward-compat — Booking row with missing tenant_id proceeds
   });
 });
 
-// ─── Row 12: workingLocation runs the OOO path ───────────────────────────────────
-// workingLocation events must run identically to outOfOffice so a string
-// typo in the eventType check would fail CI.
+// ─── Row 12 (RESOLVED 2026-05-31): workingLocation is EXCLUDED from OOO ───────────
+// workingLocation (WFH/office/travel) is NOT an absence. The OOO trigger is gated
+// on eventType === 'outOfOffice' ONLY (dispatch-interface audit row 12, operator
+// decision). A workingLocation event must NOT produce booking.ooo_overlap_detected
+// even when bookings overlap its window — treating it as OOO would
+// false-positive-reoffer/cancel valid bookings. It carries no platform booking_id,
+// so it is skipped as a non-platform event.
 
-describe('Row 12: workingLocation runs OOO overlap path', () => {
-  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+describe('Row 12: workingLocation is EXCLUDED from OOO-overlap', () => {
+  beforeEach(() => { ddbMock.reset(); snsMock.reset(); });
 
-  test('eventType=workingLocation with overlapping bookings → booking.ooo_overlap_detected', async () => {
-    ddbMock.on(QueryCommand).resolves({
-      Items: [{ booking_id: { S: 'bk-wl-1' } }],
-    });
-    const wlEvent = {
-      id: 'wl-evt',
-      eventType: 'workingLocation',
-      updated: '2026-05-29T12:00:00Z',
-      start: { dateTime: '2026-05-30T09:00:00Z' },
-      end:   { dateTime: '2026-05-30T17:00:00Z' },
-    };
-    const envelopes = await _test.deriveTypedEnvelopes(wlEvent, TENANT_ID, COORDINATOR_ID, 'google');
-    expect(envelopes).toHaveLength(1);
-    expect(envelopes[0].event_type).toBe('booking.ooo_overlap_detected');
-    expect(envelopes[0].booking_id).toBe('bk-wl-1');
-    expect(envelopes[0].ooo_start_at).toBe('2026-05-30T09:00:00Z');
-    expect(envelopes[0].overlapping_booking_ids).toEqual(['bk-wl-1']);
-  });
-
-  test('eventType=workingLocation with NO overlapping bookings → empty array', async () => {
-    ddbMock.on(QueryCommand).resolves({ Items: [] });
+  test('eventType=workingLocation with overlapping bookings → NO ooo_overlap (excluded), empty array', async () => {
+    // Even though the GSI WOULD return an overlap, the OOO path is never entered for
+    // workingLocation, so the booked-booking GSI is not consulted and no envelope is produced.
+    ddbMock.on(QueryCommand).resolves({ Items: [{ booking_id: { S: 'bk-wl-1' } }] });
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
     const wlEvent = {
       id: 'wl-evt',
       eventType: 'workingLocation',
@@ -1182,6 +1182,27 @@ describe('Row 12: workingLocation runs OOO overlap path', () => {
     };
     const envelopes = await _test.deriveTypedEnvelopes(wlEvent, TENANT_ID, COORDINATOR_ID, 'google');
     expect(envelopes).toHaveLength(0);
+    expect(envelopes.find(e => e.event_type === 'booking.ooo_overlap_detected')).toBeUndefined();
+    // OOO path skipped → the booked-booking GSI is never queried.
+    expect(ddbMock).not.toHaveReceivedCommand(QueryCommand);
+    // Falls through to the platform path; no booking_id → skipped as non-platform.
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('skipped_non_platform_event'));
+    logSpy.mockRestore();
+  });
+
+  test('control: eventType=outOfOffice still runs the OOO path → ooo_overlap_detected', async () => {
+    ddbMock.on(QueryCommand).resolves({ Items: [{ booking_id: { S: 'bk-ooo-control' } }] });
+    const oooEvent = {
+      id: 'ooo-evt',
+      eventType: 'outOfOffice',
+      updated: '2026-05-29T12:00:00Z',
+      start: { dateTime: '2026-05-30T09:00:00Z' },
+      end:   { dateTime: '2026-05-30T17:00:00Z' },
+    };
+    const envelopes = await _test.deriveTypedEnvelopes(oooEvent, TENANT_ID, COORDINATOR_ID, 'google');
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].event_type).toBe('booking.ooo_overlap_detected');
+    expect(envelopes[0].overlapping_booking_ids).toEqual(['bk-ooo-control']);
   });
 });
 
@@ -1190,7 +1211,7 @@ describe('Row 12: workingLocation runs OOO overlap path', () => {
 // tenant must return [] (no calendar_deleted envelope).
 
 describe('Row 4: cross-tenant guard fires before cancelled/private branches', () => {
-  beforeEach(() => { ddbMock.reset(); sqsMock.reset(); });
+  beforeEach(() => { ddbMock.reset(); snsMock.reset(); });
 
   test('cancelled event with foreign-tenant booking → no calendar_deleted envelope', async () => {
     ddbMock.on(GetItemCommand).resolves({
@@ -1254,7 +1275,7 @@ describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee
   test('two attendees accepting produce two distinct MessageDeduplicationIds', async () => {
     ddbMock.on(GetItemCommand).resolves({}); // no booking record
     ddbMock.on(UpdateItemCommand).resolves({});
-    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid' });
+    snsMock.on(PublishCommand).resolves({ MessageId: 'mid' });
     getOAuthClient.mockResolvedValue(FAKE_AUTH);
 
     const mutatedAt = '2026-05-29T12:00:00Z';
@@ -1281,9 +1302,9 @@ describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee
     expect(response.statusCode).toBe(200);
 
     // Two attendee_accepted envelopes must have been dispatched
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 2);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 2);
 
-    const calls = sqsMock.commandCalls(SendMessageCommand);
+    const calls = snsMock.commandCalls(PublishCommand);
     const dedupId1 = calls[0].args[0].input.MessageDeduplicationId;
     const dedupId2 = calls[1].args[0].input.MessageDeduplicationId;
 
@@ -1291,8 +1312,8 @@ describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee
     expect(dedupId1).not.toBe(dedupId2);
 
     // Verify the formula: channel_id:event_type:event_id:attendee_email:last_mutation_at
-    const body1 = JSON.parse(calls[0].args[0].input.MessageBody);
-    const body2 = JSON.parse(calls[1].args[0].input.MessageBody);
+    const body1 = JSON.parse(calls[0].args[0].input.Message);
+    const body2 = JSON.parse(calls[1].args[0].input.Message);
     const basis1 = `${CHANNEL_ID}:${body1.event_type}:${BOOKING_ID}:${body1.attendee_email ?? ''}:${mutatedAt}`;
     const basis2 = `${CHANNEL_ID}:${body2.event_type}:${BOOKING_ID}:${body2.attendee_email ?? ''}:${mutatedAt}`;
     expect(dedupId1).toBe(crypto.createHash('sha256').update(basis1).digest('hex'));
@@ -1312,7 +1333,7 @@ describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee
       },
     });
     ddbMock.on(UpdateItemCommand).resolves({});
-    sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mid' });
+    snsMock.on(PublishCommand).resolves({ MessageId: 'mid' });
     getOAuthClient.mockResolvedValue(FAKE_AUTH);
 
     // Re-resolve makeChannelRow for the handler-level GetItemCommand
@@ -1349,9 +1370,9 @@ describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee
     expect(response.statusCode).toBe(200);
 
     // calendar_moved + attendee_accepted = 2 envelopes
-    expect(sqsMock).toHaveReceivedCommandTimes(SendMessageCommand, 2);
+    expect(snsMock).toHaveReceivedCommandTimes(PublishCommand, 2);
 
-    const calls = sqsMock.commandCalls(SendMessageCommand);
+    const calls = snsMock.commandCalls(PublishCommand);
     const dedupId1 = calls[0].args[0].input.MessageDeduplicationId;
     const dedupId2 = calls[1].args[0].input.MessageDeduplicationId;
     expect(dedupId1).not.toBe(dedupId2);
