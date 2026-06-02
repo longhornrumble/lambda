@@ -749,12 +749,14 @@ class TestS3ArchiveReadPath:
 
     def test_date_range_cutoff_triggers_archive(self):
         """_date_range_extends_past_ttl returns True iff start_date is older
-        than ARCHIVE_TTL_DAYS (90) days ago."""
+        than ARCHIVE_TTL_DAYS days ago. Constant-relative so it stays correct as the
+        retention window changes (90 -> 365 for 12-month summaries)."""
         from datetime import timedelta as td
         from datetime import datetime as dt
         from datetime import timezone as tz
-        old = (dt.now(tz.utc) - td(days=95)).strftime('%Y-%m-%d')
-        recent = (dt.now(tz.utc) - td(days=30)).strftime('%Y-%m-%d')
+        ttl = lambda_function.ARCHIVE_TTL_DAYS
+        old = (dt.now(tz.utc) - td(days=ttl + 5)).strftime('%Y-%m-%d')
+        recent = (dt.now(tz.utc) - td(days=ttl - 5)).strftime('%Y-%m-%d')
         assert lambda_function._date_range_extends_past_ttl({'start_date_iso': old}) is True
         assert lambda_function._date_range_extends_past_ttl({'start_date_iso': recent}) is False
         assert lambda_function._date_range_extends_past_ttl({}) is False

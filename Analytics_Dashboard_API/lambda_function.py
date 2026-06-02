@@ -2044,12 +2044,15 @@ def validate_feature_access(tenant_id: str, required_feature: str, user_role: Op
 # S3 Archive Read Path (Tier-3)
 # =============================================================================
 
-# DDB session-summaries are TTL-deleted at 90 days. The archiver Lambda writes
-# the OldImage to s3://picasso-archive-{env}/sessions/year=Y/month=M/day=D/{sid}.json
-# at archive-write time. ADA reads from S3 when a date-range request reaches
-# back past the TTL boundary.
+# DDB session-summaries are TTL-deleted at 365 days (12-month pseudonymized-summary
+# retention — data-retention-strategy.md §2/§9; DDB-only). Must stay in lock-step with
+# the writers' TTL_DAYS (analytics_writer.py / analytics_writer.js): this is the DDB↔archive
+# read boundary, so a mismatch causes a window where both DDB and the (staging-only) archive
+# hold the row → double-read/dedup. The (staging-only) archiver writes the OldImage to
+# s3://picasso-archive-{env}/sessions/...; ADA reads S3 only when a range reaches past this
+# boundary (prod has no archive, so reads stay on DDB for the full 365d).
 
-ARCHIVE_TTL_DAYS = 90
+ARCHIVE_TTL_DAYS = 365
 
 
 def _archived_item_to_session_shape(item: Dict[str, Any]) -> Dict[str, Any]:
