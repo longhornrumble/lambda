@@ -382,8 +382,10 @@ async function triggerStrandedRemediation(tenantId, coordinatorId, offboardingTi
     });
     return true;
   } catch (err) {
-    // sanitizeErrorMessage strips ARNs (the InvokeFunction AccessDenied message can
-    // carry the remediator ARN). The offboarding already succeeded — do not fail it.
+    // sanitizeErrorMessage redacts known ARN-bearing error names (AccessDenied/
+    // ResourceNotFound/UnrecognizedClient) — the InvokeFunction AccessDenied message can
+    // carry the remediator ARN. Other Invoke errors (throttle/ServiceException) carry no
+    // ARN. The offboarding already succeeded — a dispatch failure must not fail the run.
     warn('stranded_remediation_dispatch_failed', {
       tenant_id: tenantId,
       error: sanitizeErrorMessage(err),
@@ -401,6 +403,9 @@ exports.handler = async function handler(event) {
 
   // Offboarding moment — B11 strands every booking whose last calendar mutation
   // predates this (the ones the calendar admin didn't reassign/cancel themselves).
+  // Captured at handler ENTRY (before the channel-stop loop) on purpose: a booking
+  // mutated during the teardown loop will have last_calendar_mutation_at > this and
+  // is correctly EXCLUDED from the stranded set. The conservative direction.
   const offboardingTime = new Date().toISOString();
 
   const { tenantId, coordinatorId, channelId } = validateInput(event);
