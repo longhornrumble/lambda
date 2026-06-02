@@ -195,6 +195,41 @@ describe('volunteer-facing: valid → bind + redirect', () => {
       .filter((c) => c.args[0].input.TableName === SESSION_TABLE);
     expect(bindPuts).toHaveLength(0);
   });
+
+  // C-3: distinguish "token carried no booking_id" (invalid link → 400) from
+  // "booking_id present but not found" (404 above). recovery legitimately has none.
+  test('C-3: cancel token with no booking_id → 400 (invalid link), no binding', async () => {
+    const t = await tokens.sign(
+      'cancel',
+      { tenant_id: TENANT, start_at: FAR_FUTURE_START }, // deliberately no booking_id
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/cancel', t));
+    expect(res.statusCode).toBe(400);
+    expect(res.body).not.toMatch(/token|jwt|signature/i); // still no detail leak
+    const bindPuts = ddbMock
+      .commandCalls(PutItemCommand)
+      .filter((c) => c.args[0].input.TableName === SESSION_TABLE);
+    expect(bindPuts).toHaveLength(0);
+  });
+});
+
+describe('SR-2: SESSION_BINDING_TTL_SECONDS validated at module load', () => {
+  test.each([['abc'], ['0'], ['-5']])(
+    'invalid value %p fails fast (no silent NaN/expired binding)',
+    (bad) => {
+      const prev = process.env.SESSION_BINDING_TTL_SECONDS;
+      process.env.SESSION_BINDING_TTL_SECONDS = bad;
+      try {
+        expect(() =>
+          jest.isolateModules(() => require('../index.js'))
+        ).toThrow(/SESSION_BINDING_TTL_SECONDS/);
+      } finally {
+        if (prev === undefined) delete process.env.SESSION_BINDING_TTL_SECONDS;
+        else process.env.SESSION_BINDING_TTL_SECONDS = prev;
+      }
+    }
+  );
 });
 
 describe('interviewer attendance: real security path, disposition deferred', () => {

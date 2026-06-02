@@ -75,8 +75,18 @@ const SESSION_TABLE =
 // Integration seam: the chat-widget bootstrap target. Default staging per work-order.
 const CHAT_REDIRECT_BASE_URL =
   process.env.CHAT_REDIRECT_BASE_URL || 'https://staging.chat.myrecruiter.ai';
-// §9.4 — reschedule/cancel binding lives 30 minutes.
-const BINDING_TTL_SECONDS = Number(process.env.SESSION_BINDING_TTL_SECONDS || 1800);
+// §9.4 — reschedule/cancel binding lives 30 minutes. Validate at module load (SR-2): a
+// blank env var falls back to 1800 (ok), but a non-numeric value → NaN (DDB rejects the N
+// write → 500) and an explicit '0'/'-5' → already-expired/negative bindings. Fail fast.
+const BINDING_TTL_SECONDS = (() => {
+  const v = Number(process.env.SESSION_BINDING_TTL_SECONDS || 1800);
+  if (!Number.isFinite(v) || v <= 0) {
+    throw new Error(
+      `Invalid SESSION_BINDING_TTL_SECONDS: ${process.env.SESSION_BINDING_TTL_SECONDS}`
+    );
+  }
+  return v;
+})();
 
 // Bounded SDK client (#202: @smithy/node-http-handler must BUNDLE, not externalize).
 const REQUEST_TIMEOUT_MS = Number(process.env.AWS_REQUEST_TIMEOUT_MS || 5000);
@@ -351,6 +361,16 @@ exports.handler = async (event) => {
   }
 
   // ── Volunteer-facing: bind + redirect into chat (no calendar op here, §13.4). ──
+  // C-3: cancel/reschedule MUST carry a booking_id (C8 always sets it); a token minted
+  // without one targets no booking → a clear "invalid link" 400, not a misleading 404.
+  // (post_application_recovery legitimately has none — it carries form_submission_id.)
+  // The jti is already consumed by redeem() above; harmless for a booking_id-less token
+  // (it's unusable — nothing to retry). Mint-time enforcement is a follow-up tokens.js sign-guard.
+  if (purpose !== 'post_application_recovery' && claims.booking_id == null) {
+    log('redemption_missing_booking_id', { path, purpose });
+    return failurePage(400);
+  }
+
   let booking = null;
   if (claims.booking_id != null) {
     try {
