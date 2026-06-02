@@ -39,7 +39,13 @@ describe('loadCandidatesViaResolver (X wire)', () => {
     const roster = [{ resourceId: 'r1@x', scheduling_tags: ['mentor'], coordinatorEmail: 'r1@x' }];
     mockResolveCandidates.mockResolvedValue(roster);
 
-    const out = await _test.loadCandidatesViaResolver('TEN1', { id: 'apt-1' }, { id: 'rp-7' });
+    // realistic seam args: routing-context passes the appointmentType + routingPolicy objects
+    // it already resolved (the adapter uses only routingPolicy.id and ignores appointmentType).
+    const out = await _test.loadCandidatesViaResolver(
+      'TEN1',
+      { appointmentTypeId: 'apt-1', routingPolicyId: 'rp-7' },
+      { id: 'rp-7', tag_conditions: [] }
+    );
 
     // routing_policy_id is routingPolicy.id; appointmentType is already resolved upstream.
     expect(mockResolveCandidates).toHaveBeenCalledWith({ tenantId: 'TEN1', routingPolicyId: 'rp-7' });

@@ -80,6 +80,26 @@ describe('reconcileDeleted', () => {
     await expect(reconcile.reconcileDeleted(env)).resolves.toBeUndefined();
   });
 
+  it('a sign() failure does NOT throw out of reconcile (best-effort)', async () => {
+    mockSign.mockRejectedValue(new Error('signing_key_unavailable'));
+    await expect(reconcile.reconcileDeleted(env)).resolves.toBeUndefined();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  it('absent booking row (getNoticeContext → null) → skip (no token/dispatch)', async () => {
+    mockGetNoticeContext.mockResolvedValue(null);
+    await reconcile.reconcileDeleted(env);
+    expect(mockSign).not.toHaveBeenCalled();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  it('missing start_at → skip (no token/dispatch)', async () => {
+    mockGetNoticeContext.mockResolvedValue({ ...FULL_CTX, startAt: null });
+    await reconcile.reconcileDeleted(env);
+    expect(mockSign).not.toHaveBeenCalled();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
   it('throws malformed on a missing required field', async () => {
     await expect(reconcile.reconcileDeleted({ tenant_id: 'AUS123957' }))
       .rejects.toMatchObject({ malformed: true });

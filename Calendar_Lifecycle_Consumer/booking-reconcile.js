@@ -70,6 +70,11 @@ async function sendCancelNotice(tenantId, bookingId) {
       log('notify_skipped_no_attendee_email', { tenant_id: tenantId, booking_id: bookingId });
       return;
     }
+    if (!ctx.startAt) {
+      // No start_at → sign('reschedule', {start_at: null}) would throw on expiry compute.
+      log('notify_skipped_no_start_at', { tenant_id: tenantId, booking_id: bookingId });
+      return;
+    }
     const token = await sign('reschedule', { tenant_id: tenantId, booking_id: bookingId, start_at: ctx.startAt });
     const rescheduleUrl = `${SCHEDULE_BASE_URL}/reschedule?t=${encodeURIComponent(token)}`;
     const result = await dispatchVolunteerNotice({

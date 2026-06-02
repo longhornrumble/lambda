@@ -166,6 +166,12 @@ async function sendReoffer({ tenantId, bookingId }) {
     warn('reoffer_skipped_no_appointment_type', { tenant_id: tenantId, booking_id: bookingId });
     return;
   }
+  if (!ctx.startAt) {
+    // No start_at → sign('reschedule', {start_at: null}) would throw on expiry compute.
+    // Skip explicitly (consistent with the guards above; schema-discipline forward-compat).
+    warn('reoffer_skipped_no_start_at', { tenant_id: tenantId, booking_id: bookingId });
+    return;
+  }
 
   // (X) gate — only offer a new time if the pool can still serve this appointment type.
   let candidates = [];

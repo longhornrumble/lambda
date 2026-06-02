@@ -9,10 +9,10 @@
  * deliberately skips:
  *
  *   - `booking.calendar_deleted`     → cancel the booking (`cancel_reason=coordinator_deleted`)
- *                                       + TODO(Y) volunteer reschedule-link notice.
+ *                                       + (Y) volunteer cancel_notice with a §13.4 reschedule link.
  *   - `booking.calendar_moved` (v1)  → cancel (`cancel_reason=coordinator_moved`) + self-anchor
  *                                       `rescheduleOfBookingId`; NO auto-rebook (deferred);
- *                                       + TODO(Y) reschedule path.
+ *                                       + (Y) move_optin_sms (SMS path stubbed until sub-phase-E, inert).
  *   - `booking.calendar_reassigned`  → repoint `resource_id`/`coordinator_email`; NO notify (§5.1).
  *   - `booking.event_made_private`   → degrade the channels-table row (NOT a Booking write)
  *                                       + admin alert. (channel_id contract gap — see channel-degrade.js.)

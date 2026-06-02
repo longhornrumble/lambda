@@ -427,4 +427,60 @@ describe('B9 reoffer (X + Y)', () => {
 
     expect(res.batchItemFailures).toEqual([]);
   });
+
+  test('missing start_at → skip (no token mint, no dispatch)', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue({ ...FULL_CTX, startAt: null });
+    mockResolveCandidates.mockResolvedValue([{ resourceId: 'c@x', scheduling_tags: ['m'], coordinatorEmail: 'c@x' }]);
+
+    await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(mockSign).not.toHaveBeenCalled();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  test('absent booking row (getReofferContext → null) → skip, no token/dispatch', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue(null);
+
+    await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(mockResolveCandidates).not.toHaveBeenCalled();
+    expect(mockSign).not.toHaveBeenCalled();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  test('sign throws → reoffer skipped best-effort, OOO record NOT failed', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue(FULL_CTX);
+    mockResolveCandidates.mockResolvedValue([{ resourceId: 'c@x', scheduling_tags: ['m'], coordinatorEmail: 'c@x' }]);
+    mockSign.mockRejectedValue(new Error('signing_key_unavailable'));
+
+    const res = await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(res.batchItemFailures).toEqual([]); // conflict flag is the durable outcome
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  test('multi-booking OOO: reoffer fires once per flagged booking; one failure does not suppress the other', async () => {
+    mockFlag.mockResolvedValue(true);
+    // distinct ctx per booking so we can assert per-booking sign claims
+    mockGetReofferContext
+      .mockResolvedValueOnce({ ...FULL_CTX, startAt: '2026-06-10T15:00:00Z' })
+      .mockResolvedValueOnce({ ...FULL_CTX, startAt: '2026-06-11T16:00:00Z' });
+    mockResolveCandidates.mockResolvedValue([{ resourceId: 'c@x', scheduling_tags: ['m'], coordinatorEmail: 'c@x' }]);
+    // first dispatch throws (best-effort), second succeeds — both must be ATTEMPTED.
+    mockDispatchVolunteerNotice
+      .mockRejectedValueOnce(new Error('transient'))
+      .mockResolvedValueOnce({ suppressed: false, dispatched: { email: 'queued' } });
+
+    const res = await idx.handler({ Records: [oooRecord(['bk-1', 'bk-2'])] });
+
+    expect(res.batchItemFailures).toEqual([]);
+    expect(mockResolveCandidates).toHaveBeenCalledTimes(2);
+    expect(mockDispatchVolunteerNotice).toHaveBeenCalledTimes(2);
+    // per-booking token claims (booking_id + that booking's start_at)
+    expect(mockSign).toHaveBeenNthCalledWith(1, 'reschedule', { tenant_id: 'AUS123957', booking_id: 'bk-1', start_at: '2026-06-10T15:00:00Z' });
+    expect(mockSign).toHaveBeenNthCalledWith(2, 'reschedule', { tenant_id: 'AUS123957', booking_id: 'bk-2', start_at: '2026-06-11T16:00:00Z' });
+  });
 });

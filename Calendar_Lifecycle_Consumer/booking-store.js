@@ -193,7 +193,7 @@ async function getNoticeContext({ tenantId, bookingId }) {
   }
   const res = await ddb.send(new GetItemCommand({
     TableName: BOOKING_TABLE,
-    Key: { tenantId: s(tenantId), booking_id: s(bookingId) },
+    Key: BOOKING_KEY(tenantId, bookingId), // same key helper every other fn here uses
     ProjectionExpression: 'attendee_email, attendee_name, appointment_type_id, start_at',
   }));
   if (!res.Item) return null;
