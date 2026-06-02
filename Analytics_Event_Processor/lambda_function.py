@@ -1,15 +1,20 @@
 """
 Analytics Event Processor Lambda
 
-Processes analytics events from SQS queue and stores them in S3 for Athena queries.
+Processes analytics events from an SQS queue and stores them in DynamoDB
+(picasso-session-events), the sole durable store.
 CI: pr-checks.yml runs test_session_tables.py via the python-tests matrix
 (see issue #42 / PR #43 for the wiring).
 
 Architecture:
 - Triggered by SQS: picasso-analytics-events
 - Decodes tenant_hash → tenant_id via S3 mappings
-- Writes to S3: s3://{bucket}/analytics/tenant_id={}/year={}/month={}/day={}/
-- Athena queries S3 for dashboard analytics
+- Writes per-event records to DynamoDB picasso-session-events (sole durable store)
+- Dashboard reads DynamoDB; a DDB write failure drives SQS partial-batch retry
+
+The orphaned picasso-analytics S3 lake write was removed (data-retention-strategy
+§5/§9 — zero consumer: Athena dormant, no Glue, no S3 notifications, dashboard
+reads DynamoDB). The per-event DDB record already covers everything used.
 
 Event Schema (v1.0.0):
 {
@@ -25,9 +30,9 @@ Event Schema (v1.0.0):
     "ga_client_id": "123456789.1234567890" (optional)
 }
 
-S3 Partitioning:
-- Partition by tenant_id (decoded from hash), year, month, day
-- JSON format (Athena reads directly, no Glue needed)
+DynamoDB Key Structure (picasso-session-events):
+- PK: SESSION#{session_id}, SK: STEP#{step_number:03d} (zero-padded for sort order)
+- 90-day TTL on the `ttl` attribute; re-delivery overwrites the same key (idempotent)
 
 Tenant Hash → ID Mapping:
 - Mappings stored in s3://myrecruiter-picasso/mappings/{tenant_hash}.json
@@ -37,7 +42,6 @@ Tenant Hash → ID Mapping:
 import json
 import os
 import logging
-import time
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -49,16 +53,19 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Environment variables
-ANALYTICS_BUCKET = os.environ.get('ANALYTICS_BUCKET', 'picasso-analytics')
 MAPPINGS_BUCKET = os.environ.get('MAPPINGS_BUCKET', 'myrecruiter-picasso')
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 
 # DynamoDB Session Tables (Phase 1 - User Journey Analytics)
 SESSION_EVENTS_TABLE = os.environ.get('SESSION_EVENTS_TABLE', 'picasso-session-events')
 SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries')
-DYNAMODB_WRITE_ENABLED = os.environ.get('DYNAMODB_WRITE_ENABLED', 'false').lower() == 'true'
+# DynamoDB is the sole durable store, so the write is unconditional — there is no
+# S3 backstop to fall back to. The former DYNAMODB_WRITE_ENABLED gate was removed
+# (defaulting 'false') so the durable write can never be silently disabled by config.
 
 # Initialize AWS clients
+# s3 is retained ONLY for tenant_hash → tenant_id mapping lookups (MAPPINGS_BUCKET);
+# the analytics-lake write (ANALYTICS_BUCKET) was removed.
 s3 = boto3.client('s3')
 dynamodb = boto3.client('dynamodb')
 
@@ -125,28 +132,38 @@ def lambda_handler(event, context):
     # Track failed message IDs for partial batch failure reporting
     failed_message_ids = []
 
-    # Collect all events for batch write
-    events_to_write = []
-
     for record in records:
         message_id = record.get('messageId', 'unknown')
         try:
             # Parse SQS message body
             body = json.loads(record['body'])
 
-            # Handle both single events and batched events
-            if body.get('batch'):
-                events = body.get('events', [])
-                for evt in events:
-                    enriched = enrich_event(evt)
-                    if enriched:
-                        events_to_write.append(enriched)
-                        processed_count += 1
-            else:
-                enriched = enrich_event(body)
-                if enriched:
-                    events_to_write.append(enriched)
+            # Normalize to a list of raw events (batched or single)
+            raw_events = body.get('events', []) if body.get('batch') else [body]
+
+            # Enrich + durably persist each event to DynamoDB (the sole source of
+            # truth — there is no longer an S3 backstop). A DDB write failure for
+            # ANY event in this message marks the whole SQS message for retry.
+            # write_session_event puts on a deterministic key
+            # (SESSION#{session_id} / STEP#{step:03d}), so re-delivery overwrites
+            # identically — retries are idempotent, no duplicates.
+            message_failed = False
+            for evt in raw_events:
+                enriched = enrich_event(evt)
+                if enriched is None:
+                    # Invalid/unmappable event (missing session_id or no tenant
+                    # mapping) — permanently skipped, NOT retried. Retrying cannot
+                    # fix malformed input and would loop until the queue's redrive.
+                    continue
+                if write_session_event(enriched):
                     processed_count += 1
+                else:
+                    message_failed = True
+
+            if message_failed:
+                logger.error(f"DynamoDB write failed for one or more events in message {message_id}; marking for retry")
+                error_count += 1
+                failed_message_ids.append(message_id)
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON in SQS message {message_id}: {e}")
@@ -157,25 +174,6 @@ def lambda_handler(event, context):
             error_count += 1
             failed_message_ids.append(message_id)
             # Continue processing remaining records instead of raising
-
-    # Write all successfully parsed events to S3 (REQUIRED - source of truth)
-    if events_to_write:
-        try:
-            write_events_to_s3(events_to_write)
-        except Exception as e:
-            # If S3 write fails, all records in this batch need retry
-            logger.error(f"S3 write failed, marking all records as failed: {e}")
-            failed_message_ids = [r.get('messageId', 'unknown') for r in records]
-
-        # DynamoDB writes (OPTIONAL - only if S3 succeeded and enabled)
-        # Sequential execution: S3 must succeed before DynamoDB attempt
-        # Failures logged but don't raise - S3 already has the data
-        if DYNAMODB_WRITE_ENABLED and not failed_message_ids:
-            try:
-                write_events_to_dynamodb(events_to_write)
-            except Exception as e:
-                # Log but don't fail - S3 already has the data
-                logger.warning(f"DynamoDB write failed (non-fatal): {e}")
 
     logger.info(f"Processed: {processed_count}, Errors: {error_count}, Failed IDs: {len(failed_message_ids)}")
 
@@ -251,7 +249,7 @@ def enrich_event(event_data):
     # Generate server timestamp
     server_timestamp = datetime.utcnow().isoformat() + 'Z'
 
-    # Build enriched event (flat structure for Athena)
+    # Build enriched event (flat structure)
     enriched = {
         'event_id': str(uuid.uuid4()),
         'schema_version': schema_version,
@@ -276,79 +274,11 @@ def enrich_event(event_data):
     return enriched
 
 
-def write_events_to_s3(events):
-    """
-    Write events to S3 with partitioned paths for Athena.
-
-    Path structure:
-    s3://{bucket}/analytics/tenant_id={tenant}/year={Y}/month={M}/day={D}/{batch_id}.json
-
-    Each file contains newline-delimited JSON (NDJSON) for efficient Athena parsing.
-    """
-    # Group events by partition (tenant_id + date)
-    partitions = {}
-
-    for event in events:
-        tenant_id = event['tenant_id']
-
-        # Parse timestamp for partitioning
-        ts = event.get('client_timestamp') or event.get('server_timestamp')
-        if ts:
-            try:
-                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-            except ValueError:
-                dt = datetime.utcnow()
-        else:
-            dt = datetime.utcnow()
-
-        # Create partition key
-        partition_key = (
-            tenant_id,
-            dt.year,
-            dt.month,
-            dt.day
-        )
-
-        if partition_key not in partitions:
-            partitions[partition_key] = []
-        partitions[partition_key].append(event)
-
-    # Write each partition
-    for (tenant_id, year, month, day), partition_events in partitions.items():
-        # Generate unique batch ID
-        batch_id = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
-
-        # Build S3 key with Hive-style partitioning
-        s3_key = (
-            f"analytics/"
-            f"tenant_id={tenant_id}/"
-            f"year={year}/"
-            f"month={month:02d}/"
-            f"day={day:02d}/"
-            f"{batch_id}.json"
-        )
-
-        # Create NDJSON content (newline-delimited JSON)
-        ndjson_content = '\n'.join(json.dumps(e) for e in partition_events)
-
-        try:
-            s3.put_object(
-                Bucket=ANALYTICS_BUCKET,
-                Key=s3_key,
-                Body=ndjson_content.encode('utf-8'),
-                ContentType='application/x-ndjson'
-            )
-            logger.info(f"✅ Wrote {len(partition_events)} events to s3://{ANALYTICS_BUCKET}/{s3_key}")
-        except ClientError as e:
-            logger.error(f"S3 put_object error: {e}")
-            raise
-
-
 # Direct API handler (for non-SQS invocations)
 def api_handler(event, context):
     """
     Handle direct API Gateway invocations.
-    Accepts POST with event data and writes directly to S3.
+    Accepts POST with event data and writes directly to DynamoDB.
 
     This is used when:
     - Full-page mode sends events directly
@@ -374,9 +304,9 @@ def api_handler(event, context):
             if enriched:
                 events_to_write.append(enriched)
 
-        # Write to S3
+        # Write to DynamoDB (sole durable store)
         if events_to_write:
-            write_events_to_s3(events_to_write)
+            write_events_to_dynamodb(events_to_write)
 
         return {
             'statusCode': 200,

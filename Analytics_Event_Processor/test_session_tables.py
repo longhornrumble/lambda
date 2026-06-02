@@ -14,11 +14,39 @@ from datetime import datetime, timedelta
 from botocore.exceptions import ClientError
 
 # Import functions under test
+import lambda_function
 from lambda_function import (
     calculate_ttl,
     write_session_event,
-    write_events_to_dynamodb
+    write_events_to_dynamodb,
+    lambda_handler
 )
+
+
+def _server_event(session_id='sess_1', step=1):
+    """A server-resolved event (both tenant_id + tenant_hash present) so enrich_event
+    needs no S3 mapping lookup."""
+    return {
+        'schema_version': '1.0.0',
+        'session_id': session_id,
+        'tenant_id': 'FOS402334',
+        'tenant_hash': 'fo85e6a06dcdf4',
+        'step_number': step,
+        'event_type': 'WIDGET_OPENED',
+        'client_timestamp': '2026-06-02T10:00:00Z',
+        'event_payload': {'trigger': 'button'}
+    }
+
+
+def _sqs_record(message_id, body):
+    return {'messageId': message_id, 'body': json.dumps(body)}
+
+
+def _ddb_error():
+    return ClientError(
+        {'Error': {'Code': 'InternalServerError', 'Message': 'Test error'}},
+        'PutItem'
+    )
 
 
 class TestCalculateTTL:
@@ -185,6 +213,101 @@ class TestWriteEventsToDynamoDB:
 
         # All events should be attempted
         assert mock_write.call_count == 3
+
+
+class TestLambdaHandlerDurableWrite:
+    """Tests for lambda_handler() now that DynamoDB is the SOLE durable store AND
+    the SQS partial-batch-failure retry signal (orphaned S3 lake write removed —
+    data-retention-strategy §5/§9)."""
+
+    def test_orphaned_lake_writer_removed(self):
+        """The S3 lake write surface is gone — no write_events_to_s3, no
+        ANALYTICS_BUCKET, no DYNAMODB_WRITE_ENABLED gate."""
+        assert not hasattr(lambda_function, 'write_events_to_s3')
+        assert not hasattr(lambda_function, 'ANALYTICS_BUCKET')
+        assert not hasattr(lambda_function, 'DYNAMODB_WRITE_ENABLED')
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_happy_path_processed_no_failures(self, mock_ddb, mock_s3):
+        """(a) DDB write succeeds → event processed, no failed IDs, and NO S3 call
+        (the lake path is gone; both ids present → no mapping lookup either)."""
+        mock_ddb.put_item.return_value = {}
+
+        event = {'Records': [_sqs_record('msg-1', _server_event())]}
+        result = lambda_handler(event, None)
+
+        assert result == {'batchItemFailures': []}
+        mock_ddb.put_item.assert_called_once()
+        # (c) no S3 calls — durable write is DDB-only
+        mock_s3.put_object.assert_not_called()
+        mock_s3.get_object.assert_not_called()
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_ddb_failure_drives_batch_item_failures(self, mock_ddb, mock_s3):
+        """(b) DDB write fails → the record appears in batchItemFailures so SQS
+        retries it. DDB failure (not S3) is now the retry signal."""
+        mock_ddb.put_item.side_effect = _ddb_error()
+
+        event = {'Records': [_sqs_record('msg-1', _server_event())]}
+        result = lambda_handler(event, None)
+
+        assert result == {'batchItemFailures': [{'itemIdentifier': 'msg-1'}]}
+        mock_s3.put_object.assert_not_called()
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_partial_batch_only_failing_message_retried(self, mock_ddb, mock_s3):
+        """(b) Per-message precision: msg-1 write succeeds, msg-2 write fails →
+        ONLY msg-2 is returned for retry (msg-1 is not re-delivered)."""
+        mock_ddb.put_item.side_effect = [{}, _ddb_error()]
+
+        event = {'Records': [
+            _sqs_record('msg-1', _server_event(session_id='sess_1')),
+            _sqs_record('msg-2', _server_event(session_id='sess_2')),
+        ]}
+        result = lambda_handler(event, None)
+
+        assert result == {'batchItemFailures': [{'itemIdentifier': 'msg-2'}]}
+        assert mock_ddb.put_item.call_count == 2
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_batched_message_any_event_failure_retries_whole_message(self, mock_ddb, mock_s3):
+        """A single SQS message carrying multiple events retries as a unit when any
+        one event's DDB write fails (re-delivery is idempotent on the deterministic
+        SESSION#/STEP# key)."""
+        mock_ddb.put_item.side_effect = [{}, _ddb_error()]
+
+        batch_body = {'batch': True, 'events': [_server_event('s1', 1), _server_event('s2', 2)]}
+        event = {'Records': [_sqs_record('msg-1', batch_body)]}
+        result = lambda_handler(event, None)
+
+        assert result == {'batchItemFailures': [{'itemIdentifier': 'msg-1'}]}
+        assert mock_ddb.put_item.call_count == 2
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_invalid_json_message_retried(self, mock_ddb, mock_s3):
+        """Malformed SQS body → message retried, and no DDB write attempted."""
+        event = {'Records': [{'messageId': 'msg-bad', 'body': '{not valid json'}]}
+        result = lambda_handler(event, None)
+
+        assert result == {'batchItemFailures': [{'itemIdentifier': 'msg-bad'}]}
+        mock_ddb.put_item.assert_not_called()
+
+    @patch('lambda_function.s3')
+    @patch('lambda_function.dynamodb')
+    def test_unenrichable_event_skipped_not_retried(self, mock_ddb, mock_s3):
+        """An event that can't be enriched (missing session_id) is permanently
+        skipped, NOT retried — retrying can't fix malformed input."""
+        bad_event = {'tenant_id': 'FOS402334', 'tenant_hash': 'fo85', 'event_type': 'X'}
+        event = {'Records': [_sqs_record('msg-1', bad_event)]}
+        result = lambda_handler(event, None)
+
+        assert result == {'batchItemFailures': []}
+        mock_ddb.put_item.assert_not_called()
 
 
 if __name__ == '__main__':
