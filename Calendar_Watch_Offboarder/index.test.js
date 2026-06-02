@@ -8,6 +8,7 @@ const {
   QueryCommand,
   DeleteItemCommand,
 } = require('@aws-sdk/client-dynamodb');
+const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 
 // Mock oauth-client + calendar-watch BEFORE requiring index.
 const mockOauth = jest.fn();
@@ -21,13 +22,17 @@ jest.mock('./calendar-watch', () => ({
 }));
 
 process.env.CALENDAR_WATCH_CHANNELS_TABLE = 'picasso-calendar-watch-channels-staging';
+// B11 offboarding trigger (gap B): set before require so the module-load const is set.
+process.env.REMEDIATOR_FUNCTION_NAME = 'Stranded_Booking_Remediator';
 
 const { handler, _test } = require('./index');
 
 const ddbMock = mockClient(DynamoDBClient);
+const lambdaMock = mockClient(LambdaClient);
 
 beforeEach(() => {
   ddbMock.reset();
+  lambdaMock.reset();
   mockOauth.mockReset();
   mockStopWatch.mockReset();
 });
@@ -226,7 +231,7 @@ describe('handler — channel_id selector', () => {
 
     expect(mockStopWatch).toHaveBeenCalledWith({ _auth: true }, 'ch-1', 'res-1');
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(1);
-    expect(res).toEqual({ requested: 1, stopped: ['ch-1'], deleted: ['ch-1'], failed: [] });
+    expect(res).toEqual({ requested: 1, stopped: ['ch-1'], deleted: ['ch-1'], failed: [], stranded_remediation_invoked: false });
   });
 
   test('no-op when the channel row does not exist', async () => {
@@ -234,7 +239,7 @@ describe('handler — channel_id selector', () => {
     const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-missing' });
     expect(mockStopWatch).not.toHaveBeenCalled();
     expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(0);
-    expect(res).toEqual({ requested: 0, stopped: [], deleted: [], failed: [] });
+    expect(res).toEqual({ requested: 0, stopped: [], deleted: [], failed: [], stranded_remediation_invoked: false });
   });
 
   test('refuses to offboard a channel owned by another tenant (G6)', async () => {
@@ -419,13 +424,15 @@ describe('handler — coordinator_id selector', () => {
   test('no-op when the coordinator has no channels', async () => {
     ddbMock.on(QueryCommand).resolves({ Items: [] });
     const res = await handler({ tenant_id: 'MYR384719', coordinator_id: 'ghost' });
-    expect(res).toEqual({ requested: 0, stopped: [], deleted: [], failed: [] });
+    // stranded_remediation_invoked=true: the coordinator path fires B11 regardless of
+    // channel count (stranded bookings may exist without live channels).
+    expect(res).toEqual({ requested: 0, stopped: [], deleted: [], failed: [], stranded_remediation_invoked: true });
   });
 
   test('tolerates a Query response with no Items key (forward-compat read)', async () => {
     ddbMock.on(QueryCommand).resolves({});
     const res = await handler({ tenant_id: 'MYR384719', coordinator_id: 'ghost' });
-    expect(res).toEqual({ requested: 0, stopped: [], deleted: [], failed: [] });
+    expect(res).toEqual({ requested: 0, stopped: [], deleted: [], failed: [], stranded_remediation_invoked: true });
   });
 
   test('paginates the tenant-expiration-index query', async () => {
@@ -562,5 +569,120 @@ describe('handler does not leak the OAuth secret ARN on AccessDenied (GF)', () =
     expect(res.failed).toHaveLength(1);
     expect(res.failed[0].error).not.toMatch(/arn:aws|jane@x\.org/);
     expect(res.failed[0].error).toMatch(/redacted/);
+  });
+});
+
+// ─── B11 offboarding trigger (gap B) ──────────────────────────────────────────────
+// On the coordinator-offboarding path, the Offboarder async-invokes the
+// Stranded_Booking_Remediator (B11). NOT fired on the single-channel teardown path.
+
+describe('B11 offboarding trigger', () => {
+  const COORD = 'coord@myr.example.com';
+
+  test('coordinator path → async-invokes the remediator with the offboarding payload (channel also torn down)', async () => {
+    // one matching channel for the coordinator — proves B11 fires AND the channel
+    // teardown still completes in the same realistic run (not just a 0-channel case).
+    ddbMock.on(QueryCommand).resolves({ Items: [channelItem({ coordinator_id: COORD })] });
+    ddbMock.on(DeleteItemCommand).resolves({});
+    mockOauth.mockResolvedValue({ _kind: 'oauth' });
+    mockStopWatch.mockResolvedValue(undefined);
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+    const res = await handler({ tenant_id: 'MYR384719', coordinator_id: COORD });
+
+    // channel teardown completed alongside the B11 dispatch
+    expect(res.deleted).toEqual(['ch-1']);
+    expect(lambdaMock).toHaveReceivedCommandTimes(InvokeCommand, 1);
+    const input = lambdaMock.commandCalls(InvokeCommand)[0].args[0].input;
+    expect(input.FunctionName).toBe('Stranded_Booking_Remediator');
+    expect(input.InvocationType).toBe('Event'); // fire-and-forget
+    const payload = JSON.parse(Buffer.from(input.Payload).toString());
+    expect(payload.tenant_id).toBe('MYR384719');
+    expect(payload.coordinator_email).toBe(COORD); // coordinator_id IS the calendar email
+    // pinned to the EXACT toISOString() shape — Date.parse alone would accept a Unix
+    // epoch string or non-ISO date that B11's lexicographic GSI compare would mishandle.
+    expect(payload.offboarding_time).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(payload).not.toHaveProperty('choice'); // omitted ⇒ B11 default cascade
+    expect(res.stranded_remediation_invoked).toBe(true);
+  });
+
+  test('coordinator path with ZERO live channels still fires remediation (stranded bookings may remain)', async () => {
+    ddbMock.on(QueryCommand).resolves({ Items: [] });
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+    const res = await handler({ tenant_id: 'MYR384719', coordinator_id: COORD });
+
+    expect(res.requested).toBe(0);
+    expect(lambdaMock).toHaveReceivedCommandTimes(InvokeCommand, 1);
+    expect(res.stranded_remediation_invoked).toBe(true);
+  });
+
+  test('single-channel teardown path (channel_id) does NOT fire remediation', async () => {
+    ddbMock.on(GetItemCommand).resolves({ Item: channelItem() });
+    ddbMock.on(DeleteItemCommand).resolves({});
+    mockOauth.mockResolvedValue({ _kind: 'oauth' });
+    mockStopWatch.mockResolvedValue(undefined);
+
+    const res = await handler({ tenant_id: 'MYR384719', channel_id: 'ch-1' });
+
+    expect(res.deleted).toEqual(['ch-1']); // the channel WAS torn down
+    expect(lambdaMock).toHaveReceivedCommandTimes(InvokeCommand, 0); // but B11 NOT fired
+    expect(res.stranded_remediation_invoked).toBe(false);
+  });
+
+  test('remediation dispatch failure is best-effort: offboarding still succeeds, ARN redacted', async () => {
+    ddbMock.on(QueryCommand).resolves({ Items: [] });
+    const denied = new Error(
+      'not authorized to perform lambda:InvokeFunction on arn:aws:lambda:us-east-1:525409062831:function:Stranded_Booking_Remediator'
+    );
+    denied.name = 'AccessDeniedException';
+    lambdaMock.on(InvokeCommand).rejects(denied);
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const res = await handler({ tenant_id: 'MYR384719', coordinator_id: COORD });
+
+    // offboarding itself succeeded; the dispatch failure did not throw out of the handler
+    expect(res.requested).toBe(0);
+    expect(res.stranded_remediation_invoked).toBe(false);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('stranded_remediation_dispatch_failed'));
+    // sanitizeErrorMessage redacts the ARN-bearing AccessDeniedException
+    const logged = warnSpy.mock.calls.map((c) => c[0]).join('\n');
+    expect(logged).not.toMatch(/arn:aws/);
+    expect(logged).toMatch(/redacted/);
+    warnSpy.mockRestore();
+  });
+
+  test('dispatch failure does NOT roll back completed channel teardown (best-effort, with channels)', async () => {
+    // The dangerous regression: a B11 dispatch failure aborts the handler AFTER channels
+    // were stopped+deleted. Prove the teardown result survives and the handler resolves.
+    ddbMock.on(QueryCommand).resolves({ Items: [channelItem({ coordinator_id: COORD })] });
+    ddbMock.on(DeleteItemCommand).resolves({});
+    mockOauth.mockResolvedValue({ _kind: 'oauth' });
+    mockStopWatch.mockResolvedValue(undefined);
+    lambdaMock.on(InvokeCommand).rejects(new Error('TooManyRequestsException: rate exceeded'));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const res = await handler({ tenant_id: 'MYR384719', coordinator_id: COORD });
+
+    expect(res.deleted).toEqual(['ch-1']);      // teardown completed + survived the dispatch failure
+    expect(res.stopped).toEqual(['ch-1']);
+    expect(res.stranded_remediation_invoked).toBe(false);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('stranded_remediation_dispatch_failed'));
+    warnSpy.mockRestore();
+  });
+
+  test('no REMEDIATOR_FUNCTION_NAME → skip + warn, no invoke (fresh module with env unset)', async () => {
+    const saved = process.env.REMEDIATOR_FUNCTION_NAME;
+    delete process.env.REMEDIATOR_FUNCTION_NAME;
+    let fresh;
+    jest.isolateModules(() => { fresh = require('./index'); });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const result = await fresh._test.triggerStrandedRemediation('MYR384719', COORD, '2026-06-02T00:00:00Z');
+
+    expect(result).toBe(false);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('stranded_remediation_skipped_no_function_name'));
+    warnSpy.mockRestore();
+    if (saved !== undefined) process.env.REMEDIATOR_FUNCTION_NAME = saved;
   });
 });

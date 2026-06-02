@@ -51,6 +51,7 @@ const {
   QueryCommand,
   DeleteItemCommand,
 } = require('@aws-sdk/client-dynamodb');
+const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const crypto = require('crypto');
 
 const { getOAuthClient } = require('./oauth-client');
@@ -65,6 +66,12 @@ function sha256Hex(value) {
 // ─── AWS clients ────────────────────────────────────────────────────────────────
 
 const ddb = new DynamoDBClient({});
+const lambda = new LambdaClient({});
+
+// B11 offboarding trigger (gap B): the Stranded_Booking_Remediator function the
+// Offboarder async-invokes on the coordinator-offboarding path. Unset ⇒ the
+// invoke is skipped (warn) — keeps the Offboarder safe in any env without the wire.
+const REMEDIATOR_FUNCTION_NAME = process.env.REMEDIATOR_FUNCTION_NAME || '';
 
 // ─── Environment ────────────────────────────────────────────────────────────────
 // CHANNELS_TABLE is REQUIRED (no silent default): a missing table name must not
@@ -336,12 +343,70 @@ async function offboardChannel(row) {
   return { stopped };
 }
 
+// ─── B11 offboarding trigger ──────────────────────────────────────────────────────
+// On coordinator offboarding, async-invoke the Stranded_Booking_Remediator (B11) to
+// remediate the bookings the calendar admin did NOT address (the "stranded" set:
+// status=='booked' AND resource_id==departed coordinator AND last_calendar_mutation_at
+// < offboarding_time). InvocationType=Event (fire-and-forget): the Offboarder does not
+// block on B11, which is idempotent + at-least-once safe. The `choice` field is omitted
+// ⇒ B11 applies its default cascade (reassign → cancel); the admin "N bookings need
+// attention" choice UI is deferred (E-phase). Best-effort: the offboarding has already
+// succeeded, so a dispatch failure here is logged + alarmed (Errors metric) but never
+// fails the run. NOT fired on the single-channel operator-teardown path (channel_id) —
+// that is not a coordinator departure.
+async function triggerStrandedRemediation(tenantId, coordinatorId, offboardingTime) {
+  if (!REMEDIATOR_FUNCTION_NAME) {
+    warn('stranded_remediation_skipped_no_function_name', { tenant_id: tenantId });
+    return false;
+  }
+  try {
+    await lambda.send(
+      new InvokeCommand({
+        FunctionName: REMEDIATOR_FUNCTION_NAME,
+        InvocationType: 'Event', // async fire-and-forget
+        Payload: Buffer.from(
+          JSON.stringify({
+            tenant_id: tenantId,
+            // the Offboarder's coordinator_id IS the coordinator's calendar email —
+            // exactly the Booking coordinator_email GSI key B11 detects on.
+            coordinator_email: coordinatorId,
+            offboarding_time: offboardingTime,
+          })
+        ),
+      })
+    );
+    log('stranded_remediation_triggered', {
+      tenant_id: tenantId,
+      coordinator_id_hash: sha256Hex(coordinatorId).slice(0, 12),
+      offboarding_time: offboardingTime,
+    });
+    return true;
+  } catch (err) {
+    // sanitizeErrorMessage redacts known ARN-bearing error names (AccessDenied/
+    // ResourceNotFound/UnrecognizedClient) — the InvokeFunction AccessDenied message can
+    // carry the remediator ARN. Other Invoke errors (throttle/ServiceException) carry no
+    // ARN. The offboarding already succeeded — a dispatch failure must not fail the run.
+    warn('stranded_remediation_dispatch_failed', {
+      tenant_id: tenantId,
+      error: sanitizeErrorMessage(err),
+    });
+    return false;
+  }
+}
+
 // ─── Main handler ───────────────────────────────────────────────────────────────
 
 exports.handler = async function handler(event) {
   if (!CHANNELS_TABLE) {
     throw new Error('CALENDAR_WATCH_CHANNELS_TABLE env var is required');
   }
+
+  // Offboarding moment — B11 strands every booking whose last calendar mutation
+  // predates this (the ones the calendar admin didn't reassign/cancel themselves).
+  // Captured at handler ENTRY (before the channel-stop loop) on purpose: a booking
+  // mutated during the teardown loop will have last_calendar_mutation_at > this and
+  // is correctly EXCLUDED from the stranded set. The conservative direction.
+  const offboardingTime = new Date().toISOString();
 
   const { tenantId, coordinatorId, channelId } = validateInput(event);
   log('offboarder_invoked', {
@@ -376,11 +441,23 @@ exports.handler = async function handler(event) {
     }
   }
 
+  // B11 offboarding trigger: ONLY on the coordinator-offboarding path (a coordinator
+  // is leaving), NOT the single-channel operator-teardown path. Fired regardless of
+  // how many channels were found — a coordinator may have stranded bookings even with
+  // no live watch channels (e.g. already-expired channels); B11 is a no-op if nothing
+  // is stranded.
+  let strandedRemediationInvoked = false;
+  if (coordinatorId) {
+    strandedRemediationInvoked = await triggerStrandedRemediation(tenantId, coordinatorId, offboardingTime);
+  }
+  summary.stranded_remediation_invoked = strandedRemediationInvoked;
+
   log('offboarder_run_complete', {
     tenant_id: tenantId,
     requested: summary.requested,
     deleted_count: summary.deleted.length,
     failed_count: summary.failed.length,
+    stranded_remediation_invoked: strandedRemediationInvoked,
   });
   return summary;
 };
@@ -397,4 +474,5 @@ exports._test = {
   getRowsByCoordinator,
   deleteRow,
   offboardChannel,
+  triggerStrandedRemediation,
 };
