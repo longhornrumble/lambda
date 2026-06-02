@@ -162,69 +162,49 @@ describe('executeReschedule — outcome (ii) pending_calendar_sync (insert ✓ +
   });
 });
 
-describe('executeReschedule — outcome (iii) canceled_insert_failed (insert ✗ + delete ✓)', () => {
-  it('cancels the booking and fires alertAdmin; leaves the old event id untouched', async () => {
+describe('executeReschedule — B-1 guard: insert ✗ → (iv) failed, old event NEVER deleted', () => {
+  // The B-1 guard (delete only runs if insertOk) makes outcome (iii) canceled_insert_failed
+  // UNREACHABLE from executeReschedule: a transient insert error must NOT strand the
+  // volunteer by deleting the old event. Insert✗ → (iv) failed, booking intact, retryable.
+  it('an insert that throws → failed; deleteEvent is NOT called; booking untouched; no alert', async () => {
     const alertAdmin = jest.fn(async () => undefined);
+    const deleteEvent = jest.fn(async () => undefined);
     const deps = makeDeps({
       alertAdmin,
       calendar: {
         buildEventBody: jest.fn((p) => p),
         extractMeetJoinUrl: jest.fn(() => null),
         insertEvent: jest.fn(async () => { throw new Error('Google 500 on insert'); }),
-        deleteEvent: jest.fn(async () => undefined),
+        deleteEvent,
       },
     });
     const b = booking();
+    const before = JSON.stringify(b);
     const res = await executeReschedule({ booking: b, newSlot: NEW_SLOT, deps });
 
-    expect(res.outcome).toBe('canceled_insert_failed');
-    expect(b.status).toBe('canceled');
-    expect(b.external_event_id).toBe(OLD_EVENT); // not pointed at a non-existent new event
-    expect(b.last_calendar_mutation_at).toBe(FIXED_NOW);
-    expect(b.pending_calendar_sync).toBeUndefined();
-    expect(alertAdmin).toHaveBeenCalledTimes(1);
-    expect(alertAdmin).toHaveBeenCalledWith({
-      kind: 'reschedule_insert_failed',
-      tenantId: 'AUS123957',
-      booking_id: 'booking#deadbeef',
-      old_event_id: OLD_EVENT,
-    });
+    expect(res.outcome).toBe('failed');
+    expect(deleteEvent).not.toHaveBeenCalled(); // the old event is NEVER deleted on insert✗
+    expect(b.status).toBe('booked'); // not canceled
+    expect(b.external_event_id).toBe(OLD_EVENT); // still points at the live old event
+    expect(JSON.stringify(b)).toBe(before); // no state change
+    expect(alertAdmin).not.toHaveBeenCalled();
   });
 
-  it('an insert that returns no event id counts as insert ✗ (→ iii when delete ✓)', async () => {
+  it('an insert that returns no event id → failed; deleteEvent is NOT called', async () => {
+    const deleteEvent = jest.fn(async () => undefined);
     const deps = makeDeps({
       calendar: {
         buildEventBody: jest.fn((p) => p),
         extractMeetJoinUrl: jest.fn(() => null),
-        insertEvent: jest.fn(async () => ({})), // no .id
-        deleteEvent: jest.fn(async () => undefined),
+        insertEvent: jest.fn(async () => ({})), // no .id → insert ✗
+        deleteEvent,
       },
     });
     const b = booking();
     const res = await executeReschedule({ booking: b, newSlot: NEW_SLOT, deps });
-    expect(res.outcome).toBe('canceled_insert_failed');
-    expect(b.status).toBe('canceled');
-  });
-
-  it('still cancels (and logs) when no alertAdmin is injected — does not throw', async () => {
-    const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
-    const deps = makeDeps({
-      alertAdmin: null,
-      logger,
-      calendar: {
-        buildEventBody: jest.fn((p) => p),
-        extractMeetJoinUrl: jest.fn(() => null),
-        insertEvent: jest.fn(async () => { throw new Error('insert down'); }),
-        deleteEvent: jest.fn(async () => undefined),
-      },
-    });
-    const b = booking();
-    const res = await executeReschedule({ booking: b, newSlot: NEW_SLOT, deps });
-    expect(res.outcome).toBe('canceled_insert_failed');
-    expect(b.status).toBe('canceled');
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining('reschedule_alert_admin_missing')
-    );
+    expect(res.outcome).toBe('failed');
+    expect(deleteEvent).not.toHaveBeenCalled();
+    expect(b.status).toBe('booked');
   });
 });
 
@@ -333,7 +313,7 @@ describe('executeReschedule — conference join-URL handling (§B6)', () => {
     expect(b.conference_id).toBe('null-conf-x');
   });
 
-  it('a conference-provider failure before insert → insert ✗ (delete ✓ ⇒ iii)', async () => {
+  it('a conference-provider failure before insert → insert ✗ ⇒ (iv) failed, old event preserved', async () => {
     const deps = makeDeps({
       conference: { createConference: jest.fn(async () => { throw new Error('zoom secret missing'); }) },
       calendar: {
@@ -345,8 +325,10 @@ describe('executeReschedule — conference join-URL handling (§B6)', () => {
     });
     const b = booking();
     const res = await executeReschedule({ booking: b, newSlot: NEW_SLOT, deps });
-    expect(res.outcome).toBe('canceled_insert_failed');
+    expect(res.outcome).toBe('failed'); // B-1: a config/infra error must NOT cancel the booking
     expect(deps.calendar.insertEvent).not.toHaveBeenCalled(); // never reached the insert
+    expect(deps.calendar.deleteEvent).not.toHaveBeenCalled(); // and never deletes the old event
+    expect(b.status).toBe('booked');
   });
 });
 
@@ -382,7 +364,10 @@ describe('executeReschedule — schema discipline (camelCase booking + name hand
     expect(deps.calendar.buildEventBody).toHaveBeenCalledWith(
       expect.objectContaining({ attendeeFirstName: 'Sam', attendeeLastName: 'Q Patel' })
     );
-    expect(b.external_event_id).toBe(NEW_EVENT);
+    // B-2: a camelCase booking is written back in camelCase — NOT a stale snake duplicate.
+    expect(b.externalEventId).toBe(NEW_EVENT);
+    expect(b.external_event_id).toBeUndefined(); // no shadow field for a future pick() to read stale
+    expect(b.startAt).toBe(NEW_SLOT.start);
   });
 
   it('uses explicit first/last fields when present and tolerates a missing name', async () => {

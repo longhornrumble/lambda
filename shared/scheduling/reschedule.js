@@ -22,23 +22,19 @@
  *             set pending_calendar_sync + store rescheduled_old_event_id; the E9
  *             nightly reconciler retries the delete — the volunteer sees only the
  *             new invite)
- *     (iii) insert ✗ + delete ✓ → 'canceled_insert_failed' (old gone, no usable new;
- *             status=canceled + alertAdmin → treat as cancel + manual rebook; chat
- *             surfaces "your booking was canceled — please pick a new time")
- *     (iv)  insert ✗ + delete ✗ → 'failed'             (no state change; retry)
- *   Insert-first is locked because, of the two partial-failure cells, it makes the
- *   COMMON one (ii) "two invites, recoverable by the reconciler" rather than (iii)
- *   "zero invites, unrecoverable" — better two than zero. Outcome (iii) is the rare
- *   genuinely-bad cell the state machine still handles gracefully.
+ *     (iii) insert ✗ + delete ✓ → 'canceled_insert_failed' — UNREACHABLE from
+ *             executeReschedule (see the B-1 guard below); kept only as the pure
+ *             classifyOutcome truth-table label.
+ *     (iv)  insert ✗ (delete skipped) → 'failed'        (no state change; retry)
+ *   Insert-first is locked because, of the partial-failure cells, it makes the COMMON
+ *   one (ii) "two invites, recoverable by the reconciler" rather than zero-invites.
  *
- *   ⚑ Flagged for the integrator (FROZEN §C — interpretation, NOT a fork): this
- *   module attempts BOTH ops (insert first) and classifies on the truth table, so
- *   outcome (iii) (insert✗ + delete✓) is a reachable path — required because the
- *   §B9 done-bar mandates an outcome-(iii) test asserting status=canceled +
- *   alertAdmin. If the canonical intent is instead to SHORT-CIRCUIT on insert
- *   failure (skip the delete so a transient insert hiccup can never strand the user
- *   → (iii) becomes unreachable, (iv) absorbs it), that is a one-line guard on the
- *   delete step — confirm the intended (iii) reachability.
+ *   ✓ Integrator-resolved (FROZEN §C, operator 2026-06-02 — was a flagged interpretation,
+ *   NOT a fork): the delete is GUARDED on insertOk (B-1). If the insert fails, the old
+ *   event is NEVER deleted → a transient insert hiccup (Zoom secret, Google 500) can never
+ *   strand the volunteer with zero invites; insert✗ lands in (iv) 'failed' (retryable).
+ *   Outcome (iii) 'canceled_insert_failed' is therefore unreachable here; §B9 + canonical
+ *   plan D6 were corrected to match (the "delete✓+insert✗" framing was a delete-first vestige).
  *
  * ── Zoom join-URL preservation (§B6) ──
  *   The new event's conference is resolved through the injected §B6 ConferenceProvider
@@ -58,9 +54,14 @@
  *     deleteEvent(calendarId, eventId) → void       // 404/410 idempotent inside
  *     extractMeetJoinUrl(event) → string | null
  *   `deps.conference` is the resolved §B6 provider (createConference(ctx)). `deps.ddb`
- *   is part of the shared §B9 deps shape but UNUSED here — this module never persists
- *   (the caller does). `deps.alertAdmin(info)` fires on outcome (iii). `deps.logger`
- *   logs PII-redacted (booking_id + outcome only — never attendee email/name/phone).
+ *   and `deps.alertAdmin` are part of the shared §B9 deps shape but UNUSED here — this
+ *   module never persists (the caller does) and, post-B-1, never destructively cancels
+ *   (so there is nothing to alert on; both stay reserved for shape symmetry). `deps.logger`
+ *   logs PII-redacted (booking_id + outcome only — never attendee email/name/phone), and
+ *   SR-2: error fields log err.code/err.name, never err.message (Google errors embed PII).
+ *   MUTATES the booking IN PLACE and returns the same object for the caller to persist
+ *   (SR-3 resolved this way — consistent with the test suite + reviewer's "test is authority";
+ *   D7 cancel.js + §B9 aligned to mutate-in-place; a caller wanting isolation defends-copies).
  */
 
 // ─── booking field reads (schema discipline — tolerate camel OR snake, missing → undefined) ──
@@ -150,6 +151,13 @@ async function executeReschedule({ booking, newSlot, deps } = {}) {
   if (!calendarId) {
     throw new Error('executeReschedule requires booking.coordinator_email (the calendar id)');
   }
+  // SR-4: guard the identity fields too — without them the logs (and any alert) carry undefined.
+  if (!bookingId) {
+    throw new Error('executeReschedule requires booking.booking_id');
+  }
+  if (!tenantId) {
+    throw new Error('executeReschedule requires booking.tenant_id');
+  }
 
   const now = (deps.now || (() => new Date().toISOString()))();
 
@@ -203,62 +211,67 @@ async function executeReschedule({ booking, newSlot, deps } = {}) {
       : conf.conferenceId;
   } catch (err) {
     insertOk = false;
+    // SR-2: log a non-PII discriminator, NOT err.message — Google errors embed the
+    // calendar id (coordinator email): "Calendar 'maya@org' not found".
     logEvent(logger, 'error', 'reschedule_insert_failed', {
       booking_id: bookingId,
-      error: err && err.message,
+      error: (err && (err.code || err.name)) || 'error',
     });
   }
 
-  // ── step 2: delete the OLD event SECOND ───────────────────────────────────────────────
+  // ── step 2: delete the OLD event SECOND — ONLY if the new one is live (B-1 guard) ──────
+  // Insert-first exists to PREFER "two invites (recoverable)" over "zero invites
+  // (unrecoverable)". So if the insert failed, we must NOT delete the old event — a
+  // transient insert hiccup (Zoom secret, Google 500) would otherwise strand the volunteer
+  // with no booking. Insert✗ therefore lands in outcome (iv) 'failed' (no state change,
+  // retryable). This makes outcome (iii) 'canceled_insert_failed' UNREACHABLE from
+  // executeReschedule (classifyOutcome keeps it only as the pure-truth-table label).
   let deleteOk = false;
-  try {
-    await deps.calendar.deleteEvent(calendarId, oldEventId);
-    deleteOk = true;
-  } catch (err) {
-    deleteOk = false;
-    logEvent(logger, 'warn', 'reschedule_delete_failed', {
-      booking_id: bookingId,
-      error: err && err.message,
-    });
+  if (insertOk) {
+    try {
+      await deps.calendar.deleteEvent(calendarId, oldEventId);
+      deleteOk = true;
+    } catch (err) {
+      deleteOk = false;
+      logEvent(logger, 'warn', 'reschedule_delete_failed', {
+        booking_id: bookingId,
+        error: (err && (err.code || err.name)) || 'error',
+      });
+    }
   }
 
-  // ── step 3: classify + mutate the booking IN MEMORY (caller persists) ─────────────────
+  // ── step 3: classify + mutate the booking IN MEMORY (caller persists; same object back) ─
   const outcome = classifyOutcome(insertOk, deleteOk);
+  // B-2: write back in the SAME casing the caller used (camel OR snake) so a later pick()
+  // read (incl. a retry) never sees a stale camelCase field shadowing the new snake value.
+  const isCamel = booking.externalEventId !== undefined || booking.bookingId !== undefined;
+  const set = (snakeKey, camelKey, val) => {
+    booking[isCamel ? camelKey : snakeKey] = val;
+  };
 
   if (outcome === OUTCOME.SUCCESS || outcome === OUTCOME.PENDING_CALENDAR_SYNC) {
     // The new event owns the booking now — point the row at it and stamp the move.
-    booking.external_event_id = newEventId;
-    booking.start_at = newSlot.start;
-    booking.end_at = newSlot.end;
-    booking.last_calendar_mutation_at = now;
-    if (newJoinUrl != null) booking.channel_details = newJoinUrl;
-    if (newConferenceId != null) booking.conference_id = newConferenceId;
+    set('external_event_id', 'externalEventId', newEventId);
+    set('start_at', 'startAt', newSlot.start);
+    set('end_at', 'endAt', newSlot.end);
+    set('last_calendar_mutation_at', 'lastCalendarMutationAt', now);
+    if (newJoinUrl != null) set('channel_details', 'channelDetails', newJoinUrl);
+    if (newConferenceId != null) set('conference_id', 'conferenceId', newConferenceId);
   }
 
   if (outcome === OUTCOME.PENDING_CALENDAR_SYNC) {
     // (ii) old delete failed → the E9 reconciler retries it; flag + remember the orphan.
-    booking.pending_calendar_sync = true;
-    booking.rescheduled_old_event_id = oldEventId;
+    set('pending_calendar_sync', 'pendingCalendarSync', true);
+    set('rescheduled_old_event_id', 'rescheduledOldEventId', oldEventId);
   } else if (outcome === OUTCOME.SUCCESS) {
     // Clean move — clear any stale sync bookkeeping a prior attempt may have left.
-    if ('pending_calendar_sync' in booking) booking.pending_calendar_sync = false;
-    delete booking.rescheduled_old_event_id;
-  } else if (outcome === OUTCOME.CANCELED_INSERT_FAILED) {
-    // (iii) old gone, no usable new event → treat as cancel + manual rebook.
-    booking.status = 'canceled';
-    booking.last_calendar_mutation_at = now;
-    if (typeof deps.alertAdmin === 'function') {
-      await deps.alertAdmin({
-        kind: 'reschedule_insert_failed',
-        tenantId,
-        booking_id: bookingId,
-        old_event_id: oldEventId,
-      });
-    } else {
-      logEvent(logger, 'error', 'reschedule_alert_admin_missing', { booking_id: bookingId });
-    }
+    const psKey = isCamel ? 'pendingCalendarSync' : 'pending_calendar_sync';
+    if (psKey in booking) booking[psKey] = false;
+    delete booking[isCamel ? 'rescheduledOldEventId' : 'rescheduled_old_event_id'];
   }
-  // (iv) FAILED → no state change.
+  // (iv) FAILED → no state change (the B-1 guard guarantees the old event is untouched on
+  // insert✗, so the booking is intact and the volunteer can retry). No admin alert: a
+  // failed move is transient/retryable, not a destructive cancel.
 
   logEvent(logger, 'info', 'reschedule_outcome', { booking_id: bookingId, outcome });
 
