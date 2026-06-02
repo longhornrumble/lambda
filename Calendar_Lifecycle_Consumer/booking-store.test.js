@@ -8,7 +8,7 @@
 const { mockClient } = require('aws-sdk-client-mock');
 require('aws-sdk-client-mock-jest');
 
-const { DynamoDBClient, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBClient, UpdateItemCommand, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 
 const ddbMock = mockClient(DynamoDBClient);
 
@@ -22,6 +22,37 @@ function conditionalFail() {
 
 beforeEach(() => {
   ddbMock.reset();
+});
+
+describe('getNoticeContext — attendee/appt read for the (Y) cancel notice (gap C)', () => {
+  it('projects + unmarshals the notice fields the deleted envelope lacks', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        attendee_email: { S: 'vol@example.org' },
+        attendee_name: { S: 'Vol' },
+        appointment_type_id: { S: 'apt-1' },
+        start_at: { S: '2026-06-10T15:00:00Z' },
+      },
+    });
+    const ctx = await store.getNoticeContext({ tenantId: 'AUS123957', bookingId: 'b1' });
+    expect(ctx).toEqual({ attendeeEmail: 'vol@example.org', attendeeName: 'Vol', appointmentTypeId: 'apt-1', startAt: '2026-06-10T15:00:00Z' });
+    expect(ddbMock.commandCalls(GetItemCommand)[0].args[0].input.ProjectionExpression).toContain('attendee_email');
+  });
+
+  it('returns null when the booking row is absent', async () => {
+    ddbMock.on(GetItemCommand).resolves({});
+    expect(await store.getNoticeContext({ tenantId: 'AUS123957', bookingId: 'gone' })).toBeNull();
+  });
+
+  it('tolerates an old-shape row missing optional fields (forward-compat)', async () => {
+    ddbMock.on(GetItemCommand).resolves({ Item: { attendee_email: { S: 'v@x' } } });
+    expect(await store.getNoticeContext({ tenantId: 'AUS123957', bookingId: 'b2' }))
+      .toEqual({ attendeeEmail: 'v@x', attendeeName: null, appointmentTypeId: null, startAt: null });
+  });
+
+  it('throws on missing identifiers', async () => {
+    await expect(store.getNoticeContext({ tenantId: 'AUS123957' })).rejects.toThrow('requires tenantId, bookingId');
+  });
 });
 
 describe('cancelOnCoordinatorDelete — calendar_deleted booked→canceled (idempotent)', () => {

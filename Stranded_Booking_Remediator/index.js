@@ -48,6 +48,7 @@ const calendarOps = require('./calendar-ops');
 const { getOAuthClient } = require('./oauth-client');
 const { buildResolveAlternate } = require('./routing-context');
 const { remediate, OUTCOMES } = require('./remediation');
+const { resolveCandidates } = require('../shared/scheduling/candidate-resolver'); // (X) §B7
 
 // ─── structured logging ─────────────────────────────────────────────────────────────
 
@@ -96,12 +97,23 @@ function validateInput(input) {
 
 // ─── dependency wiring ──────────────────────────────────────────────────────────────
 // Built once at module load and reused. resolveAlternate's roster loader is the
-// integrator-wired seam (routing-context.js header); the default degrades reassign to
-// cancel until wired, which is the documented cascade fallback.
+// integrator-wired seam (routing-context.js header); now wired to the (X) candidate
+// resolver so reassign produces a real alternate instead of degrading to cancel.
+
+// (X) gap-C wire: adapt resolveCandidates to the loadCandidates seam contract
+// (tenantId, appointmentType, routingPolicy) → [{resourceId, scheduling_tags, coordinatorEmail}].
+// routing-context's loadRoutingPolicy returns { id, tag_conditions, ... }, so the
+// routing_policy_id is routingPolicy.id. resolveCandidates reads its own tables via its
+// default deps (routing_policy + appointment_type GetItem already granted to B11;
+// employee-registry-v2 Query added in the coupled IaC PR).
+function loadCandidatesViaResolver(tenantId, appointmentType, routingPolicy) {
+  return resolveCandidates({ tenantId, routingPolicyId: routingPolicy.id });
+}
 
 function buildDeps(overrides = {}) {
   return {
-    resolveAlternate: overrides.resolveAlternate || buildResolveAlternate(),
+    resolveAlternate:
+      overrides.resolveAlternate || buildResolveAlternate({ loadCandidates: loadCandidatesViaResolver }),
     getOAuthClient: overrides.getOAuthClient || getOAuthClient,
     calendarOps: overrides.calendarOps || calendarOps,
     bookingStore: overrides.bookingStore || bookingStore,
@@ -187,5 +199,6 @@ exports._test = {
   validateInput,
   buildDeps,
   hashId,
+  loadCandidatesViaResolver,
   OUTCOMES,
 };

@@ -28,6 +28,7 @@
 const {
   DynamoDBClient,
   UpdateItemCommand,
+  GetItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 
 const { isBookingStatus } = require('../shared/booking-status');
@@ -146,9 +147,34 @@ async function cancelOnDecline({ tenantId, bookingId, now = nowIso() }) {
   }
 }
 
+// (B9 reoffer, gap C) — the ooo_overlap_detected envelope carries no attendee contact
+// info; read the fields the (Y) reoffer notice + the (X) pool re-check need. Projects
+// ONLY those fields (schema discipline / bounds the PII surface). Returns null if absent.
+async function getReofferContext({ tenantId, bookingId }) {
+  if (!tenantId || !bookingId) {
+    throw new Error('getReofferContext requires tenantId, bookingId');
+  }
+  const res = await ddb.send(new GetItemCommand({
+    TableName: BOOKING_TABLE,
+    Key: BOOKING_KEY(tenantId, bookingId),
+    ProjectionExpression: 'attendee_email, attendee_name, appointment_type_id, start_at, #st',
+    ExpressionAttributeNames: { '#st': 'status' },
+  }));
+  if (!res.Item) return null;
+  const it = res.Item;
+  return {
+    attendeeEmail: it.attendee_email?.S ?? null,
+    attendeeName: it.attendee_name?.S ?? null,
+    appointmentTypeId: it.appointment_type_id?.S ?? null,
+    startAt: it.start_at?.S ?? null,
+    status: it.status?.S ?? null,
+  };
+}
+
 module.exports = {
   flagOooConflict,
   cancelOnDecline,
+  getReofferContext,
   isConditionalCheckFailed,
   _BOOKING_TABLE: BOOKING_TABLE,
 };

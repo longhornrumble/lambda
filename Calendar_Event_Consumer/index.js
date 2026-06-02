@@ -37,12 +37,13 @@
  * MUST set `FunctionResponseTypes: ['ReportBatchItemFailures']`, or a non-empty
  * `batchItemFailures` return is ignored and failures will not redrive.
  *
- * OUT OF SCOPE (operator decision 2026-05-31 — "Stub + escalate"):
- *   - B9 volunteer reoffer (pool re-run + notification). There is no stored
- *     booking→routing_policy/candidate-pool linkage and no reoffer-notification contract;
- *     building it would fork undefined behavior. Stubbed + escalated to the integrator
- *     (see the reoffer TODO below + the PR escalation block). The conflict-flag + admin
- *     alert ensures no conflict is silently dropped in the meantime.
+ * B9 volunteer reoffer (gap C, wired 2026-06-02): on a flagged OOO conflict, re-resolve
+ * the pool from the booking's appointment_type (X = resolveCandidates), and if a candidate
+ * can still serve it, send the volunteer a §13.4 signed reschedule link (Y =
+ * dispatchVolunteerNotice, kind 'reoffer'). Best-effort — the durable conflict flag + admin
+ * alert remain the safety mechanism; a reoffer failure never redrives the record.
+ *
+ * OUT OF SCOPE (operator decision 2026-05-31):
  *   - B10 reminder-suppression + defensive `responseStatus` poll → `TODO(E)` (sub-phase E
  *     does not exist yet).
  *
@@ -54,8 +55,12 @@ const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 
 const { sdkConfig } = require('./aws-client-config');
 const bookingUpdates = require('./booking-updates');
+const { resolveCandidates } = require('../shared/scheduling/candidate-resolver'); // (X) §B7
+const { dispatchVolunteerNotice } = require('../shared/scheduling/notify'); // (Y) §B8
+const { sign } = require('../shared/scheduling/tokens'); // §13.4 signed reschedule link
 
 const OPS_ALERTS_TOPIC_ARN = process.env.OPS_ALERTS_TOPIC_ARN || '';
+const SCHEDULE_BASE_URL = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
 const sns = new SNSClient(sdkConfig());
 
 const EVENT_OOO_OVERLAP = 'booking.ooo_overlap_detected';
@@ -143,6 +148,71 @@ async function alertAdmin(subject, detail) {
   }
 }
 
+// ─── B9 reoffer (gap C): proactively offer the volunteer a new time (§14.2) ───────────
+// Called per flagged booking. Best-effort value-add on top of the durable conflict flag:
+//   1. read the attendee/appt context (the OOO envelope carries none),
+//   2. (X) re-resolve the pool from the booking's appointment_type — if NO candidate can
+//      serve it, do NOT send a false-hope reoffer (the conflict flag + admin alert stand),
+//   3. mint a §13.4 signed reschedule link (the volunteer re-picks; the pool re-runs fresh
+//      at that point — we don't pre-compute slots, matching the (Y) reoffer template),
+//   4. (Y) send the reoffer notice (Y is itself best-effort + agent-of-CoR guarded).
+async function sendReoffer({ tenantId, bookingId }) {
+  const ctx = await bookingUpdates.getReofferContext({ tenantId, bookingId });
+  if (!ctx || !ctx.attendeeEmail) {
+    warn('reoffer_skipped_no_attendee_email', { tenant_id: tenantId, booking_id: bookingId });
+    return;
+  }
+  if (!ctx.appointmentTypeId) {
+    warn('reoffer_skipped_no_appointment_type', { tenant_id: tenantId, booking_id: bookingId });
+    return;
+  }
+  if (!ctx.startAt) {
+    // No start_at → sign('reschedule', {start_at: null}) would throw on expiry compute.
+    // Skip explicitly (consistent with the guards above; schema-discipline forward-compat).
+    warn('reoffer_skipped_no_start_at', { tenant_id: tenantId, booking_id: bookingId });
+    return;
+  }
+
+  // (X) gate — only offer a new time if the pool can still serve this appointment type.
+  let candidates = [];
+  try {
+    candidates = await resolveCandidates({ tenantId, appointmentTypeId: ctx.appointmentTypeId });
+  } catch (err) {
+    warn('reoffer_resolve_candidates_failed', { tenant_id: tenantId, booking_id: bookingId, error: err.message });
+    return;
+  }
+  if (!candidates.length) {
+    log('reoffer_skipped_no_candidates', { tenant_id: tenantId, booking_id: bookingId });
+    return;
+  }
+
+  // (§13.4) signed reschedule link — same claims shape C8 mints for the confirmation email.
+  const token = await sign('reschedule', {
+    tenant_id: tenantId,
+    booking_id: bookingId,
+    start_at: ctx.startAt,
+  });
+  const reofferUrl = `${SCHEDULE_BASE_URL}/reschedule?t=${encodeURIComponent(token)}`;
+
+  // (Y) best-effort reoffer notice (no PII in our own logs — booking_id only).
+  const result = await dispatchVolunteerNotice({
+    kind: 'reoffer',
+    tenantId,
+    booking: {
+      booking_id: bookingId,
+      attendee_email: ctx.attendeeEmail,
+      attendee_name: ctx.attendeeName,
+      reoffer_url: reofferUrl,
+    },
+  });
+  log('reoffer_dispatched', {
+    tenant_id: tenantId,
+    booking_id: bookingId,
+    suppressed: Boolean(result && result.suppressed),
+    email_dispatched: Boolean(result && result.dispatched && result.dispatched.email),
+  });
+}
+
 // ─── B9: coordinator OOO event overlaps booked appointments (§14.2) ───────────────────
 
 async function handleOooOverlap(env) {
@@ -180,17 +250,17 @@ async function handleOooOverlap(env) {
         ooo_start_at: env.ooo_start_at,
         ooo_end_at: env.ooo_end_at,
       });
-      // TODO(reoffer) — ESCALATED to the integrator (operator decision 2026-05-31).
-      // Canonical §14.2 also says "volunteer is proactively notified and offered
-      // alternative slots" via a pool re-run. Blocked on two MISSING frozen contracts:
-      //   (1) booking→routing_policy/candidate-pool resolution — the Booking row stores
-      //       no routing_policy_id; C8 receives the candidate pool from upstream
-      //       conversation ctx, not from any shared resolver this Lambda can consume; and
-      //   (2) a volunteer-reoffer notification dispatch contract.
-      // Building either here would fork undefined behavior (FROZEN_CONTRACTS §C). The
-      // durable conflict flag + admin alert above guarantee the conflict is never
-      // silently dropped while the integrator defines those contracts. See the PR
-      // escalation block.
+      // (reoffer) gap C — the two contracts the original TODO was blocked on now exist:
+      // (X) resolveCandidates resolves the pool from the booking's appointment_type_id
+      // (no routing_policy_id on the row), and (Y) dispatchVolunteerNotice is the reoffer
+      // dispatch. Best-effort: the durable conflict flag + admin alert above are the
+      // safety mechanism; a reoffer failure must NOT redrive the record (which would only
+      // re-flag/re-alert idempotently). So this is wrapped + swallowed.
+      try {
+        await sendReoffer({ tenantId, bookingId });
+      } catch (err) {
+        warn('reoffer_failed', { tenant_id: tenantId, booking_id: bookingId, error: err.message });
+      }
     } else {
       // {absent | not 'booked' | already flagged for THIS calendar-mutation} — idempotent
       // no-op; the admin alert fires at-most-once per (booking, calendar-mutation).

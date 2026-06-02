@@ -17,12 +17,40 @@ jest.mock('./remediation', () => ({
 jest.mock('./routing-context', () => ({ buildResolveAlternate: () => jest.fn() }));
 jest.mock('./calendar-ops', () => ({ transferEvent: jest.fn(), deleteEvent: jest.fn() }));
 jest.mock('./oauth-client', () => ({ getOAuthClient: jest.fn() }));
+// (X) gap-C wire: mock the candidate resolver so the loadCandidates adapter is testable
+// without touching DDB.
+const mockResolveCandidates = jest.fn();
+jest.mock('../shared/scheduling/candidate-resolver', () => ({
+  resolveCandidates: (...a) => mockResolveCandidates(...a),
+}));
 
 const { handler, _test } = require('./index');
 
 beforeEach(() => {
   mockFindStranded.mockReset();
   mockRemediate.mockReset();
+  mockResolveCandidates.mockReset();
+});
+
+// ─── (X) gap-C wire: loadCandidates adapter ───────────────────────────────────────────
+
+describe('loadCandidatesViaResolver (X wire)', () => {
+  test('maps the loadCandidates seam args to resolveCandidates({tenantId, routingPolicyId})', async () => {
+    const roster = [{ resourceId: 'r1@x', scheduling_tags: ['mentor'], coordinatorEmail: 'r1@x' }];
+    mockResolveCandidates.mockResolvedValue(roster);
+
+    // realistic seam args: routing-context passes the appointmentType + routingPolicy objects
+    // it already resolved (the adapter uses only routingPolicy.id and ignores appointmentType).
+    const out = await _test.loadCandidatesViaResolver(
+      'TEN1',
+      { appointmentTypeId: 'apt-1', routingPolicyId: 'rp-7' },
+      { id: 'rp-7', tag_conditions: [] }
+    );
+
+    // routing_policy_id is routingPolicy.id; appointmentType is already resolved upstream.
+    expect(mockResolveCandidates).toHaveBeenCalledWith({ tenantId: 'TEN1', routingPolicyId: 'rp-7' });
+    expect(out).toEqual(roster); // shape passes straight through to resolveAlternate's filter
+  });
 });
 
 const VALID = {

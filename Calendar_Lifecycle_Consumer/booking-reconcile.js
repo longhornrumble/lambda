@@ -17,9 +17,16 @@
  */
 
 const bookingStore = require('./booking-store');
+const { dispatchVolunteerNotice } = require('../shared/scheduling/notify'); // (Y) §B8
+const { sign } = require('../shared/scheduling/tokens'); // §13.4 signed reschedule link
+
+const SCHEDULE_BASE_URL = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
 
 function log(event, fields) {
   console.log(JSON.stringify({ event, ...fields }));
+}
+function warn(event, fields) {
+  console.warn(JSON.stringify({ event, level: 'WARN', ...fields }));
 }
 
 // Require non-empty string fields. Applied ONLY to the fields an action actually needs
@@ -44,19 +51,48 @@ async function reconcileDeleted(env) {
   const canceled = await bookingStore.cancelOnCoordinatorDelete({ tenantId, bookingId });
   if (canceled) {
     log('calendar_deleted_canceled', { tenant_id: tenantId, booking_id: bookingId });
-    // TODO(Y) — enqueue a volunteer reschedule-link notice via the WS-SCHED-FOUNDATIONS
-    // notification-dispatch contract. §5.1 value-add: Google's cancellation email lacks the
-    // reschedule link, so this platform notice is NOT a duplicate of native comms.
-    // Intended payload (no contract yet — STUBBED, not sent):
-    //   { tenant_id, booking_id, channel: 'volunteer', template: 'coordinator_canceled_reschedule',
-    //     token_purpose: 'reschedule' /* §13.4 signed-token link, minted by (Y) */ }
-    log('notify_stub_skipped', {
-      reason: 'TODO(Y) notification-dispatch contract not built (WS-SCHED-FOUNDATIONS)',
-      tenant_id: tenantId, booking_id: bookingId,
-      intent: 'volunteer_reschedule_link_notice', token_purpose: 'reschedule',
-    });
+    // (Y) gap C — volunteer cancel-notice with an embedded reschedule link. §5.1 value-add:
+    // Google's cancellation email lacks the reschedule link. Best-effort — the cancel
+    // (the durable outcome) already succeeded, so a notice failure must NOT redrive.
+    await sendCancelNotice(tenantId, bookingId);
   } else {
     log('calendar_deleted_noop', { tenant_id: tenantId, booking_id: bookingId });
+  }
+}
+
+// Best-effort volunteer cancel-notice (kind 'cancel_notice' with a §13.4 reschedule link).
+// Swallows its own errors — the cancellation is the durable outcome; a courtesy notice
+// failure must never fail/redrive the reconcile record.
+async function sendCancelNotice(tenantId, bookingId) {
+  try {
+    const ctx = await bookingStore.getNoticeContext({ tenantId, bookingId });
+    if (!ctx || !ctx.attendeeEmail) {
+      log('notify_skipped_no_attendee_email', { tenant_id: tenantId, booking_id: bookingId });
+      return;
+    }
+    if (!ctx.startAt) {
+      // No start_at → sign('reschedule', {start_at: null}) would throw on expiry compute.
+      log('notify_skipped_no_start_at', { tenant_id: tenantId, booking_id: bookingId });
+      return;
+    }
+    const token = await sign('reschedule', { tenant_id: tenantId, booking_id: bookingId, start_at: ctx.startAt });
+    const rescheduleUrl = `${SCHEDULE_BASE_URL}/reschedule?t=${encodeURIComponent(token)}`;
+    const result = await dispatchVolunteerNotice({
+      kind: 'cancel_notice',
+      tenantId,
+      booking: {
+        booking_id: bookingId,
+        attendee_email: ctx.attendeeEmail,
+        attendee_name: ctx.attendeeName,
+        reschedule_url: rescheduleUrl, // cancel_notice uses this as the optional rebook link
+      },
+    });
+    log('cancel_notice_dispatched', {
+      tenant_id: tenantId, booking_id: bookingId,
+      email_dispatched: Boolean(result && result.dispatched && result.dispatched.email),
+    });
+  } catch (err) {
+    warn('cancel_notice_failed', { tenant_id: tenantId, booking_id: bookingId, error: err.message });
   }
 }
 
@@ -70,19 +106,25 @@ async function reconcileMoved(env) {
   const canceled = await bookingStore.cancelOnCoordinatorMove({ tenantId, bookingId });
   if (canceled) {
     log('calendar_moved_canceled', { tenant_id: tenantId, booking_id: bookingId });
-    // TODO(Y) — emit the reschedule path via the WS-SCHED-FOUNDATIONS notification-dispatch
-    // contract. §5.1/§14.2: do NOT auto-create the replacement booking (deferred — C8 + a
-    // re-pool). Email-only volunteers rely on Google's native event-update email; the (Y)
-    // value-add is an opt-in SMS with the new time + a reschedule link.
-    // Intended payload (STUBBED, not sent):
-    //   { tenant_id, booking_id, channel: 'volunteer_sms_opt_in',
-    //     template: 'coordinator_moved_reschedule', token_purpose: 'reschedule',
-    //     new_start_at: env.new_start_at, new_end_at: env.new_end_at }
-    log('notify_stub_skipped', {
-      reason: 'TODO(Y) notification-dispatch contract not built (WS-SCHED-FOUNDATIONS)',
-      tenant_id: tenantId, booking_id: bookingId,
-      intent: 'volunteer_moved_reschedule_path', token_purpose: 'reschedule',
-    });
+    // (Y) gap C — §5.1/§14.2: email-only volunteers rely on Google's native event-update
+    // email (the 'moved' email kind is agent-of-CoR-suppressed in Y); the platform value-add
+    // is an OPT-IN SMS with the new time + reschedule link. Y's SMS path is a stub until the
+    // sub-phase-E/SMS twin lands, so this dispatch is INERT today (returns {stub:true}, no
+    // send) — but the wire is in place. Best-effort: never fails/redrives the reconcile.
+    try {
+      const result = await dispatchVolunteerNotice({
+        kind: 'move_optin_sms',
+        tenantId,
+        booking: { booking_id: bookingId, new_start_at: env.new_start_at, new_end_at: env.new_end_at },
+      });
+      log('moved_notice_dispatched', {
+        tenant_id: tenantId, booking_id: bookingId,
+        sms_stub: Boolean(result && result.dispatched && result.dispatched.sms),
+        suppressed: Boolean(result && result.suppressed),
+      });
+    } catch (err) {
+      warn('moved_notice_failed', { tenant_id: tenantId, booking_id: bookingId, error: err.message });
+    }
   } else {
     log('calendar_moved_noop', { tenant_id: tenantId, booking_id: bookingId });
   }
