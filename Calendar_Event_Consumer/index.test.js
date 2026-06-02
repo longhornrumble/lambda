@@ -17,10 +17,21 @@ const { SNSClient, PublishCommand } = require('@aws-sdk/client-sns');
 // Persistent mock fns (the `mock` prefix lets the hoisted factory reference them).
 const mockFlag = jest.fn();
 const mockCancel = jest.fn();
+const mockGetReofferContext = jest.fn();
 jest.mock('./booking-updates', () => ({
   flagOooConflict: mockFlag,
   cancelOnDecline: mockCancel,
+  getReofferContext: mockGetReofferContext,
 }));
+
+// gap C reoffer wire: mock (X) resolveCandidates, (Y) dispatchVolunteerNotice, and the
+// §13.4 token signer so the reoffer path is testable without DDB / send_email / secrets.
+const mockResolveCandidates = jest.fn();
+const mockDispatchVolunteerNotice = jest.fn();
+const mockSign = jest.fn();
+jest.mock('../shared/scheduling/candidate-resolver', () => ({ resolveCandidates: (...a) => mockResolveCandidates(...a) }));
+jest.mock('../shared/scheduling/notify', () => ({ dispatchVolunteerNotice: (...a) => mockDispatchVolunteerNotice(...a) }));
+jest.mock('../shared/scheduling/tokens', () => ({ sign: (...a) => mockSign(...a) }));
 
 const snsMock = mockClient(SNSClient);
 
@@ -62,6 +73,13 @@ beforeEach(() => {
   snsMock.on(PublishCommand).resolves({ MessageId: 'sns-1' });
   mockFlag.mockReset().mockResolvedValue(true);
   mockCancel.mockReset().mockResolvedValue(true);
+  // Default: no reoffer context → the reoffer best-effort path early-returns, so the
+  // existing OOO tests (which only assert flag + admin-alert) are unaffected. The
+  // dedicated reoffer suite below sets these per-case.
+  mockGetReofferContext.mockReset().mockResolvedValue(null);
+  mockResolveCandidates.mockReset().mockResolvedValue([]);
+  mockDispatchVolunteerNotice.mockReset().mockResolvedValue({ suppressed: false, dispatched: { email: 'queued' } });
+  mockSign.mockReset().mockResolvedValue('tok-resched');
   jest.spyOn(console, 'log').mockImplementation(() => {});
   warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
@@ -321,5 +339,92 @@ describe('admin alert routing', () => {
       process.env.OPS_ALERTS_TOPIC_ARN = prev;
       jest.resetModules();
     }
+  });
+});
+
+// ─── B9 reoffer (gap C: X + Y) ──────────────────────────────────────────────────────────
+// On a flagged OOO conflict, re-resolve the pool (X) and — only if a candidate can still
+// serve the appointment type — send the volunteer a signed reschedule link (Y, kind 'reoffer').
+
+describe('B9 reoffer (X + Y)', () => {
+  const FULL_CTX = {
+    attendeeEmail: 'vol@example.org',
+    attendeeName: 'Vol Unteer',
+    appointmentTypeId: 'apt-mentoring',
+    startAt: '2026-06-10T15:00:00Z',
+    status: 'booked',
+  };
+
+  test('happy path: candidates exist → mints reschedule token + dispatches reoffer', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue(FULL_CTX);
+    mockResolveCandidates.mockResolvedValue([{ resourceId: 'c@x', scheduling_tags: ['mentor'], coordinatorEmail: 'c@x' }]);
+
+    await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    // (X) resolved from the booking's appointment_type (no routing_policy_id on the row)
+    expect(mockResolveCandidates).toHaveBeenCalledWith({ tenantId: 'AUS123957', appointmentTypeId: 'apt-mentoring' });
+    // §13.4 reschedule token: same claim shape C8 mints
+    expect(mockSign).toHaveBeenCalledWith('reschedule', { tenant_id: 'AUS123957', booking_id: 'bk-1', start_at: FULL_CTX.startAt });
+    // (Y) reoffer notice with the signed link
+    expect(mockDispatchVolunteerNotice).toHaveBeenCalledTimes(1);
+    const arg = mockDispatchVolunteerNotice.mock.calls[0][0];
+    expect(arg.kind).toBe('reoffer');
+    expect(arg.tenantId).toBe('AUS123957');
+    expect(arg.booking.attendee_email).toBe('vol@example.org');
+    expect(arg.booking.reoffer_url).toBe('https://schedule.myrecruiter.ai/reschedule?t=tok-resched');
+  });
+
+  test('no candidates → no false-hope reoffer (no token, no dispatch)', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue(FULL_CTX);
+    mockResolveCandidates.mockResolvedValue([]);
+
+    await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(mockSign).not.toHaveBeenCalled();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  test('missing attendee_email → skip (no candidate lookup, no dispatch)', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue({ ...FULL_CTX, attendeeEmail: null });
+
+    await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(mockResolveCandidates).not.toHaveBeenCalled();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  test('missing appointment_type_id → skip', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue({ ...FULL_CTX, appointmentTypeId: null });
+
+    await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(mockResolveCandidates).not.toHaveBeenCalled();
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  test('resolveCandidates throws → reoffer skipped, conflict flag still durable (no record failure)', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue(FULL_CTX);
+    mockResolveCandidates.mockRejectedValue(new Error('DDB throttled'));
+
+    const res = await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(res.batchItemFailures).toEqual([]); // best-effort: the OOO record did NOT fail
+    expect(mockDispatchVolunteerNotice).not.toHaveBeenCalled();
+  });
+
+  test('reoffer dispatch throwing does NOT fail the OOO record (best-effort swallow)', async () => {
+    mockFlag.mockResolvedValue(true);
+    mockGetReofferContext.mockResolvedValue(FULL_CTX);
+    mockResolveCandidates.mockResolvedValue([{ resourceId: 'c@x', scheduling_tags: ['mentor'], coordinatorEmail: 'c@x' }]);
+    mockDispatchVolunteerNotice.mockRejectedValue(new Error('send_email invoke failed'));
+
+    const res = await idx.handler({ Records: [oooRecord(['bk-1'])] });
+
+    expect(res.batchItemFailures).toEqual([]);
   });
 });

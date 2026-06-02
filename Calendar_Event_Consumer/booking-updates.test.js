@@ -11,6 +11,7 @@ require('aws-sdk-client-mock-jest');
 const {
   DynamoDBClient,
   UpdateItemCommand,
+  GetItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 
 const ddbMock = mockClient(DynamoDBClient);
@@ -142,5 +143,45 @@ describe('canonical status binding', () => {
     const { BOOKING_STATUSES } = require('../shared/booking-status');
     expect(BOOKING_STATUSES).toContain('booked');
     expect(BOOKING_STATUSES).toContain('canceled');
+  });
+});
+
+describe('getReofferContext — B9 reoffer attendee/appt read (gap C)', () => {
+  it('projects + unmarshals the reoffer fields the OOO envelope lacks', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        attendee_email: { S: 'vol@example.org' },
+        attendee_name: { S: 'Vol Unteer' },
+        appointment_type_id: { S: 'apt-1' },
+        start_at: { S: '2026-06-10T15:00:00Z' },
+        status: { S: 'booked' },
+      },
+    });
+    const ctx = await updates.getReofferContext({ tenantId: 'AUS123957', bookingId: 'bk-1' });
+    expect(ctx).toEqual({
+      attendeeEmail: 'vol@example.org',
+      attendeeName: 'Vol Unteer',
+      appointmentTypeId: 'apt-1',
+      startAt: '2026-06-10T15:00:00Z',
+      status: 'booked',
+    });
+    const sent = ddbMock.commandCalls(GetItemCommand)[0].args[0].input;
+    expect(sent.ProjectionExpression).toContain('attendee_email');
+    expect(sent.ExpressionAttributeNames).toEqual({ '#st': 'status' }); // 'status' is reserved
+  });
+
+  it('returns null when the booking row is absent', async () => {
+    ddbMock.on(GetItemCommand).resolves({});
+    expect(await updates.getReofferContext({ tenantId: 'AUS123957', bookingId: 'gone' })).toBeNull();
+  });
+
+  it('tolerates an old-shape row missing the optional fields (forward-compat)', async () => {
+    ddbMock.on(GetItemCommand).resolves({ Item: { attendee_email: { S: 'v@x' } } });
+    const ctx = await updates.getReofferContext({ tenantId: 'AUS123957', bookingId: 'bk-2' });
+    expect(ctx).toEqual({ attendeeEmail: 'v@x', attendeeName: null, appointmentTypeId: null, startAt: null, status: null });
+  });
+
+  it('throws on missing identifiers', async () => {
+    await expect(updates.getReofferContext({ tenantId: 'AUS123957' })).rejects.toThrow('requires tenantId, bookingId');
   });
 });

@@ -33,6 +33,7 @@
 const {
   DynamoDBClient,
   UpdateItemCommand,
+  GetItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 
 const { isBookingStatus } = require('../shared/booking-status');
@@ -183,10 +184,33 @@ async function reassignCoordinator({ tenantId, bookingId, previousResourceId, ne
   }
 }
 
+// (Y) gap C — the calendar_deleted envelope carries no attendee contact info; read the
+// fields the volunteer cancel/reschedule notice needs. Projects ONLY those fields (schema
+// discipline / bounds the PII surface). Returns null if the row is absent.
+async function getNoticeContext({ tenantId, bookingId }) {
+  if (!tenantId || !bookingId) {
+    throw new Error('getNoticeContext requires tenantId, bookingId');
+  }
+  const res = await ddb.send(new GetItemCommand({
+    TableName: BOOKING_TABLE,
+    Key: { tenantId: s(tenantId), booking_id: s(bookingId) },
+    ProjectionExpression: 'attendee_email, attendee_name, appointment_type_id, start_at',
+  }));
+  if (!res.Item) return null;
+  const it = res.Item;
+  return {
+    attendeeEmail: it.attendee_email?.S ?? null,
+    attendeeName: it.attendee_name?.S ?? null,
+    appointmentTypeId: it.appointment_type_id?.S ?? null,
+    startAt: it.start_at?.S ?? null,
+  };
+}
+
 module.exports = {
   cancelOnCoordinatorDelete,
   cancelOnCoordinatorMove,
   reassignCoordinator,
+  getNoticeContext,
   isConditionalCheckFailed,
   _BOOKING_TABLE: BOOKING_TABLE,
   _CANCEL_REASON_DELETED: CANCEL_REASON_DELETED,

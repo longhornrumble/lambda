@@ -7,6 +7,9 @@ import * as esbuild from 'esbuild';
 const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
   '@aws-sdk/client-sns',
+  // gap C reoffer wire: notify.js (Y) → client-lambda; tokens.js (§13.4) → client-secrets-manager.
+  '@aws-sdk/client-lambda',
+  '@aws-sdk/client-secrets-manager',
 ];
 
 await esbuild.build({

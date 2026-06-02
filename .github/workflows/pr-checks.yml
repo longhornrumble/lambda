@@ -225,9 +225,9 @@ jobs:
         working-directory: shared
         run: npm install
 
-      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator consume them)
+      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator + Calendar_Event_Consumer + Calendar_Lifecycle_Consumer consume them)
         if: |
-          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator') &&
+          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator' || matrix.lambda == 'Calendar_Event_Consumer' || matrix.lambda == 'Calendar_Lifecycle_Consumer') &&
           (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
         working-directory: shared/scheduling
         run: npm install
@@ -687,9 +687,9 @@ jobs:
           cache: 'npm'
           cache-dependency-path: ${{ matrix.lambda }}/package-lock.json
 
-      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator bundle them)
+      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator + Calendar_Event_Consumer + Calendar_Lifecycle_Consumer bundle them)
         if: |
-          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator') &&
+          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator' || matrix.lambda == 'Calendar_Event_Consumer' || matrix.lambda == 'Calendar_Lifecycle_Consumer') &&
           (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
         working-directory: shared/scheduling
         run: npm install
