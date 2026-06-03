@@ -33,6 +33,7 @@ on:
           - Calendar_Watch_Renewer
           - Calendar_Watch_Offboarder
           - Booking_Commit_Handler
+          - Scheduling_Redemption_Handler
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -483,6 +484,25 @@ jobs:
             # phase-completion-audit (Calendar / Zoom / SES / DDB / Secrets), not
             # an automated probe — a synthetic invoke would attempt real Google
             # Calendar + SES + DDB writes. Zoom path additionally secret-gated.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Scheduling_Redemption_Handler
+            # Scheduling sub-phase D Task D4 — the one-tap token-redemption edge
+            # (Lambda Function URL behind the staging.schedule CloudFront dist).
+            # Node.js esbuild bundle (npm run package = node esbuild.config.mjs +
+            # zip). It bundles ../shared/scheduling/tokens.js, but — UNLIKE C8 —
+            # tokens.js's only non-builtin deps (@aws-sdk/*) are externalized, so
+            # it needs NO shared/scheduling npm install. Env vars Terraform-managed
+            # in picasso infra/ module lambda-scheduling-redemption-handler-staging.
+            staging_function: Scheduling_Redemption_Handler
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # Public Function URL, but every path is token-gated — an unauthenticated
+            # synthetic probe would 4xx (no token) rather than exercise a real flow.
+            # Live smoke is the integrator's curl of the redemption host post-deploy.
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
