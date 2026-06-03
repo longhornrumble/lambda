@@ -55,9 +55,28 @@ describe('saveState', () => {
     expect('selected_slot' in call.Item).toBe(false); // omitted when undefined
   });
 
-  it('fail-soft on missing keys (no DDB write)', async () => {
+  it('fail-soft on missing keys OR missing state (no DDB write) — audit S-2', async () => {
     await deps().saveState({ tenantId: '', sessionId: 'x', state: 'proposing' });
+    await deps().saveState({ tenantId: 'T1', sessionId: 'x' }); // state undefined → guard (DDB rejects null attr)
     expect(ddbMock).not.toHaveReceivedCommand(PutCommand);
+  });
+
+  it('swallows a PutItem throw (fail-soft → no-op, no propagation) — audit S-1', async () => {
+    ddbMock.on(PutCommand).rejects(new Error('ProvisionedThroughputExceededException'));
+    await expect(
+      deps().saveState({ tenantId: 'T1', sessionId: 'sess-1', state: 'confirming' })
+    ).resolves.toBeUndefined(); // does NOT throw → caller stays handled:true, no CTA leak
+  });
+});
+
+describe('fail-soft reads (audit S-1)', () => {
+  it('loadState returns null when GetItem throws', async () => {
+    ddbMock.on(GetCommand).rejects(new Error('boom'));
+    expect(await deps().loadState({ tenantId: 'T1', sessionId: 'sess-1' })).toBeNull();
+  });
+  it('loadBooking returns null when GetItem throws', async () => {
+    ddbMock.on(GetCommand).rejects(new Error('boom'));
+    expect(await deps().loadBooking({ tenantId: 'T1', bookingId: 'bk-9' })).toBeNull();
   });
 });
 

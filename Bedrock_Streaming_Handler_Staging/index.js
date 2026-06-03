@@ -43,10 +43,9 @@ const { corsHeaders } = require('./cors-helper');
 // C9 state row + loadBooking). Built once per container (client reuse). resolveBinding/
 // detect/generateSlots/stateMachine use schedulingFlow's bundled defaults; the Google-auth
 // calendar EXECUTION seam is Tier 2 (Booking_Commit_Handler executor invoke), not wired here.
-const SCHED_ENV = process.env.ENVIRONMENT || 'staging';
 const schedulingDeps = buildSchedulingDeps({
-  sessionTable: process.env.SCHEDULING_SESSION_TABLE || `picasso-conversation-scheduling-session-${SCHED_ENV}`,
-  bookingTable: process.env.BOOKING_TABLE || `picasso-booking-${SCHED_ENV}`,
+  sessionTable: process.env.SCHEDULING_SESSION_TABLE || `picasso-conversation-scheduling-session-${process.env.ENVIRONMENT || 'staging'}`,
+  bookingTable: process.env.BOOKING_TABLE || `picasso-booking-${process.env.ENVIRONMENT || 'staging'}`,
 });
 const { validateCfOriginHeader } = require('./cf-origin-validator');
 

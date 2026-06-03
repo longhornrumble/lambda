@@ -33,36 +33,58 @@ function buildSchedulingDeps({ sessionTable, bookingTable, region, client } = {}
     client || new DynamoDBClient({ region: region || process.env.AWS_REGION })
   );
 
+  // All three are FAIL-SOFT: this is a post-stream enhancement on the chat hot path,
+  // never worth breaking the (already-streamed) response over. A DDB error logs (PII-free
+  // error_name) and degrades gracefully — reads → null (flow falls back to initial state /
+  // skips execution non-fatally), saveState → no-op (next turn re-derives). This also keeps
+  // a saveState throw from propagating to handled:false and leaking the normal CTA chain
+  // onto a live scheduling turn (audit S-1).
+
   // C9 state row read (plain-<sessionId> SK). Returns the raw item ({ state,
-  // candidate_slots?, selected_slot? }) or null on a first turn / missing row.
+  // candidate_slots?, selected_slot? }) or null on a first turn / missing row / error.
   async function loadState({ tenantId, sessionId } = {}) {
     if (!tenantId || !sessionId) return null;
-    const res = await ddb.send(new GetCommand({
-      TableName: sessionTable,
-      Key: { tenantId, session_id: sessionId },
-    }));
-    return res.Item || null;
+    try {
+      const res = await ddb.send(new GetCommand({
+        TableName: sessionTable,
+        Key: { tenantId, session_id: sessionId },
+      }));
+      return res.Item || null;
+    } catch (err) {
+      console.error(`[WS-CONVO] loadState failed (fail-soft → null): error_name=${(err && err.name) || 'unknown'}`);
+      return null;
+    }
   }
 
   // C9 state row write. PUTs the plain-<sessionId> row — never touches the
-  // `binding#<sessionId>` row, so the §B10 binding is preserved.
+  // `binding#<sessionId>` row, so the §B10 binding is preserved. Guards `state`
+  // (DDB rejects a null/undefined attribute, audit S-2).
   async function saveState({ tenantId, sessionId, state, candidate_slots, selected_slot } = {}) {
-    if (!tenantId || !sessionId) return;
+    if (!tenantId || !sessionId || !state) return;
     const item = { tenantId, session_id: sessionId, state, updated_at: new Date().toISOString() };
     if (candidate_slots !== undefined) item.candidate_slots = candidate_slots;
     if (selected_slot !== undefined) item.selected_slot = selected_slot;
-    await ddb.send(new PutCommand({ TableName: sessionTable, Item: item }));
+    try {
+      await ddb.send(new PutCommand({ TableName: sessionTable, Item: item }));
+    } catch (err) {
+      console.error(`[WS-CONVO] saveState failed (fail-soft → no-op): error_name=${(err && err.name) || 'unknown'}`);
+    }
   }
 
   // Booking read (PK tenantId · SK booking_id). schedulingFlow reads it tolerantly
   // (camel OR snake), so the raw item is fine. GetItem only — BSH never writes Booking.
   async function loadBooking({ tenantId, bookingId } = {}) {
     if (!tenantId || !bookingId) return null;
-    const res = await ddb.send(new GetCommand({
-      TableName: bookingTable,
-      Key: { tenantId, booking_id: bookingId },
-    }));
-    return res.Item || null;
+    try {
+      const res = await ddb.send(new GetCommand({
+        TableName: bookingTable,
+        Key: { tenantId, booking_id: bookingId },
+      }));
+      return res.Item || null;
+    } catch (err) {
+      console.error(`[WS-CONVO] loadBooking failed (fail-soft → null): error_name=${(err && err.name) || 'unknown'}`);
+      return null;
+    }
   }
 
   return { loadState, saveState, loadBooking };
