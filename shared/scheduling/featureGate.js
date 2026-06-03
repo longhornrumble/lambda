@@ -30,7 +30,11 @@ const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 // Module-level default client (reused across warm invocations). Tests inject deps.s3.
 const defaultS3 = new S3Client({});
 
-const DEFAULT_CONFIG_BUCKET = process.env.CONFIG_BUCKET || process.env.S3_CONFIG_BUCKET || 'myrecruiter-picasso';
+// No hardcoded bucket fallback. If neither env var is set, the bucket is '' → the S3
+// GetObject fails → isSchedulingEnabledForTenant fail-closes to DISABLED. A default to a
+// real bucket name (esp. the prod bucket) would point a misconfigured Lambda at the wrong
+// account's data — the CLAUDE.md "never cross environments" rule. Fail loud + closed instead.
+const DEFAULT_CONFIG_BUCKET = process.env.CONFIG_BUCKET || process.env.S3_CONFIG_BUCKET || '';
 
 /**
  * Load and parse a tenant config object from S3. Throws on miss / malformed JSON — the

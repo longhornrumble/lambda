@@ -102,6 +102,13 @@ describe('feature gate: scheduling_enabled (OFF unless config opts in)', () => {
       .commandCalls(PutItemCommand)
       .filter((c) => c.args[0].input.TableName === SESSION_TABLE);
     expect(sessionPuts.length).toBe(0);
+    // SECURITY ORDERING: the gate runs AFTER redeem() so the one-time jti is STILL burned
+    // (the link is single-use regardless of the gate). Assert the burn happened — this is
+    // the property the test name claims; a refactor moving the gate before redeem() must fail.
+    const jtiPuts = ddbMock
+      .commandCalls(PutItemCommand)
+      .filter((c) => c.args[0].input.TableName === JTI_TABLE);
+    expect(jtiPuts.length).toBe(1);
   });
 });
 

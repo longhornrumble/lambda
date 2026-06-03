@@ -59,7 +59,8 @@ describe('commit route gating', () => {
     const res = await handler(commitEvent());
     expect(res).toEqual({ status: 'SCHEDULING_DISABLED', reason: 'feature_not_enabled' });
     expect(pool.lockSlot).not.toHaveBeenCalled();
-    expect(featureGate.isSchedulingEnabledForTenant).toHaveBeenCalledWith('AUS123957', expect.any(Object));
+    // module-default path is called with ONLY the tenant id (never the injected bag)
+    expect(featureGate.isSchedulingEnabledForTenant).toHaveBeenCalledWith('AUS123957');
   });
 
   test('injected.isSchedulingEnabledForTenant override is honored (and short-circuits the module default)', async () => {

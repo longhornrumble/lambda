@@ -442,6 +442,17 @@ function validate(event) {
 
 // ─── handler ──────────────────────────────────────────────────────────────────────────
 
+// Resolve the scheduling feature gate (fail-closed). A test may inject
+// `injected.isSchedulingEnabledForTenant` (called with the full injected bag so a stub can
+// inspect it); otherwise the shared gate is called with ONLY the tenant id — never the
+// injected bag — so a future unrelated `injected` key can't silently override the gate's
+// config loader (collision-proofing the DI seam).
+function gateScheduling(tenantId, injected) {
+  return injected.isSchedulingEnabledForTenant
+    ? injected.isSchedulingEnabledForTenant(tenantId, injected)
+    : featureGate.isSchedulingEnabledForTenant(tenantId);
+}
+
 exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
   // Tier-2 calendar-mutation executor (option d): BSH invokes BCH for an
   // already-§B14-authorized reschedule/cancel. Routed before the commit flow; it
@@ -450,7 +461,7 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
   if (event && event.action === 'scheduling_mutate') {
     // Feature gate (defense-in-depth — BSH already gates before invoking): refuse a
     // calendar mutation for a tenant without scheduling_enabled. Fail-closed.
-    const enabled = await (injected.isSchedulingEnabledForTenant || featureGate.isSchedulingEnabledForTenant)(event.tenantId, injected);
+    const enabled = await gateScheduling(event.tenantId, injected);
     if (!enabled) {
       log('scheduling_mutate_disabled', { mutation: event.mutation });
       return { outcome: 'failed', error: 'scheduling_disabled' };
@@ -464,7 +475,7 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
 
   // Feature gate: scheduling is OFF unless the tenant config sets feature_flags.
   // scheduling_enabled (like Forms). Fail-closed — a config we cannot read → refuse.
-  const schedulingEnabled = await (injected.isSchedulingEnabledForTenant || featureGate.isSchedulingEnabledForTenant)(tenantId, injected);
+  const schedulingEnabled = await gateScheduling(tenantId, injected);
   if (!schedulingEnabled) {
     log('commit_scheduling_disabled', { tenant_id: tenantId });
     return { status: 'SCHEDULING_DISABLED', reason: 'feature_not_enabled' };
