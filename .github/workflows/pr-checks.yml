@@ -52,6 +52,7 @@ jobs:
       pii_dsar:                  ${{ steps.filter.outputs.pii_dsar }}
       pii_dsar_sla_monitor:      ${{ steps.filter.outputs.pii_dsar_sla_monitor }}
       pii_dsar_weekly_reminder:  ${{ steps.filter.outputs.pii_dsar_weekly_reminder }}
+      pii_tenant_purge:          ${{ steps.filter.outputs.pii_tenant_purge }}
       # Node.js Lambda using node:test runner (no Jest)
       applier:        ${{ steps.filter.outputs.applier }}
       notification_hub: ${{ steps.filter.outputs.notification_hub }}
@@ -126,6 +127,8 @@ jobs:
               - 'picasso_pii_dsar_sla_monitor_staging/**'
             pii_dsar_weekly_reminder:
               - 'picasso_pii_dsar_weekly_reminder_staging/**'
+            pii_tenant_purge:
+              - 'picasso_pii_tenant_purge_staging/**'
             applier:
               - 'kb_proposal_applier/**'
             notification_hub:
@@ -359,7 +362,8 @@ jobs:
       needs.detect-changes.outputs.session_archiver == 'true' ||
       needs.detect-changes.outputs.pii_dsar == 'true' ||
       needs.detect-changes.outputs.pii_dsar_sla_monitor == 'true' ||
-      needs.detect-changes.outputs.pii_dsar_weekly_reminder == 'true'
+      needs.detect-changes.outputs.pii_dsar_weekly_reminder == 'true' ||
+      needs.detect-changes.outputs.pii_tenant_purge == 'true'
 
     strategy:
       fail-fast: false
@@ -401,6 +405,10 @@ jobs:
           - lambda: picasso_pii_dsar_weekly_reminder_staging
             changed: ${{ needs.detect-changes.outputs.pii_dsar_weekly_reminder }}
             # boto3 from Lambda runtime; no requirements.txt.
+            has_requirements: false
+          - lambda: picasso_pii_tenant_purge_staging
+            changed: ${{ needs.detect-changes.outputs.pii_tenant_purge }}
+            # boto3 from Lambda runtime; no requirements.txt (P1 Class A purge).
             has_requirements: false
 
     steps:

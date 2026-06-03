@@ -1,0 +1,13 @@
+# picasso-pii-tenant-purge-staging Lambda dependencies
+#
+# The deploy zip contains ONLY lambda_function.py — no pip-installed deps.
+# This file is the explicit, machine-readable declaration that the Lambda runs
+# on stdlib + boto3/botocore (provided by the managed Python 3.11 runtime).
+# Adding a third-party import without first updating this file AND the deploy
+# build step (zip -j lambda_function.py) WILL produce a silent runtime
+# ImportError on next invocation.
+#
+# Stdlib used: json, logging, os, datetime.
+# Runtime-provided: boto3, botocore (per AWS Lambda Python 3.11 runtime).
+
+# (intentionally empty — runtime-only)
