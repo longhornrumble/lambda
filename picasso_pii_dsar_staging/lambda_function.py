@@ -143,20 +143,22 @@ logger.setLevel(logging.INFO)
 # v2 §"Locked decisions" / Apply-1 module's env-guard pattern).
 EXPECTED_ACCOUNT = "525409062831"
 
-# Staging table names — single source of truth (matches infra/modules/* locals).
-TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
-TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit-staging"
-TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
-TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
-TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
-TABLE_RECENT_MESSAGES = "recent-messages"
-TABLE_CHANNEL_MAPPINGS = "picasso-channel-mappings-staging"
-TABLE_SESSION_EVENTS = "picasso-session-events-staging"
+# Table names — read from env vars (IaC sets them per-account from the ddb
+# module outputs, so a table rename cascades automatically). Defaults are the
+# current physical names, so behavior is unchanged if an env var is unset.
+TABLE_SUBJECT_INDEX = os.environ.get("SUBJECT_INDEX_TABLE", "picasso-pii-subject-index-staging")
+TABLE_DSAR_AUDIT = os.environ.get("DSAR_AUDIT_TABLE", "picasso-pii-dsar-audit-staging")
+TABLE_FORM_SUBMISSIONS = os.environ.get("FORM_SUBMISSIONS_TABLE", "picasso-form-submissions-staging")
+TABLE_NOTIFICATION_SENDS = os.environ.get("NOTIFICATION_SENDS_TABLE", "picasso-notification-sends-staging")
+TABLE_NOTIFICATION_EVENTS = os.environ.get("NOTIFICATION_EVENTS_TABLE", "picasso-notification-events-staging")
+TABLE_RECENT_MESSAGES = os.environ.get("RECENT_MESSAGES_TABLE", "recent-messages")
+TABLE_CHANNEL_MAPPINGS = os.environ.get("CHANNEL_MAPPINGS_TABLE", "picasso-channel-mappings-staging")
+TABLE_SESSION_EVENTS = os.environ.get("SESSION_EVENTS_TABLE", "picasso-session-events-staging")
 # F-DSAR31 (closed): session-summaries surface. pk=TENANT#{tenant_hash},
 # sk=SESSION#{sessionId}; rows carry a redacted first_question + counts/outcome
 # linkable by pii_subject_id. Reached via the operator-passed tenant_hash on the
 # DSAR event (the partition is tenant_hash-keyed, not tenant_id-keyed).
-TABLE_SESSION_SUMMARIES = "picasso-session-summaries-staging"
+TABLE_SESSION_SUMMARIES = os.environ.get("SESSION_SUMMARIES_TABLE", "picasso-session-summaries-staging")
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 GSI_CHANNEL_MAPPINGS_TENANT_INDEX = "TenantIndex"
 # M2 Sprint C: ARCHIVE_BUCKET. Per archive-reachability-decision.md
