@@ -667,10 +667,22 @@ jobs:
               --function-name ${{ matrix.lambda.staging_function }} \
               --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
           fi
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${URL%/}${{ matrix.lambda.smoke_path }}")
-          echo "Smoke: GET ${URL%/}${{ matrix.lambda.smoke_path }} → $STATUS"
-          if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
-            echo "::error::Expected ${{ matrix.lambda.smoke_expect_status }}, got $STATUS"
+          # Retry: immediately after update-function-code the Function URL
+          # transiently 403s (or 5xx) for a few seconds while the new code +
+          # resource policy propagate — a single curl raced that window and
+          # false-failed the deploy. Retry up to 5×6s; succeed on the first
+          # expected status.
+          FULL_URL="${URL%/}${{ matrix.lambda.smoke_path }}"
+          EXPECT="${{ matrix.lambda.smoke_expect_status }}"
+          STATUS=""
+          for attempt in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$FULL_URL")
+            echo "Smoke attempt $attempt: GET $FULL_URL → $STATUS (expect $EXPECT)"
+            [ "$STATUS" = "$EXPECT" ] && break
+            sleep 6
+          done
+          if [ "$STATUS" != "$EXPECT" ]; then
+            echo "::error::Expected $EXPECT, got $STATUS after 5 attempts"
             exit 1
           fi
 
