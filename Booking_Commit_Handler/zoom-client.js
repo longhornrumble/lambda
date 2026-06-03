@@ -211,6 +211,31 @@ async function getMeeting(tenantId, coordinatorId, meetingId) {
   return { meetingId: String(json.id || meetingId), joinUrl: json.join_url };
 }
 
+/**
+ * updateMeeting({ tenantId, meetingId, start, end, timezone }) → void  (§B15 / §9.4 seam-3)
+ *   Reschedule reuses the meeting (createMeeting({existingMeetingId}) preserves the JOIN URL),
+ *   but its START TIME stays stale until this PATCH. Per-tenant token via getAccessToken (in zoomFetch).
+ *   Idempotent: re-PATCH to the same time → 204, no-op-equivalent.
+ */
+async function updateMeeting({ tenantId, meetingId, start, end, timezone }) {
+  if (!tenantId || !meetingId || !start || !end) {
+    throw new Error('tenantId, meetingId, start, and end are required');
+  }
+  const durationMin = Math.max(1, Math.round((Date.parse(end) - Date.parse(start)) / 60000));
+  const res = await zoomFetch(tenantId, `${ZOOM_API_BASE}/meetings/${encodeURIComponent(meetingId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      start_time: start,
+      duration: durationMin,
+      timezone: timezone || 'UTC',
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Zoom update-meeting failed: ${res.status}`);
+  }
+}
+
 // Compensating delete (§4.5 / §6.2). 404 ⇒ already gone ⇒ success (idempotent).
 async function deleteMeeting(tenantId, meetingId) {
   if (!tenantId || !meetingId) {
@@ -229,6 +254,7 @@ function _resetForTests() {
 module.exports = {
   createMeeting,
   getMeeting,
+  updateMeeting,
   deleteMeeting,
   getAccessToken,
   fetchZoomSecret,

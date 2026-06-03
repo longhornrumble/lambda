@@ -113,6 +113,67 @@ describe('createMeeting', () => {
   });
 });
 
+describe('updateMeeting (§B15) — reschedule start-time PATCH', () => {
+  beforeEach(() => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: S2S_SECRET });
+  });
+
+  it('PATCHes the meeting with the new start/end → duration + timezone', async () => {
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600 })) // token
+      .mockResolvedValueOnce(jsonResponse({}, true, 204)); // PATCH OK (204 No Content)
+    await expect(zoom.updateMeeting({
+      tenantId: 'MYR384719', meetingId: '55',
+      start: '2026-06-03T18:00:00Z', end: '2026-06-03T18:30:00Z', timezone: 'America/Chicago',
+    })).resolves.toBeUndefined();
+    const patchCall = global.fetch.mock.calls[1];
+    expect(patchCall[0]).toContain('/meetings/55');
+    expect(patchCall[1].method).toBe('PATCH');
+    const body = JSON.parse(patchCall[1].body);
+    expect(body.start_time).toBe('2026-06-03T18:00:00Z');
+    expect(body.duration).toBe(30);
+    expect(body.timezone).toBe('America/Chicago');
+  });
+
+  it('idempotent: a 2xx (re-PATCH to the same time) resolves', async () => {
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600 }))
+      .mockResolvedValueOnce(jsonResponse({}, true, 204));
+    await expect(zoom.updateMeeting({
+      tenantId: 'MYR384719', meetingId: '55',
+      start: '2026-06-03T18:00:00Z', end: '2026-06-03T18:30:00Z',
+    })).resolves.toBeUndefined();
+  });
+
+  it('throws on a non-2xx Zoom failure (caller compensates), like the siblings', async () => {
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok', expires_in: 3600 }))
+      .mockResolvedValueOnce(jsonResponse({}, false, 400));
+    await expect(zoom.updateMeeting({
+      tenantId: 'MYR384719', meetingId: '55',
+      start: '2026-06-03T18:00:00Z', end: '2026-06-03T18:30:00Z',
+    })).rejects.toThrow(/Zoom update-meeting failed: 400/);
+  });
+
+  it('(5d) a 401 evicts the token and retries the PATCH once, matching createMeeting', async () => {
+    global.fetch
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok1', expires_in: 3600 })) // first token
+      .mockResolvedValueOnce(jsonResponse({}, false, 401)) // PATCH → 401
+      .mockResolvedValueOnce(jsonResponse({ access_token: 'tok2', expires_in: 3600 })) // re-token
+      .mockResolvedValueOnce(jsonResponse({}, true, 204)); // retry PATCH OK
+    await expect(zoom.updateMeeting({
+      tenantId: 'MYR384719', meetingId: '55',
+      start: '2026-06-03T18:00:00Z', end: '2026-06-03T18:30:00Z',
+    })).resolves.toBeUndefined();
+    const retryPatch = global.fetch.mock.calls[3];
+    expect(retryPatch[1].headers.Authorization).toBe('Bearer tok2');
+  });
+
+  it('throws on missing required args', async () => {
+    await expect(zoom.updateMeeting({ tenantId: 'T', meetingId: '55' })).rejects.toThrow(/required/);
+  });
+});
+
 describe('deleteMeeting — idempotent compensation', () => {
   beforeEach(() => {
     smMock.on(GetSecretValueCommand).resolves({ SecretString: S2S_SECRET });
