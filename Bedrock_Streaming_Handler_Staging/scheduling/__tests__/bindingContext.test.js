@@ -14,6 +14,7 @@ const {
   resolveSchedulingBinding,
   buildSchedulingContextBlock,
   initStateFromIntent,
+  isSchedulingEnabled,
   STATE_FOR_INTENT,
   CONTEXT_INSTRUCTION,
 } = require('../bindingContext');
@@ -25,6 +26,29 @@ const RESCHEDULE_BINDING = {
   expires_at: Date.now() + 60000,
   session_id: 'binding#sess-1',
 };
+
+describe('isSchedulingEnabled (the feature gate — OFF unless config opts in)', () => {
+  test('feature_flags.scheduling_enabled === true → enabled', () => {
+    expect(isSchedulingEnabled({ feature_flags: { scheduling_enabled: true } })).toBe(true);
+  });
+  test('flag explicitly false → disabled', () => {
+    expect(isSchedulingEnabled({ feature_flags: { scheduling_enabled: false } })).toBe(false);
+  });
+  test('flag absent (feature_flags present) → disabled (fail-closed)', () => {
+    expect(isSchedulingEnabled({ feature_flags: { V4_ACTION_SELECTOR: true } })).toBe(false);
+  });
+  test('no feature_flags block at all → disabled', () => {
+    expect(isSchedulingEnabled({})).toBe(false);
+  });
+  test('null / undefined config → disabled (never throws)', () => {
+    expect(isSchedulingEnabled(null)).toBe(false);
+    expect(isSchedulingEnabled(undefined)).toBe(false);
+  });
+  test('truthy-but-not-true (e.g. "true" string, 1) → disabled (strict === true)', () => {
+    expect(isSchedulingEnabled({ feature_flags: { scheduling_enabled: 'true' } })).toBe(false);
+    expect(isSchedulingEnabled({ feature_flags: { scheduling_enabled: 1 } })).toBe(false);
+  });
+});
 
 describe('initStateFromIntent', () => {
   test('rescheduling_intent → rescheduling', () => {

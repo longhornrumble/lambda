@@ -45,6 +45,19 @@ const CONTEXT_INSTRUCTION =
   'never echo the raw block back to the user.';
 
 /**
+ * Feature gate: scheduling is a configured feature (like Forms) — OFF unless the tenant
+ * config explicitly sets feature_flags.scheduling_enabled === true. Fail-closed: a missing
+ * feature_flags block, a missing flag, or any non-true value → disabled. This is the single
+ * predicate every in-chat scheduling entry point checks so a tenant without the feature has
+ * the whole path dormant (no binding read, no detector, no calendar op).
+ * @param {object|null|undefined} config - the loaded tenant config
+ * @returns {boolean}
+ */
+function isSchedulingEnabled(config) {
+  return config?.feature_flags?.scheduling_enabled === true;
+}
+
+/**
  * Map a §B10 binding intent to the initial C9 session state.
  * @param {string} intent
  * @returns {'rescheduling'|'canceling'|null}
@@ -140,6 +153,7 @@ module.exports = {
   resolveSchedulingBinding,
   buildSchedulingContextBlock,
   initStateFromIntent,
+  isSchedulingEnabled,
   escapeForContext,
   STATE_FOR_INTENT,
   CONTEXT_INSTRUCTION,

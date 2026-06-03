@@ -36,6 +36,7 @@ const { sdkConfig } = require('./aws-client-config');
 const pool = require('../shared/scheduling/pool'); // C6
 const routing = require('../shared/scheduling/routing'); // C5
 const availability = require('../shared/scheduling/availability'); // C4
+const featureGate = require('../shared/scheduling/featureGate'); // backend scheduling_enabled gate
 
 const { getOAuthClient, clearCacheEntry } = require('./oauth-client');
 const calendarEvents = require('./calendar-events');
@@ -447,12 +448,27 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
   // shares BCH's Google-auth + calendar/conference/zoom modules but NOT the commit
   // path. The state machine is NOT re-run here — BSH validated the transition.
   if (event && event.action === 'scheduling_mutate') {
+    // Feature gate (defense-in-depth — BSH already gates before invoking): refuse a
+    // calendar mutation for a tenant without scheduling_enabled. Fail-closed.
+    const enabled = await (injected.isSchedulingEnabledForTenant || featureGate.isSchedulingEnabledForTenant)(event.tenantId, injected);
+    if (!enabled) {
+      log('scheduling_mutate_disabled', { mutation: event.mutation });
+      return { outcome: 'failed', error: 'scheduling_disabled' };
+    }
     const { handleSchedulingMutate } = require('./scheduling-mutate');
     return await handleSchedulingMutate(event, injected);
   }
 
   const startedAtMs = Date.now();
   const { tenantId, slot, conferenceType } = validate(event);
+
+  // Feature gate: scheduling is OFF unless the tenant config sets feature_flags.
+  // scheduling_enabled (like Forms). Fail-closed — a config we cannot read → refuse.
+  const schedulingEnabled = await (injected.isSchedulingEnabledForTenant || featureGate.isSchedulingEnabledForTenant)(tenantId, injected);
+  if (!schedulingEnabled) {
+    log('commit_scheduling_disabled', { tenant_id: tenantId });
+    return { status: 'SCHEDULING_DISABLED', reason: 'feature_not_enabled' };
+  }
   const appt = event.appointment_type || {};
 
   const bookingId = bookingStore.buildBookingId(tenantId, event.session_id, slot.start);

@@ -23,6 +23,13 @@ jest.mock('./calendar-watch', () => ({
   stopWatch: (...args) => mockStopWatch(...args),
 }));
 
+// Feature gate: default-enabled so the orchestration tests onboard; the disabled
+// (refuse) path is covered in its own describe block below.
+const mockSchedulingEnabled = jest.fn().mockResolvedValue(true);
+jest.mock('../shared/scheduling/featureGate', () => ({
+  isSchedulingEnabledForTenant: (...args) => mockSchedulingEnabled(...args),
+}));
+
 process.env.LISTENER_URL = 'https://listener.example/';
 process.env.CALENDAR_WATCH_CHANNELS_TABLE = 'picasso-calendar-watch-channels-staging';
 process.env.ENVIRONMENT = 'staging';
@@ -135,6 +142,18 @@ function setUpHappyPath() {
   });
   ddbMock.on(PutItemCommand).resolves({});
 }
+
+describe('handler — feature gate (scheduling_enabled)', () => {
+  test('scheduling disabled → refuse onboard, NO watch registered, NO channel row', async () => {
+    mockSchedulingEnabled.mockResolvedValueOnce(false);
+    const result = await handler({ tenant_id: 'MYR384719', coordinator_id: 'test-coordinator' });
+    expect(result).toEqual({ status: 'scheduling_disabled', tenant_id: 'MYR384719' });
+    expect(mockSchedulingEnabled).toHaveBeenCalledWith('MYR384719');
+    expect(mockSeedSync).not.toHaveBeenCalled();
+    expect(mockRegisterWatch).not.toHaveBeenCalled();
+    expect(ddbMock.commandCalls(PutItemCommand).length).toBe(0);
+  });
+});
 
 describe('handler — happy path', () => {
   test('orchestrates onboarding, returns channel_id + expiration, NO secret_id', async () => {

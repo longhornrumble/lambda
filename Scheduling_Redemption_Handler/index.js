@@ -64,6 +64,9 @@ const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 // SoT token validator + one-time-use (§B4, lambda#186/#192). Never re-implement.
 const { redeem, TokenError } = require('../shared/scheduling/tokens.js');
+// Backend scheduling feature gate (fail-closed). Scheduling is OFF unless the tenant
+// config sets feature_flags.scheduling_enabled (like Forms).
+const { isSchedulingEnabledForTenant } = require('../shared/scheduling/featureGate');
 
 // ─── config ───────────────────────────────────────────────────────────────────────
 
@@ -342,6 +345,22 @@ exports.handler = async (event) => {
     // Unexpected (e.g. a raw DynamoDB error from the jti PutItem) → 500, no detail leak.
     warn('redemption_error', { path, purpose, name: err && err.name });
     return failurePage(500);
+  }
+
+  // ── Feature gate: scheduling is OFF unless the tenant config enables it (like Forms). ──
+  // The token validated, but a tenant without feature_flags.scheduling_enabled must not be
+  // able to drive any scheduling action. Fail-closed (a config we can't read → unavailable).
+  // Checked AFTER redeem() so a disabled tenant's one-time token is still burned (the link
+  // is single-use regardless), but BEFORE any binding write / attendance ack / booking read.
+  const schedulingEnabled = await isSchedulingEnabledForTenant(claims.tenant_id);
+  if (!schedulingEnabled) {
+    log('redemption_scheduling_disabled', { purpose, tenant_id: claims.tenant_id });
+    return page(
+      403,
+      'Scheduling unavailable',
+      '<p>Online scheduling isn’t available for this organization right now. ' +
+        'Please contact them directly to change your appointment.</p>'
+    );
   }
 
   // ── Interviewer attendance: real security path, disposition deferred to E6. ──

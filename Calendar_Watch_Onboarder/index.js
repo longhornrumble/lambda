@@ -39,6 +39,9 @@ const {
 
 const { getOAuthClient } = require('./oauth-client');
 const { registerWatch, seedInitialSyncToken, stopWatch } = require('./calendar-watch');
+// Backend scheduling feature gate (fail-closed). Do not onboard a coordinator for a
+// tenant without feature_flags.scheduling_enabled (like Forms).
+const { isSchedulingEnabledForTenant } = require('../shared/scheduling/featureGate');
 
 // ─── AWS clients ────────────────────────────────────────────────────────────────
 
@@ -158,6 +161,15 @@ exports.handler = async function handler(event) {
   // calendar_id as a primary/non-primary flag (a non-primary id can be an email).
   // PII-in-logs hygiene matching the Listener's Y3 discipline (sub-phase B audit SR-2).
   log('onboarder_invoked', { tenant_id: tenantId, coordinator_id_hash: sha256Hex(coordinatorId).slice(0, 12), calendar_id_primary: calendarId === 'primary' });
+
+  // 0. Feature gate: refuse to onboard a coordinator for a tenant without scheduling
+  // enabled (like Forms). Fail-closed. Refusing here means the §14.2 listener never
+  // watches a disabled tenant's calendar — no watch channel is registered or stored.
+  const schedulingEnabled = await isSchedulingEnabledForTenant(tenantId);
+  if (!schedulingEnabled) {
+    log('onboarder_scheduling_disabled', { tenant_id: tenantId });
+    return { status: 'scheduling_disabled', tenant_id: tenantId };
+  }
 
   // 1. OAuth client (per-tenant secret)
   const authClient = await getOAuthClient({ tenantId, coordinatorId });
