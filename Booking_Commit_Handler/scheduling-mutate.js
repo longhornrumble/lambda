@@ -54,6 +54,15 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   if (mutation !== 'reschedule' && mutation !== 'cancel') {
     return { outcome: 'failed', error: 'unknown_mutation' };
   }
+  // SR-1 (cross-tenant): BCH trusts the BSH payload, so assert the outer tenantId (used for
+  // OAuth-secret lookup + the DDB write) matches the booking's own tenant_id (used by
+  // executeReschedule for calendar resolution). A divergent payload would auth as tenant A
+  // against tenant B's calendar — refuse it. tenant_id is in the §B-projected booking.
+  const bookingTenant = pick(booking, 'tenantId', 'tenant_id');
+  if (bookingTenant && bookingTenant !== tenantId) {
+    (injected.logger || console).error('scheduling_mutate_tenant_mismatch', { mutation });
+    return { outcome: 'failed', error: 'tenant_mismatch' };
+  }
 
   // An UNEXPECTED throw (bad OAuth secret, Google/Zoom client error, etc.) becomes a
   // clean { outcome:'failed' } the BSH email-fallback already handles — NOT a Lambda
@@ -86,6 +95,10 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
       const b = result.booking || booking;
       // §B15: PATCH the reused Zoom meeting's start time (join URL already preserved by
       // reschedule.js). Non-fatal — the move already happened; a stale Zoom time recovers.
+      // Explicit-provider check only (no numeric-id heuristic like BSH's zoomMeetingIdOf):
+      // every executor-path booking carries an explicit conference_provider
+      // (booking-store writes 'zoom'|'google_meet'|'null'), so the legacy unset-provider
+      // numeric fallback can't occur here.
       const provider = pick(b, 'conferenceProvider', 'conference_provider');
       const confId = pick(b, 'conferenceId', 'conference_id');
       if (provider && String(provider).toLowerCase() === 'zoom' && confId) {

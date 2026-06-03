@@ -49,6 +49,15 @@ describe('handleSchedulingMutate — validation', () => {
     const out = await handleSchedulingMutate({ ...RESCH_EVENT, newSlot: undefined }, injected);
     expect(out.outcome).toBe('failed');
   });
+  it('SR-1: refuses a cross-tenant payload (event.tenantId != booking.tenant_id)', async () => {
+    const { injected, calls } = baseInjected();
+    const out = await handleSchedulingMutate(
+      { ...RESCH_EVENT, tenantId: 'T1', booking: { ...RESCH_EVENT.booking, tenant_id: 'T2' } },
+      injected
+    );
+    expect(out).toEqual({ outcome: 'failed', error: 'tenant_mismatch' });
+    expect(calls.reschedule).toHaveLength(0); // never reached the calendar op
+  });
 });
 
 describe('handleSchedulingMutate — cancel', () => {
@@ -77,6 +86,12 @@ describe('handleSchedulingMutate — reschedule', () => {
     expect(fields.startAt).toBe(RESCH_EVENT.newSlot.start);
     expect(fields.externalEventId).toBe('evt-new');
     expect(fields.pendingCalendarSync).toBe(false);
+  });
+
+  it('does NOT call zoom.updateMeeting for a non-zoom (google_meet) booking', async () => {
+    const { injected, calls } = baseInjected(); // RESCH_EVENT booking has no conference_provider
+    await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(calls.zoom).toHaveLength(0);
   });
 
   it('PATCHes Zoom start-time only for a zoom booking', async () => {
