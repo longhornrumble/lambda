@@ -152,6 +152,11 @@ TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
 TABLE_RECENT_MESSAGES = "staging-recent-messages"
 TABLE_CHANNEL_MAPPINGS = "picasso-channel-mappings-staging"
 TABLE_SESSION_EVENTS = "picasso-session-events-staging"
+# F-DSAR31 (closed): session-summaries surface. pk=TENANT#{tenant_hash},
+# sk=SESSION#{sessionId}; rows carry a redacted first_question + counts/outcome
+# linkable by pii_subject_id. Reached via the operator-passed tenant_hash on the
+# DSAR event (the partition is tenant_hash-keyed, not tenant_id-keyed).
+TABLE_SESSION_SUMMARIES = "picasso-session-summaries-staging"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 GSI_CHANNEL_MAPPINGS_TENANT_INDEX = "TenantIndex"
 # M2 Sprint C: ARCHIVE_BUCKET. Per archive-reachability-decision.md
@@ -203,20 +208,12 @@ MAX_EXPORTED_STEPS = 1000
 # rationale for `conversation-summaries` (session-summaries surface) has
 # evolved — F-DSAR31 names tenant_hash discovery as the new prerequisite.
 # `audit-read-only` deferral rationale is unchanged (Art 17(3)(b) carve-out).
+#
+# F-DSAR31 CLOSED 2026-06-03: the `conversation-summaries` (session-summaries)
+# surface now has a real walker (`_walk_session_summaries`), reached via the
+# operator-passed `tenant_hash` on the DSAR event (resolution option (a)). It is
+# no longer deferred; `audit-read-only` remains the only deferred surface.
 DEFERRED_SURFACES = {
-    "conversation-summaries": (
-        "Walker pending: picasso-session-summaries-staging uses "
-        "pk=TENANT#{tenant_hash}, sk=SESSION#{sessionId} — requires "
-        "tenant_id → tenant_hash discovery before any Query can run. M2 "
-        "Sprint A §3.2 absorbed under M2; M2 Sprint B (lambda PR #157) "
-        "discovered the asymmetry vs session-events (sessionId-keyed) and "
-        "descoped to F-DSAR31. Three resolution options: (a) operator-passed "
-        "tenant_hash field on DSAR event (contract change), (b) tenant_id → "
-        "tenant_hash lookup via tenant-registry (new code path), (c) defer-"
-        "with-trigger until first DSAR shows recent-messages walker missed "
-        "Meta session-summary content (recommended at current product scale). "
-        "Calendar backstop: 2026-08-22 (D2/D3/D4 currency review pair)."
-    ),
     "audit-read-only": (
         "Walker pending: picasso-audit-staging is read-only per Art 17(3)(b) "
         "carve-out (D5 G-C; counsel-pending). Access-type DSAR exports rows; "
@@ -426,6 +423,12 @@ def _validate(event):
         "tenant_id": event["tenant_id"],
         "operator": event["operator"],
         "dsar_id": dsar_id,
+        # F-DSAR31: optional operator-passed tenant_hash. Required ONLY to reach
+        # the session-summaries surface (pk=TENANT#{tenant_hash}). Absent → that
+        # surface is skipped with a manual_followup (all other surfaces still
+        # walk). Normalize empty/whitespace to None so the dispatcher's
+        # presence-check is unambiguous.
+        "tenant_hash": (event.get("tenant_hash") or "").strip() or None,
         "dry_run": bool(event.get("dry_run", True)),
         # Closeout-audit row #15: propagate the validated marker so the
         # audit writer can stamp a top-level `is_smoke_test` attribute on
@@ -738,6 +741,91 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
         "rows_found": rows_found,
         "session_ids": session_ids,
         "matched_rows": matched,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
+        "rows_skipped_corrupted": skipped_corrupted,
+    }
+
+
+def _walk_session_summaries(pii_subject_id, tenant_hash, request_type, dry_run):
+    """Walk picasso-session-summaries-staging for one subject (F-DSAR31, closed).
+
+    The partition is keyed pk=TENANT#{tenant_hash}, sk=SESSION#{sessionId}; rows
+    carry a redacted first_question + counts/outcome linkable by pii_subject_id.
+    Mirrors _walk_form_submissions: tenant-partition Query + FilterExpression on
+    pii_subject_id.
+
+    `tenant_hash` is operator-passed on the DSAR event (the partition is
+    tenant_hash-keyed, not tenant_id-keyed — that asymmetry was why this surface
+    was deferred). The dispatcher only calls this walker when tenant_hash is
+    non-empty; otherwise it skips with a manual_followup.
+
+    request_type: "access" → export matched rows; "delete"+dry_run → count;
+    "delete"+real → DeleteItem per (pk, sk). Logs NEVER carry pii_subject_id
+    (opaque PSID is PII per D5 G-H) or row content.
+    """
+    table = ddb.Table(TABLE_SESSION_SUMMARIES)
+    pk_value = f"TENANT#{tenant_hash}"
+
+    matched = []
+    last_evaluated_key = None
+    while True:
+        kwargs = {
+            "KeyConditionExpression": Key("pk").eq(pk_value),
+            "FilterExpression": Attr("pii_subject_id").eq(pii_subject_id),
+        }
+        if last_evaluated_key:
+            kwargs["ExclusiveStartKey"] = last_evaluated_key
+        try:
+            resp = table.query(**kwargs)
+        except ClientError as exc:
+            logger.error(
+                "session_summaries_query_failed: code=%s",
+                exc.response.get("Error", {}).get("Code"),
+            )
+            return {"rows_found": 0, "session_ids": [], "error": "query_failed"}
+        matched.extend(resp.get("Items", []))
+        last_evaluated_key = resp.get("LastEvaluatedKey")
+        if not last_evaluated_key:
+            break
+
+    rows_found = len(matched)
+
+    if request_type == "access":
+        return {
+            "rows_found": rows_found,
+            "action": "exported",
+            "exported_rows": matched,
+        }
+
+    if dry_run:
+        return {"rows_found": rows_found, "action": "dry_run_count"}
+
+    deleted = 0
+    delete_failed = 0
+    skipped_corrupted = 0
+    for row in matched:
+        row_pk = row.get("pk")
+        row_sk = row.get("sk")
+        if row_pk is None or row_sk is None:
+            skipped_corrupted += 1
+            logger.error(
+                "session_summaries_delete_skipped_corrupted: pk=%s sk=%s — row missing PK/SK",
+                row_pk, row_sk,
+            )
+            continue
+        try:
+            table.delete_item(Key={"pk": row_pk, "sk": row_sk})
+            deleted += 1
+        except ClientError as exc:
+            delete_failed += 1
+            logger.error(
+                "session_summaries_delete_failed: sk=%s code=%s",
+                row_sk, exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
         "action": "deleted",
         "rows_deleted": deleted,
         "rows_delete_failed": delete_failed,
@@ -1950,7 +2038,8 @@ def _pre_phase1_cli_snippet(tenant_id):
     )
 
 
-def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type, dry_run):
+def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type, dry_run,
+                       tenant_hash=None):
     """Dispatch per-surface walkers.
 
     Returns (rows_touched: Dict[str,int], manual_followups: List[str],
@@ -1981,6 +2070,9 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         # M2 Sprint D: per-tenant S3 fulfillment walker chained off the
         # form-submissions matched rows (reads each row's fulfillment_path).
         "fulfillment": 0,
+        # F-DSAR31 (closed): session-summaries, reached via operator-passed
+        # tenant_hash. Stays 0 when tenant_hash is absent (surface skipped).
+        "session-summaries": 0,
     }
     rows_touched.update({s: 0 for s in MFS_SCOPED_SURFACES})
     manual_followups = []
@@ -2044,6 +2136,11 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "matched rows; no subject resolved → no chain)"
         )
         walker_results["fulfillment"] = {"status": "skipped_no_subject"}
+        manual_followups.append(
+            "session-summaries: skipped (filters on pii_subject_id; no subject "
+            "resolved)"
+        )
+        walker_results["session-summaries"] = {"status": "skipped_no_subject"}
         for surface, reason in MFS_SCOPED_SURFACES.items():
             manual_followups.append(f"{surface}: {reason}")
             walker_results[surface] = {"status": "deferred", "reason": reason}
@@ -2455,6 +2552,63 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         tenant_id, captured_matched_rows, request_type, dry_run,
         rows_touched, manual_followups, exported_rows, walker_results,
     )
+
+    # session-summaries (F-DSAR31, closed): reachable only with the operator-
+    # passed tenant_hash (partition pk=TENANT#{tenant_hash}). When absent, skip
+    # the surface gracefully with a manual_followup rather than guessing the
+    # hash — all other surfaces have already walked.
+    if tenant_hash:
+        ss = _walk_session_summaries(pii_subject_id, tenant_hash, request_type, dry_run)
+        rows_touched["session-summaries"] = ss["rows_found"]
+        if ss.get("error"):
+            manual_followups.append(
+                f"session-summaries: query failed ({ss['error']}); retry advised"
+            )
+            walker_results["session-summaries"] = {
+                "status": "errored", "error": ss["error"],
+                "rows_touched": ss["rows_found"],
+            }
+        elif ss.get("action") == "exported":
+            exported_rows["session-summaries"] = ss["exported_rows"]
+            walker_results["session-summaries"] = {
+                "status": "completed", "action": "exported",
+                "rows_touched": ss["rows_found"],
+            }
+        elif ss.get("action") == "dry_run_count":
+            manual_followups.append(
+                f"session-summaries: {ss['rows_found']} row(s) match (dry-run; "
+                f"none deleted)"
+            )
+            walker_results["session-summaries"] = {
+                "status": "completed", "action": "dry_run_count",
+                "rows_touched": ss["rows_found"],
+            }
+        else:  # deleted
+            if ss.get("rows_delete_failed"):
+                manual_followups.append(
+                    f"session-summaries: {ss['rows_delete_failed']} row(s) failed "
+                    f"to delete — retry advised"
+                )
+            if ss.get("rows_skipped_corrupted"):
+                manual_followups.append(
+                    f"session-summaries: {ss['rows_skipped_corrupted']} corrupted "
+                    f"row(s) skipped"
+                )
+            walker_results["session-summaries"] = {
+                "status": "completed", "action": "deleted",
+                "rows_touched": ss.get("rows_deleted", 0),
+            }
+    else:
+        manual_followups.append(
+            "session-summaries: skipped — tenant_hash not provided on the DSAR "
+            "event. This surface (pk=TENANT#{tenant_hash}) requires the tenant's "
+            "hash; re-invoke with a `tenant_hash` field to include it. All other "
+            "surfaces walked normally."
+        )
+        walker_results["session-summaries"] = {
+            "status": "deferred",
+            "reason": "tenant_hash not provided on the DSAR event",
+        }
 
     # Other surfaces: still scaffolded.
     for surface, reason in MFS_SCOPED_SURFACES.items():
@@ -3054,6 +3208,7 @@ def lambda_handler(event, context):
                 normalized_email=inputs["subject_identifier"],
                 request_type=inputs["request_type"],
                 dry_run=inputs["dry_run"],
+                tenant_hash=inputs["tenant_hash"],
             )
         )
     else:  # psid path

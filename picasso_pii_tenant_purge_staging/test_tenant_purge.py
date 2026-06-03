@@ -422,9 +422,9 @@ def test_audit_rows_written_opening_per_surface_closing(purge):
     audit = _table_mock()
     store = _wire_tables(mod, mock_ddb, {mod.TABLE_PURGE_AUDIT: audit})
     resp = mod.lambda_handler(_event(), None)
-    # 1 opening + 5 surface + 1 closing = 7 audit put_items.
-    assert audit.put_item.call_count == 7
-    assert len(resp["audit_row_pks"]) == 7
+    # 1 opening + 6 surface (incl. session-summaries) + 1 closing = 8 put_items.
+    assert audit.put_item.call_count == 8
+    assert len(resp["audit_row_pks"]) == 8
     # Append-only condition present on each put.
     for call in audit.put_item.call_args_list:
         assert "attribute_not_exists" in call.kwargs["ConditionExpression"]
@@ -460,7 +460,7 @@ def test_response_shape_has_all_surfaces(purge):
     resp = mod.lambda_handler(_event(), None)
     assert set(resp["rows_touched"].keys()) == {
         "form-submissions", "notification-sends", "notification-events",
-        "subject-index", "sms-usage"}
+        "subject-index", "sms-usage", "session-summaries"}
     assert resp["purge_id"] == "purge-uuid-1"
     assert resp["tenant_id"] == "TEN-X"
 
@@ -472,3 +472,39 @@ def test_idempotent_rerun_empty_tables_zero_counts(purge):
     assert resp["status"] == "completed"
     assert all(v == 0 for v in resp["rows_touched"].values())
     assert resp["deleted"] is True  # authorized, just nothing left to delete
+
+
+# ── Class C (F-DSAR31): session-summaries surface ───────────────────────────
+def test_session_summaries_purged_when_tenant_hash_provided(purge):
+    mod, mock_ddb, _ = purge
+    store = _wire_tables(mod, mock_ddb, {
+        "picasso-session-summaries-staging": _table_mock(items=[
+            {"pk": "TENANT#h", "sk": "SESSION#s1"},
+            {"pk": "TENANT#h", "sk": "SESSION#s2"}]),
+    })
+    resp = mod.lambda_handler(
+        _event(dry_run=False, grace_confirmed=True, tenant_hash="h"), None)
+    assert resp["rows_touched"]["session-summaries"] == 2
+    ss = store["picasso-session-summaries-staging"]
+    assert ss.delete_item.call_count == 2
+    ss.delete_item.assert_any_call(Key={"pk": "TENANT#h", "sk": "SESSION#s1"})
+
+
+def test_session_summaries_dry_run_counts_only(purge):
+    mod, mock_ddb, _ = purge
+    store = _wire_tables(mod, mock_ddb, {
+        "picasso-session-summaries-staging": _table_mock(items=[
+            {"pk": "TENANT#h", "sk": "SESSION#s1"}]),
+    })
+    resp = mod.lambda_handler(_event(tenant_hash="h"), None)  # dry_run defaults True
+    assert resp["deleted"] is False
+    assert resp["rows_touched"]["session-summaries"] == 1
+    store["picasso-session-summaries-staging"].delete_item.assert_not_called()
+
+
+def test_session_summaries_skipped_without_tenant_hash(purge):
+    mod, mock_ddb, _ = purge
+    _wire_tables(mod, mock_ddb, {})  # no tenant_hash on event
+    resp = mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
+    assert resp["rows_touched"]["session-summaries"] == 0
+    assert any("session-summaries: skipped" in f for f in resp["manual_followups"])

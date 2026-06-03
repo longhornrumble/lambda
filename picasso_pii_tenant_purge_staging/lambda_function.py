@@ -91,6 +91,10 @@ TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
 TABLE_SMS_USAGE = "picasso-sms-usage-staging"
+# Class C (F-DSAR31): pseudonymized session summaries, partitioned by
+# pk=TENANT#{tenant_hash} (tenant_hash, NOT tenant_id). Reached only when the
+# caller (the dashboard UI, or a CLI operator) supplies tenant_hash.
+TABLE_SESSION_SUMMARIES = "picasso-session-summaries-staging"
 TABLE_PURGE_AUDIT = "picasso-pii-tenant-purge-audit-staging"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 
@@ -208,6 +212,10 @@ def _validate(event):
         "purge_id": purge_id,
         "grace_confirmed": grace_confirmed,
         "dry_run": dry_run,
+        # Optional: tenant_hash unlocks the Class-C session-summaries surface
+        # (pk=TENANT#{tenant_hash}). Absent → that surface is skipped with a
+        # manual_followup; all Class-A surfaces still purge.
+        "tenant_hash": (event.get("tenant_hash") or "").strip() or None,
     }
 
 
@@ -455,6 +463,21 @@ def _purge_sms_usage(tenant_id, dry_run):
         table, matched, ["tenant_id", "month"], "sms_usage", dry_run)
 
 
+def _purge_session_summaries(tenant_hash, dry_run):
+    """session-summaries (Class C): Query PK=TENANT#{tenant_hash} → delete the
+    whole tenant partition. tenant_hash-keyed (not tenant_id) — caller must
+    supply tenant_hash; the handler only calls this when it's present."""
+    table = ddb.Table(TABLE_SESSION_SUMMARIES)
+    try:
+        matched = _query_partition(table, Key("pk").eq(f"TENANT#{tenant_hash}"))
+    except ClientError as exc:
+        logger.error("session_summaries_query_failed: code=%s",
+                     exc.response.get("Error", {}).get("Code"))
+        return {"rows_found": 0, "action": "error", "error": "query_failed"}
+    return _delete_partition_rows(
+        table, matched, ["pk", "sk"], "session_summaries", dry_run)
+
+
 # ───────────────────────────────────────────────────────────────────────────
 # Handler
 # ───────────────────────────────────────────────────────────────────────────
@@ -538,12 +561,27 @@ def lambda_handler(event, context):
     sms_res = _purge_sms_usage(tenant_id, walker_dry_run)
     rows_touched["sms-usage"] = _surface_rows_touched(sms_res)
 
+    # Class C (F-DSAR31): session-summaries — only if tenant_hash supplied.
+    tenant_hash = params["tenant_hash"]
+    if tenant_hash:
+        ss_res = _purge_session_summaries(tenant_hash, walker_dry_run)
+    else:
+        ss_res = {"rows_found": 0, "action": "skipped_no_tenant_hash"}
+        manual_followups.append(
+            "session-summaries: skipped — tenant_hash not provided. This "
+            "tenant_hash-keyed surface (pk=TENANT#{tenant_hash}) is only purged "
+            "when tenant_hash is supplied (the dashboard passes it automatically; "
+            "a CLI caller must include it). All other surfaces purged normally."
+        )
+    rows_touched["session-summaries"] = _surface_rows_touched(ss_res)
+
     surface_results = {
         "form-submissions": form_res,
         "notification-sends": sends_res,
         "notification-events": events_res,
         "subject-index": subject_res,
         "sms-usage": sms_res,
+        "session-summaries": ss_res,
     }
 
     # 5. Per-surface audit + error/followup aggregation.
