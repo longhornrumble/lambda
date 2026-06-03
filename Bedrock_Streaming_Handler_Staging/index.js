@@ -47,6 +47,28 @@ const schedulingDeps = buildSchedulingDeps({
   sessionTable: process.env.SCHEDULING_SESSION_TABLE || `picasso-conversation-scheduling-session-${process.env.ENVIRONMENT || 'staging'}`,
   bookingTable: process.env.BOOKING_TABLE || `picasso-booking-${process.env.ENVIRONMENT || 'staging'}`,
 });
+
+// Tier-2 calendar-execution seam (architecture option d): invoke the
+// Booking_Commit_Handler executor for an already-§B14-authorized reschedule/cancel
+// (BSH cannot bundle googleapis). Gated on SCHEDULING_EXECUTOR_FUNCTION_NAME — when
+// unset, invokeSchedulingExecutor is undefined and schedulingFlow falls back to its
+// (skip-non-fatally) local path, so this stays dormant until the IAM + env land.
+const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+const SCHEDULING_EXECUTOR_FN = process.env.SCHEDULING_EXECUTOR_FUNCTION_NAME || '';
+const schedulingExecutorClient = SCHEDULING_EXECUTOR_FN ? new LambdaClient({}) : null;
+async function invokeSchedulingExecutor(payload) {
+  const out = await schedulingExecutorClient.send(new InvokeCommand({
+    FunctionName: SCHEDULING_EXECUTOR_FN,
+    InvocationType: 'RequestResponse',
+    Payload: Buffer.from(JSON.stringify(payload)),
+  }));
+  if (out.FunctionError) {
+    // Unhandled error inside the executor → throw so the caller hits the email fallback.
+    throw new Error(`scheduling executor FunctionError: ${out.FunctionError}`);
+  }
+  return out.Payload ? JSON.parse(Buffer.from(out.Payload).toString('utf8')) : null;
+}
+const schedulingExecDep = SCHEDULING_EXECUTOR_FN ? { invokeSchedulingExecutor } : {};
 const { validateCfOriginHeader } = require('./cf-origin-validator');
 
 // Default model configuration - single source of truth, sourced from
@@ -623,7 +645,8 @@ const streamingHandler = async (event, responseStream, context) => {
       // detection + transitions run and execution is skipped non-fatally.
       const schedulingResult = await runSchedulingTurn({
         responseText: responseBuffer, conversationHistory,
-        tenantId: config?.tenant_id, sessionId, config, bedrock, write, deps: schedulingDeps,
+        tenantId: config?.tenant_id, sessionId, config, bedrock, write,
+        deps: { ...schedulingDeps, ...schedulingExecDep },
       });
 
       if (schedulingResult?.handled) {
@@ -1057,7 +1080,8 @@ const bufferedHandler = async (event, context) => {
       const schedulingResult = await runSchedulingTurn({
         responseText: responseBuffer, conversationHistory,
         tenantId: config?.tenant_id, sessionId, config, bedrock,
-        write: (data) => chunks.splice(chunks.length - 1, 0, data), deps: schedulingDeps,
+        write: (data) => chunks.splice(chunks.length - 1, 0, data),
+        deps: { ...schedulingDeps, ...schedulingExecDep },
       });
 
       if (schedulingResult?.handled) {

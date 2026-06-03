@@ -442,6 +442,15 @@ function validate(event) {
 // ─── handler ──────────────────────────────────────────────────────────────────────────
 
 exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
+  // Tier-2 calendar-mutation executor (option d): BSH invokes BCH for an
+  // already-§B14-authorized reschedule/cancel. Routed before the commit flow; it
+  // shares BCH's Google-auth + calendar/conference/zoom modules but NOT the commit
+  // path. The state machine is NOT re-run here — BSH validated the transition.
+  if (event && event.action === 'scheduling_mutate') {
+    const { handleSchedulingMutate } = require('./scheduling-mutate');
+    return await handleSchedulingMutate(event, injected);
+  }
+
   const startedAtMs = Date.now();
   const { tenantId, slot, conferenceType } = validate(event);
   const appt = event.appointment_type || {};

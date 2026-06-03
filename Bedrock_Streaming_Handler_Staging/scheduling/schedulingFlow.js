@@ -54,6 +54,15 @@ const { initStateFromIntent } = require('./bindingContext');
 // The four §B14 structured actions. Anything else (incl. unparseable output) → 'none'.
 const ACTIONS = Object.freeze(['select_slot', 'confirm_reschedule', 'confirm_cancel', 'none']);
 
+// Tech-lead Tier-2 note: when the executor errors / outcome 'failed', surface a clear
+// "we'll confirm by email" notice rather than a silent no-op. Emitted via the SSE write;
+// the widget rendering is WS-WIDGET/B-remainder — but the event is on the wire now.
+function _emitFallbackNotice(write, sessionId) {
+  if (typeof write === 'function') {
+    write(`data: ${JSON.stringify({ type: 'scheduling_notice', notice: 'request_received_email_followup', session_id: sessionId })}\n\n`);
+  }
+}
+
 // ─── booking field reads (schema discipline — tolerate camel OR snake) ──────────────────
 
 function pick(booking, camel, snake) {
@@ -202,7 +211,43 @@ function _resolveFacade({ tenantId, binding, booking, deps }) {
 
 // ─── execution (only reached past the §B14 boundary) ─────────────────────────────────────
 
+// Tier-2 calendar execution via the Booking_Commit_Handler executor (architecture
+// option d). BSH cannot bundle googleapis, so when the integrator wires
+// `deps.invokeSchedulingExecutor` (a Lambda InvokeCommand to BCH), the already-
+// §B14-authorized mutation is delegated. The boundary stays HERE — runSchedulingTurn
+// validated the transition via stateMachine.transition BEFORE this is reached; BCH is a
+// pure executor. On executor error / outcome 'failed' we DON'T claim success: the caller
+// surfaces the "we'll confirm by email" fallback rather than a silent no-op.
+async function _executeViaExecutor(mutation, { tenantId, binding, booking, newSlot, deps, logger }) {
+  const coordinatorId =
+    (binding && binding.coordinator_id) ||
+    pick(booking, 'resourceId', 'resource_id') ||
+    calendarIdOf(booking);
+  const payload = {
+    action: 'scheduling_mutate',
+    mutation,
+    tenantId,
+    coordinatorId,
+    bookingId: (binding && binding.booking_id) || pick(booking, 'bookingId', 'booking_id'),
+    booking,
+  };
+  if (mutation === 'reschedule') payload.newSlot = newSlot;
+  try {
+    const res = await deps.invokeSchedulingExecutor(payload);
+    if (!res || res.error || res.outcome === 'failed') {
+      return { executed: false, outcome: (res && res.outcome) || 'failed', fallback: 'email' };
+    }
+    return { executed: true, outcome: res.outcome, booking: res.booking };
+  } catch (err) {
+    (logger || console).error(`[WS-CONVO] scheduling executor invoke failed (fallback→email): error_name=${(err && err.name) || 'unknown'}`);
+    return { executed: false, outcome: 'failed', fallback: 'email' };
+  }
+}
+
 async function _doReschedule({ tenantId, binding, booking, newSlot, deps, logger }) {
+  if (deps.invokeSchedulingExecutor) {
+    return _executeViaExecutor('reschedule', { tenantId, binding, booking, newSlot, deps, logger });
+  }
   const facade = _resolveFacade({ tenantId, binding, booking, deps });
   if (!facade || !deps.conference) {
     // Integrator seam (Google auth / ConferenceProvider) not wired — do NOT execute.
@@ -241,6 +286,9 @@ async function _doReschedule({ tenantId, binding, booking, newSlot, deps, logger
 }
 
 async function _doCancel({ tenantId, binding, booking, deps, logger }) {
+  if (deps.invokeSchedulingExecutor) {
+    return _executeViaExecutor('cancel', { tenantId, binding, booking, deps, logger });
+  }
   const facade = _resolveFacade({ tenantId, binding, booking, deps });
   if (!facade) {
     console.warn('[WS-CONVO] calendar facade not wired (integrator seam) — cancel skipped');
@@ -359,6 +407,7 @@ async function runSchedulingTurn({
           if (res.executed && deps.saveState) {
             await deps.saveState({ tenantId, sessionId, state: 'booked' });
           }
+          if (res.fallback === 'email') _emitFallbackNotice(write, sessionId);
           return { handled: true, action, ...res };
         }
         return { handled: true, executed: false, action }; // await explicit confirmation
@@ -384,6 +433,7 @@ async function runSchedulingTurn({
         if (res.executed && deps.saveState) {
           await deps.saveState({ tenantId, sessionId, state: 'booked' });
         }
+        if (res.fallback === 'email') _emitFallbackNotice(write, sessionId);
         return { handled: true, action, ...res };
       }
 
@@ -436,4 +486,5 @@ module.exports = {
   _resolveFacade,
   _doReschedule,
   _doCancel,
+  _executeViaExecutor,
 };
