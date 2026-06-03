@@ -19,6 +19,11 @@ jest.mock('../../shared/scheduling/tokens.js', () => {
   return { ...actual, redeem: jest.fn() };
 });
 const { redeem, TokenError } = require('../../shared/scheduling/tokens.js');
+// Feature gate default-enabled here; these tests exercise routing/DDB-failure paths, not
+// the gate (its disabled path is covered in index.test.js).
+jest.mock('../../shared/scheduling/featureGate', () => ({
+  isSchedulingEnabledForTenant: jest.fn().mockResolvedValue(true),
+}));
 const { handler, _internal } = require('../index.js');
 
 const ddbMock = mockClient(DynamoDBClient);

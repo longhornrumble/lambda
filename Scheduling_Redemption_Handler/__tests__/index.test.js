@@ -21,6 +21,12 @@ const {
 } = require('@aws-sdk/client-secrets-manager');
 
 const tokens = require('../../shared/scheduling/tokens.js');
+// Feature gate: default-enabled so the existing redeem/bind/redirect tests exercise the
+// real flow. The disabled (403) path is covered in the dedicated describe block below.
+jest.mock('../../shared/scheduling/featureGate', () => ({
+  isSchedulingEnabledForTenant: jest.fn().mockResolvedValue(true),
+}));
+const featureGate = require('../../shared/scheduling/featureGate');
 const { handler } = require('../index.js');
 
 const ddbMock = mockClient(DynamoDBClient);
@@ -75,6 +81,35 @@ beforeEach(() => {
   // Default happy DDB: booking present, both PutItems succeed.
   ddbMock.on(GetItemCommand).resolves(bookingItem());
   ddbMock.on(PutItemCommand).resolves({});
+});
+
+describe('feature gate: scheduling_enabled (OFF unless config opts in)', () => {
+  test('disabled tenant → 403 leak-free page, NO binding write (jti still burned)', async () => {
+    featureGate.isSchedulingEnabledForTenant.mockResolvedValueOnce(false);
+    const t = await tokens.sign(
+      'cancel',
+      { tenant_id: TENANT, booking_id: BOOKING, start_at: FAR_FUTURE_START },
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/cancel', t));
+    expect(res.statusCode).toBe(403);
+    expect(res.body).toMatch(/unavailable/i);
+    expect(res.body).not.toMatch(/token|jwt|signature/i);
+    // gate ran for the token's tenant
+    expect(featureGate.isSchedulingEnabledForTenant).toHaveBeenCalledWith(TENANT);
+    // no §B10 binding written to the session table (the disabled path returns first)
+    const sessionPuts = ddbMock
+      .commandCalls(PutItemCommand)
+      .filter((c) => c.args[0].input.TableName === SESSION_TABLE);
+    expect(sessionPuts.length).toBe(0);
+    // SECURITY ORDERING: the gate runs AFTER redeem() so the one-time jti is STILL burned
+    // (the link is single-use regardless of the gate). Assert the burn happened — this is
+    // the property the test name claims; a refactor moving the gate before redeem() must fail.
+    const jtiPuts = ddbMock
+      .commandCalls(PutItemCommand)
+      .filter((c) => c.args[0].input.TableName === JTI_TABLE);
+    expect(jtiPuts.length).toBe(1);
+  });
 });
 
 describe('§13.8 routing', () => {

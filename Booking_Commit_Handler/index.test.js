@@ -16,6 +16,12 @@
 // these tests exercise the SNS admin-alert paths.
 process.env.OPS_ALERTS_TOPIC_ARN = 'arn:aws:sns:us-east-1:525409062831:picasso-ops-alerts-staging';
 
+// Feature gate: these tests exercise the commit LOGIC, so scheduling is enabled.
+// The disabled/refuse paths live in index.gate.test.js.
+jest.mock('../shared/scheduling/featureGate', () => ({
+  isSchedulingEnabledForTenant: jest.fn().mockResolvedValue(true),
+  isSchedulingEnabled: () => true,
+}));
 jest.mock('../shared/scheduling/pool', () => ({
   lockSlot: jest.fn(),
   recordFreeBusySuccess: jest.fn(),

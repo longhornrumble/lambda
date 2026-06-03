@@ -12,6 +12,7 @@ import * as esbuild from 'esbuild';
 // all bundle it for the same reason.
 const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
+  '@aws-sdk/client-s3',
   '@aws-sdk/client-secrets-manager',
 ];
 

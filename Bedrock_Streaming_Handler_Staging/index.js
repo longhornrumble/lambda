@@ -34,7 +34,7 @@ const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock
 const { injectFormContext } = require('./scheduling/formInjection');
 // WS-CONVO (B3 keystone): in-chat reschedule/cancel. Pre-turn binding hook +
 // post-stream §B14 structured-action boundary. No-op for non-scheduling sessions.
-const { injectSchedulingContext } = require('./scheduling/bindingContext');
+const { injectSchedulingContext, isSchedulingEnabled } = require('./scheduling/bindingContext');
 const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
 const { buildSchedulingDeps } = require('./scheduling/schedulingStateStore');
 const { corsHeaders } = require('./cors-helper');
@@ -506,7 +506,12 @@ const streamingHandler = async (event, responseStream, context) => {
     const formPrompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
     // WS-CONVO (B3): prepend <scheduling_context> when a §B10 reschedule/cancel binding
     // governs this session (WS-D4 redemption). No-op (prompt unchanged) for normal chat.
-    const prompt = await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId });
+    // Feature-gated: scheduling is OFF unless feature_flags.scheduling_enabled (like Forms);
+    // when disabled, skip the binding read entirely so the path is fully dormant.
+    const schedulingEnabled = isSchedulingEnabled(config);
+    const prompt = schedulingEnabled
+      ? await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId })
+      : formPrompt;
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
     const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
@@ -643,11 +648,15 @@ const streamingHandler = async (event, responseStream, context) => {
       // executes via the shipped §B9 modules — NEVER on free text. The Google-auth facade +
       // booking/state DDB I/O are the integrator's in-chat wiring seam (deps); until wired,
       // detection + transitions run and execution is skipped non-fatally.
-      const schedulingResult = await runSchedulingTurn({
-        responseText: responseBuffer, conversationHistory,
-        tenantId: config?.tenant_id, sessionId, config, bedrock, write,
-        deps: { ...schedulingDeps, ...schedulingExecDep },
-      });
+      // Feature-gated (see schedulingEnabled above): when scheduling is OFF, skip the
+      // turn entirely → schedulingResult is null → the CTA chain below runs unchanged.
+      const schedulingResult = schedulingEnabled
+        ? await runSchedulingTurn({
+            responseText: responseBuffer, conversationHistory,
+            tenantId: config?.tenant_id, sessionId, config, bedrock, write,
+            deps: { ...schedulingDeps, ...schedulingExecDep },
+          })
+        : null;
 
       if (schedulingResult?.handled) {
         // S-3: this turn was a scheduling turn (slot presentation / selection / state
@@ -963,7 +972,11 @@ const bufferedHandler = async (event, context) => {
     const formPrompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
     // WS-CONVO (B3): prepend <scheduling_context> when a §B10 reschedule/cancel binding
     // governs this session (WS-D4 redemption). No-op (prompt unchanged) for normal chat.
-    const prompt = await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId });
+    // Feature-gated: OFF unless feature_flags.scheduling_enabled (like Forms).
+    const schedulingEnabled = isSchedulingEnabled(config);
+    const prompt = schedulingEnabled
+      ? await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId })
+      : formPrompt;
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
     const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
@@ -1077,12 +1090,15 @@ const bufferedHandler = async (event, context) => {
       // WS-CONVO (B3 keystone): post-stream §B14 action boundary (buffered path). Same
       // contract as the streaming path; SSE is emitted by splicing into `chunks` (mirrors
       // the CTA splice below). No-op when no §B10 binding governs the session.
-      const schedulingResult = await runSchedulingTurn({
-        responseText: responseBuffer, conversationHistory,
-        tenantId: config?.tenant_id, sessionId, config, bedrock,
-        write: (data) => chunks.splice(chunks.length - 1, 0, data),
-        deps: { ...schedulingDeps, ...schedulingExecDep },
-      });
+      // Feature-gated (see schedulingEnabled above): OFF → null → CTA chain unchanged.
+      const schedulingResult = schedulingEnabled
+        ? await runSchedulingTurn({
+            responseText: responseBuffer, conversationHistory,
+            tenantId: config?.tenant_id, sessionId, config, bedrock,
+            write: (data) => chunks.splice(chunks.length - 1, 0, data),
+            deps: { ...schedulingDeps, ...schedulingExecDep },
+          })
+        : null;
 
       if (schedulingResult?.handled) {
         // S-3: scheduling turn owned the post-stream surface — skip CTA selection.

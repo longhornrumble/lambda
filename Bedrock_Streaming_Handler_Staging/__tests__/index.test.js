@@ -48,6 +48,18 @@ jest.mock('../response_enhancer', () => ({
   enhanceResponse: jest.fn()
 }));
 
+// Scheduling feature gate: stub the two gated calls so the ENABLED path (feature_flags.
+// scheduling_enabled === true) can be asserted without real binding/DDB I/O. isSchedulingEnabled
+// stays REAL (the gate predicate) so the disabled default (mockConfig has no feature_flags) is
+// honored exactly as in production — every existing test still runs with scheduling OFF.
+jest.mock('../scheduling/bindingContext', () => {
+  const actual = jest.requireActual('../scheduling/bindingContext');
+  return { ...actual, injectSchedulingContext: jest.fn(async (p) => p) };
+});
+jest.mock('../scheduling/schedulingFlow', () => ({
+  runSchedulingTurn: jest.fn(async () => ({ handled: false })),
+}));
+
 // Mock Lambda streaming global
 // streamifyResponse wraps the handler but passes through event, responseStream, context
 global.awslambda = {
@@ -63,6 +75,8 @@ global.awslambda = {
 const { handleFormMode } = require('../form_handler');
 const { enhanceResponse } = require('../response_enhancer');
 const { loadConfig, retrieveKB } = require('../../shared/bedrock-core');
+const { injectSchedulingContext } = require('../scheduling/bindingContext');
+const { runSchedulingTurn } = require('../scheduling/schedulingFlow');
 
 // We need to dynamically import index.js to capture the handler
 let indexModule;
@@ -574,6 +588,38 @@ describe('Index.js Integration Tests', () => {
 
       // KB should NOT be called (retrieveKB not invoked in form mode)
       expect(retrieveKB).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Scheduling feature gate wiring (G9 — the enabled-path call-sites)', () => {
+    beforeEach(() => {
+      injectSchedulingContext.mockClear();
+      runSchedulingTurn.mockClear();
+      bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(createBedrockStream(['ok']));
+    });
+
+    it('feature_flags.scheduling_enabled:true → injectSchedulingContext + runSchedulingTurn ARE called', async () => {
+      loadConfig.mockResolvedValue({ ...mockConfig, feature_flags: { scheduling_enabled: true } });
+      const event = { body: JSON.stringify({ tenant_hash: 'abc123', user_input: 'reschedule please' }) };
+      await indexModule.handler(event, createMockResponseStream(), {});
+      expect(injectSchedulingContext).toHaveBeenCalled();
+      expect(runSchedulingTurn).toHaveBeenCalled();
+    });
+
+    it('no feature_flags → both scheduling calls are SKIPPED (dormant; the no-regression bar)', async () => {
+      loadConfig.mockResolvedValue(mockConfig); // mockConfig has no feature_flags
+      const event = { body: JSON.stringify({ tenant_hash: 'abc123', user_input: 'hello' }) };
+      await indexModule.handler(event, createMockResponseStream(), {});
+      expect(injectSchedulingContext).not.toHaveBeenCalled();
+      expect(runSchedulingTurn).not.toHaveBeenCalled();
+    });
+
+    it('feature_flags present but scheduling_enabled:false → calls SKIPPED', async () => {
+      loadConfig.mockResolvedValue({ ...mockConfig, feature_flags: { scheduling_enabled: false } });
+      const event = { body: JSON.stringify({ tenant_hash: 'abc123', user_input: 'hi' }) };
+      await indexModule.handler(event, createMockResponseStream(), {});
+      expect(injectSchedulingContext).not.toHaveBeenCalled();
+      expect(runSchedulingTurn).not.toHaveBeenCalled();
     });
   });
 
