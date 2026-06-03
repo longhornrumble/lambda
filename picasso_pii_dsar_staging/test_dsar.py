@@ -2874,7 +2874,7 @@ def test_dispatcher_recent_messages_followup_includes_f_dsar1_inheritance(dsar):
 # ───────────────────────────────────────────────────────────────────────────
 def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
                           ns_items=None, ne_items=None, rm_items=None,
-                          se_items=None):
+                          se_items=None, ss_items=None):
     """Plumb the subject-index Query + form-submissions Query +
     notification-sends Query + notification-events Query +
     recent-messages Query + session-events Query + audit PutItem onto
@@ -2906,6 +2906,10 @@ def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
     ne_table.query.return_value = {"Items": ne_items or []}
     rm_table.query.return_value = {"Items": rm_items or []}
     se_table.query.return_value = {"Items": se_items or []}
+    # F-DSAR31: session-summaries route (only hit when tenant_hash is on the
+    # event; existing callers pass no tenant_hash so this stays inert for them).
+    ss_table = MagicMock()
+    ss_table.query.return_value = {"Items": ss_items or []}
 
     def route(name):
         if name == "picasso-pii-subject-index-staging":
@@ -2922,6 +2926,8 @@ def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
             return rm_table
         if name == "picasso-session-events-staging":
             return se_table
+        if name == "picasso-session-summaries-staging":
+            return ss_table
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
     mock_ddb.Table.side_effect = route
@@ -2984,10 +2990,10 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
     assert resp["pii_subject_id"] is None
     assert "not found in pii-subject-index" in resp["manual_followups"][0]
     assert resp["exported_rows"] == {}
-    # Audit rows: request_received + 7 surface_walked (all skipped_no_subject;
-    # M2 Sprint D added fulfillment) + closed. Deferred surfaces (2) still
-    # suppressed → 9 total.
-    assert audit_table.put_item.call_count == 9
+    # Audit rows: request_received + 8 surface_walked (all skipped_no_subject;
+    # M2 Sprint D added fulfillment; F-DSAR31 added session-summaries) + closed.
+    # Deferred surfaces (1: audit-read-only) still suppressed → 10 total.
+    assert audit_table.put_item.call_count == 10
     event_types = [c.kwargs["Item"]["event_type"] for c in audit_table.put_item.call_args_list]
     assert event_types == [
         "request_received",
@@ -3001,9 +3007,11 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
         # M2 Sprint D: per-tenant S3 fulfillment walker chained off form-
         # submissions matched rows (email path only).
         "surface_walked:fulfillment",
+        # F-DSAR31: session-summaries skipped (no pii_subject_id resolved).
+        "surface_walked:session-summaries",
         "closed",
     ]
-    for i in (1, 2, 3, 4, 5, 6, 7):
+    for i in (1, 2, 3, 4, 5, 6, 7, 8):
         skipped_event = audit_table.put_item.call_args_list[i].kwargs["Item"]
         assert skipped_event["status"] == "skipped_no_subject"
     # No walker actually queried — all skipped
@@ -3869,13 +3877,13 @@ def test_walk_archive_handles_absent_versions_key(dsar):
 
 # ── #28 DEFERRED_SURFACES count sentinel ──────────────────────────────────
 def test_deferred_surfaces_count_sentinel(dsar):
-    """Audit fix #28: pin DEFERRED_SURFACES count at exactly 2. Future
-    additions to the dict require updating shipped_walker_surfaces in
-    test_handler_does_not_emit_surface_walked_for_deferred_surfaces; this
-    sentinel makes that contract explicit."""
+    """Audit fix #28 (updated F-DSAR31 2026-06-03): pin DEFERRED_SURFACES at
+    exactly 1 — conversation-summaries (session-summaries) now has a real walker
+    (_walk_session_summaries); only audit-read-only (Art 17(3)(b) carve-out)
+    remains deferred."""
     mod, _, _ = dsar
-    assert len(mod.DEFERRED_SURFACES) == 2
-    assert set(mod.DEFERRED_SURFACES.keys()) == {"conversation-summaries", "audit-read-only"}
+    assert len(mod.DEFERRED_SURFACES) == 1
+    assert set(mod.DEFERRED_SURFACES.keys()) == {"audit-read-only"}
 
 
 # ── #16 psid dispatcher partial-error tests ──────────────────────────────
@@ -3897,3 +3905,125 @@ def test_walk_psid_surfaces_archive_failed_sessions_taint_status(dsar):
     )
     assert results["archive"]["status"] == "errored"
     assert results["archive"]["error"] == "failed_session_ids"
+
+
+# ── F-DSAR31: session-summaries walker (_walk_session_summaries) ─────────────
+def test_walk_session_summaries_access_exports_matched(dsar):
+    mod, mock_ddb, _ = dsar
+    mt = MagicMock()
+    mt.query.return_value = {"Items": [
+        {"pk": "TENANT#h", "sk": "SESSION#s1", "pii_subject_id": "subj",
+         "first_question": "[redacted]"},
+    ]}
+    mock_ddb.Table.return_value = mt
+    out = mod._walk_session_summaries("subj", "h", "access", dry_run=False)
+    assert out["action"] == "exported"
+    assert out["rows_found"] == 1
+    mock_ddb.Table.assert_called_with("picasso-session-summaries-staging")
+    kw = mt.query.call_args.kwargs
+    assert "KeyConditionExpression" in kw and "FilterExpression" in kw
+
+
+def test_walk_session_summaries_delete_dry_run_counts_only(dsar):
+    mod, mock_ddb, _ = dsar
+    mt = MagicMock()
+    mt.query.return_value = {"Items": [
+        {"pk": "TENANT#h", "sk": "SESSION#s1", "pii_subject_id": "subj"},
+        {"pk": "TENANT#h", "sk": "SESSION#s2", "pii_subject_id": "subj"}]}
+    mock_ddb.Table.return_value = mt
+    out = mod._walk_session_summaries("subj", "h", "delete", dry_run=True)
+    assert out["action"] == "dry_run_count"
+    assert out["rows_found"] == 2
+    mt.delete_item.assert_not_called()
+
+
+def test_walk_session_summaries_delete_real_deletes_each(dsar):
+    mod, mock_ddb, _ = dsar
+    mt = MagicMock()
+    mt.query.return_value = {"Items": [
+        {"pk": "TENANT#h", "sk": "SESSION#s1", "pii_subject_id": "subj"},
+        {"pk": "TENANT#h", "sk": "SESSION#s2", "pii_subject_id": "subj"}]}
+    mock_ddb.Table.return_value = mt
+    out = mod._walk_session_summaries("subj", "h", "delete", dry_run=False)
+    assert out["action"] == "deleted"
+    assert out["rows_deleted"] == 2
+    assert mt.delete_item.call_count == 2
+    mt.delete_item.assert_any_call(Key={"pk": "TENANT#h", "sk": "SESSION#s1"})
+
+
+def test_walk_session_summaries_empty(dsar):
+    mod, mock_ddb, _ = dsar
+    mt = MagicMock(); mt.query.return_value = {"Items": []}
+    mock_ddb.Table.return_value = mt
+    out = mod._walk_session_summaries("subj", "h", "delete", dry_run=False)
+    assert out["rows_found"] == 0
+    mt.delete_item.assert_not_called()
+
+
+def test_walk_session_summaries_query_error(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    mt = MagicMock()
+    mt.query.side_effect = ClientError({"Error": {"Code": "InternalError"}}, "Query")
+    mock_ddb.Table.return_value = mt
+    out = mod._walk_session_summaries("subj", "h", "delete", dry_run=False)
+    assert out.get("error") == "query_failed"
+    assert out["rows_found"] == 0
+
+
+def test_walk_session_summaries_corrupted_row_skipped(dsar):
+    mod, mock_ddb, _ = dsar
+    mt = MagicMock()
+    mt.query.return_value = {"Items": [
+        {"pk": "TENANT#h", "sk": "SESSION#s1", "pii_subject_id": "subj"},
+        {"pk": "TENANT#h", "pii_subject_id": "subj"}]}  # missing sk
+    mock_ddb.Table.return_value = mt
+    out = mod._walk_session_summaries("subj", "h", "delete", dry_run=False)
+    assert out["rows_deleted"] == 1
+    assert out["rows_skipped_corrupted"] == 1
+
+
+def test_walk_session_summaries_pagination(dsar):
+    mod, mock_ddb, _ = dsar
+    mt = MagicMock()
+    mt.query.side_effect = [
+        {"Items": [{"pk": "TENANT#h", "sk": "SESSION#s1", "pii_subject_id": "subj"}],
+         "LastEvaluatedKey": {"pk": "x", "sk": "y"}},
+        {"Items": [{"pk": "TENANT#h", "sk": "SESSION#s2", "pii_subject_id": "subj"}]},
+    ]
+    mock_ddb.Table.return_value = mt
+    out = mod._walk_session_summaries("subj", "h", "delete", dry_run=False)
+    assert out["rows_deleted"] == 2
+    assert mt.query.call_count == 2
+
+
+# ── F-DSAR31: dispatcher + handler integration ──────────────────────────────
+def test_handler_session_summaries_walked_when_tenant_hash_provided(dsar):
+    """tenant_hash on the event → session-summaries surface is walked + appears
+    in rows_touched + emits a surface_walked audit event (not deferred)."""
+    mod, mock_ddb, _ = dsar
+    _stub_handler_tables(
+        mock_ddb, subject_found=True,
+        ss_items=[{"pk": "TENANT#my87674d777bf9", "sk": "SESSION#s1",
+                   "pii_subject_id": "subj_opaque"}])
+    resp = mod.lambda_handler(
+        _valid_event(subject_identifier="test@x.co", request_type="delete",
+                     dry_run=True, tenant_hash="my87674d777bf9"),
+        context=None,
+    )
+    assert resp["rows_touched"]["session-summaries"] == 1
+    assert "session-summaries" not in mod.DEFERRED_SURFACES
+
+
+def test_handler_session_summaries_skipped_when_tenant_hash_absent(dsar):
+    """No tenant_hash → session-summaries gracefully skipped (deferred reason),
+    all other surfaces still walk; status not 'failed'."""
+    mod, mock_ddb, _ = dsar
+    _stub_handler_tables(mock_ddb, subject_found=True)
+    resp = mod.lambda_handler(
+        _valid_event(subject_identifier="test@x.co", request_type="delete",
+                     dry_run=True),  # no tenant_hash
+        context=None,
+    )
+    assert resp["rows_touched"]["session-summaries"] == 0
+    assert any("session-summaries: skipped" in f for f in resp["manual_followups"])

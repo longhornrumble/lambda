@@ -163,3 +163,15 @@ def test_invoke_client_error_502(staging_env):
             {'Error': {'Code': 'AccessDeniedException'}}, 'Invoke')
         resp = handle_admin_tenant_purge('super_admin', 'TEN-X', {}, 'op@myrecruiter.ai')
     assert resp['statusCode'] == 502
+
+
+def test_purge_passes_tenant_hash_from_registry(staging_env):
+    """F-DSAR31: the dashboard forwards the registry tenantHash so the purge
+    Lambda can reach the Class-C session-summaries surface."""
+    with patch.object(lambda_function.tenant_registry_ops, 'get_tenant',
+                      return_value={'tenantId': 'TEN-X', 'tenantHash': 'my87674d777bf9'}), \
+         patch.object(lambda_function, 'lambda_client') as mock_lambda:
+        mock_lambda.invoke.return_value = _invoke_response(_LAMBDA_DRYRUN_RESULT)
+        handle_admin_tenant_purge('super_admin', 'TEN-X', {}, 'op@myrecruiter.ai')
+    sent = json.loads(mock_lambda.invoke.call_args.kwargs['Payload'])
+    assert sent['tenant_hash'] == 'my87674d777bf9'

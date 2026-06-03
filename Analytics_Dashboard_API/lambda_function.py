@@ -1565,6 +1565,11 @@ def handle_admin_tenant_purge(user_role: Optional[str], tenant_id: str, body: Di
             'purge_id': purge_id,
             'grace_confirmed': grace_confirmed,
             'dry_run': dry_run,
+            # F-DSAR31: pass the registry tenant_hash so the purge reaches the
+            # Class-C session-summaries surface (pk=TENANT#{tenant_hash}). The
+            # registry record we just fetched carries it; omitted/None → the
+            # purge Lambda skips that surface gracefully.
+            'tenant_hash': tenant.get('tenantHash'),
         }
         logger.info(
             f"[admin] tenant purge invoke: tenant={tenant_id} operator={operator_email} "
