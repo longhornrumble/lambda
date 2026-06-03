@@ -111,21 +111,23 @@ describe('executeCancel — API-unreachable path', () => {
     expect(booking.pending_calendar_sync).toBeUndefined();
   });
 
-  test('logs booking_id + outcome + error message on failure (PII-safe)', async () => {
+  test('logs a non-PII error discriminator on failure (S-4: never err.message, which embeds the calendar email)', async () => {
     const booking = baseBooking();
     const logger = quietLogger();
-    const deps = {
-      calendar: { deleteEvent: jest.fn().mockRejectedValue(new Error('ENOTFOUND')) },
-      logger,
-    };
+    // A realistic Google error whose MESSAGE embeds the coordinator email (PII).
+    const piiErr = Object.assign(new Error("Calendar 'maya@org.example' not found"), { code: 404 });
+    const deps = { calendar: { deleteEvent: jest.fn().mockRejectedValue(piiErr) }, logger };
 
     await executeCancel({ booking, deps });
 
     expect(logger.warn).toHaveBeenCalledTimes(1);
     const [, meta] = logger.warn.mock.calls[0];
-    expect(meta).toMatchObject({ booking_id: 'bk-1', outcome: 'pending_calendar_sync', error: 'ENOTFOUND' });
+    expect(meta).toMatchObject({ booking_id: 'bk-1', outcome: 'pending_calendar_sync', error: 404 }); // err.code, not message
+    // PII proof: neither the attendee email NOR the message's embedded coordinator email is logged.
     const logged = JSON.stringify(logger.warn.mock.calls);
     expect(logged).not.toContain('vol@example.com');
+    expect(logged).not.toContain('maya@org.example');
+    expect(logged).not.toContain('not found');
   });
 });
 

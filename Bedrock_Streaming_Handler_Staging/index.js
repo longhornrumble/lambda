@@ -32,6 +32,10 @@ const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock
 // WS-C2 (scheduling §5.6): same-session form-data injection. Read-only fetch +
 // sanitize + <user_application_context> block. Prompt-injection surface.
 const { injectFormContext } = require('./scheduling/formInjection');
+// WS-CONVO (B3 keystone): in-chat reschedule/cancel. Pre-turn binding hook +
+// post-stream §B14 structured-action boundary. No-op for non-scheduling sessions.
+const { injectSchedulingContext } = require('./scheduling/bindingContext');
+const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
 const { corsHeaders } = require('./cors-helper');
 const { validateCfOriginHeader } = require('./cf-origin-validator');
 
@@ -467,7 +471,10 @@ const streamingHandler = async (event, responseStream, context) => {
     // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
     // <user_application_context> block so the LLM can skip re-qualification.
     // Non-fatal — returns basePrompt unchanged when there's no form data.
-    const prompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
+    const formPrompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
+    // WS-CONVO (B3): prepend <scheduling_context> when a §B10 reschedule/cancel binding
+    // governs this session (WS-D4 redemption). No-op (prompt unchanged) for normal chat.
+    const prompt = await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId });
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
     const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
@@ -597,6 +604,17 @@ const streamingHandler = async (event, responseStream, context) => {
       const sessionContext = body.session_context || {};
 
       const validation = validateTopicDefinitions(config);
+
+      // WS-CONVO (B3 keystone): post-stream §B14 action boundary. Resolves the §B10
+      // binding (returns no-op when absent → the CTA logic below runs unchanged) and, when
+      // a reschedule/cancel binding governs this turn, detects a STRUCTURED action and
+      // executes via the shipped §B9 modules — NEVER on free text. The Google-auth facade +
+      // booking/state DDB I/O are the integrator's in-chat wiring seam (deps); until wired,
+      // detection + transitions run and execution is skipped non-fatally.
+      await runSchedulingTurn({
+        responseText: responseBuffer, conversationHistory,
+        tenantId: config?.tenant_id, sessionId, config, bedrock, write, deps: {},
+      });
 
       if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks — use enhanceResponse()
@@ -904,7 +922,10 @@ const bufferedHandler = async (event, context) => {
     // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
     // <user_application_context> block so the LLM can skip re-qualification.
     // Non-fatal — returns basePrompt unchanged when there's no form data.
-    const prompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
+    const formPrompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
+    // WS-CONVO (B3): prepend <scheduling_context> when a §B10 reschedule/cancel binding
+    // governs this session (WS-D4 redemption). No-op (prompt unchanged) for normal chat.
+    const prompt = await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId });
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
     const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
@@ -1014,6 +1035,15 @@ const bufferedHandler = async (event, context) => {
       const sessionContext = body.session_context || {};
 
       const validation = validateTopicDefinitions(config);
+
+      // WS-CONVO (B3 keystone): post-stream §B14 action boundary (buffered path). Same
+      // contract as the streaming path; SSE is emitted by splicing into `chunks` (mirrors
+      // the CTA splice below). No-op when no §B10 binding governs the session.
+      await runSchedulingTurn({
+        responseText: responseBuffer, conversationHistory,
+        tenantId: config?.tenant_id, sessionId, config, bedrock,
+        write: (data) => chunks.splice(chunks.length - 1, 0, data), deps: {},
+      });
 
       if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks
