@@ -33,16 +33,13 @@
  *
  * ── DI seam ──
  *   deps = { calendar, ddb, logger } — INJECTED; no module-level AWS/Google clients.
- *     • deps.calendar.deleteEvent(booking) → resolves on success (idempotent: an
- *       already-deleted event / 404 / 410 resolves, it does NOT throw), throws when the
- *       Google API is unreachable. Auth + which-calendar + the event id are resolved
- *       inside this injected facade (the integrator wires the same facade WS-D6's
- *       reschedule.js consumes for insert+delete) — they are NOT in the frozen deps.
- *       *** INTEGRATION SEAM (flagged for the integrator per FROZEN_CONTRACTS §C):
- *       §B9 froze `deps = { calendar, ddb, logger }` but did not pin the calendar
- *       facade's method shape, and (unlike availability.js) injects no auth/calendarId
- *       resolver. This module codes to a thin `deps.calendar.deleteEvent(booking)`
- *       facade; reconcile it with WS-D6 + the in-chat caller wiring. NOT a fork. ***
+ *     • deps.calendar.deleteEvent(calendarId, eventId) → resolves on success (idempotent:
+ *       an already-deleted event / 404 / 410 resolves, it does NOT throw), throws when the
+ *       Google API is unreachable. This module resolves calendarId (coordinator_email) +
+ *       eventId (external_event_id) from the booking and passes them; the §B13 facade
+ *       (buildCalendarFacade, WS-FACADE) curries the per-(tenant,coordinator) auth in.
+ *       (§C reconciliation 2026-06-03: §B9/§B13 standardized on the TWO-arg shape that
+ *       WS-D6 reschedule.js + §B13 already use; cancel.js re-synced to match. NOT a fork.)
  *     • deps.ddb is accepted for §B9 signature symmetry with reschedule.js but is
  *       intentionally UNUSED here — this module persists nothing (the caller does).
  *     • deps.logger?.info/.warn — optional; logs booking_id + outcome ONLY, never the
@@ -74,6 +71,13 @@ async function executeCancel({ booking, deps } = {}) {
   if (!externalEventId) {
     throw new Error('executeCancel: booking.external_event_id is required');
   }
+  // The calendar id = the coordinator's email (v1: resourceId == coordinatorEmail == cal id, §B7).
+  const calendarId =
+    pick(booking, 'coordinatorEmail', 'coordinator_email') ||
+    pick(booking, 'resourceId', 'resource_id');
+  if (!calendarId) {
+    throw new Error('executeCancel: booking.coordinator_email is required');
+  }
 
   const logger = deps.logger;
   const bookingId = pick(booking, 'bookingId', 'booking_id');
@@ -82,7 +86,7 @@ async function executeCancel({ booking, deps } = {}) {
     // Single-path: delete the platform-owned calendar event. The facade resolves an
     // already-deleted event idempotently (no throw); the §14.2 listener will see the
     // deletion and own the status flip + notice.
-    await calendar.deleteEvent(booking);
+    await calendar.deleteEvent(calendarId, externalEventId);
     if (logger && typeof logger.info === 'function') {
       logger.info('executeCancel: calendar event deleted', { booking_id: bookingId, outcome: 'deleted' });
     }
