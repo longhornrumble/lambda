@@ -164,6 +164,27 @@ async function recordConferenceOnLock(tenantId, lockKey, { conferenceId, provide
   }));
 }
 
+// Tier-2 reschedule persistence (option A): after the executor moves the calendar
+// event, write the booking's NEW fields (start_at — also the GSI key — + the new
+// external_event_id + the pending_calendar_sync flag). UpdateItem (not writeBooking,
+// which is conditional-create); guarded on the booking already existing. CANCEL is
+// NOT persisted here — the §14.2 cal-lifecycle listener owns Booking.status on delete.
+async function updateBookingReschedule(tenantId, bookingId, { startAt, externalEventId, pendingCalendarSync } = {}) {
+  if (!tenantId || !bookingId) throw new Error('updateBookingReschedule requires tenantId and bookingId');
+  const sets = ['last_calendar_mutation_at = :now'];
+  const vals = { ':now': s(new Date().toISOString()) };
+  if (startAt) { sets.push('start_at = :sa'); vals[':sa'] = s(startAt); }
+  if (externalEventId) { sets.push('external_event_id = :eid'); vals[':eid'] = s(externalEventId); }
+  if (pendingCalendarSync !== undefined) { sets.push('pending_calendar_sync = :pcs'); vals[':pcs'] = { BOOL: !!pendingCalendarSync }; }
+  await ddb.send(new UpdateItemCommand({
+    TableName: BOOKING_TABLE,
+    Key: BOOKING_KEY(tenantId, bookingId),
+    UpdateExpression: 'SET ' + sets.join(', '),
+    ExpressionAttributeValues: vals,
+    ConditionExpression: 'attribute_exists(booking_id)',
+  }));
+}
+
 // Stamp a TTL on the lock item right after acquisition (the lock is created by C6
 // pool.lockSlot, which this module must not modify — so C8 adds the TTL attribute
 // via UpdateItem). DynamoDB TTL then garbage-collects any lock orphaned by a crash
@@ -230,6 +251,7 @@ module.exports = {
   buildBookingItem,
   getBookingById,
   writeBooking,
+  updateBookingReschedule,
   readLock,
   recordConferenceOnLock,
   setLockTtl,

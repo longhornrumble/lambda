@@ -54,6 +54,15 @@ const { initStateFromIntent } = require('./bindingContext');
 // The four §B14 structured actions. Anything else (incl. unparseable output) → 'none'.
 const ACTIONS = Object.freeze(['select_slot', 'confirm_reschedule', 'confirm_cancel', 'none']);
 
+// Tech-lead Tier-2 note: when the executor errors / outcome 'failed', surface a clear
+// "we'll confirm by email" notice rather than a silent no-op. Emitted via the SSE write;
+// the widget rendering is WS-WIDGET/B-remainder — but the event is on the wire now.
+function _emitFallbackNotice(write, sessionId) {
+  if (typeof write === 'function') {
+    write(`data: ${JSON.stringify({ type: 'scheduling_notice', notice: 'request_received_email_followup', session_id: sessionId })}\n\n`);
+  }
+}
+
 // ─── booking field reads (schema discipline — tolerate camel OR snake) ──────────────────
 
 function pick(booking, camel, snake) {
@@ -202,7 +211,74 @@ function _resolveFacade({ tenantId, binding, booking, deps }) {
 
 // ─── execution (only reached past the §B14 boundary) ─────────────────────────────────────
 
+// Tier-2 calendar execution via the Booking_Commit_Handler executor (architecture
+// option d). BSH cannot bundle googleapis, so when the integrator wires
+// `deps.invokeSchedulingExecutor` (a Lambda InvokeCommand to BCH), the already-
+// §B14-authorized mutation is delegated. The boundary stays HERE — runSchedulingTurn
+// validated the transition via stateMachine.transition BEFORE this is reached; BCH is a
+// pure executor. On executor error / outcome 'failed' we DON'T claim success: the caller
+// surfaces the "we'll confirm by email" fallback rather than a silent no-op.
+// Audit NTH1 (PII): project the booking to ONLY the fields the executor + reschedule.js +
+// cancel.js read (verified exhaustively) — drops attendee_phone + booking metadata from the
+// cross-Lambda payload. NOT the 6-field strip the reviewer first suggested: reschedule
+// rebuilds the new invite, so attendee_email/name + appointment_type_name + timezone ARE
+// required (omitting them would create an event with no attendee). Both casings kept so the
+// executor's pick() still resolves. (transport is encrypted + same-account + not logged;
+// this minimizes blast radius, it is not the security boundary.)
+const _EXEC_BOOKING_FIELDS = [
+  'booking_id', 'bookingId', 'tenant_id', 'tenantId',
+  'coordinator_email', 'coordinatorEmail', 'resource_id', 'resourceId',
+  'external_event_id', 'externalEventId', 'conference_id', 'conferenceId',
+  'conference_provider', 'conferenceProvider', 'appointment_type_name', 'appointmentTypeName',
+  'attendee_email', 'attendeeEmail', 'attendee_first_name', 'attendeeFirstName',
+  'attendee_last_name', 'attendeeLastName', 'attendee_name', 'attendeeName',
+  'timezone', 'timeZone', 'deep_link', 'deepLink',
+];
+function _projectBookingForExecutor(booking) {
+  const out = {};
+  if (!booking) return out;
+  for (const k of _EXEC_BOOKING_FIELDS) if (booking[k] !== undefined) out[k] = booking[k];
+  return out;
+}
+
+async function _executeViaExecutor(mutation, { tenantId, binding, booking, newSlot, deps, logger }) {
+  const coordinatorId =
+    (binding && binding.coordinator_id) ||
+    pick(booking, 'resourceId', 'resource_id') ||
+    calendarIdOf(booking);
+  // CR-Low: fail loud-but-clean if the coordinator can't be resolved (integrator wiring
+  // bug) — without this the fallback fires with no diagnostic of the actual cause.
+  if (!coordinatorId) {
+    (logger || console).error(`[WS-CONVO] scheduling executor: unresolved coordinatorId (fallback→email): mutation=${mutation}`);
+    return { executed: false, outcome: 'failed', fallback: 'email' };
+  }
+  const payload = {
+    action: 'scheduling_mutate',
+    mutation,
+    tenantId,
+    coordinatorId,
+    booking: _projectBookingForExecutor(booking), // NTH1: PII-minimized projection
+  };
+  if (mutation === 'reschedule') payload.newSlot = newSlot;
+  try {
+    const res = await deps.invokeSchedulingExecutor(payload);
+    // res.error is a DEFENSIVE guard (future contract-violation backstop); res.outcome
+    // ==='failed' already covers every BCH-generated failure. Do NOT add an `error` field
+    // to a SUCCESS response — it would silently flip executed to false here.
+    if (!res || res.error || res.outcome === 'failed') {
+      return { executed: false, outcome: (res && res.outcome) || 'failed', fallback: 'email' };
+    }
+    return { executed: true, outcome: res.outcome, booking: res.booking };
+  } catch (err) {
+    (logger || console).error(`[WS-CONVO] scheduling executor invoke failed (fallback→email): error_name=${(err && err.name) || 'unknown'}`);
+    return { executed: false, outcome: 'failed', fallback: 'email' };
+  }
+}
+
 async function _doReschedule({ tenantId, binding, booking, newSlot, deps, logger }) {
+  if (deps.invokeSchedulingExecutor) {
+    return _executeViaExecutor('reschedule', { tenantId, binding, booking, newSlot, deps, logger });
+  }
   const facade = _resolveFacade({ tenantId, binding, booking, deps });
   if (!facade || !deps.conference) {
     // Integrator seam (Google auth / ConferenceProvider) not wired — do NOT execute.
@@ -241,6 +317,9 @@ async function _doReschedule({ tenantId, binding, booking, newSlot, deps, logger
 }
 
 async function _doCancel({ tenantId, binding, booking, deps, logger }) {
+  if (deps.invokeSchedulingExecutor) {
+    return _executeViaExecutor('cancel', { tenantId, binding, booking, deps, logger });
+  }
   const facade = _resolveFacade({ tenantId, binding, booking, deps });
   if (!facade) {
     console.warn('[WS-CONVO] calendar facade not wired (integrator seam) — cancel skipped');
@@ -353,12 +432,15 @@ async function runSchedulingTurn({
             return { handled: true, executed: false, reason: 'booking_unavailable' };
           }
           const res = await _doCancel({ tenantId, binding, booking, deps, logger });
-          // [B-1]: advance the session off 'canceling' so a later turn within the binding TTL
-          // can't re-fire _doCancel (booked→booked is illegal → rejected). The §14.2 listener
-          // owns the async Booking.status='canceled' flip; this only terminates the SESSION.
-          if (res.executed && deps.saveState) {
+          // [B-1] + SR-2: advance off 'canceling' on a SUCCESS *or* an email-fallback turn so
+          // a later turn within the binding TTL can't re-fire _doCancel (booked→booked is
+          // illegal → rejected) — closing both the original re-fire and the executor
+          // double-execute window. The fallback is terminal ("we'll confirm by email"). The
+          // §14.2 listener owns the async Booking.status='canceled' flip; this ends the SESSION.
+          if ((res.executed || res.fallback === 'email') && deps.saveState) {
             await deps.saveState({ tenantId, sessionId, state: 'booked' });
           }
+          if (res.fallback === 'email') _emitFallbackNotice(write, sessionId);
           return { handled: true, action, ...res };
         }
         return { handled: true, executed: false, action }; // await explicit confirmation
@@ -381,9 +463,14 @@ async function runSchedulingTurn({
           newSlot: { start: selected.start, end: selected.end },
           deps, logger,
         });
-        if (res.executed && deps.saveState) {
+        // SR-2: advance on SUCCESS or email-fallback (terminal turn) → booked→booked rejects
+        // a re-fire, closing the executor double-execute window. On fallback the booking stays
+        // at its old time; the email follow-up (E-phase, not yet wired — tracked residual) is
+        // the recovery path, not an in-chat retry.
+        if ((res.executed || res.fallback === 'email') && deps.saveState) {
           await deps.saveState({ tenantId, sessionId, state: 'booked' });
         }
+        if (res.fallback === 'email') _emitFallbackNotice(write, sessionId);
         return { handled: true, action, ...res };
       }
 
@@ -436,4 +523,7 @@ module.exports = {
   _resolveFacade,
   _doReschedule,
   _doCancel,
+  // SR-3: _executeViaExecutor is intentionally NOT exported — it has no §B14 gate (it's the
+  // raw delegate). Exercise the executor path via _doReschedule/_doCancel (which enforce the
+  // executor-first check) or runSchedulingTurn (full boundary), never the raw helper.
 };
