@@ -45,6 +45,7 @@ import os
 import logging
 import time
 import re
+import uuid
 import boto3
 import hashlib
 import hmac
@@ -71,6 +72,7 @@ ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 secrets_manager = boto3.client('secretsmanager')
 dynamodb = boto3.client('dynamodb')
 dynamodb_resource = boto3.resource('dynamodb')
+lambda_client = boto3.client('lambda')
 
 
 # DynamoDB table for form submissions (contains PII)
@@ -85,6 +87,13 @@ SESSION_SUMMARIES_TABLE = os.environ.get('SESSION_SUMMARIES_TABLE', 'picasso-ses
 # fallback when the requested date range extends past the TTL boundary. Default
 # follows the environment naming convention; override per-env via the Lambda env.
 ARCHIVE_BUCKET = os.environ.get('ARCHIVE_BUCKET', f'picasso-archive-{ENVIRONMENT}')
+
+# Env-aware target for the super-admin tenant-purge trigger. In prod
+# (ENVIRONMENT=production) this resolves to the prod purge Lambda, which does
+# not exist until the gated P2 promotion — handle_admin_tenant_purge's
+# structural env block keeps the endpoint staging/dev-only until then.
+# Design: docs/roadmap/PII-Project/tenant-purge-ui-trigger-design.md
+TENANT_PURGE_FUNCTION = os.environ.get('TENANT_PURGE_FUNCTION', f'picasso-pii-tenant-purge-{ENVIRONMENT}')
 
 # DynamoDB Notification Tables (Phase 2a)
 # IAM: Lambda execution role needs dynamodb:Query on both tables and the ByMessageId GSI.
@@ -425,6 +434,14 @@ def lambda_handler(event, context):
         elif '/admin/tenants/' in path and path.endswith('/employees') and method == 'GET':
             admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
             return handle_admin_tenant_employees(user_role, admin_tenant_id)
+
+        # Super-admin tenant data purge (preview via dry_run, real via dual gate).
+        # Thin proxy to the picasso-pii-tenant-purge Lambda; design doc
+        # docs/roadmap/PII-Project/tenant-purge-ui-trigger-design.md.
+        elif '/admin/tenants/' in path and path.endswith('/purge') and method == 'POST':
+            admin_tenant_id = path.split('/admin/tenants/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_admin_tenant_purge(user_role, admin_tenant_id, body, user_email)
 
         # Admin tenant invitation revoke (must be before invitations list — more specific)
         elif '/admin/tenants/' in path and '/invitations/' in path and path.endswith('/revoke') and method == 'POST':
@@ -1504,6 +1521,73 @@ def handle_admin_tenant_update(user_role: Optional[str], tenant_id: str, body: D
         return cors_response(200, updated)
     except Exception as e:
         logger.exception(f"[admin] Error updating tenant {tenant_id}: {e}")
+        return cors_response(500, {'error': 'Internal server error'})
+
+
+def handle_admin_tenant_purge(user_role: Optional[str], tenant_id: str, body: Dict[str, Any], operator_email: Optional[str]) -> Dict[str, Any]:
+    """POST /admin/tenants/{id}/purge — super-admin-triggered tenant data purge.
+
+    Thin identity-stamping proxy to the picasso-pii-tenant-purge Lambda (design:
+    docs/roadmap/PII-Project/tenant-purge-ui-trigger-design.md). The dashboard
+    owns NO deletion logic — it authenticates the super-admin, stamps `operator`
+    from the auth token (never the client body) + a server-generated `purge_id`,
+    and forwards only {dry_run, grace_confirmed} to the Lambda, whose dual gate
+    (dry_run=false AND grace_confirmed=true) is the real safety. dry_run defaults
+    true and grace_confirmed defaults false, so a bare call can only preview.
+    """
+    guard = _require_super_admin(user_role)
+    if guard:
+        return guard
+
+    # Structural env block (mirrors handle_archive_probe): the purge Lambda is
+    # staging-only (its own account guard refuses outside acct 525). Keep this
+    # endpoint staging/dev-only until the gated prod promotion (P2). Fail loud +
+    # clear for a super-admin rather than a raw ResourceNotFound on a missing
+    # prod function.
+    env = os.environ.get('ENVIRONMENT')
+    if env not in ('staging', 'dev'):
+        return cors_response(403, {'error': 'Tenant purge is not available in this environment (prod promotion gated).'})
+
+    dry_run = body.get('dry_run', True)
+    grace_confirmed = body.get('grace_confirmed', False)
+    if not isinstance(dry_run, bool) or not isinstance(grace_confirmed, bool):
+        return cors_response(400, {'error': 'dry_run and grace_confirmed must be booleans'})
+
+    try:
+        tenant = tenant_registry_ops.get_tenant(tenant_id)
+        if not tenant:
+            return cors_response(404, {'error': 'Tenant not found'})
+
+        purge_id = str(uuid.uuid4())
+        payload = {
+            'tenant_id': tenant_id,
+            'operator': operator_email or 'unknown',
+            'purge_id': purge_id,
+            'grace_confirmed': grace_confirmed,
+            'dry_run': dry_run,
+        }
+        logger.info(
+            f"[admin] tenant purge invoke: tenant={tenant_id} operator={operator_email} "
+            f"dry_run={dry_run} grace_confirmed={grace_confirmed} purge_id={purge_id}"
+        )
+        resp = lambda_client.invoke(
+            FunctionName=TENANT_PURGE_FUNCTION,
+            InvocationType='RequestResponse',
+            Payload=json.dumps(payload).encode('utf-8'),
+        )
+        raw = resp['Payload'].read()
+        result = json.loads(raw) if raw else {}
+        if resp.get('FunctionError'):
+            logger.error(f"[admin] tenant purge Lambda FunctionError: {result}")
+            return cors_response(502, {'error': 'Purge function error', 'detail': result, 'purge_id': purge_id})
+        # Ensure the server purge_id is present even if the Lambda omitted it.
+        result['purge_id'] = purge_id
+        return cors_response(200, result)
+    except ClientError as e:
+        logger.exception(f"[admin] tenant purge invoke failed: {e}")
+        return cors_response(502, {'error': 'Failed to invoke purge function'})
+    except Exception as e:
+        logger.exception(f"[admin] tenant purge error: {e}")
         return cors_response(500, {'error': 'Internal server error'})
 
 
