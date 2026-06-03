@@ -103,6 +103,29 @@ describe('loadTenantConfig + isSchedulingEnabledForTenant — default S3 path (a
     expect(call.args[0].input.Key).toBe('tenants/MYR384719/config.json');
   });
 
+  test('default path: falls back to tenants/{id}/{id}-config.json when config.json 404s', async () => {
+    // The MYR384719-style tenant: only the {id}-config.json key exists.
+    s3Mock
+      .on(GetObjectCommand, { Key: 'tenants/MYR384719/config.json' })
+      .rejects(Object.assign(new Error('missing'), { name: 'NoSuchKey' }));
+    s3Mock
+      .on(GetObjectCommand, { Key: 'tenants/MYR384719/MYR384719-config.json' })
+      .resolves({ Body: { transformToString: async () => JSON.stringify({ feature_flags: { scheduling_enabled: true } }) } });
+    expect(await isSchedulingEnabledForTenant('MYR384719')).toBe(true);
+    const keysTried = s3Mock.commandCalls(GetObjectCommand).map((c) => c.args[0].input.Key);
+    expect(keysTried).toEqual([
+      'tenants/MYR384719/config.json',
+      'tenants/MYR384719/MYR384719-config.json',
+    ]);
+  });
+
+  test('default path: BOTH keys 404 → fail-closed false', async () => {
+    jest.spyOn(console, 'error').mockImplementation(() => {});
+    s3Mock.on(GetObjectCommand).rejects(Object.assign(new Error('missing'), { name: 'NoSuchKey' }));
+    expect(await isSchedulingEnabledForTenant('MYR384719')).toBe(false);
+    expect(s3Mock.commandCalls(GetObjectCommand).length).toBe(2); // tried both keys
+  });
+
   test('default path: malformed JSON → fail-closed false', async () => {
     jest.spyOn(console, 'error').mockImplementation(() => {});
     s3Mock.on(GetObjectCommand).resolves({

@@ -44,12 +44,24 @@ const DEFAULT_CONFIG_BUCKET = process.env.CONFIG_BUCKET || process.env.S3_CONFIG
  * @returns {Promise<object>} the parsed tenant config
  */
 async function loadTenantConfig(tenantId, { s3 = defaultS3, bucket = DEFAULT_CONFIG_BUCKET } = {}) {
-  const res = await s3.send(new GetObjectCommand({
-    Bucket: bucket,
-    Key: `tenants/${tenantId}/config.json`,
-  }));
-  const raw = await res.Body.transformToString();
-  return JSON.parse(raw);
+  // Two key conventions exist in the config bucket (mirrors shared/bedrock-core.loadConfig's
+  // fallback list): tenants/{id}/config.json first, then tenants/{id}/{id}-config.json. A
+  // tenant uses one or the other (e.g. MYR384719 only has the {id}-config.json form). Try
+  // both; throw the last error if neither resolves (caller fail-closes to disabled).
+  const keys = [
+    `tenants/${tenantId}/config.json`,
+    `tenants/${tenantId}/${tenantId}-config.json`,
+  ];
+  let lastErr;
+  for (const Key of keys) {
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key }));
+      return JSON.parse(await res.Body.transformToString());
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
 }
 
 /**
