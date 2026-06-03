@@ -66,7 +66,7 @@ const sqs = new SQSClient({ region: AWS_REGION });
 const CHANNEL_MAPPINGS_TABLE =
   process.env.CHANNEL_MAPPINGS_TABLE || `picasso-channel-mappings-${ENVIRONMENT}`;
 const RECENT_MESSAGES_TABLE =
-  process.env.RECENT_MESSAGES_TABLE || `${ENVIRONMENT}-recent-messages`;
+  process.env.RECENT_MESSAGES_TABLE || 'recent-messages';
 const KMS_KEY_ID = process.env.KMS_KEY_ID || 'alias/picasso-channel-tokens';
 const ANALYTICS_QUEUE_URL =
   process.env.ANALYTICS_QUEUE_URL ||

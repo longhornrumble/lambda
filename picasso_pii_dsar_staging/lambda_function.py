@@ -68,7 +68,7 @@ WHAT THIS LAMBDA DOES TODAY:
       records `action=no_messages_to_walk` with rows_touched=0.
     - recent-messages walker — chained walk via `session_id`s captured by
       form-submissions (email path) OR composed `meta:{pageId}:{psid}` session
-      ids (psid path). Queries `staging-recent-messages` per sessionId.
+      ids (psid path). Queries `recent-messages` per sessionId.
       Per-message export projected to {role, content, messageTimestamp};
       delete-real iterates DeleteItem per (sessionId, messageTimestamp).
     - session-events walker (M2 Sprint B) — chained walk via the same
@@ -149,7 +149,7 @@ TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit-staging"
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
-TABLE_RECENT_MESSAGES = "staging-recent-messages"
+TABLE_RECENT_MESSAGES = "recent-messages"
 TABLE_CHANNEL_MAPPINGS = "picasso-channel-mappings-staging"
 TABLE_SESSION_EVENTS = "picasso-session-events-staging"
 # F-DSAR31 (closed): session-summaries surface. pk=TENANT#{tenant_hash},
@@ -1134,7 +1134,7 @@ def _project_recent_messages_row(row):
     """Project a recent-messages row to the minimum subject-meaningful fields.
 
     Article 15 / data minimization (pii-lifecycle advisor 2026-05-21):
-    `staging-recent-messages` rows include internal join keys (`sessionId`,
+    `recent-messages` rows include internal join keys (`sessionId`,
     `messageId`) and lifecycle metadata (`expires_at`) that the subject
     neither created nor has any operational use for. Returning the full row
     would over-disclose internal identifiers and could enable session
@@ -1154,7 +1154,7 @@ def _project_recent_messages_row(row):
 
 
 def _walk_recent_messages(tenant_id, session_ids, request_type, dry_run):
-    """Walk staging-recent-messages for one subject via chained session_ids.
+    """Walk recent-messages for one subject via chained session_ids.
 
     Chained walker: input is `session_ids` produced by `_walk_form_submissions`.
     The recent-messages table has no subject-linking attribute (no email, no
@@ -1985,13 +1985,13 @@ def _recent_messages_chat_only_cli_snippet(tenant_id):
     """
     return (
         f"  # Operator-known session_id direct query (preferred):\n"
-        f"  aws dynamodb query --table-name staging-recent-messages \\\n"
+        f"  aws dynamodb query --table-name recent-messages \\\n"
         f"    --profile myrecruiter-staging \\\n"
         f"    --key-condition-expression 'sessionId = :s' \\\n"
         f"    --expression-attribute-values "
         f"'{{\":s\":{{\"S\":\"<SESSION_ID-from-out-of-band-source>\"}}}}'\n"
         f"  # Last-resort content-substring scan (CASE-SENSITIVE; false positives likely):\n"
-        f"  aws dynamodb scan --table-name staging-recent-messages \\\n"
+        f"  aws dynamodb scan --table-name recent-messages \\\n"
         f"    --profile myrecruiter-staging \\\n"
         f"    --filter-expression 'contains(#c, :e)' \\\n"
         f"    --expression-attribute-names '{{\"#c\":\"content\"}}' \\\n"
@@ -2653,7 +2653,7 @@ def _walk_psid_surfaces(tenant_id, psid, session_ids, request_type, dry_run):
         # tenant has no Meta pages OR pages had no matching sessions for
         # this psid. Surface as completed-with-no-data; operator may need
         # to verify the PSID is correct, or the subject's TTL may have
-        # purged the rows already (staging-recent-messages has a 7-day
+        # purged the rows already (recent-messages has a 7-day
         # TTL per Meta_Response_Processor).
         manual_followups.append(
             f"psid path: 0 sessionIds resolved for tenant {tenant_id!r} + "
@@ -2661,7 +2661,7 @@ def _walk_psid_surfaces(tenant_id, psid, session_ids, request_type, dry_run):
             f"configured (channel-mappings TenantIndex GSI Query); (b) "
             f"PSID belongs to a page in the tenant's channel mappings; "
             f"(c) subject's messages may have aged out via 7-day TTL on "
-            f"staging-recent-messages."
+            f"recent-messages."
         )
         walker_results["recent-messages"] = {
             "status": "completed",
