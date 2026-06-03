@@ -539,15 +539,20 @@ describe('Form Handler - Phase 2: SMS Rate Limiting', () => {
     await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
 
     expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(1);
-    const updateCall = dynamoMock.commandCalls(UpdateCommand)[0];
-    expect(updateCall.args[0].input).toMatchObject({
+    const updateInput = dynamoMock.commandCalls(UpdateCommand)[0].args[0].input;
+    expect(updateInput).toMatchObject({
       TableName: 'test-sms-usage',
       Key: {
         tenant_id: 'TEST123',
         month: expect.stringMatching(/^\d{4}-\d{2}$/)
       },
-      UpdateExpression: 'SET #count = if_not_exists(#count, :zero) + :inc, updated_at = :now'
+      UpdateExpression: 'SET #count = if_not_exists(#count, :zero) + :inc, updated_at = :now, #ttl = :ttl'
     });
+    // 30-day TTL on the monthly rate-limit counter (data-retention-strategy.md §2/§5 #4)
+    expect(updateInput.ExpressionAttributeNames['#ttl']).toBe('ttl');
+    const ttl = updateInput.ExpressionAttributeValues[':ttl'];
+    expect(typeof ttl).toBe('number');
+    expect(Math.abs(ttl - (Math.floor(Date.now() / 1000) + 30 * 24 * 3600))).toBeLessThan(120);
   });
 
   it('should handle DynamoDB GetCommand errors gracefully (fail-safe to 0)', async () => {
