@@ -1064,20 +1064,25 @@ async function incrementSMSUsage(tenantId) {
   try {
     const currentMonth = new Date().toISOString().slice(0, 7); // YYYY-MM format
 
+    // 30-day TTL on the monthly rate-limit counter (data-retention-strategy.md §2/§5 #4):
+    // refreshed on each increment so a tenant's counter ages out ~30 days after its last
+    // SMS that month. Inert until the table TTL is enabled on the `ttl` attribute (IaC).
     await dynamodb.send(new UpdateCommand({
       TableName: SMS_USAGE_TABLE,
       Key: {
         tenant_id: tenantId,
         month: currentMonth
       },
-      UpdateExpression: 'SET #count = if_not_exists(#count, :zero) + :inc, updated_at = :now',
+      UpdateExpression: 'SET #count = if_not_exists(#count, :zero) + :inc, updated_at = :now, #ttl = :ttl',
       ExpressionAttributeNames: {
-        '#count': 'count'
+        '#count': 'count',
+        '#ttl': 'ttl'
       },
       ExpressionAttributeValues: {
         ':inc': 1,
         ':zero': 0,
-        ':now': new Date().toISOString()
+        ':now': new Date().toISOString(),
+        ':ttl': Math.floor(Date.now() / 1000) + 30 * 24 * 3600
       }
     }));
 
