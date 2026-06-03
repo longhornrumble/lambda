@@ -36,7 +36,17 @@ const { injectFormContext } = require('./scheduling/formInjection');
 // post-stream §B14 structured-action boundary. No-op for non-scheduling sessions.
 const { injectSchedulingContext } = require('./scheduling/bindingContext');
 const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
+const { buildSchedulingDeps } = require('./scheduling/schedulingStateStore');
 const { corsHeaders } = require('./cors-helper');
+
+// Tier-1 deps-wiring: the DDB I/O seam runSchedulingTurn consumes (loadState/saveState
+// C9 state row + loadBooking). Built once per container (client reuse). resolveBinding/
+// detect/generateSlots/stateMachine use schedulingFlow's bundled defaults; the Google-auth
+// calendar EXECUTION seam is Tier 2 (Booking_Commit_Handler executor invoke), not wired here.
+const schedulingDeps = buildSchedulingDeps({
+  sessionTable: process.env.SCHEDULING_SESSION_TABLE || `picasso-conversation-scheduling-session-${process.env.ENVIRONMENT || 'staging'}`,
+  bookingTable: process.env.BOOKING_TABLE || `picasso-booking-${process.env.ENVIRONMENT || 'staging'}`,
+});
 const { validateCfOriginHeader } = require('./cf-origin-validator');
 
 // Default model configuration - single source of truth, sourced from
@@ -611,12 +621,17 @@ const streamingHandler = async (event, responseStream, context) => {
       // executes via the shipped §B9 modules — NEVER on free text. The Google-auth facade +
       // booking/state DDB I/O are the integrator's in-chat wiring seam (deps); until wired,
       // detection + transitions run and execution is skipped non-fatally.
-      await runSchedulingTurn({
+      const schedulingResult = await runSchedulingTurn({
         responseText: responseBuffer, conversationHistory,
-        tenantId: config?.tenant_id, sessionId, config, bedrock, write, deps: {},
+        tenantId: config?.tenant_id, sessionId, config, bedrock, write, deps: schedulingDeps,
       });
 
-      if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
+      if (schedulingResult?.handled) {
+        // S-3: this turn was a scheduling turn (slot presentation / selection / state
+        // progression / the §B14 boundary). The flow owns the post-stream surface —
+        // skip normal CTA selection so a scheduling turn doesn't also append CTAs.
+        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult.action || 'n/a'}) — skipping CTA selection`);
+      } else if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks — use enhanceResponse()
         console.log('[Tier 1-2] Explicit click routing — using enhanceResponse()');
         const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
@@ -1039,13 +1054,16 @@ const bufferedHandler = async (event, context) => {
       // WS-CONVO (B3 keystone): post-stream §B14 action boundary (buffered path). Same
       // contract as the streaming path; SSE is emitted by splicing into `chunks` (mirrors
       // the CTA splice below). No-op when no §B10 binding governs the session.
-      await runSchedulingTurn({
+      const schedulingResult = await runSchedulingTurn({
         responseText: responseBuffer, conversationHistory,
         tenantId: config?.tenant_id, sessionId, config, bedrock,
-        write: (data) => chunks.splice(chunks.length - 1, 0, data), deps: {},
+        write: (data) => chunks.splice(chunks.length - 1, 0, data), deps: schedulingDeps,
       });
 
-      if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
+      if (schedulingResult?.handled) {
+        // S-3: scheduling turn owned the post-stream surface — skip CTA selection.
+        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult.action || 'n/a'}) — skipping CTA selection`);
+      } else if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks
         const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
         if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
