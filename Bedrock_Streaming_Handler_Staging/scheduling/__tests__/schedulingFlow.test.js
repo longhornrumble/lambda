@@ -219,21 +219,39 @@ describe('runSchedulingTurn — cancel confirm', () => {
     const facade = makeFacade();
     // cancel.js (#212) resolves calendarId/eventId from the booking and calls the two-arg
     // facade itself, so the flow passes the facade unmodified (no booking-shape adapter).
-    const executeCancel = jest.fn().mockResolvedValue({ outcome: 'deleted', booking: BOOKING });
+    const executeCancel = jest.fn().mockResolvedValue({ outcome: 'deleted', executed: true, booking: BOOKING });
     const saveBooking = jest.fn();
+    const saveState = jest.fn().mockResolvedValue(undefined);
     const res = await runSchedulingTurn(baseTurn({
       bedrock: fakeBedrock({ action: 'confirm_cancel' }),
       deps: {
         resolveBinding: async () => CANCEL_BINDING,
         loadState: async () => ({ state: 'canceling' }),
         loadBooking: async () => BOOKING,
-        calendar: facade, executeCancel, saveBooking,
+        calendar: facade, executeCancel, saveBooking, saveState,
       },
     }));
     expect(executeCancel).toHaveBeenCalledTimes(1);
     expect(executeCancel.mock.calls[0][0].deps.calendar).toBe(facade); // §B13 facade passed directly
     expect(saveBooking).toHaveBeenCalledWith(BOOKING);
+    // [B-1]: the session state advances off 'canceling' so it can't re-fire within the TTL.
+    expect(saveState).toHaveBeenCalledWith(expect.objectContaining({ state: 'booked' }));
     expect(res).toMatchObject({ handled: true, executed: true, outcome: 'deleted' });
+  });
+
+  test('[B-1] confirm_cancel after the session already advanced (state booked) → rejected, executeCancel NOT called', async () => {
+    const executeCancel = jest.fn();
+    const res = await runSchedulingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'confirm_cancel' }),
+      deps: {
+        resolveBinding: async () => CANCEL_BINDING,
+        loadState: async () => ({ state: 'booked' }), // already cancelled this session
+        loadBooking: async () => BOOKING,
+        calendar: makeFacade(), executeCancel,
+      },
+    }));
+    expect(executeCancel).not.toHaveBeenCalled(); // booked→booked is illegal → IllegalStateTransition → rejected
+    expect(res).toMatchObject({ handled: true, executed: false });
   });
 
   test("non-confirm action in 'canceling' → awaits confirmation, no execute", async () => {

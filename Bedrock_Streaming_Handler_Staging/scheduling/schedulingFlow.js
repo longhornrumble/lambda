@@ -310,6 +310,9 @@ async function runSchedulingTurn({
 } = {}) {
   const logger = deps.logger || console;
   try {
+    // [B-2] guard before realResolveBinding (which throws on empty keys) — a misconfigured
+    // tenant (no tenant_id) / missing session becomes a clean no-op, not a per-turn CloudWatch error.
+    if (!tenantId || !sessionId) return { handled: false };
     const resolveFn = deps.resolveBinding || realResolveBinding;
     const binding = await resolveFn({ tenantId, sessionId, deps });
     if (!binding) return { handled: false };
@@ -341,14 +344,21 @@ async function runSchedulingTurn({
       // ── CANCEL intent ────────────────────────────────────────────────────────────────
       if (initialState === 'canceling') {
         if (action === 'confirm_cancel') {
-          if (state !== 'canceling') {
-            return { handled: true, executed: false, rejected: true, reason: `cannot confirm_cancel from '${state}'` };
-          }
+          // §B14 [S-1]: gate via the state machine (the canceling→booked "cancel the cancel"
+          // edge) — IllegalStateTransition (caught below) rejects a confirm_cancel from any
+          // other state, exactly like the reschedule path. No manual state check.
+          transition({ state }, 'booked');
           if (!booking) {
             console.warn('[WS-CONVO] booking not loaded (integrator seam) — cancel skipped');
             return { handled: true, executed: false, reason: 'booking_unavailable' };
           }
           const res = await _doCancel({ tenantId, binding, booking, deps, logger });
+          // [B-1]: advance the session off 'canceling' so a later turn within the binding TTL
+          // can't re-fire _doCancel (booked→booked is illegal → rejected). The §14.2 listener
+          // owns the async Booking.status='canceled' flip; this only terminates the SESSION.
+          if (res.executed && deps.saveState) {
+            await deps.saveState({ tenantId, sessionId, state: 'booked' });
+          }
           return { handled: true, action, ...res };
         }
         return { handled: true, executed: false, action }; // await explicit confirmation

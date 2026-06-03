@@ -95,10 +95,12 @@ async function executeCancel({ booking, deps } = {}) {
     // API-unreachable / transient: flag for the E9 reconciler to retry. Do NOT flip
     // status here — the listener still owns that once the eventual delete lands.
     if (logger && typeof logger.warn === 'function') {
+      // SR-2 (S-4): log a non-PII discriminator, NOT err.message — Google errors embed the
+      // calendar id (coordinator email): "Calendar 'maya@org' not found". Mirrors reschedule.js.
       logger.warn('executeCancel: calendar delete failed, marking pending_calendar_sync', {
         booking_id: bookingId,
         outcome: 'pending_calendar_sync',
-        error: err && err.message,
+        error: (err && (err.code || err.name)) || 'error',
       });
     }
     const updated = { ...booking, pending_calendar_sync: true };
