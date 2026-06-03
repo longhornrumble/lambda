@@ -29,7 +29,7 @@ const baseBooking = () => ({
 const quietLogger = () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn() });
 
 describe('executeCancel — success path', () => {
-  test('delete ✓ → outcome "deleted" and the facade was called once with the booking', async () => {
+  test('delete ✓ → outcome "deleted" and the facade was called with (calendarId, eventId)', async () => {
     const booking = baseBooking();
     const deleteEvent = jest.fn().mockResolvedValue(undefined);
     const deps = { calendar: { deleteEvent }, ddb: {}, logger: quietLogger() };
@@ -38,7 +38,8 @@ describe('executeCancel — success path', () => {
 
     expect(result.outcome).toBe('deleted');
     expect(deleteEvent).toHaveBeenCalledTimes(1);
-    expect(deleteEvent).toHaveBeenCalledWith(booking);
+    // §B13 two-arg facade: calendarId (coordinator_email) + eventId (external_event_id).
+    expect(deleteEvent).toHaveBeenCalledWith('coord@example.com', 'gcal-evt-123');
   });
 
   test('does NOT mutate Booking.status (the listener owns the flip)', async () => {
@@ -152,16 +153,16 @@ describe('executeCancel — persists nothing / no token work', () => {
 });
 
 describe('executeCancel — forward-compatible booking reads (schema discipline)', () => {
-  test('accepts a camelCase externalEventId', async () => {
-    const booking = { booking_id: 'bk-2', externalEventId: 'gcal-evt-camel', status: 'booked' };
+  test('accepts a camelCase externalEventId + coordinatorEmail', async () => {
+    const booking = { booking_id: 'bk-2', externalEventId: 'gcal-evt-camel', coordinatorEmail: 'maya@org.example', status: 'booked' };
     const deleteEvent = jest.fn().mockResolvedValue(undefined);
     const result = await executeCancel({ booking, deps: { calendar: { deleteEvent } } });
     expect(result.outcome).toBe('deleted');
-    expect(deleteEvent).toHaveBeenCalledWith(booking);
+    expect(deleteEvent).toHaveBeenCalledWith('maya@org.example', 'gcal-evt-camel');
   });
 
   test('reads camelCase bookingId for the log', async () => {
-    const booking = { bookingId: 'bk-camel', external_event_id: 'gcal-evt-9', status: 'booked' };
+    const booking = { bookingId: 'bk-camel', external_event_id: 'gcal-evt-9', coordinator_email: 'coord@example.com', status: 'booked' };
     const logger = quietLogger();
     await executeCancel({ booking, deps: { calendar: { deleteEvent: jest.fn().mockResolvedValue() }, logger } });
     const [, meta] = logger.info.mock.calls[0];
@@ -197,6 +198,13 @@ describe('executeCancel — caller-contract guards (throw, not an outcome)', () 
     await expect(
       executeCancel({ booking, deps: { calendar: { deleteEvent: jest.fn() } } })
     ).rejects.toThrow(/external_event_id is required/);
+  });
+
+  test('booking without a coordinator (calendar id) throws (§B13 two-arg needs calendarId)', async () => {
+    const booking = { booking_id: 'bk-4', external_event_id: 'gcal-evt-7', status: 'booked' };
+    await expect(
+      executeCancel({ booking, deps: { calendar: { deleteEvent: jest.fn() } } })
+    ).rejects.toThrow(/coordinator_email is required/);
   });
 });
 
