@@ -36,6 +36,9 @@ jest.mock('../shared/scheduling/availability', () => ({
 }));
 jest.mock('./oauth-client', () => ({
   getOAuthClient: jest.fn(async () => ({})),
+  // Default: calendarId === coordinatorId (v1 convention / coordinator_email absent).
+  // The decoupling test below overrides this to a distinct real-calendar email.
+  getCoordinatorCalendarId: jest.fn(async ({ coordinatorId }) => coordinatorId),
   clearCacheEntry: jest.fn(),
 }));
 jest.mock('./zoom-client', () => ({
@@ -115,6 +118,7 @@ beforeEach(() => {
   bookingStore.writeBooking.mockResolvedValue({ booking_id: { S: 'booking#x' }, status: { S: 'booked' } });
   calendarEvents.insertEvent.mockResolvedValue(EVENT);
   oauth.getOAuthClient.mockResolvedValue({});
+  oauth.getCoordinatorCalendarId.mockImplementation(async ({ coordinatorId }) => coordinatorId);
 });
 
 // ─── validation ──────────────────────────────────────────────────────────────────────
@@ -178,6 +182,44 @@ describe('NullConferenceProvider DI — interface-seam verification', () => {
     const written = bookingStore.writeBooking.mock.calls[0][0];
     expect(written.status).toBe('booked');
     expect(written.externalEventId).toBe('evt-1');
+  });
+});
+
+// ─── calendarId decoupled from the secret-path key (coordinator_email) ──────────────────
+//
+// The OAuth secret-path key (coordinatorId) can be an opaque routing label; the real
+// writable calendar is the secret's coordinator_email. getCoordinatorCalendarId resolves
+// it. These assert the commit writes the REAL calendar everywhere — else events.insert
+// 404s on the label and a later cancel/reschedule (which reads Booking.coordinatorEmail)
+// 404s too. Regression guard for the in-chat-booking UAT defect (2026-06-04).
+describe('calendarId resolves from coordinator_email, not the secret-path label', () => {
+  const REAL_CAL = 'coordinator-maya@org.example';
+
+  it('insert + persisted coordinatorEmail target the real calendar, not coordinatorId', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1', format: 'one_to_one' });
+    oauth.getCoordinatorCalendarId.mockResolvedValue(REAL_CAL); // label 'res-a' → real calendar
+    const res = await handler(baseEvent(), {}, nullInjection());
+
+    expect(res.status).toBe('BOOKED');
+    // events.insert(authClient, calendarId, requestBody) — calendarId is the real
+    // calendar, decoupled from the secret-path key coordinatorId ('maya@org.org').
+    expect(calendarEvents.insertEvent.mock.calls[0][1]).toBe(REAL_CAL);
+    expect(calendarEvents.insertEvent.mock.calls[0][1]).not.toBe('maya@org.org');
+    // Booking.coordinatorEmail is what cancel/reschedule later use as the calendarId.
+    expect(bookingStore.writeBooking.mock.calls[0][0].coordinatorEmail).toBe(REAL_CAL);
+    // The OAuth secret lookup still uses the path-key coordinatorId, NOT the calendar id.
+    expect(oauth.getOAuthClient.mock.calls[0][0].coordinatorId).toBe('maya@org.org');
+  });
+
+  it('rollback deletes from the real calendar when the booking write fails', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1', format: 'one_to_one' });
+    oauth.getCoordinatorCalendarId.mockResolvedValue(REAL_CAL);
+    bookingStore.writeBooking.mockRejectedValue(new Error('DDB throttle'));
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res.status).toBe('COMMIT_FAILED');
+    // events.delete(client, calendarId, eventId) — rollback targets the real calendar.
+    expect(calendarEvents.deleteEvent).toHaveBeenCalled();
+    expect(calendarEvents.deleteEvent.mock.calls[0][1]).toBe(REAL_CAL);
   });
 });
 

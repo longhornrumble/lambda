@@ -38,7 +38,7 @@ const routing = require('../shared/scheduling/routing'); // C5
 const availability = require('../shared/scheduling/availability'); // C4
 const featureGate = require('../shared/scheduling/featureGate'); // backend scheduling_enabled gate
 
-const { getOAuthClient, clearCacheEntry } = require('./oauth-client');
+const { getOAuthClient, getCoordinatorCalendarId, clearCacheEntry } = require('./oauth-client');
 const calendarEvents = require('./calendar-events');
 const { resolveProvider } = require('./conference-providers');
 const bookingStore = require('./booking-store');
@@ -226,8 +226,14 @@ async function commitAgainstResource({
       deepLink,
       conference,
     });
+    // The calendar to write into is the coordinator's REAL calendar (the OAuth
+    // secret's coordinator_email), not the secret-path key coordinatorId — which can
+    // be an opaque routing label. freeBusy already resolves it this way
+    // (shared/scheduling/availability.js); the commit path must match or events.insert
+    // 404s on a non-calendar id. Falls back to coordinatorId under the v1 convention.
+    const calendarId = await getCoordinatorCalendarId({ tenantId, coordinatorId });
     event = await insertWithOAuthRetry({
-      tenantId, coordinatorId, calendarId: coordinatorId, requestBody,
+      tenantId, coordinatorId, calendarId, requestBody,
     });
 
     // Resolve the join URL + conference id (Meet's are known only post-insert).
@@ -256,7 +262,10 @@ async function commitAgainstResource({
         tenantId, bookingId, sessionId: ctx.sessionId,
         status: 'booked',
         start: ctx.start, end: ctx.end, timezone: ctx.timezone,
-        coordinatorEmail: coordinatorId, resourceId,
+        // Persist the REAL calendar id (coordinator_email) — cancel/reschedule read
+        // Booking.coordinatorEmail as the calendarId, so storing the secret-path label
+        // here would 404 a later mutation of this booking.
+        coordinatorEmail: calendarId, resourceId,
         appointmentTypeId: ctx.appointmentTypeId,
         attendeeEmail: ctx.attendee.email,
         attendeeName: [ctx.attendee.first_name, ctx.attendee.last_name].filter(Boolean).join(' '),
@@ -301,7 +310,7 @@ async function commitAgainstResource({
         appointmentTypeName: ctx.appointmentTypeName,
         orgName: ctx.orgName,
         coordinatorName: ctx.coordinatorName,
-        coordinatorEmail: coordinatorId,
+        coordinatorEmail: calendarId,
         start: ctx.start, end: ctx.end,
         whenLabel: formatWhen(ctx.start, ctx.timezone),
         joinUrl, deepLink,
@@ -392,7 +401,11 @@ async function rollbackCalendarAndConference({ tenantId, coordinatorId, event, c
   if (event && event.id) {
     try {
       const client = await getOAuthClient({ tenantId, coordinatorId });
-      await calendarEvents.deleteEvent(client, coordinatorId, event.id);
+      // Delete from the REAL calendar (coordinator_email), matching the calendarId the
+      // insert used — deleting against the secret-path label would 404 and strand the
+      // event. Cache hit (the insert already fetched the secret).
+      const calendarId = await getCoordinatorCalendarId({ tenantId, coordinatorId });
+      await calendarEvents.deleteEvent(client, calendarId, event.id);
     } catch (err) {
       warn('event_rollback_failed', { event_id: event.id, error: err.message });
       await alertAdmin('Scheduling: calendar event rollback failed', { tenantId, eventId: event.id });

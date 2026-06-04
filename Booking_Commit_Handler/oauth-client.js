@@ -63,11 +63,17 @@ async function fetchOAuthSecret(secretPath) {
   return parsed;
 }
 
-async function getOAuthClient({ tenantId, coordinatorId }) {
-  const secretPath = buildSecretPath(tenantId, coordinatorId);
+// Fetch-or-cache the per-(tenant, coordinator) entry: the authed client AND the
+// coordinator's real Google calendarId. The OAuth secret's coordinator_email is the
+// authoritative writable calendar; coordinatorId (the secret-path key / routing
+// resourceId) is only an identifier and is NOT guaranteed to be a real calendar id —
+// it can be an opaque label. Fall back to coordinatorId when coordinator_email is
+// absent (v1 convention: the two are equal, and older secrets predate the field).
+// Mirrors shared/scheduling/availability.js getAuthClient's { client, calendarId }.
+async function _getCacheEntry(secretPath, coordinatorId) {
   const cached = _clientCache.get(secretPath);
   if (cached && (Date.now() - cached.cachedAt) < CACHE_TTL_MS) {
-    return cached.client;
+    return cached;
   }
   const secret = await fetchOAuthSecret(secretPath);
   const client = new OAuth2Client({
@@ -75,8 +81,32 @@ async function getOAuthClient({ tenantId, coordinatorId }) {
     clientSecret: secret.client_secret,
   });
   client.setCredentials({ refresh_token: secret.refresh_token });
-  _clientCache.set(secretPath, { client, cachedAt: Date.now() });
-  return client;
+  const calendarId =
+    typeof secret.coordinator_email === 'string' && secret.coordinator_email
+      ? secret.coordinator_email
+      : coordinatorId;
+  const entry = { client, calendarId, cachedAt: Date.now() };
+  _clientCache.set(secretPath, entry);
+  return entry;
+}
+
+async function getOAuthClient({ tenantId, coordinatorId }) {
+  const secretPath = buildSecretPath(tenantId, coordinatorId);
+  return (await _getCacheEntry(secretPath, coordinatorId)).client;
+}
+
+/**
+ * Resolve the coordinator's real Google calendarId from the OAuth secret's
+ * coordinator_email (falling back to coordinatorId for pre-coordinator_email secrets
+ * / the v1 convention). Shares getOAuthClient's TTL cache, so a preceding
+ * getOAuthClient call makes this a cache hit with no extra Secrets Manager fetch.
+ * The commit path uses this so events.insert / events.delete and the persisted
+ * Booking.coordinatorEmail target the coordinator's real calendar, NOT the
+ * secret-path key (which can be an opaque label).
+ */
+async function getCoordinatorCalendarId({ tenantId, coordinatorId }) {
+  const secretPath = buildSecretPath(tenantId, coordinatorId);
+  return (await _getCacheEntry(secretPath, coordinatorId)).calendarId;
 }
 
 /**
@@ -99,6 +129,7 @@ function _resetCacheForTests() {
 
 module.exports = {
   getOAuthClient,
+  getCoordinatorCalendarId,
   clearCacheEntry,
   buildSecretPath,
   fetchOAuthSecret,
