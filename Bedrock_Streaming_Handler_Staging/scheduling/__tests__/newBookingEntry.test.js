@@ -159,17 +159,39 @@ describe('runNewBookingEntry — engage / bootstrap / no-op', () => {
 });
 
 describe('resolveSessionAttendee — §B16d form-injection read', () => {
-  test('latest submission with canonical contact → { email, first_name, last_name } trimmed', async () => {
+  test('latest submission with canonical contact → { email, first_name, last_name, phone } trimmed', async () => {
     fetchSessionSubmissions.mockResolvedValue([
-      { contact: { email: '  vol@x.org ', first_name: ' Vee ', last_name: ' Doe ' } },
+      { contact: { email: '  vol@x.org ', first_name: ' Vee ', last_name: ' Doe ', phone: ' 555-1234 ' } },
     ]);
     expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' }))
-      .toEqual({ email: 'vol@x.org', first_name: 'Vee', last_name: 'Doe' });
+      .toEqual({ email: 'vol@x.org', first_name: 'Vee', last_name: 'Doe', phone: '555-1234' });
   });
 
-  test('email only (no name fields) → { email } (name keys omitted, not empty)', async () => {
+  test('email only (no name/phone fields) → { email } (optional keys omitted, not empty)', async () => {
     fetchSessionSubmissions.mockResolvedValue([{ contact: { email: 'a@b.io' } }]);
     expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toEqual({ email: 'a@b.io' });
+  });
+
+  test('accepts plus-addressing, subdomains, and mixed case', async () => {
+    for (const good of ['user+tag@sub.example.co', 'USER@X.ORG', 'a.b-c@mail.example.com']) {
+      fetchSessionSubmissions.mockResolvedValue([{ contact: { email: good } }]);
+      expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toEqual({ email: good });
+    }
+  });
+
+  test('over-long email (> 254, RFC 5321 cap) → null even if otherwise well-shaped', async () => {
+    const longLocal = 'a'.repeat(250);
+    fetchSessionSubmissions.mockResolvedValue([{ contact: { email: `${longLocal}@x.org` } }]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
+  });
+
+  test('over-long name/phone are capped (defensive vs an oversized calendar invite)', async () => {
+    fetchSessionSubmissions.mockResolvedValue([
+      { contact: { email: 'a@b.io', first_name: 'x'.repeat(500), phone: '9'.repeat(200) } },
+    ]);
+    const a = await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' });
+    expect(a.first_name).toHaveLength(100);
+    expect(a.phone).toHaveLength(40);
   });
 
   test('no submissions → null (the identity hold)', async () => {
@@ -182,11 +204,26 @@ describe('resolveSessionAttendee — §B16d form-injection read', () => {
     expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
   });
 
-  test('malformed email (no @ / no domain) → null (worse than none — would book a dead inbox)', async () => {
-    for (const bad of ['not-an-email', 'x@y', 'x@y.', '@x.org', 'a b@x.org']) {
+  test('malformed email → null (worse than none — would book a dead inbox)', async () => {
+    // incl. the shapes the pre-audit regex wrongly passed: angle-bracket, trailing-dot,
+    // IP-literal, <2-char TLD (audit A1).
+    for (const bad of [
+      'not-an-email', 'x@y', 'x@y.', '@x.org', 'a b@x.org',
+      '<a@b.com>', 'a@b.com.', 'a@b.c', 'a@[10.0.0.1]',
+    ]) {
       fetchSessionSubmissions.mockResolvedValue([{ contact: { email: bad } }]);
       expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
     }
+  });
+
+  test('with multiple submissions, the most recent (by submitted_at) supplies identity', async () => {
+    // Use the REAL pickLatest so the recency contract at the seam is actually exercised.
+    pickLatest.mockImplementation(jest.requireActual('../formInjection').pickLatest);
+    fetchSessionSubmissions.mockResolvedValue([
+      { contact: { email: 'old@x.org' }, submitted_at: '2026-05-01T00:00:00Z' },
+      { contact: { email: 'new@x.org' }, submitted_at: '2026-05-30T00:00:00Z' },
+    ]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toEqual({ email: 'new@x.org' });
   });
 
   test('non-string / absent contact → null (schema discipline, no throw)', async () => {
@@ -235,5 +272,35 @@ describe('runNewBookingEntry — attendee wiring into qualifyingContext', () => 
     await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState } });
     expect(fetchSessionSubmissions).toHaveBeenCalledWith({ tenantId: 'T1', sessionId: 'S1' });
     expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toEqual({ email: 'def@x.org' });
+  });
+
+  test('bootstrap turn (intent=new_booking, nothing in flight) + sourced attendee → qualifying row AND attendee forwarded', async () => {
+    const loadState = jest.fn().mockResolvedValue(null);
+    const saveState = jest.fn();
+    const getSessionAttendee = jest.fn().mockResolvedValue({ email: 'boot@x.org', first_name: 'Boot' });
+    await runNewBookingEntry({ ...base, routingMetadata: { scheduling_intent: 'new_booking' }, deps: { loadState, saveState, getSessionAttendee } });
+    expect(saveState).toHaveBeenCalledWith({ tenantId: 'T1', sessionId: 'S1', state: 'qualifying' });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toEqual({ email: 'boot@x.org', first_name: 'Boot' });
+  });
+
+  test('a freshly-sourced attendee CLOBBERS a stale deps.qualifyingContext from the caller', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'confirming' });
+    const getSessionAttendee = jest.fn().mockResolvedValue({ email: 'fresh@x.org' });
+    // Caller passes a stale context (e.g. cached) — the fresh resolution must win (spread order).
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState, getSessionAttendee, qualifyingContext: { appointmentTypeId: 'STALE', attendee: { email: 'stale@x.org' } } } });
+    const fwd = runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext;
+    expect(fwd.attendee).toEqual({ email: 'fresh@x.org' });
+    expect(fwd.appointmentTypeId).toBe('apt1'); // freshly resolved, not the caller's 'STALE'
+  });
+
+  test('outer error (loadState throws) → non-fatal; PII-safe log carries no tenant/session', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const loadState = jest.fn().mockRejectedValue(new Error('boom vol@x.org'));
+    const res = await runNewBookingEntry({ ...base, tenantId: 'TENANT-SECRET', sessionId: 'SESSION-SECRET', routingMetadata: { scheduling_intent: 'new_booking' }, deps: { loadState } });
+    expect(res).toEqual({ handled: false, error: true });
+    const logged = errSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/error_name=/);
+    expect(logged).not.toMatch(/TENANT-SECRET|SESSION-SECRET|vol@x\.org/);
+    errSpy.mockRestore();
   });
 });

@@ -46,10 +46,13 @@ const { fetchSessionSubmissions, pickLatest } = require('./formInjection');
 // the terminal 'booked'.
 const IN_FLIGHT_STATES = Object.freeze(['qualifying', 'proposing', 'confirming']);
 
-// Minimal email shape check. The commit (§B16c) REQUIRES a usable attendee.email; a value that
-// can't be an address is worse than none (it would book to a dead inbox), so we treat it as
-// "no identity" and let the flow hold at `confirming`.
-const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Email shape check. The commit (§B16c) REQUIRES a usable attendee.email; a value that can't be
+// an address is worse than none (it would book a dead inbox), so we treat it as "no identity" and
+// let the flow hold at `confirming`. Rejects angle-bracket forms (`<a@b.com>`), trailing-dot
+// domains (`a@b.com.`), IP-literals (`a@[1.2.3.4]`), and <2-char TLDs; accepts plus-addressing,
+// subdomains, and mixed case. (Tightened per PR #230 audit A1 — the prior regex passed all of
+// the above.) Length is capped separately (RFC 5321 = 254).
+const EMAIL_SHAPE = /^[^\s@<>]+@[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*\.[A-Za-z]{2,}$/;
 
 /**
  * Build `qualifyingContext` from the tenant `scheduling` config block. Schema-discipline:
@@ -113,10 +116,17 @@ async function resolveSessionAttendee({ tenantId, sessionId, client } = {}) {
     const latest = pickLatest(items);
     const contact = (latest && latest.contact && typeof latest.contact === 'object') ? latest.contact : {};
     const email = typeof contact.email === 'string' ? contact.email.trim() : '';
-    if (!email || !EMAIL_SHAPE.test(email)) return null;
+    // Reject empty / over-long (RFC 5321 = 254) / malformed — see EMAIL_SHAPE (audit A1/A2).
+    if (!email || email.length > 254 || !EMAIL_SHAPE.test(email)) return null;
     const out = { email };
-    if (typeof contact.first_name === 'string' && contact.first_name.trim()) out.first_name = contact.first_name.trim();
-    if (typeof contact.last_name === 'string' && contact.last_name.trim()) out.last_name = contact.last_name.trim();
+    // §B16c also accepts optional first_name/last_name/phone; cap each so an over-long stored
+    // value can't bloat the calendar invite (audit A2/A3). `name` is composed BCH-side.
+    const fn = typeof contact.first_name === 'string' ? contact.first_name.trim().slice(0, 100) : '';
+    const ln = typeof contact.last_name === 'string' ? contact.last_name.trim().slice(0, 100) : '';
+    const ph = typeof contact.phone === 'string' ? contact.phone.trim().slice(0, 40) : '';
+    if (fn) out.first_name = fn;
+    if (ln) out.last_name = ln;
+    if (ph) out.phone = ph;
     return out;
   } catch (err) {
     // PII-safe: log ONLY the error shape — never tenantId, sessionId, email, or name.
