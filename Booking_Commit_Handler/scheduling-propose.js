@@ -76,7 +76,19 @@ async function handleSchedulingPropose(event = {}, injected = {}) {
     //     coordinatorEmail }], exactly what pool.select consumes (it reads candidate.resourceId
     //     + candidate.coordinatorId || resourceId for the calendar query; coordinatorEmail ===
     //     resourceId in v1 so the `||` fallback addresses the right calendar). Fits as-is.
-    const candidates = await _resolveCandidates({ tenantId, appointmentTypeId });
+    //
+    //     resolveCandidates would otherwise re-read the AppointmentType + RoutingPolicy via its
+    //     own default readers (+2 redundant GetItems). Hand it cached readers that return the
+    //     rows already fetched above, so its internal hops hit NO DynamoDB — leaving the
+    //     employee Query as the only fresh read here: 3 reads total (appt-type + policy +
+    //     employees), not 5.
+    const candidates = await _resolveCandidates(
+      { tenantId, appointmentTypeId },
+      {
+        getAppointmentType: async () => appointmentType,
+        getRoutingPolicy: async () => routingPolicy,
+      }
+    );
 
     // The SHIPPED C6 orchestrator — do NOT re-implement its freeBusy/eval/slot passes.
     const result = await _select({

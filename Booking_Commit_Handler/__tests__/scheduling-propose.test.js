@@ -1,5 +1,7 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { handleSchedulingPropose } = require('../scheduling-propose');
 
 // ── Fixtures (no real DDB / Google) ──────────────────────────────────────────────────
@@ -33,11 +35,11 @@ const PROPOSED_RETURN = {
 };
 
 function baseInjected(overrides = {}) {
-  const calls = { resolve: [], getAppt: [], getPolicy: [], select: [], logs: [] };
+  const calls = { resolve: [], resolveDeps: [], getAppt: [], getPolicy: [], select: [], logs: [] };
   const injected = {
     getAppointmentType: async (a) => { calls.getAppt.push(a); return APPT; },
     getRoutingPolicy: async (a) => { calls.getPolicy.push(a); return POLICY; },
-    resolveCandidates: async (a) => { calls.resolve.push(a); return CANDIDATES; },
+    resolveCandidates: async (a, deps) => { calls.resolve.push(a); calls.resolveDeps.push(deps); return CANDIDATES; },
     poolSelect: async (a) => { calls.select.push(a); return PROPOSED_RETURN; },
     logger: { log: (l) => calls.logs.push(l) },
     ...overrides,
@@ -104,6 +106,21 @@ describe('handleSchedulingPropose — happy path', () => {
     expect(arg.alreadyRejected).toEqual(['slot#2026-06-30T15:00:00.000Z']); // forwarded unchanged
     expect(arg.windowStart).toBe('W1');
     expect(arg.windowEnd).toBe('W2');
+  });
+
+  it('does NOT double-read: reuses the appt-type + policy it already read (3 DDB reads, not 5)', async () => {
+    const { injected, calls } = baseInjected();
+    await handleSchedulingPropose(PROPOSE_EVENT, injected);
+    // the route itself reads the appt-type once + the policy once …
+    expect(calls.getAppt).toHaveLength(1);
+    expect(calls.getPolicy).toHaveLength(1);
+    // … and hands resolveCandidates cached readers returning those SAME rows, so its
+    // internal appt-type/policy hops hit no DynamoDB (only its employee Query is a fresh
+    // read → 3 reads total, eliminating the +2 redundant GetItems).
+    const deps = calls.resolveDeps[0];
+    expect(deps).toBeDefined();
+    expect(await deps.getAppointmentType()).toBe(APPT);
+    expect(await deps.getRoutingPolicy()).toBe(POLICY);
   });
 });
 
@@ -217,20 +234,33 @@ describe('handleSchedulingPropose — PII-clean logging', () => {
   });
 });
 
-// ── READ-ONLY: never locks a slot or advances round-robin ────────────────────────────
+// ── READ-ONLY: the route contains NO write-op call sites ─────────────────────────────
+// Structural proof (not a runtime spy that an injected pool.select would render vacuous):
+// the propose module never references a slot lock, round-robin advance, or any Booking
+// write — and never imports a write-capable module. A future edit that adds one fails here.
 
-describe('handleSchedulingPropose — read-only (no write side effects)', () => {
-  it('never calls pool.lockSlot or routing.advanceRoundRobin (no PutItem/UpdateItem)', async () => {
-    const realPool = require('../../shared/scheduling/pool');
-    const realRouting = require('../../shared/scheduling/routing');
-    const lockSpy = jest.spyOn(realPool, 'lockSlot');
-    const advSpy = jest.spyOn(realRouting, 'advanceRoundRobin');
-    const { injected } = baseInjected(); // injected poolSelect → real pool.select never runs either
-    await handleSchedulingPropose(PROPOSE_EVENT, injected);
-    expect(lockSpy).not.toHaveBeenCalled();
-    expect(advSpy).not.toHaveBeenCalled();
-    lockSpy.mockRestore();
-    advSpy.mockRestore();
+describe('scheduling-propose.js — read-only (no write call sites in the source)', () => {
+  // Scan CODE only — strip comments first (the docstring deliberately names the write ops
+  // it AVOIDS, e.g. "bound at commit by pool.lockSlot()", which would false-positive).
+  const code = fs
+    .readFileSync(path.join(__dirname, '..', 'scheduling-propose.js'), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '') // block comments
+    .replace(/\/\/.*$/gm, ''); // line comments
+
+  it('references no slot-lock, round-robin advance, or Booking write op', () => {
+    expect(code).not.toMatch(/lockSlot|advanceRoundRobin|revertRoundRobin/);
+    expect(code).not.toMatch(/writeBooking|updateBooking|writeDegradedMarker|PutItemCommand|UpdateItemCommand|DeleteItemCommand/);
+  });
+
+  it('imports no write-capable module (booking-store / routing)', () => {
+    expect(code).not.toMatch(/require\(\s*['"]\.\/booking-store['"]\s*\)/);
+    expect(code).not.toMatch(/require\(\s*['"][^'"]*scheduling\/routing['"]\s*\)/);
+  });
+
+  it('only consumes pool (for select) + the candidate-resolver (reads)', () => {
+    // pool.select is the only pool member it may use; assert no other pool.* call slips in.
+    const poolCalls = code.match(/pool\.\w+/g) || [];
+    expect(poolCalls.every((c) => c === 'pool.select')).toBe(true);
   });
 });
 
