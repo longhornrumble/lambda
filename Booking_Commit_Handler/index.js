@@ -137,7 +137,7 @@ async function liveFreeBusyRecheck({ tenantId, candidateResourceIds, coordinator
       }
     } catch (err) {
       pool.recordFreeBusyFailure(tenantId, resourceId);
-      warn('recheck_freebusy_failed', { tenant_id: tenantId, resource_id: resourceId });
+      warn('recheck_freebusy_failed', { tenant_id: tenantId, resource_id_hash: hashId(resourceId) });
     }
   }
   return survivors;
@@ -350,7 +350,7 @@ async function commitAgainstResource({
         warn('degraded_marker_failed', { coordinator_id_hash: hashId(coordinatorId), error: markErr.message });
       }
       await alertAdmin('Scheduling: coordinator OAuth revoked (degraded)', {
-        tenantId, resourceId, coordinator_id_hash: hashId(coordinatorId),
+        tenantId, resource_id_hash: hashId(resourceId), coordinator_id_hash: hashId(coordinatorId),
       });
       if (rrAdvanced) await safeRevertRR(tenantId, resourceId, ctx);
       await rollbackCalendarAndConference({ tenantId, coordinatorId, event, conference });
@@ -391,8 +391,8 @@ async function safeRevertRR(tenantId, resourceId, ctx) {
       previousAt: ctx.roundRobinCursor.previousAt,
     });
   } catch (err) {
-    warn('round_robin_revert_failed', { tenant_id: tenantId, resource_id: resourceId, error: err.message });
-    await alertAdmin('Scheduling: round-robin revert failed', { tenantId, resourceId });
+    warn('round_robin_revert_failed', { tenant_id: tenantId, resource_id_hash: hashId(resourceId), error: err.message });
+    await alertAdmin('Scheduling: round-robin revert failed', { tenantId, resource_id_hash: hashId(resourceId) });
   }
 }
 
@@ -576,14 +576,14 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
       const result = await commitAgainstResource({
         tenantId, resourceId: lock.resourceId, lockKey: lock.lockKey, bookingId, ctx,
       });
-      log('commit_result', { tenant_id: tenantId, booking_id: bookingId, status: result.status, resource_id: result.resourceId });
+      log('commit_result', { tenant_id: tenantId, booking_id: bookingId, status: result.status, resource_id_hash: hashId(result.resourceId) });
       return result;
     } catch (err) {
       if (err instanceof DegradeCoordinator) {
         // re-pool: exclude the degraded coordinator, lock the next candidate.
         remaining = remaining.filter((r) => r !== lock.resourceId);
         attempt += 1;
-        warn('coordinator_degraded_repool', { tenant_id: tenantId, resource_id: lock.resourceId, remaining: remaining.length });
+        warn('coordinator_degraded_repool', { tenant_id: tenantId, resource_id_hash: hashId(lock.resourceId), remaining: remaining.length });
         continue;
       }
       // graceful failure surfaced to the conversation (lock already released).
