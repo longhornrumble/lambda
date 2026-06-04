@@ -302,7 +302,7 @@ def test_form_submissions_pagination(purge):
 def test_notification_sends_uses_tenant_prefixed_pk(purge):
     mod, mock_ddb, _ = purge
     t = _table_mock(items=[{"pk": "TENANT#TEN-X", "sk": "m1", "message_id": "mid-1"}])
-    store = _wire_tables(mod, mock_ddb, {"picasso-notification-sends-staging": t})
+    store = _wire_tables(mod, mock_ddb, {"picasso-notification-sends": t})
     mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     # Query keyed on TENANT#<id>; delete on (pk, sk).
     t.delete_item.assert_called_once_with(Key={"pk": "TENANT#TEN-X", "sk": "m1"})
@@ -316,8 +316,8 @@ def test_notification_events_chained_from_send_message_ids(purge):
     ])
     events = _table_mock(items=[{"pk": "EVT#mid-1", "sk": "delivered", "message_id": "mid-1"}])
     store = _wire_tables(mod, mock_ddb, {
-        "picasso-notification-sends-staging": sends,
-        "picasso-notification-events-staging": events,
+        "picasso-notification-sends": sends,
+        "picasso-notification-events": events,
     })
     resp = mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     # events Query issued once (only the non-empty message_id).
@@ -331,8 +331,8 @@ def test_notification_events_no_messages(purge):
     sends = _table_mock(items=[])  # no sends → no message_ids
     events = _table_mock(items=[{"pk": "x", "sk": "y", "message_id": "z"}])
     store = _wire_tables(mod, mock_ddb, {
-        "picasso-notification-sends-staging": sends,
-        "picasso-notification-events-staging": events,
+        "picasso-notification-sends": sends,
+        "picasso-notification-events": events,
     })
     resp = mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     assert resp["rows_touched"]["notification-events"] == 0
@@ -346,8 +346,8 @@ def test_notification_events_gsi_failure_recorded(purge):
     events.query.side_effect = _client_error(op="Query")
     events.put_item.return_value = {}
     store = _wire_tables(mod, mock_ddb, {
-        "picasso-notification-sends-staging": sends,
-        "picasso-notification-events-staging": events,
+        "picasso-notification-sends": sends,
+        "picasso-notification-events": events,
     })
     resp = mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     assert resp["status"] == "partial_error"
@@ -362,8 +362,8 @@ def test_notification_events_truncation_cap(purge):
     sends = _table_mock(items=sends_items)
     events = _table_mock(items=[])
     store = _wire_tables(mod, mock_ddb, {
-        "picasso-notification-sends-staging": sends,
-        "picasso-notification-events-staging": events,
+        "picasso-notification-sends": sends,
+        "picasso-notification-events": events,
     })
     resp = mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     # Only `cap` GSI queries issued despite cap+3 message_ids.
@@ -387,7 +387,7 @@ def test_subject_index_real_delete_key(purge):
 def test_sms_usage_real_delete_key(purge):
     mod, mock_ddb, _ = purge
     t = _table_mock(items=[{"tenant_id": "TEN-X", "month": "2026-06", "count": 3}])
-    store = _wire_tables(mod, mock_ddb, {"picasso-sms-usage-staging": t})
+    store = _wire_tables(mod, mock_ddb, {"picasso-sms-usage": t})
     mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     t.delete_item.assert_called_once_with(Key={"tenant_id": "TEN-X", "month": "2026-06"})
 
@@ -478,14 +478,14 @@ def test_idempotent_rerun_empty_tables_zero_counts(purge):
 def test_session_summaries_purged_when_tenant_hash_provided(purge):
     mod, mock_ddb, _ = purge
     store = _wire_tables(mod, mock_ddb, {
-        "picasso-session-summaries-staging": _table_mock(items=[
+        "picasso-session-summaries": _table_mock(items=[
             {"pk": "TENANT#h", "sk": "SESSION#s1"},
             {"pk": "TENANT#h", "sk": "SESSION#s2"}]),
     })
     resp = mod.lambda_handler(
         _event(dry_run=False, grace_confirmed=True, tenant_hash="h"), None)
     assert resp["rows_touched"]["session-summaries"] == 2
-    ss = store["picasso-session-summaries-staging"]
+    ss = store["picasso-session-summaries"]
     assert ss.delete_item.call_count == 2
     ss.delete_item.assert_any_call(Key={"pk": "TENANT#h", "sk": "SESSION#s1"})
 
@@ -493,13 +493,13 @@ def test_session_summaries_purged_when_tenant_hash_provided(purge):
 def test_session_summaries_dry_run_counts_only(purge):
     mod, mock_ddb, _ = purge
     store = _wire_tables(mod, mock_ddb, {
-        "picasso-session-summaries-staging": _table_mock(items=[
+        "picasso-session-summaries": _table_mock(items=[
             {"pk": "TENANT#h", "sk": "SESSION#s1"}]),
     })
     resp = mod.lambda_handler(_event(tenant_hash="h"), None)  # dry_run defaults True
     assert resp["deleted"] is False
     assert resp["rows_touched"]["session-summaries"] == 1
-    store["picasso-session-summaries-staging"].delete_item.assert_not_called()
+    store["picasso-session-summaries"].delete_item.assert_not_called()
 
 
 def test_session_summaries_skipped_without_tenant_hash(purge):

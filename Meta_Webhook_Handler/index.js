@@ -32,7 +32,7 @@ const secretsClient = new SecretsManagerClient({});
 // ─── Environment ────────────────────────────────────────────────────────────────
 
 const ENV                      = process.env.ENVIRONMENT || 'staging';
-const CHANNEL_MAPPINGS_TABLE   = process.env.CHANNEL_MAPPINGS_TABLE || `picasso-channel-mappings-${ENV}`;
+const CHANNEL_MAPPINGS_TABLE   = process.env.CHANNEL_MAPPINGS_TABLE || 'picasso-channel-mappings';
 const DEDUP_TABLE              = process.env.DEDUP_TABLE || `picasso-webhook-dedup-${ENV}`;
 const RESPONSE_PROCESSOR_FN    = process.env.RESPONSE_PROCESSOR_FUNCTION || 'Meta_Response_Processor';
 const META_APP_SECRET_ARN      = process.env.META_APP_SECRET_ARN || '';
@@ -158,7 +158,7 @@ function validateSignature(rawBody, signatureHdr, appSecret) {
 /**
  * Look up the channel-mapping record for a given Meta Page ID.
  *
- * Table: picasso-channel-mappings-{ENV}
+ * Table: picasso-channel-mappings
  *   PK: "PAGE#{pageId}"
  *   SK: "CHANNEL#{channelType}"
  *

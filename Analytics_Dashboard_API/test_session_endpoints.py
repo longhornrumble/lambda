@@ -892,8 +892,8 @@ class TestArchivedRealFixture:
     }
 
     # What a real MFS-produced session-summary row would archive when TTL fires.
-    # Captured from picasso-session-summaries-staging::bsh_smoke_1777997575 row
-    # via: aws dynamodb scan --table-name picasso-session-summaries-staging
+    # Captured from picasso-session-summaries::bsh_smoke_1777997575 row
+    # via: aws dynamodb scan --table-name picasso-session-summaries
     # (then conceptually deserialized via the archiver's TypeDeserializer path).
     REAL_PRODUCTION_SHAPE = {
         "total_response_time_ms": 1739,
