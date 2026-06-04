@@ -21,7 +21,7 @@ logger.setLevel(logging.INFO)
 # Configuration
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
-AUDIT_TABLE_NAME = f"picasso-audit-{ENVIRONMENT}"
+AUDIT_TABLE_NAME = os.environ.get('AUDIT_TABLE_NAME', f"picasso-audit-{ENVIRONMENT}")
 DEFAULT_RETENTION_DAYS = 90
 MAX_RETENTION_DAYS = 365
 
