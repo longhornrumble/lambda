@@ -59,11 +59,16 @@ function buildSchedulingDeps({ sessionTable, bookingTable, region, client } = {}
   // C9 state row write. PUTs the plain-<sessionId> row — never touches the
   // `binding#<sessionId>` row, so the §B10 binding is preserved. Guards `state`
   // (DDB rejects a null/undefined attribute, audit S-2).
-  async function saveState({ tenantId, sessionId, state, candidate_slots, selected_slot } = {}) {
+  async function saveState({ tenantId, sessionId, state, candidate_slots, selected_slot, proposal, rejected_slot_ids } = {}) {
     if (!tenantId || !sessionId || !state) return;
     const item = { tenantId, session_id: sessionId, state, updated_at: new Date().toISOString() };
     if (candidate_slots !== undefined) item.candidate_slots = candidate_slots;
     if (selected_slot !== undefined) item.selected_slot = selected_slot;
+    // WS-NEWBOOK (§B16): the new-booking flow persists the propose metadata (poolSize +
+    // tie-breaker + round-robin cursor) so _doCommit can supply the §B16c pool_size, and the
+    // accumulated rejected slot ids so the "more times" self-loop re-proposes fresh times.
+    if (proposal !== undefined) item.proposal = proposal;
+    if (rejected_slot_ids !== undefined) item.rejected_slot_ids = rejected_slot_ids;
     try {
       await ddb.send(new PutCommand({ TableName: sessionTable, Item: item }));
     } catch (err) {

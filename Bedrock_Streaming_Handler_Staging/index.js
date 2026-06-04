@@ -36,6 +36,10 @@ const { injectFormContext } = require('./scheduling/formInjection');
 // post-stream §B14 structured-action boundary. No-op for non-scheduling sessions.
 const { injectSchedulingContext, isSchedulingEnabled } = require('./scheduling/bindingContext');
 const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
+// WS-NEWBOOK (B-remainder §B16d): the in-chat NEW-booking entry-hook. No-op for normal chat +
+// the recovery loop; engages on the widget's scheduling_intent:'new_booking' signal or an
+// in-flight new-booking session row.
+const { runNewBookingEntry } = require('./scheduling/newBookingEntry');
 const { buildSchedulingDeps } = require('./scheduling/schedulingStateStore');
 const { corsHeaders } = require('./cors-helper');
 
@@ -69,6 +73,14 @@ async function invokeSchedulingExecutor(payload) {
   return out.Payload ? JSON.parse(Buffer.from(out.Payload).toString('utf8')) : null;
 }
 const schedulingExecDep = SCHEDULING_EXECUTOR_FN ? { invokeSchedulingExecutor } : {};
+// WS-NEWBOOK (§B16d) entry-hook deps: the new-booking flow invokes BCH for the read-only
+// `scheduling_propose` route (§B16a) AND the booking commit (§B16c) — both are RequestResponse
+// invokes of the SAME Booking_Commit_Handler function (the executor), so they reuse
+// invokeSchedulingExecutor (no new client, no new IAM). Dormant (empty bag) until
+// SCHEDULING_EXECUTOR_FUNCTION_NAME + its IAM grant land — the same gate as the Tier-2 executor.
+const newBookingDep = SCHEDULING_EXECUTOR_FN
+  ? { invokeProposal: invokeSchedulingExecutor, invokeBookingCommit: invokeSchedulingExecutor }
+  : {};
 const { validateCfOriginHeader } = require('./cf-origin-validator');
 
 // Default model configuration - single source of truth, sourced from
@@ -658,11 +670,22 @@ const streamingHandler = async (event, responseStream, context) => {
           })
         : null;
 
-      if (schedulingResult?.handled) {
+      // WS-NEWBOOK (§B16d): if the recovery loop didn't own this turn, try the NEW-booking
+      // entry-hook (engages on routing_metadata.scheduling_intent:'new_booking' or an in-flight
+      // new-booking session row). No-op for normal chat. tenantId from config (audit row 9).
+      const newBookingResult = (schedulingEnabled && !schedulingResult?.handled)
+        ? await runNewBookingEntry({
+            responseText: responseBuffer, conversationHistory,
+            tenantId: config?.tenant_id, sessionId, config, bedrock, write,
+            routingMetadata, deps: { ...schedulingDeps, ...newBookingDep },
+          })
+        : null;
+
+      if (schedulingResult?.handled || newBookingResult?.handled) {
         // S-3: this turn was a scheduling turn (slot presentation / selection / state
         // progression / the §B14 boundary). The flow owns the post-stream surface —
         // skip normal CTA selection so a scheduling turn doesn't also append CTAs.
-        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult.action || 'n/a'}) — skipping CTA selection`);
+        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult?.action || newBookingResult?.action || 'n/a'}) — skipping CTA selection`);
       } else if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks — use enhanceResponse()
         console.log('[Tier 1-2] Explicit click routing — using enhanceResponse()');
@@ -1100,9 +1123,20 @@ const bufferedHandler = async (event, context) => {
           })
         : null;
 
-      if (schedulingResult?.handled) {
+      // WS-NEWBOOK (§B16d): NEW-booking entry-hook (buffered path), only if the recovery loop
+      // didn't own this turn. No-op for normal chat. SSE spliced into `chunks` like above.
+      const newBookingResult = (schedulingEnabled && !schedulingResult?.handled)
+        ? await runNewBookingEntry({
+            responseText: responseBuffer, conversationHistory,
+            tenantId: config?.tenant_id, sessionId, config, bedrock,
+            write: (data) => chunks.splice(chunks.length - 1, 0, data),
+            routingMetadata, deps: { ...schedulingDeps, ...newBookingDep },
+          })
+        : null;
+
+      if (schedulingResult?.handled || newBookingResult?.handled) {
         // S-3: scheduling turn owned the post-stream surface — skip CTA selection.
-        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult.action || 'n/a'}) — skipping CTA selection`);
+        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult?.action || newBookingResult?.action || 'n/a'}) — skipping CTA selection`);
       } else if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
         // Tiers 1-2: Explicit clicks
         const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
