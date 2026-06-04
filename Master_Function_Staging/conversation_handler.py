@@ -23,7 +23,7 @@ logger.setLevel(logging.INFO)
 # Environment Configuration
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 SUMMARIES_TABLE_NAME = os.environ.get('SUMMARIES_TABLE_NAME', f'{ENVIRONMENT}-conversation-summaries')
-MESSAGES_TABLE_NAME = os.environ.get('MESSAGES_TABLE_NAME', 'recent-messages')
+MESSAGES_TABLE_NAME = os.environ.get('MESSAGES_TABLE_NAME', 'picasso-recent-messages')
 JWT_SECRET_KEY_NAME = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 

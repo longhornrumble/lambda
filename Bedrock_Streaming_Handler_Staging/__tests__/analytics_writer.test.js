@@ -9,7 +9,7 @@ const { DynamoDBClient, UpdateItemCommand } = require('@aws-sdk/client-dynamodb'
 // Mock must be installed BEFORE requiring the writer (singleton client).
 const ddbMock = mockClient(DynamoDBClient);
 
-process.env.SESSION_SUMMARIES_TABLE = 'picasso-session-summaries-staging';
+process.env.SESSION_SUMMARIES_TABLE = 'picasso-session-summaries';
 
 const {
   writeSessionSummary,
@@ -116,7 +116,7 @@ describe('buildUpdateParams (wire-format contract)', () => {
 
   test('TableName is read from process.env.SESSION_SUMMARIES_TABLE', () => {
     const { params } = buildUpdateParams(baseInput);
-    expect(params.TableName).toBe('picasso-session-summaries-staging');
+    expect(params.TableName).toBe('picasso-session-summaries');
   });
 
   test('placeholder invariant: every :placeholder in UpdateExpression appears in ExpressionAttributeValues', () => {
