@@ -70,6 +70,10 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   // normal way already returns outcome:'failed'/'pending_calendar_sync' from execute*.
   try {
     // Per-tenant Google auth + the §B13 facade (auth curried; BSH cannot build this).
+    // NOTE: the calendarId for cancel/reschedule is resolved by cancel.js/reschedule.js
+    // from Booking.coordinator_email (persisted by the commit path), NOT re-fetched from
+    // the OAuth secret — so this path needs getOAuthClient only (coordinatorId is the
+    // secret-path key). Do NOT add getCoordinatorCalendarId here; it would be redundant.
     const authClient = await getOAuthClient({ tenantId, coordinatorId });
     const calendar = {
       buildEventBody: calendarEvents.buildEventBody,

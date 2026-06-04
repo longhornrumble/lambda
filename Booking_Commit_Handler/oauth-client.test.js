@@ -84,3 +84,51 @@ describe('getOAuthClient — cache + eviction', () => {
     expect(() => oauth.clearCacheEntry({})).not.toThrow();
   });
 });
+
+describe('getCoordinatorCalendarId — real calendar from coordinator_email', () => {
+  it('returns the secret coordinator_email (NOT the secret-path key)', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: SECRET });
+    const calId = await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'res-a' });
+    expect(calId).toBe('maya@org.org');
+    expect(calId).not.toBe('res-a');
+  });
+
+  it('falls back to coordinatorId when coordinator_email is absent (v1 convention)', async () => {
+    smMock.on(GetSecretValueCommand).resolves({
+      SecretString: JSON.stringify({ client_id: 'cid', client_secret: 'csecret', refresh_token: 'rtok' }),
+    });
+    const calId = await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'legacy-coord' });
+    expect(calId).toBe('legacy-coord');
+  });
+
+  it('falls back when coordinator_email is whitespace-only', async () => {
+    smMock.on(GetSecretValueCommand).resolves({
+      SecretString: JSON.stringify({ client_id: 'cid', client_secret: 'csecret', refresh_token: 'rtok', coordinator_email: '   ' }),
+    });
+    const calId = await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'c-ws' });
+    expect(calId).toBe('c-ws');
+  });
+
+  it('trims a padded coordinator_email', async () => {
+    smMock.on(GetSecretValueCommand).resolves({
+      SecretString: JSON.stringify({ client_id: 'cid', client_secret: 'csecret', refresh_token: 'rtok', coordinator_email: '  maya@org.org  ' }),
+    });
+    const calId = await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'c1' });
+    expect(calId).toBe('maya@org.org');
+  });
+
+  it('falls back when coordinator_email is empty-string', async () => {
+    smMock.on(GetSecretValueCommand).resolves({
+      SecretString: JSON.stringify({ client_id: 'cid', client_secret: 'csecret', refresh_token: 'rtok', coordinator_email: '' }),
+    });
+    const calId = await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'c1' });
+    expect(calId).toBe('c1');
+  });
+
+  it('shares the getOAuthClient cache — no second Secrets Manager fetch', async () => {
+    smMock.on(GetSecretValueCommand).resolves({ SecretString: SECRET });
+    await oauth.getOAuthClient({ tenantId: 'AUS123957', coordinatorId: 'res-a' });
+    await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'res-a' });
+    expect(smMock.commandCalls(GetSecretValueCommand).length).toBe(1);
+  });
+});
