@@ -83,6 +83,10 @@ const { NullConferenceProvider } = require('./conference-providers');
 
 const { handler } = require('./index');
 
+const crypto = require('crypto');
+// Mirror index.js hashId() so tests can assert the hashed value, not just absence-of-raw.
+const h = (v) => crypto.createHash('sha256').update(String(v)).digest('hex').slice(0, 12);
+
 const FREE = { busy: [], cachedAt: 'x', source: 'google_freebusy' };
 const EVENT = { id: 'evt-1', conferenceData: {}, updated: '2026-06-01T00:00:00.000Z' };
 
@@ -549,6 +553,49 @@ describe('audit fixes — compensation + alert branches', () => {
       expect(slaAlert).toBeDefined();
     } finally {
       Date.now.mockRestore();
+    }
+  });
+});
+
+// ─── PII: resource_id is hashed in log/alert sinks, never raw ───────────────────────────
+
+// When a tenant has no coordinator_emails map, resolveCoordinatorId returns the resourceId
+// itself — so resourceId IS the coordinator's email. Log/alert sinks must hash it (parity
+// with coordinator_id_hash), or the raw email leaks to CloudWatch / the ops-alerts topic.
+describe('resource_id hashing in logs/alerts (no coordinator_emails map → resourceId is PII)', () => {
+  const EMAIL = 'coordinator-maya@org.example';
+  const emailSlot = {
+    start: '2026-06-03T18:00:00.000Z',
+    end: '2026-06-03T18:30:00.000Z',
+    candidateResourceIds: [EMAIL],
+  };
+
+  it('degrade alert (SNS) carries resource_id_hash, never the raw email', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: EMAIL, lockKey: 'lk1' });
+    calendarEvents.insertEvent.mockRejectedValue({ response: { data: { error: 'invalid_grant' } } });
+    await handler(baseEvent({ slot: emailSlot, coordinator_emails: undefined }), {}, nullInjection());
+    const alert = snsMock.commandCalls(PublishCommand).find((c) => /degraded/i.test(c.args[0].input.Subject));
+    expect(alert).toBeDefined();
+    const msg = alert.args[0].input.Message;
+    expect(msg).toContain('resource_id_hash');
+    expect(msg).toContain(h(EMAIL));
+    expect(msg).not.toContain(EMAIL); // never raw
+  });
+
+  it('commit_result (console.log) carries resource_id_hash, never the raw email', async () => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: EMAIL, lockKey: 'lk1' });
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const res = await handler(baseEvent({ slot: emailSlot, coordinator_emails: undefined }), {}, nullInjection());
+      expect(res.status).toBe('BOOKED');
+      const commitLine = logSpy.mock.calls
+        .map((c) => c[0])
+        .find((l) => typeof l === 'string' && l.includes('commit_result'));
+      expect(commitLine).toBeDefined();
+      expect(commitLine).toContain(h(EMAIL));
+      expect(commitLine).not.toContain(EMAIL); // never raw
+    } finally {
+      logSpy.mockRestore();
     }
   });
 });
