@@ -36,11 +36,20 @@
 
 const { runNewBookingTurn } = require('./newBookingFlow');
 const { isSchedulingEnabled } = require('./bindingContext');
+// §B16d attendee-sourcing (form-injection read): CONSUME the WS-C2 module's already-exported
+// same-session form-submission read primitives. We do NOT touch formInjection.js — we assemble
+// the attendee from its canonical `contact` here, in integrator-owned glue.
+const { fetchSessionSubmissions, pickLatest } = require('./formInjection');
 
 // The in-flight new-booking session states (NOT 'booked' — a booked arc is finished, so a
 // stray later turn must not re-engage it). Mirrors newBookingFlow's NEW_BOOKING_STATES minus
 // the terminal 'booked'.
 const IN_FLIGHT_STATES = Object.freeze(['qualifying', 'proposing', 'confirming']);
+
+// Minimal email shape check. The commit (§B16c) REQUIRES a usable attendee.email; a value that
+// can't be an address is worse than none (it would book to a dead inbox), so we treat it as
+// "no identity" and let the flow hold at `confirming`.
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 /**
  * Build `qualifyingContext` from the tenant `scheduling` config block. Schema-discipline:
@@ -80,6 +89,40 @@ function resolveQualifyingContext({ config, routingMetadata = {}, attendee } = {
   const qctx = { appointmentTypeId, appointment_type, userTimeZone, conference_type };
   if (attendee && attendee.email) qctx.attendee = attendee;
   return qctx;
+}
+
+/**
+ * §B16d attendee-sourcing (form-injection read) — the POST-APPLICATION case: a visitor who
+ * submitted a form THIS session (e.g. a volunteer application) and then books. Resolve their
+ * identity from the most recent same-session submission's canonical `contact` so the flow can
+ * COMMIT instead of holding at `confirming`. Returns `{ email, first_name?, last_name? }` or
+ * `null` when no submission / no usable email exists (→ the flow's identity-required hold).
+ *
+ * Distinct from formInjection.buildFormContextBlock (which sanitizes for the LLM PROMPT surface):
+ * here the email/name flow to the calendar COMMIT, not into a prompt — so values are read
+ * canonically (trimmed, email shape-validated), NOT injection-marker-mangled. Read-only;
+ * non-fatal (any error → null, so a sourcing failure degrades to the hold, never breaks chat).
+ *
+ * @param {object} params - { tenantId, sessionId, client? }
+ * @returns {Promise<{email:string, first_name?:string, last_name?:string}|null>}
+ */
+async function resolveSessionAttendee({ tenantId, sessionId, client } = {}) {
+  try {
+    const items = await fetchSessionSubmissions({ tenantId, sessionId, client });
+    if (!items || !items.length) return null;
+    const latest = pickLatest(items);
+    const contact = (latest && latest.contact && typeof latest.contact === 'object') ? latest.contact : {};
+    const email = typeof contact.email === 'string' ? contact.email.trim() : '';
+    if (!email || !EMAIL_SHAPE.test(email)) return null;
+    const out = { email };
+    if (typeof contact.first_name === 'string' && contact.first_name.trim()) out.first_name = contact.first_name.trim();
+    if (typeof contact.last_name === 'string' && contact.last_name.trim()) out.last_name = contact.last_name.trim();
+    return out;
+  } catch (err) {
+    // PII-safe: log ONLY the error shape — never tenantId, sessionId, email, or name.
+    console.error(`[WS-NEWBOOK] attendee-sourcing skipped (non-fatal): error_name=${(err && err.name) || 'unknown'}`);
+    return null;
+  }
 }
 
 /**
@@ -126,7 +169,13 @@ async function runNewBookingEntry({
       await deps.saveState({ tenantId, sessionId, state: 'qualifying' });
     }
 
-    const qualifyingContext = resolveQualifyingContext({ config, routingMetadata });
+    // §B16d attendee-sourcing: resolve same-session applicant identity (post-application case)
+    // so the commit can complete. Injectable for tests; defaults to the form-injection read.
+    // Non-fatal → null → the flow holds at `confirming` (identity_required), never breaks chat.
+    const sourceAttendee = deps.getSessionAttendee || resolveSessionAttendee;
+    const attendee = await sourceAttendee({ tenantId, sessionId });
+
+    const qualifyingContext = resolveQualifyingContext({ config, routingMetadata, attendee });
 
     return await runNewBookingTurn({
       responseText,
@@ -144,4 +193,4 @@ async function runNewBookingEntry({
   }
 }
 
-module.exports = { runNewBookingEntry, resolveQualifyingContext, IN_FLIGHT_STATES };
+module.exports = { runNewBookingEntry, resolveQualifyingContext, resolveSessionAttendee, IN_FLIGHT_STATES };

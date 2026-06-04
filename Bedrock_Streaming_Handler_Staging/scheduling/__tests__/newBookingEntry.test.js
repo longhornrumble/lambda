@@ -7,13 +7,27 @@
  */
 
 jest.mock('../newBookingFlow', () => ({
-  runNewBookingTurn: jest.fn().mockResolvedValue({ handled: true, state: 'proposing', action: 'none' }),
+  runNewBookingTurn: jest.fn(),
+}));
+// Mock the WS-C2 read primitives so no real DDB query runs. Default: no submissions → no
+// attendee (the v1 hold). Per-test overrides drive the attendee-sourcing cases.
+jest.mock('../formInjection', () => ({
+  fetchSessionSubmissions: jest.fn(),
+  pickLatest: jest.fn(),
 }));
 
 const { runNewBookingTurn } = require('../newBookingFlow');
-const { runNewBookingEntry, resolveQualifyingContext, IN_FLIGHT_STATES } = require('../newBookingEntry');
+const { fetchSessionSubmissions, pickLatest } = require('../formInjection');
+const { runNewBookingEntry, resolveQualifyingContext, resolveSessionAttendee, IN_FLIGHT_STATES } = require('../newBookingEntry');
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  // Re-establish defaults each test (clearAllMocks keeps implementations, so reset explicitly
+  // to prevent a per-test mockResolvedValue from leaking into the next test).
+  runNewBookingTurn.mockResolvedValue({ handled: true, state: 'proposing', action: 'none' });
+  fetchSessionSubmissions.mockResolvedValue([]);
+  pickLatest.mockImplementation((items) => (Array.isArray(items) && items.length ? items[0] : null));
+});
 
 describe('resolveQualifyingContext', () => {
   test('sole configured appt-type → uses it + tz from the type + google_meet default', () => {
@@ -141,5 +155,85 @@ describe('runNewBookingEntry — engage / bootstrap / no-op', () => {
     const loadState = jest.fn().mockRejectedValue(new Error('ddb'));
     expect(await runNewBookingEntry({ ...base, routingMetadata: { scheduling_intent: 'new_booking' }, deps: { loadState } }))
       .toEqual({ handled: false, error: true });
+  });
+});
+
+describe('resolveSessionAttendee — §B16d form-injection read', () => {
+  test('latest submission with canonical contact → { email, first_name, last_name } trimmed', async () => {
+    fetchSessionSubmissions.mockResolvedValue([
+      { contact: { email: '  vol@x.org ', first_name: ' Vee ', last_name: ' Doe ' } },
+    ]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' }))
+      .toEqual({ email: 'vol@x.org', first_name: 'Vee', last_name: 'Doe' });
+  });
+
+  test('email only (no name fields) → { email } (name keys omitted, not empty)', async () => {
+    fetchSessionSubmissions.mockResolvedValue([{ contact: { email: 'a@b.io' } }]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toEqual({ email: 'a@b.io' });
+  });
+
+  test('no submissions → null (the identity hold)', async () => {
+    fetchSessionSubmissions.mockResolvedValue([]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
+  });
+
+  test('submission missing email → null', async () => {
+    fetchSessionSubmissions.mockResolvedValue([{ contact: { first_name: 'V' } }]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
+  });
+
+  test('malformed email (no @ / no domain) → null (worse than none — would book a dead inbox)', async () => {
+    for (const bad of ['not-an-email', 'x@y', 'x@y.', '@x.org', 'a b@x.org']) {
+      fetchSessionSubmissions.mockResolvedValue([{ contact: { email: bad } }]);
+      expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
+    }
+  });
+
+  test('non-string / absent contact → null (schema discipline, no throw)', async () => {
+    fetchSessionSubmissions.mockResolvedValue([{ contact: { email: 12345 } }]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
+    fetchSessionSubmissions.mockResolvedValue([{}]);
+    expect(await resolveSessionAttendee({ tenantId: 'T1', sessionId: 'S1' })).toBeNull();
+  });
+
+  test('fetch throws → null (non-fatal); PII-safe log carries no email/name/tenant/session', async () => {
+    const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    fetchSessionSubmissions.mockRejectedValue(new Error('contains secret vol@x.org'));
+    expect(await resolveSessionAttendee({ tenantId: 'TENANT-SECRET', sessionId: 'SESSION-SECRET' })).toBeNull();
+    const logged = errSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(logged).toMatch(/error_name=Error/);
+    expect(logged).not.toMatch(/vol@x\.org|TENANT-SECRET|SESSION-SECRET/);
+    errSpy.mockRestore();
+  });
+});
+
+describe('runNewBookingEntry — attendee wiring into qualifyingContext', () => {
+  const base = {
+    responseText: 'hi', conversationHistory: [], tenantId: 'T1', sessionId: 'S1',
+    config: { feature_flags: { scheduling_enabled: true }, scheduling: { appointment_types: { apt1: {} } } },
+    bedrock: {}, write: jest.fn(),
+  };
+
+  test('sourced attendee with email → qctx.attendee forwarded to the flow', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'confirming' });
+    const getSessionAttendee = jest.fn().mockResolvedValue({ email: 'vol@x.org', first_name: 'Vee' });
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState, getSessionAttendee } });
+    expect(getSessionAttendee).toHaveBeenCalledWith({ tenantId: 'T1', sessionId: 'S1' });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toEqual({ email: 'vol@x.org', first_name: 'Vee' });
+  });
+
+  test('no attendee sourced (null) → qctx.attendee unset (flow holds at confirming)', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'confirming' });
+    const getSessionAttendee = jest.fn().mockResolvedValue(null);
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState, getSessionAttendee } });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toBeUndefined();
+  });
+
+  test('default sourcing path (no deps.getSessionAttendee) uses the form-injection read', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'qualifying' });
+    fetchSessionSubmissions.mockResolvedValue([{ contact: { email: 'def@x.org' } }]);
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState } });
+    expect(fetchSessionSubmissions).toHaveBeenCalledWith({ tenantId: 'T1', sessionId: 'S1' });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toEqual({ email: 'def@x.org' });
   });
 });
