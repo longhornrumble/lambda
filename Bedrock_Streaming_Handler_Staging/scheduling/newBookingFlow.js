@@ -101,6 +101,7 @@ async function detectNewBookingAction({
   session,
   config,
   bedrock,
+  logger = console,
 } = {}) {
   try {
     if (!bedrock || typeof bedrock.send !== 'function') {
@@ -160,7 +161,7 @@ Return ONLY raw JSON: {"action":"select_slot|confirm_book|none","slotId":"<id or
     }
     return out;
   } catch (err) {
-    console.error(`[WS-NEWBOOK] action detect failed (fail-closed → none): error_name=${(err && err.name) || 'unknown'}`);
+    logger.error(`[WS-NEWBOOK] action detect failed (fail-closed → none): error_name=${(err && err.name) || 'unknown'}`);
     return { action: 'none' };
   }
 }
@@ -209,16 +210,25 @@ async function _propose({ tenantId, sessionId, fromState, prior, qctx, config, d
     ? Array.from(new Set([...priorRejected, ...priorSlotIds]))
     : priorRejected;
 
+  const proposePayload = {
+    action: 'scheduling_propose',
+    tenantId,
+    sessionId,
+    appointmentTypeId,
+    userTimeZone: ctxUserTimeZone(qctx),
+    alreadyRejected,
+  };
+  // §B16a optional availability window — forward the tenant's configured window when present
+  // (schema-discipline: tolerate camel OR snake) so propose's pool.select doesn't silently
+  // fall back to its default window. Omit when absent (don't send explicit undefined).
+  const windowStart = qctx.windowStart ?? qctx.window_start;
+  const windowEnd = qctx.windowEnd ?? qctx.window_end;
+  if (windowStart != null) proposePayload.windowStart = windowStart;
+  if (windowEnd != null) proposePayload.windowEnd = windowEnd;
+
   let res;
   try {
-    res = await deps.invokeProposal({
-      action: 'scheduling_propose',
-      tenantId,
-      sessionId,
-      appointmentTypeId,
-      userTimeZone: ctxUserTimeZone(qctx),
-      alreadyRejected,
-    });
+    res = await deps.invokeProposal(proposePayload);
   } catch (err) {
     (logger || console).error(`[WS-NEWBOOK] propose invoke failed (non-fatal): error_name=${(err && err.name) || 'unknown'}`);
     return { handled: true, executed: false, state: fromState, reason: 'propose_failed' };
@@ -234,6 +244,12 @@ async function _propose({ tenantId, sessionId, fromState, prior, qctx, config, d
   }
 
   const slots = res.slots || [];
+  // §B16c: pool_size at commit = this TOP-LEVEL poolSize; persist it (+ the round-robin
+  // carry-forwards) so the later confirming→booked turn can forward them. Omit the optional
+  // carry-forwards when absent (don't persist explicit undefined).
+  const proposal = { poolSize: res.poolSize };
+  if (res.tieBreaker != null) proposal.tieBreaker = res.tieBreaker;
+  if (res.roundRobinCursor != null) proposal.roundRobinCursor = res.roundRobinCursor;
   // Validate + advance the state machine: qualifying→proposing OR proposing→proposing (both legal).
   const next = transition({ state: fromState }, 'proposing'); // throws if illegal
   if (deps.saveState) {
@@ -242,9 +258,7 @@ async function _propose({ tenantId, sessionId, fromState, prior, qctx, config, d
       sessionId,
       state: 'proposing',
       candidate_slots: slots,
-      // §B16c: pool_size at commit = this TOP-LEVEL poolSize; persist it (+ the round-robin
-      // carry-forwards) so the later confirming→booked turn can forward them.
-      proposal: { poolSize: res.poolSize, tieBreaker: res.tieBreaker, roundRobinCursor: res.roundRobinCursor },
+      proposal,
       rejected_slot_ids: alreadyRejected,
     });
   }
@@ -270,11 +284,15 @@ async function _doCommit({ tenantId, sessionId, prior, selected, qctx, deps, log
   }
   const proposal = (prior && prior.proposal) || {};
   // §B16c: pool_size is the propose response's TOP-LEVEL poolSize (the ROUTING pool size),
-  // NOT slot.candidateResourceIds.length. The length is only a defensive floor if the propose
-  // metadata wasn't persisted (commit requires pool_size ≥ 1).
-  const poolSize = proposal.poolSize != null
-    ? proposal.poolSize
-    : (Array.isArray(selected.candidateResourceIds) ? selected.candidateResourceIds.length : 1);
+  // NOT slot.candidateResourceIds.length — BCH's §5.5 solo-vs-pool branch depends on it.
+  // If it wasn't persisted, the only honest cause is an integrator mis-wire (a saveState that
+  // dropped the `proposal` field). Fail LOUD rather than fall back to candidateResourceIds.length,
+  // which would silently mis-flag the booking. (Caller does NOT advance to booked on this.)
+  const poolSize = proposal.poolSize;
+  if (poolSize == null) {
+    (logger || console).error('[WS-NEWBOOK] commit aborted: missing pool_size (propose metadata not persisted — integrator saveState mis-wire)');
+    return { executed: false, outcome: 'failed', error: 'missing_pool_size' };
+  }
 
   const payload = {
     tenant_id: tenantId,
@@ -367,12 +385,17 @@ async function runNewBookingTurn({
 
     const qctx = deps.qualifyingContext || {};
 
+    // The detector output is ADVISORY only — the C9 state machine (transition() below), NOT
+    // this prompt, is the primary defense against a fabricated/injected action: every action
+    // is gated through stateMachine.transition, so a spoofed `confirm_book` from the wrong
+    // state is rejected regardless of what the detector returns.
     const detected = await detectNewBookingAction({
       responseText,
       conversationHistory,
       session: { state },
       config,
       bedrock,
+      logger,
     });
     const action = detected.action;
 
@@ -390,7 +413,10 @@ async function runNewBookingTurn({
         if (!ctxAttendeeEmail(qctx)) {
           return { handled: true, executed: false, rejected: true, reason: 'identity_required', state };
         }
-        const selected = (prior && prior.selected_slot) || deps.selectedSlot;
+        // Security (§B14): the slot MUST come from PERSISTED state — never an injected seam.
+        // An LLM-fabricated slot that bypassed the select_slot unknown_slot guard must not
+        // reach commit. No `deps.selectedSlot` fallback.
+        const selected = prior && prior.selected_slot;
         if (!selected || !selected.start || !selected.end) {
           return { handled: true, executed: false, rejected: true, reason: 'no_slot_selected', state };
         }
@@ -429,8 +455,11 @@ async function runNewBookingTurn({
       if (action === 'select_slot') {
         // §B14: validate proposing → confirming (illegal from any other state → rejected).
         transition({ state }, 'confirming');
-        const candidates = (prior && prior.candidate_slots) || deps.candidateSlots || [];
-        const chosen = candidates.find((s) => s.slotId === detected.slotId) || deps.selectedSlot;
+        // Security (§B14): the chosen slot MUST be one we PERSISTED as a candidate — never an
+        // injected seam. An LLM-fabricated slotId that matches no persisted candidate is
+        // rejected (unknown_slot). No `deps.candidateSlots` / `deps.selectedSlot` fallback.
+        const candidates = (prior && prior.candidate_slots) || [];
+        const chosen = candidates.find((s) => s.slotId === detected.slotId);
         if (!chosen) {
           return { handled: true, executed: false, rejected: true, reason: 'unknown_slot' };
         }

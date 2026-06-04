@@ -105,6 +105,14 @@ describe('detectNewBookingAction (§B14 focused post-stream call) — fail-close
     const out = await detectNewBookingAction({ bedrock: fakeBedrock({ action: 'confirm_book' }) });
     expect(out.action).toBe('confirm_book');
   });
+  test('bedrock.send THROWS → none, routed through the INJECTED logger (not console)', async () => {
+    const logger = { error: jest.fn(), warn: jest.fn() };
+    const bedrock = { send: jest.fn().mockRejectedValue(new Error('bedrock 5xx')) };
+    const out = await detectNewBookingAction({ bedrock, logger });
+    expect(out.action).toBe('none');
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0]).toContain('action detect failed');
+  });
 });
 
 // ── no-regression gates ──────────────────────────────────────────────────────────────
@@ -170,6 +178,56 @@ describe('runNewBookingTurn — qualifying entry: propose + advance on ok', () =
     }));
     expect(write).toHaveBeenCalledTimes(1);
     expect(write.mock.calls[0][0]).toContain('scheduling_slots');
+  });
+
+  test('forwards windowStart/windowEnd from qualifyingContext when present (camel + snake)', async () => {
+    const invokeProposal = jest.fn().mockResolvedValue(PROPOSE_OK);
+    // camelCase window on qctx
+    await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'qualifying' }),
+        qualifyingContext: { ...QCTX, windowStart: '2026-06-10T00:00:00Z', windowEnd: '2026-06-17T00:00:00Z' },
+        invokeProposal, saveState: jest.fn(),
+      },
+    }));
+    expect(invokeProposal.mock.calls[0][0]).toMatchObject({
+      windowStart: '2026-06-10T00:00:00Z', windowEnd: '2026-06-17T00:00:00Z',
+    });
+
+    // snake_case window on qctx (schema-discipline)
+    const invokeProposal2 = jest.fn().mockResolvedValue(PROPOSE_OK);
+    await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'qualifying' }),
+        qualifyingContext: { ...QCTX, window_start: 'S', window_end: 'E' },
+        invokeProposal: invokeProposal2, saveState: jest.fn(),
+      },
+    }));
+    expect(invokeProposal2.mock.calls[0][0]).toMatchObject({ windowStart: 'S', windowEnd: 'E' });
+  });
+
+  test('no window on qualifyingContext → payload omits windowStart/windowEnd (no explicit undefined)', async () => {
+    const invokeProposal = jest.fn().mockResolvedValue(PROPOSE_OK);
+    await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: { loadState: async () => ({ state: 'qualifying' }), qualifyingContext: QCTX, invokeProposal, saveState: jest.fn() },
+    }));
+    const payload = invokeProposal.mock.calls[0][0];
+    expect('windowStart' in payload).toBe(false);
+    expect('windowEnd' in payload).toBe(false);
+  });
+
+  test("outcome 'failed' (clean return, not a throw) → STAY in fromState, no advance", async () => {
+    const saveState = jest.fn();
+    const invokeProposal = jest.fn().mockResolvedValue({ outcome: 'failed', error: 'pool_read_error' });
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: { loadState: async () => ({ state: 'qualifying' }), qualifyingContext: QCTX, invokeProposal, saveState },
+    }));
+    expect(res).toMatchObject({ handled: true, executed: false, state: 'qualifying', reason: 'failed' });
+    expect(saveState).not.toHaveBeenCalled();
   });
 
   test("outcome 'no_availability' → STAY in qualifying (no advance, no strand)", async () => {
@@ -268,6 +326,23 @@ describe('runNewBookingTurn — select_slot advances proposing → confirming', 
     }));
     expect(res).toMatchObject({ handled: true, executed: false, rejected: true, reason: 'unknown_slot' });
   });
+
+  // §B14 exhaustive illegal-state coverage (mirrors the confirm_book set): select_slot is
+  // legal ONLY from 'proposing'. From any other state → IllegalStateTransition → rejected,
+  // BEFORE the candidate lookup (so even a matching slotId can't advance).
+  test.each(['qualifying', 'confirming', 'booked'])(
+    'select_slot from %s → IllegalStateTransition → rejected, nothing persisted',
+    async (state) => {
+      const saveState = jest.fn();
+      const res = await runNewBookingTurn(baseTurn({
+        bedrock: fakeBedrock({ action: 'select_slot', slotId: 's1' }),
+        deps: { loadState: async () => ({ state, candidate_slots: [SLOT] }), qualifyingContext: QCTX, saveState },
+      }));
+      expect(res).toMatchObject({ handled: true, executed: false, rejected: true });
+      expect(res.reason).toMatch(/Illegal/i);
+      expect(saveState).not.toHaveBeenCalled();
+    }
+  );
 });
 
 // ── confirm_book: the commit (§B16c) — the highest-risk surface ─────────────────────────
@@ -445,6 +520,25 @@ describe('runNewBookingTurn — confirm_book commit outcomes', () => {
     expect(res.state).toBe('confirming'); // did NOT advance to booked
     expect(saveState).not.toHaveBeenCalled();
     expect(write.mock.calls.some((c) => c[0].includes('request_received_email_followup'))).toBe(false);
+  });
+
+  test('missing pool_size (proposal meta not persisted) → fail LOUD, NOT a length floor; commit NOT called', async () => {
+    const saveState = jest.fn();
+    const logger = { error: jest.fn(), warn: jest.fn() };
+    const invokeBookingCommit = jest.fn();
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'confirm_book' }),
+      deps: {
+        // selected_slot has 2 candidateResourceIds, but proposal.poolSize is absent (mis-wire).
+        loadState: async () => ({ state: 'confirming', selected_slot: SLOT /* no proposal */ }),
+        qualifyingContext: QCTX, invokeBookingCommit, saveState, logger,
+      },
+    }));
+    expect(invokeBookingCommit).not.toHaveBeenCalled(); // did NOT proceed with a fabricated pool_size
+    expect(res).toMatchObject({ handled: true, executed: false, outcome: 'failed', error: 'missing_pool_size' });
+    expect(res.state).toBe('confirming'); // did NOT advance to booked
+    expect(saveState).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalled();
   });
 
   test('confirm_book with no slot persisted → rejected (no_slot_selected), commit NOT called', async () => {
