@@ -141,7 +141,17 @@ function extractMeetJoinUrl(event) {
  */
 function classifyAuthError(err) {
   const code = err?.code ?? err?.response?.status;
-  const oauthError = err?.response?.data?.error || '';
+  // Google's two error shapes differ: the OAuth token endpoint returns
+  // `response.data.error` as a STRING ('invalid_grant', ...), but the Calendar API
+  // returns it as an OBJECT ({ code, message, errors[], status }). Coerce to a
+  // searchable string so the marker scan below can't crash with
+  // "<x>.includes is not a function" (which would mask the real calendar-write error
+  // and force COMMIT_FAILED — caught by the 2026-06-04 live booking UAT).
+  const rawOauthError = err?.response?.data?.error;
+  const oauthError =
+    typeof rawOauthError === 'string'
+      ? rawOauthError
+      : (rawOauthError && (rawOauthError.message || rawOauthError.status)) || '';
   const message = String(err?.message || '');
   const PERMANENT_MARKERS = [
     'invalid_grant',

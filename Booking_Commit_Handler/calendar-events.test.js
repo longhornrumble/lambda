@@ -187,4 +187,21 @@ describe('classifyAuthError — §5.5 row 4 transient vs permanent', () => {
   it('non-auth error ⇒ not auth', () => {
     expect(ce.classifyAuthError({ code: 500 })).toEqual({ isAuth: false, permanent: false });
   });
+  // Calendar API errors return response.data.error as an OBJECT, not a string. The
+  // classifier must not crash on .includes (the 2026-06-04 live-UAT "t.includes is not a
+  // function" that masked the real calendar-write error and forced COMMIT_FAILED).
+  it('object-shaped Calendar API error ⇒ classified, never throws', () => {
+    const googleErr = { response: { status: 403, data: { error: { code: 403, status: 'PERMISSION_DENIED', message: 'Request had insufficient authentication scopes.', errors: [{ reason: 'insufficientPermissions' }] } } } };
+    expect(() => ce.classifyAuthError(googleErr)).not.toThrow();
+    // 403 (not 401, no permanent marker) ⇒ non-auth from this classifier's view
+    expect(ce.classifyAuthError(googleErr)).toEqual({ isAuth: false, permanent: false });
+  });
+  it('object-shaped error whose message carries a permanent marker ⇒ permanent', () => {
+    const err = { response: { data: { error: { message: 'invalid_grant: token revoked', status: 'UNAUTHENTICATED' } } } };
+    expect(ce.classifyAuthError(err)).toEqual({ isAuth: true, permanent: true });
+  });
+  it('object-shaped error with a 401 status ⇒ transient', () => {
+    const err = { response: { status: 401, data: { error: { code: 401, message: 'Invalid Credentials' } } } };
+    expect(ce.classifyAuthError(err)).toEqual({ isAuth: true, permanent: false });
+  });
 });
