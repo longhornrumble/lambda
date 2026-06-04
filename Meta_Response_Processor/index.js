@@ -227,7 +227,7 @@ async function loadPageAccessToken(pageId, channelType) {
 /**
  * Load conversation history for this Messenger thread from DynamoDB.
  *
- * DynamoDB schema (existing staging-recent-messages table):
+ * DynamoDB schema (existing picasso-recent-messages table):
  *   sessionId        (HASH)  — e.g. "meta:{pageId}:{psid}"
  *   messageTimestamp  (RANGE) — ISO timestamp
  *   role, content     — message data

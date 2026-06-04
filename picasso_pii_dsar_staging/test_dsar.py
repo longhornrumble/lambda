@@ -2601,7 +2601,7 @@ def test_dispatcher_recent_messages_emits_f_dsar4_followup(dsar):
     assert any("24h TTL" in f or "TTL" in f for f in rm_followups)
     # Operator CLI snippet (sessionId-direct + content-substring scan)
     cli_block = "\n".join(rm_followups)
-    assert "recent-messages" in cli_block
+    assert "picasso-recent-messages" in cli_block
     assert "<SESSION_ID-from-out-of-band-source>" in cli_block
 
 

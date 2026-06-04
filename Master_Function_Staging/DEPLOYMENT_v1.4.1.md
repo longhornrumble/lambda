@@ -214,7 +214,7 @@ All environment variables remain the same:
 ```json
 {
   "S3_BUCKET": "myrecruiter-picasso",
-  "MESSAGES_TABLE_NAME": "staging-recent-messages",
+  "MESSAGES_TABLE_NAME": "picasso-recent-messages",
   "MONITORING_ENABLED": "true",
   "ENVIRONMENT": "staging",
   "JWT_EXPIRY_MINUTES": "30",

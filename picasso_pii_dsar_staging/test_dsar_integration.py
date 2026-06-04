@@ -61,7 +61,7 @@ TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
 TABLE_AUDIT = "picasso-pii-dsar-audit-staging"
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events"
-TABLE_RECENT_MESSAGES = "staging-recent-messages"
+TABLE_RECENT_MESSAGES = "picasso-recent-messages"
 
 TEST_TENANT_PREFIX = "TEN-SMOKE-INT-"
 TEST_DSAR_PREFIX = "smoke-int-"
@@ -719,7 +719,7 @@ def test_h_notification_events_chained_walker_finds_events_via_message_id(aws):
 
 def test_i_recent_messages_walker_finds_messages_for_chained_session(aws):
     """Walker `_walk_recent_messages` chains off session_ids from the
-    form-submissions walker; per session_id, queries `staging-recent-messages`
+    form-submissions walker; per session_id, queries `picasso-recent-messages`
     on sessionId hash key.
 
     Audit row 1 closure: exercises the recent-messages walker against real
