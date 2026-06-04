@@ -15,7 +15,7 @@ AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 
 # Table names
 SUMMARIES_TABLE_NAME = f'{ENVIRONMENT}-conversation-summaries'
-MESSAGES_TABLE_NAME = 'recent-messages'
+MESSAGES_TABLE_NAME = 'picasso-recent-messages'
 
 def create_summaries_table(dynamodb_client):
     """Create the conversation summaries table"""

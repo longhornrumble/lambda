@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # Set the env var BEFORE importing the writer module (it's read inside
 # build_update_params, not at import — but match the JS fixture for clarity).
-os.environ['SESSION_SUMMARIES_TABLE'] = 'picasso-session-summaries-staging'
+os.environ['SESSION_SUMMARIES_TABLE'] = 'picasso-session-summaries'
 
 from analytics_writer import (  # noqa: E402
     build_update_params,
@@ -133,7 +133,7 @@ def test_form_completed_with_form_id(fixtures_by_name):
 
 def test_table_name_from_env_var(base_input):
     p = build_update_params(base_input)['params']
-    assert p['TableName'] == 'picasso-session-summaries-staging'
+    assert p['TableName'] == 'picasso-session-summaries'
 
 
 def test_placeholder_invariant_every_placeholder_in_values():
@@ -181,7 +181,7 @@ def test_happy_path_returns_true_one_call(base_input, mock_ddb_op):
     assert mock_ddb_op.call_count == 1
     args, kwargs = mock_ddb_op.call_args
     assert args[0] == 'update_item'
-    assert kwargs['TableName'] == 'picasso-session-summaries-staging'
+    assert kwargs['TableName'] == 'picasso-session-summaries'
 
 
 def test_atomicity_one_call_per_event_type(base_input, mock_ddb_op):
@@ -353,7 +353,7 @@ def test_cold_start_missing_env_var_emits_misconfiguration(monkeypatch, capsys):
 
 def test_cold_start_env_var_present_no_misconfiguration(monkeypatch, capsys):
     """When SESSION_SUMMARIES_TABLE IS set, the cold-start path is silent."""
-    monkeypatch.setenv('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries-staging')
+    monkeypatch.setenv('SESSION_SUMMARIES_TABLE', 'picasso-session-summaries')
     _reload_analytics_writer()
     captured = capsys.readouterr().out
     assert 'analytics_write_misconfiguration' not in captured

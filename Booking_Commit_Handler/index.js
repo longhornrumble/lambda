@@ -470,6 +470,21 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
     return await handleSchedulingMutate(event, injected);
   }
 
+  // New-booking availability route (§B16a): BSH invokes BCH for 3-5 GENERIC candidate
+  // slots once an appointment type is resolved. READ-ONLY — no Booking write, no
+  // round-robin advance (the default commit route owns those). camelCase keys (matches
+  // scheduling_mutate, NOT the snake_case commit route). Gate runs HERE (fail-closed)
+  // BEFORE the sub-handler does any calendar I/O — the sub-handler does not gate itself.
+  if (event && event.action === 'scheduling_propose') {
+    const enabled = await gateScheduling(event.tenantId, injected);
+    if (!enabled) {
+      log('scheduling_propose_disabled', {});
+      return { outcome: 'failed', error: 'scheduling_disabled' };
+    }
+    const { handleSchedulingPropose } = require('./scheduling-propose');
+    return await handleSchedulingPropose(event, injected);
+  }
+
   const startedAtMs = Date.now();
   const { tenantId, slot, conferenceType } = validate(event);
 

@@ -1,7 +1,7 @@
 """
 picasso-session-archiver
 -----------------------
-DynamoDB Streams handler for picasso-session-summaries-{env}.
+DynamoDB Streams handler for picasso-session-summaries.
 
 On REMOVE events (TTL-driven or manual delete-item), writes the row's
 OldImage as JSON to S3 partitioned by UTC date of archive write.

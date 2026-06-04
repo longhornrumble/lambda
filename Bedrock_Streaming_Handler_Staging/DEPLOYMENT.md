@@ -48,7 +48,7 @@ These have sensible defaults but can be customized:
 ```bash
 CONFIG_BUCKET=myrecruiter-picasso-staging
 FORM_SUBMISSIONS_TABLE=picasso-form-submissions-staging
-SMS_USAGE_TABLE=picasso-sms-usage-staging
+SMS_USAGE_TABLE=picasso-sms-usage
 AWS_REGION=us-east-1
 ```
 

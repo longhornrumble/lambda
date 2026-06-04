@@ -22,10 +22,10 @@ Cleanly tenant-partitioned DynamoDB surfaces, plus the notification-events chain
 | Surface | Reached by |
 |---|---|
 | `picasso-form-submissions-staging` | Query `PK=tenant_id` → delete partition |
-| `picasso-notification-sends-staging` | Query `PK=TENANT#{tenant_id}` → delete; yields `message_id`s |
-| `picasso-notification-events-staging` | chained via `message_id`s (ByMessageId GSI) |
+| `picasso-notification-sends` | Query `PK=TENANT#{tenant_id}` → delete; yields `message_id`s |
+| `picasso-notification-events` | chained via `message_id`s (ByMessageId GSI) |
 | `picasso-pii-subject-index-staging` | Query `PK=tenant_id` → delete (re-id key) |
-| `picasso-sms-usage-staging` | Query `PK=tenant_id` → delete (also 30d TTL) |
+| `picasso-sms-usage` | Query `PK=tenant_id` → delete (also 30d TTL) |
 
 **Not in P1** (design §8 decisions, RESOLVED 2026-06-03):
 - **Class B** (recent-messages 24h, session-events 90d, archive): **TTL age-out** — not force-deleted (no sub-TTL erasure promise in v1).

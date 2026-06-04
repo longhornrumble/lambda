@@ -1,4 +1,4 @@
-"""Server-side analytics writer for picasso-session-summaries-{env}.
+"""Server-side analytics writer for picasso-session-summaries.
 
 Python port of Bedrock_Streaming_Handler_Staging/analytics_writer.js. Both
 writers must produce identical wire format (UpdateExpression, attribute

@@ -44,15 +44,15 @@ class TestFormHandlerEnvTables(unittest.TestCase):
         """Env vars set → constants resolve to staging-suffixed values."""
         fh = self._reload_with_env({
             'FORM_SUBMISSIONS_TABLE': 'picasso-form-submissions-staging',
-            'SMS_USAGE_TABLE': 'picasso-sms-usage-staging',
+            'SMS_USAGE_TABLE': 'picasso-sms-usage',
             'FORM_AUDIT_TABLE': 'picasso-audit-staging',
-            'NOTIFICATION_SENDS_TABLE': 'picasso-notification-sends-staging',
+            'NOTIFICATION_SENDS_TABLE': 'picasso-notification-sends',
         })
 
         self.assertEqual(fh.SUBMISSIONS_TABLE, 'picasso-form-submissions-staging')
-        self.assertEqual(fh.SMS_USAGE_TABLE, 'picasso-sms-usage-staging')
+        self.assertEqual(fh.SMS_USAGE_TABLE, 'picasso-sms-usage')
         self.assertEqual(fh.AUDIT_TABLE, 'picasso-audit-staging')
-        self.assertEqual(fh.NOTIFICATION_SENDS_TABLE, 'picasso-notification-sends-staging')
+        self.assertEqual(fh.NOTIFICATION_SENDS_TABLE, 'picasso-notification-sends')
 
     def test_partial_override_keeps_defaults_for_unset(self):
         """Setting one env var only changes that constant; others stay default."""

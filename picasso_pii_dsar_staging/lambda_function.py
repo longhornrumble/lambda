@@ -73,7 +73,7 @@ WHAT THIS LAMBDA DOES TODAY:
       delete-real iterates DeleteItem per (sessionId, messageTimestamp).
     - session-events walker (M2 Sprint B) — chained walk via the same
       sessionId list as recent-messages. Queries
-      `picasso-session-events-staging` by `pk=SESSION#{sessionId}`. Access
+      `picasso-session-events` by `pk=SESSION#{sessionId}`. Access
       exports full STEP rows; delete real deletes per (pk, sk).
     - archive walker (M2 Sprint C) — version-aware S3 walk over
       `picasso-archive-staging/sessions/{sessionId}/` prefix. Uses
@@ -147,16 +147,16 @@ EXPECTED_ACCOUNT = "525409062831"
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
 TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit-staging"
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
-TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
-TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
-TABLE_RECENT_MESSAGES = "recent-messages"
-TABLE_CHANNEL_MAPPINGS = "picasso-channel-mappings-staging"
-TABLE_SESSION_EVENTS = "picasso-session-events-staging"
+TABLE_NOTIFICATION_SENDS = "picasso-notification-sends"
+TABLE_NOTIFICATION_EVENTS = "picasso-notification-events"
+TABLE_RECENT_MESSAGES = "picasso-recent-messages"
+TABLE_CHANNEL_MAPPINGS = "picasso-channel-mappings"
+TABLE_SESSION_EVENTS = "picasso-session-events"
 # F-DSAR31 (closed): session-summaries surface. pk=TENANT#{tenant_hash},
 # sk=SESSION#{sessionId}; rows carry a redacted first_question + counts/outcome
 # linkable by pii_subject_id. Reached via the operator-passed tenant_hash on the
 # DSAR event (the partition is tenant_hash-keyed, not tenant_id-keyed).
-TABLE_SESSION_SUMMARIES = "picasso-session-summaries-staging"
+TABLE_SESSION_SUMMARIES = "picasso-session-summaries"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 GSI_CHANNEL_MAPPINGS_TENANT_INDEX = "TenantIndex"
 # M2 Sprint C: ARCHIVE_BUCKET. Per archive-reachability-decision.md
@@ -749,7 +749,7 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
 
 
 def _walk_session_summaries(pii_subject_id, tenant_hash, request_type, dry_run):
-    """Walk picasso-session-summaries-staging for one subject (F-DSAR31, closed).
+    """Walk picasso-session-summaries for one subject (F-DSAR31, closed).
 
     The partition is keyed pk=TENANT#{tenant_hash}, sk=SESSION#{sessionId}; rows
     carry a redacted first_question + counts/outcome linkable by pii_subject_id.
@@ -834,7 +834,7 @@ def _walk_session_summaries(pii_subject_id, tenant_hash, request_type, dry_run):
 
 
 def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run):
-    """Walk picasso-notification-sends-staging for direct-to-consumer messages.
+    """Walk picasso-notification-sends for direct-to-consumer messages.
 
     Access pattern: tenant-scoped Query (PK=`TENANT#<tenant_id>`) +
     FilterExpression on `recipient == normalized_email`. Catches notification
@@ -980,7 +980,7 @@ def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run)
 
 
 def _walk_notification_events(message_ids, request_type, dry_run):
-    """Walk picasso-notification-events-staging via ByMessageId GSI.
+    """Walk picasso-notification-events via ByMessageId GSI.
 
     Chained walker: input is `message_ids` produced by
     `_walk_notification_sends`. For each message_id, Query the ByMessageId
@@ -1343,7 +1343,7 @@ def _walk_recent_messages(tenant_id, session_ids, request_type, dry_run):
 
 
 def _walk_session_events(tenant_id, session_ids, request_type, dry_run):
-    """Walk picasso-session-events-staging for one subject via session_ids.
+    """Walk picasso-session-events for one subject via session_ids.
 
     M2 Sprint B walker. Chained input: session_ids derived from either
     _walk_form_submissions (email path, via the subject's submitted forms)
@@ -1985,13 +1985,13 @@ def _recent_messages_chat_only_cli_snippet(tenant_id):
     """
     return (
         f"  # Operator-known session_id direct query (preferred):\n"
-        f"  aws dynamodb query --table-name recent-messages \\\n"
+        f"  aws dynamodb query --table-name picasso-recent-messages \\\n"
         f"    --profile myrecruiter-staging \\\n"
         f"    --key-condition-expression 'sessionId = :s' \\\n"
         f"    --expression-attribute-values "
         f"'{{\":s\":{{\"S\":\"<SESSION_ID-from-out-of-band-source>\"}}}}'\n"
         f"  # Last-resort content-substring scan (CASE-SENSITIVE; false positives likely):\n"
-        f"  aws dynamodb scan --table-name recent-messages \\\n"
+        f"  aws dynamodb scan --table-name picasso-recent-messages \\\n"
         f"    --profile myrecruiter-staging \\\n"
         f"    --filter-expression 'contains(#c, :e)' \\\n"
         f"    --expression-attribute-names '{{\"#c\":\"content\"}}' \\\n"
@@ -2008,7 +2008,7 @@ def _staff_notification_cli_snippet(tenant_id):
     placeholders at run time from the DSAR ledger.
     """
     return (
-        f"  aws dynamodb query --table-name picasso-notification-sends-staging \\\n"
+        f"  aws dynamodb query --table-name picasso-notification-sends \\\n"
         f"    --profile myrecruiter-staging \\\n"
         f"    --key-condition-expression 'pk = :pk' \\\n"
         f"    --filter-expression 'submission_id = :sid' \\\n"
