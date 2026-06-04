@@ -231,6 +231,10 @@ async function lookupBookingByEventId(externalEventId) {
       IndexName: BOOKING_EXTERNAL_EVENT_INDEX,
       KeyConditionExpression: 'external_event_id = :eid',
       ExpressionAttributeValues: { ':eid': { S: externalEventId } },
+      // G3: project only the fields used (the GSI projects ALL, but don't pull PII
+      // fields like attendee_email over the wire). Mirrors lookupBooking's projection.
+      ProjectionExpression: 'booking_id, tenantId, resource_id, start_at, end_at, #st',
+      ExpressionAttributeNames: { '#st': 'status' },
       // Expect exactly one. >1 only if an event id were reused across rows
       // (reschedule-in-place keeps the row, so this is defensive): prefer a
       // still-`booked` row.
@@ -255,9 +259,12 @@ async function lookupBookingByEventId(externalEventId) {
 // [oooStart, oooEnd) for the given tenant + coordinator, then filters to those
 // whose time range overlaps the OOO event.  The GSI hash key is the camelCase
 // `tenantId` (NOT snake `tenant_id`). We filter by `resource_id` (the Booking
-// attribute that holds the assigned coordinator/resource id == the channel's
-// coordinator_id) as a filter expression — the booking has no `coordinator_id`
-// attribute, only `resource_id` + `coordinator_email`.
+// attribute that holds the assigned coordinator/resource id) — the booking has no
+// `coordinator_id` attribute, only `resource_id` + `coordinator_email`.
+// CONTRACT: this assumes `channel.coordinator_id` (the Onboarder's coordinator_id
+// input) equals `booking.resource_id` (BCH's candidateResourceIds entry). True for
+// the v1 single-coordinator pilot; if a tenant onboards a coordinator_id that
+// differs from its routing-policy resource ids, OOO-overlap silently finds nothing.
 async function queryBookedBookingsForOoo(tenantId, coordinatorId, oooStartAt, oooEndAt) {
   const params = {
     TableName: BOOKING_TABLE,
@@ -378,7 +385,7 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
   // external_event_id GSI. (Resolves the live-proven `skipped_non_platform_event`
   // gap on real coordinator deletes.) The GSI key has no tenant element, so the
   // cross-tenant guard below validates the resolved booking's tenantId.
-  if (!bookingId && calEvent.status === 'cancelled') {
+  if (!bookingId && calEvent.status === 'cancelled' && calEvent.id) {
     try {
       booking = await lookupBookingByEventId(calEvent.id);
       if (booking) bookingId = booking.bookingId;

@@ -714,7 +714,7 @@ describe('deriveTypedEnvelopes', () => {
     ddbMock.on(GetItemCommand).resolves({
       Item: {
         booking_id:  { S: BOOKING_ID },
-        tenant_id:   { S: TENANT_ID },
+        tenantId:    { S: TENANT_ID },
         resource_id: { S: 'org@x.com' },
         start_at:    { S: '2026-05-30T09:00:00Z' },
         end_at:      { S: '2026-05-30T10:00:00Z' },
@@ -739,7 +739,7 @@ describe('deriveTypedEnvelopes', () => {
     ddbMock.on(GetItemCommand).resolves({
       Item: {
         booking_id:  { S: BOOKING_ID },
-        tenant_id:   { S: TENANT_ID },
+        tenantId:    { S: TENANT_ID },
         resource_id: { S: 'original@x.com' },
         start_at:    { S: '2026-05-30T09:00:00Z' },
         end_at:      { S: '2026-05-30T10:00:00Z' },
@@ -795,7 +795,7 @@ describe('CI-3b: every exported event_type has a reachable derivation branch', (
     // booking.calendar_moved — requires booking with different start_at
     ddbMock.on(GetItemCommand).resolves({
       Item: {
-        booking_id: { S: 'bk-mv' }, tenant_id: { S: TENANT_ID },
+        booking_id: { S: 'bk-mv' }, tenantId: { S: TENANT_ID },
         resource_id: { S: 'r@x' }, start_at: { S: '2026-05-30T09:00:00Z' },
         end_at: { S: '2026-05-30T10:00:00Z' }, status: { S: 'booked' },
       },
@@ -814,7 +814,7 @@ describe('CI-3b: every exported event_type has a reachable derivation branch', (
     ddbMock.reset();
     ddbMock.on(GetItemCommand).resolves({
       Item: {
-        booking_id: { S: 'bk-re' }, tenant_id: { S: TENANT_ID },
+        booking_id: { S: 'bk-re' }, tenantId: { S: TENANT_ID },
         resource_id: { S: 'old@x' }, start_at: { S: '2026-05-30T09:00:00Z' },
         end_at: { S: '2026-05-30T10:00:00Z' }, status: { S: 'booked' },
       },
@@ -1379,6 +1379,51 @@ describe('calendar_deleted: booking resolved via external_event_id GSI when exte
     expect(envelopes.find(e => e.event_type === 'booking.calendar_deleted')).toBeDefined();
     expect(gsiQuery).not.toHaveBeenCalled(); // resolved from extendedProperties, no GSI fallback
   });
+
+  test('GSI returns 2 rows (event id reused) → prefers the booked row over a cancelled one', async () => {
+    ddbMock.on(QueryCommand, { IndexName: 'external_event_id-index' }).resolves({
+      Items: [
+        { booking_id: { S: 'bk-old' }, tenantId: { S: TENANT_ID }, status: { S: 'cancelled' }, external_event_id: { S: 'g-reused' } },
+        { booking_id: { S: 'bk-new' }, tenantId: { S: TENANT_ID }, status: { S: 'booked' },    external_event_id: { S: 'g-reused' } },
+      ],
+    });
+    const calEvent = { id: 'g-reused', status: 'cancelled', updated: '2026-05-29T12:00:00Z' };
+    const envelopes = await _test.deriveTypedEnvelopes(calEvent, TENANT_ID, COORDINATOR_ID, 'google');
+    const del = envelopes.find(e => e.event_type === 'booking.calendar_deleted');
+    expect(del).toBeDefined();
+    expect(del.booking_id).toBe('bk-new'); // the booked row, not the cancelled one
+  });
+
+  test('GSI returns 2 cancelled rows → falls back to the first item (still emits calendar_deleted)', async () => {
+    ddbMock.on(QueryCommand, { IndexName: 'external_event_id-index' }).resolves({
+      Items: [
+        { booking_id: { S: 'bk-c1' }, tenantId: { S: TENANT_ID }, status: { S: 'cancelled' }, external_event_id: { S: 'g-2c' } },
+        { booking_id: { S: 'bk-c2' }, tenantId: { S: TENANT_ID }, status: { S: 'cancelled' }, external_event_id: { S: 'g-2c' } },
+      ],
+    });
+    const calEvent = { id: 'g-2c', status: 'cancelled', updated: '2026-05-29T12:00:00Z' };
+    const envelopes = await _test.deriveTypedEnvelopes(calEvent, TENANT_ID, COORDINATOR_ID, 'google');
+    expect(envelopes.find(e => e.event_type === 'booking.calendar_deleted')?.booking_id).toBe('bk-c1');
+  });
+
+  test('GSI Query throws → booking_lookup_by_event_failed warned, no envelope (graceful)', async () => {
+    ddbMock.on(QueryCommand, { IndexName: 'external_event_id-index' }).rejects(new Error('GSI not active'));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const calEvent = { id: 'g-throw', status: 'cancelled', updated: '2026-05-29T12:00:00Z' };
+    const envelopes = await _test.deriveTypedEnvelopes(calEvent, TENANT_ID, COORDINATOR_ID, 'google');
+    expect(envelopes).toHaveLength(0);
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('booking_lookup_by_event_failed'));
+    warnSpy.mockRestore();
+  });
+
+  test('lookupBookingByEventId projects fields (no full-row PII over-read)', async () => {
+    ddbMock.on(QueryCommand, { IndexName: 'external_event_id-index' }).resolves({ Items: [{ booking_id: { S: BOOKING_ID }, tenantId: { S: TENANT_ID }, status: { S: 'booked' } }] });
+    const calEvent = { id: 'g-proj', status: 'cancelled', updated: '2026-05-29T12:00:00Z' };
+    await _test.deriveTypedEnvelopes(calEvent, TENANT_ID, COORDINATOR_ID, 'google');
+    const q = ddbMock.commandCalls(QueryCommand).find(c => c.args[0].input.IndexName === 'external_event_id-index');
+    expect(q.args[0].input.ProjectionExpression).toBeDefined();
+    expect(q.args[0].input.ProjectionExpression).not.toContain('attendee');
+  });
 });
 
 // ─── Real-shape schema contract: Booking reads must match the live key schema ──────
@@ -1482,7 +1527,7 @@ describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee
     ddbMock.on(GetItemCommand).resolves({
       Item: {
         booking_id:  { S: BOOKING_ID },
-        tenant_id:   { S: TENANT_ID },
+        tenantId:    { S: TENANT_ID },
         resource_id: { S: 'org@x.com' },
         start_at:    { S: '2026-05-30T09:00:00Z' },
         end_at:      { S: '2026-05-30T10:00:00Z' },
@@ -1499,7 +1544,7 @@ describe('Row 5: dedup formula discriminates per-envelope (event_type + attendee
       .resolves({
         Item: {
           booking_id:  { S: BOOKING_ID },
-          tenant_id:   { S: TENANT_ID },
+          tenantId:    { S: TENANT_ID },
           resource_id: { S: 'org@x.com' },
           start_at:    { S: '2026-05-30T09:00:00Z' },
           end_at:      { S: '2026-05-30T10:00:00Z' },
