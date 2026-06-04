@@ -87,14 +87,14 @@ EXPECTED_ACCOUNT = "525409062831"
 # Staging table names — single source of truth (matches infra/modules/* locals
 # and the DSAR Lambda's constants).
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
-TABLE_NOTIFICATION_SENDS = "picasso-notification-sends-staging"
-TABLE_NOTIFICATION_EVENTS = "picasso-notification-events-staging"
+TABLE_NOTIFICATION_SENDS = "picasso-notification-sends"
+TABLE_NOTIFICATION_EVENTS = "picasso-notification-events"
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
-TABLE_SMS_USAGE = "picasso-sms-usage-staging"
+TABLE_SMS_USAGE = "picasso-sms-usage"
 # Class C (F-DSAR31): pseudonymized session summaries, partitioned by
 # pk=TENANT#{tenant_hash} (tenant_hash, NOT tenant_id). Reached only when the
 # caller (the dashboard UI, or a CLI operator) supplies tenant_hash.
-TABLE_SESSION_SUMMARIES = "picasso-session-summaries-staging"
+TABLE_SESSION_SUMMARIES = "picasso-session-summaries"
 TABLE_PURGE_AUDIT = "picasso-pii-tenant-purge-audit-staging"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 

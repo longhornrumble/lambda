@@ -375,7 +375,7 @@ def test_resolve_psid_subject_returns_sessionIds_for_each_page(dsar):
         "meta:100200300400500:9876543210",
         "meta:600700800900100:9876543210",
     ]
-    mock_ddb.Table.assert_called_with("picasso-channel-mappings-staging")
+    mock_ddb.Table.assert_called_with("picasso-channel-mappings")
     # Verify the GSI Query is scoped to the tenant + channelType=messenger.
     call_kwargs = mock_table.query.call_args.kwargs
     assert call_kwargs["IndexName"] == "TenantIndex"
@@ -1469,7 +1469,7 @@ def test_walk_session_events_access_exports_all_step_rows(dsar):
     # Query was keyed by pk=SESSION#{sessionId}
     call_kwargs = mock_table.query.call_args.kwargs
     assert "KeyConditionExpression" in call_kwargs
-    mock_ddb.Table.assert_called_with("picasso-session-events-staging")
+    mock_ddb.Table.assert_called_with("picasso-session-events")
 
 
 def test_walk_session_events_delete_dry_run_counts_no_deletes(dsar):
@@ -1589,9 +1589,9 @@ def _stub_psid_tables(mock_ddb, *, rm_items=None, se_items=None):
     se_table.query.return_value = {"Items": se_items or []}
 
     def route(name):
-        if name == "recent-messages":
+        if name == "picasso-recent-messages":
             return rm_table
-        if name == "picasso-session-events-staging":
+        if name == "picasso-session-events":
             return se_table
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
@@ -2239,13 +2239,13 @@ def _stub_dispatch(mock_ddb, *, fs_items=None, fs_error=False,
             return subject_table
         if name == "picasso-pii-dsar-audit-staging":
             return audit_table
-        if name == "picasso-notification-sends-staging":
+        if name == "picasso-notification-sends":
             return ns_table
-        if name == "picasso-notification-events-staging":
+        if name == "picasso-notification-events":
             return ne_table
-        if name == "recent-messages":
+        if name == "picasso-recent-messages":
             return rm_table
-        if name == "picasso-session-events-staging":
+        if name == "picasso-session-events":
             return se_table
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
@@ -2525,7 +2525,7 @@ def test_dispatcher_emits_staff_recipient_cli_snippet_followup(dsar):
         if "Staff-recipient rows" in f or "staff were notified ABOUT" in f
     )
     assert "aws dynamodb query" in staff
-    assert "picasso-notification-sends-staging" in staff
+    assert "picasso-notification-sends" in staff
     assert "TEN999" in staff
     assert "<SUBMISSION_ID-from-form-submissions-walker>" in staff
     # D5 cross-reference must be visible so operator/auditor can trace
@@ -2601,7 +2601,7 @@ def test_dispatcher_recent_messages_emits_f_dsar4_followup(dsar):
     assert any("24h TTL" in f or "TTL" in f for f in rm_followups)
     # Operator CLI snippet (sessionId-direct + content-substring scan)
     cli_block = "\n".join(rm_followups)
-    assert "recent-messages" in cli_block
+    assert "picasso-recent-messages" in cli_block
     assert "<SESSION_ID-from-out-of-band-source>" in cli_block
 
 
@@ -2671,10 +2671,10 @@ def test_dispatcher_recent_messages_partial_error_taint_on_failed_session_ids(ds
             "picasso-form-submissions-staging": fs_table,
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
-            "recent-messages": rm_table,
-            "picasso-session-events-staging": se_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
+            "picasso-recent-messages": rm_table,
+            "picasso-session-events": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2719,10 +2719,10 @@ def test_dispatcher_recent_messages_truncation_taints_completed_to_errored(dsar)
             "picasso-form-submissions-staging": fs_table,
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
-            "recent-messages": rm_table,
-            "picasso-session-events-staging": se_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
+            "picasso-recent-messages": rm_table,
+            "picasso-session-events": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2772,10 +2772,10 @@ def test_dispatcher_recent_messages_combined_failures_and_truncation_taint(dsar)
             "picasso-form-submissions-staging": fs_table,
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
-            "recent-messages": rm_table,
-            "picasso-session-events-staging": se_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
+            "picasso-recent-messages": rm_table,
+            "picasso-session-events": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2832,10 +2832,10 @@ def test_dispatcher_notification_events_combined_failures_and_truncation_taint(d
             "picasso-form-submissions-staging": fs_table,
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
-            "recent-messages": rm_table,
-            "picasso-session-events-staging": se_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
+            "picasso-recent-messages": rm_table,
+            "picasso-session-events": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -2918,15 +2918,15 @@ def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
             return audit_table
         if name == "picasso-form-submissions-staging":
             return fs_table
-        if name == "picasso-notification-sends-staging":
+        if name == "picasso-notification-sends":
             return ns_table
-        if name == "picasso-notification-events-staging":
+        if name == "picasso-notification-events":
             return ne_table
-        if name == "recent-messages":
+        if name == "picasso-recent-messages":
             return rm_table
-        if name == "picasso-session-events-staging":
+        if name == "picasso-session-events":
             return se_table
-        if name == "picasso-session-summaries-staging":
+        if name == "picasso-session-summaries":
             return ss_table
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
@@ -3140,8 +3140,8 @@ def test_handler_close_status_partial_error_when_walker_errors(dsar):
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
             "picasso-form-submissions-staging": fs_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -3190,8 +3190,8 @@ def test_handler_returns_failed_on_audit_collision_at_request_received(dsar):
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
             "picasso-form-submissions-staging": fs_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -3260,10 +3260,10 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
             "picasso-form-submissions-staging": fs_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
-            "recent-messages": rm_table,
-            "picasso-session-events-staging": se_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
+            "picasso-recent-messages": rm_table,
+            "picasso-session-events": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -3332,10 +3332,10 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
             "picasso-pii-subject-index-staging": subject_table,
             "picasso-pii-dsar-audit-staging": audit_table,
             "picasso-form-submissions-staging": fs_table,
-            "picasso-notification-sends-staging": ns_table,
-            "picasso-notification-events-staging": ne_table,
-            "recent-messages": rm_table,
-            "picasso-session-events-staging": se_table,
+            "picasso-notification-sends": ns_table,
+            "picasso-notification-events": ne_table,
+            "picasso-recent-messages": rm_table,
+            "picasso-session-events": se_table,
         }[name]
     mock_ddb.Table.side_effect = route
 
@@ -3606,13 +3606,13 @@ def _stub_psid_handler_tables(mock_ddb, *, page_ids=("p1",), rm_items=None, se_i
     se_table.query.return_value = {"Items": se_items or []}
 
     def route(name):
-        if name == "picasso-channel-mappings-staging":
+        if name == "picasso-channel-mappings":
             return cm_table
         if name == "picasso-pii-dsar-audit-staging":
             return audit_table
-        if name == "recent-messages":
+        if name == "picasso-recent-messages":
             return rm_table
-        if name == "picasso-session-events-staging":
+        if name == "picasso-session-events":
             return se_table
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
@@ -3698,7 +3698,7 @@ def test_handler_psid_path_subject_resolution_clienterror_returns_failed_with_au
         {"Error": {"Code": "ThrottlingException"}}, "Query")
 
     def route(name):
-        if name == "picasso-channel-mappings-staging":
+        if name == "picasso-channel-mappings":
             return cm_table
         if name == "picasso-pii-dsar-audit-staging":
             return audit_table
@@ -3919,7 +3919,7 @@ def test_walk_session_summaries_access_exports_matched(dsar):
     out = mod._walk_session_summaries("subj", "h", "access", dry_run=False)
     assert out["action"] == "exported"
     assert out["rows_found"] == 1
-    mock_ddb.Table.assert_called_with("picasso-session-summaries-staging")
+    mock_ddb.Table.assert_called_with("picasso-session-summaries")
     kw = mt.query.call_args.kwargs
     assert "KeyConditionExpression" in kw and "FilterExpression" in kw
 

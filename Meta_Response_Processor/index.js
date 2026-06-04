@@ -64,9 +64,9 @@ const sqs = new SQSClient({ region: AWS_REGION });
 // ─── Configuration constants ──────────────────────────────────────────────────
 
 const CHANNEL_MAPPINGS_TABLE =
-  process.env.CHANNEL_MAPPINGS_TABLE || `picasso-channel-mappings-${ENVIRONMENT}`;
+  process.env.CHANNEL_MAPPINGS_TABLE || 'picasso-channel-mappings';
 const RECENT_MESSAGES_TABLE =
-  process.env.RECENT_MESSAGES_TABLE || 'recent-messages';
+  process.env.RECENT_MESSAGES_TABLE || 'picasso-recent-messages';
 const KMS_KEY_ID = process.env.KMS_KEY_ID || 'alias/picasso-channel-tokens';
 const ANALYTICS_QUEUE_URL =
   process.env.ANALYTICS_QUEUE_URL ||
@@ -227,7 +227,7 @@ async function loadPageAccessToken(pageId, channelType) {
 /**
  * Load conversation history for this Messenger thread from DynamoDB.
  *
- * DynamoDB schema (existing staging-recent-messages table):
+ * DynamoDB schema (existing picasso-recent-messages table):
  *   sessionId        (HASH)  — e.g. "meta:{pageId}:{psid}"
  *   messageTimestamp  (RANGE) — ISO timestamp
  *   role, content     — message data

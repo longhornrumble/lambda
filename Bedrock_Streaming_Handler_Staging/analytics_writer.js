@@ -1,4 +1,4 @@
-// Server-side analytics writer for picasso-session-summaries-{env}.
+// Server-side analytics writer for picasso-session-summaries.
 // Single atomic UpdateItem per call. Per-event-type ConditionExpression
 // provides idempotency via last_request_id_<event>. See v7 plan
 // §"PR A" and analytics_writer_contract.json for the wire-format

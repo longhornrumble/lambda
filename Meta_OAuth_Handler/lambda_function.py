@@ -24,7 +24,7 @@ Environment variables:
     META_APP_ID             — Facebook App ID
     META_APP_SECRET_ARN     — Secrets Manager ARN for the Meta App Secret
     OAUTH_CALLBACK_URL      — Publicly reachable callback URL for this Lambda
-    CHANNEL_MAPPINGS_TABLE  — DynamoDB table (e.g. picasso-channel-mappings-staging)
+    CHANNEL_MAPPINGS_TABLE  — DynamoDB table (e.g. picasso-channel-mappings)
     KMS_KEY_ID              — KMS key alias or ARN (e.g. alias/picasso-channel-tokens)
     AWS_REGION              — AWS region (set automatically by Lambda runtime)
 """
@@ -65,7 +65,7 @@ _META_APP_ID = os.environ.get("META_APP_ID", "")
 _META_APP_SECRET_ARN = os.environ.get("META_APP_SECRET_ARN", "")
 _OAUTH_CALLBACK_URL = os.environ.get("OAUTH_CALLBACK_URL", "")
 _CHANNEL_MAPPINGS_TABLE = os.environ.get(
-    "CHANNEL_MAPPINGS_TABLE", f"picasso-channel-mappings-{_ENV}"
+    "CHANNEL_MAPPINGS_TABLE", "picasso-channel-mappings"
 )
 _KMS_KEY_ID = os.environ.get("KMS_KEY_ID", "alias/picasso-channel-tokens")
 
