@@ -13,7 +13,7 @@ from botocore.exceptions import ClientError
 # Configuration
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
-TABLE_NAME = f"picasso-audit-{ENVIRONMENT}"
+TABLE_NAME = os.environ.get('AUDIT_TABLE_NAME', f"picasso-audit-{ENVIRONMENT}")
 
 def create_audit_table():
     """Create the audit DynamoDB table with proper configuration"""
