@@ -207,8 +207,11 @@ describe('calendarId resolves from coordinator_email, not the secret-path label'
     expect(calendarEvents.insertEvent.mock.calls[0][1]).not.toBe('maya@org.org');
     // Booking.coordinatorEmail is what cancel/reschedule later use as the calendarId.
     expect(bookingStore.writeBooking.mock.calls[0][0].coordinatorEmail).toBe(REAL_CAL);
+    // The confirmation email's ORGANIZER also carries the real calendar (not the label).
+    expect(confirmationEmail.sendConfirmationEmail.mock.calls[0][0].coordinatorEmail).toBe(REAL_CAL);
     // The OAuth secret lookup still uses the path-key coordinatorId, NOT the calendar id.
     expect(oauth.getOAuthClient.mock.calls[0][0].coordinatorId).toBe('maya@org.org');
+    expect(oauth.getCoordinatorCalendarId.mock.calls[0][0].coordinatorId).toBe('maya@org.org');
   });
 
   it('rollback deletes from the real calendar when the booking write fails', async () => {

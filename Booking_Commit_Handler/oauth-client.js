@@ -31,7 +31,7 @@ const CACHE_TTL_MS = Number(process.env.OAUTH_CACHE_TTL_MS || String(50 * 60 * 1
 
 const secrets = new SecretsManagerClient(sdkConfig());
 
-// Cache stores { client, cachedAt } so TTL can be checked on each access.
+// Cache stores { client, calendarId, cachedAt } so TTL can be checked on each access.
 const _clientCache = new Map();
 
 function buildSecretPath(tenantId, coordinatorId) {
@@ -81,10 +81,10 @@ async function _getCacheEntry(secretPath, coordinatorId) {
     clientSecret: secret.client_secret,
   });
   client.setCredentials({ refresh_token: secret.refresh_token });
-  const calendarId =
-    typeof secret.coordinator_email === 'string' && secret.coordinator_email
-      ? secret.coordinator_email
-      : coordinatorId;
+  // .trim() so an operator-padded "  maya@org  " falls back to coordinatorId rather
+  // than 404ing Google with a whitespace-wrapped calendarId.
+  const email = typeof secret.coordinator_email === 'string' ? secret.coordinator_email.trim() : '';
+  const calendarId = email || coordinatorId;
   const entry = { client, calendarId, cachedAt: Date.now() };
   _clientCache.set(secretPath, entry);
   return entry;

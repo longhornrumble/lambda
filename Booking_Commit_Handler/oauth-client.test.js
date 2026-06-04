@@ -101,6 +101,22 @@ describe('getCoordinatorCalendarId — real calendar from coordinator_email', ()
     expect(calId).toBe('legacy-coord');
   });
 
+  it('falls back when coordinator_email is whitespace-only', async () => {
+    smMock.on(GetSecretValueCommand).resolves({
+      SecretString: JSON.stringify({ client_id: 'cid', client_secret: 'csecret', refresh_token: 'rtok', coordinator_email: '   ' }),
+    });
+    const calId = await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'c-ws' });
+    expect(calId).toBe('c-ws');
+  });
+
+  it('trims a padded coordinator_email', async () => {
+    smMock.on(GetSecretValueCommand).resolves({
+      SecretString: JSON.stringify({ client_id: 'cid', client_secret: 'csecret', refresh_token: 'rtok', coordinator_email: '  maya@org.org  ' }),
+    });
+    const calId = await oauth.getCoordinatorCalendarId({ tenantId: 'AUS123957', coordinatorId: 'c1' });
+    expect(calId).toBe('maya@org.org');
+  });
+
   it('falls back when coordinator_email is empty-string', async () => {
     smMock.on(GetSecretValueCommand).resolves({
       SecretString: JSON.stringify({ client_id: 'cid', client_secret: 'csecret', refresh_token: 'rtok', coordinator_email: '' }),
