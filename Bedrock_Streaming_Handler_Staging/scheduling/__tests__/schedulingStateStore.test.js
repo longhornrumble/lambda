@@ -55,6 +55,26 @@ describe('saveState', () => {
     expect('selected_slot' in call.Item).toBe(false); // omitted when undefined
   });
 
+  it('persists the WS-NEWBOOK propose metadata (proposal + rejected_slot_ids) when present', async () => {
+    ddbMock.on(PutCommand).resolves({});
+    await deps().saveState({
+      tenantId: 'T1', sessionId: 'sess-1', state: 'proposing',
+      proposal: { poolSize: 3, tieBreaker: 'round_robin', roundRobinCursor: { routingPolicyId: 'rp-1' } },
+      rejected_slot_ids: ['slot#2026-06-10T14:00:00Z'],
+    });
+    const call = ddbMock.commandCalls(PutCommand)[0].args[0].input;
+    expect(call.Item.proposal).toEqual({ poolSize: 3, tieBreaker: 'round_robin', roundRobinCursor: { routingPolicyId: 'rp-1' } });
+    expect(call.Item.rejected_slot_ids).toEqual(['slot#2026-06-10T14:00:00Z']);
+  });
+
+  it('omits proposal + rejected_slot_ids when undefined (no explicit-undefined write)', async () => {
+    ddbMock.on(PutCommand).resolves({});
+    await deps().saveState({ tenantId: 'T1', sessionId: 'sess-1', state: 'qualifying' });
+    const call = ddbMock.commandCalls(PutCommand)[0].args[0].input;
+    expect('proposal' in call.Item).toBe(false);
+    expect('rejected_slot_ids' in call.Item).toBe(false);
+  });
+
   it('fail-soft on missing keys OR missing state (no DDB write) — audit S-2', async () => {
     await deps().saveState({ tenantId: '', sessionId: 'x', state: 'proposing' });
     await deps().saveState({ tenantId: 'T1', sessionId: 'x' }); // state undefined → guard (DDB rejects null attr)
