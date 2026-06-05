@@ -735,26 +735,51 @@ describe('deriveTypedEnvelopes', () => {
     expect(moved.new_end_at).toBe('2026-05-30T12:00:00Z');
   });
 
-  test('booking.calendar_reassigned is DISABLED — an organizer change emits NO reassigned envelope', async () => {
-    // Real shape: resource_id is a routing LABEL, organizer is an email — the old
-    // comparison false-positived on every booking. Emission is disabled pending an
-    // owner-identity contract decision.
+  test('booking.calendar_reassigned does NOT fire on a normal booking (organizer == coordinator_email, resource_id is a label)', async () => {
+    // Regression for the false-positive self-repoint: real shape is resource_id=LABEL,
+    // coordinator_email=EMAIL. The organizer of a platform booking IS the coordinator,
+    // so comparing the organizer email to coordinator_email (NOT resource_id) yields no
+    // reassignment.
     ddbMock.on(GetItemCommand).resolves({
       Item: {
-        booking_id:  { S: BOOKING_ID },
-        tenantId:    { S: TENANT_ID },
-        resource_id: { S: 'test-coordinator' },        // routing label (real shape)
-        start_at:    { S: '2026-05-30T09:00:00Z' },
-        end_at:      { S: '2026-05-30T10:00:00Z' },
-        status:      { S: 'booked' },
+        booking_id:        { S: BOOKING_ID },
+        tenantId:          { S: TENANT_ID },
+        resource_id:       { S: 'test-coordinator' },        // routing label (real shape)
+        coordinator_email: { S: 'chris@myrecruiter.ai' },    // the coordinator's email
+        start_at:          { S: '2026-05-30T09:00:00Z' },
+        end_at:            { S: '2026-05-30T10:00:00Z' },
+        status:            { S: 'booked' },
       },
     });
     const evt = makeCalEvent({
       start: { dateTime: '2026-05-30T09:00:00Z' },  // same instant — no move
-      organizer: { email: 'chris@myrecruiter.ai' }, // organizer email (NOT the label)
+      organizer: { email: 'chris@myrecruiter.ai' }, // organizer == coordinator_email → NOT reassigned
     });
     const envelopes = await _test.deriveTypedEnvelopes(evt, TENANT_ID, COORDINATOR_ID, PROVIDER);
     expect(envelopes.find(e => e.event_type === 'booking.calendar_reassigned')).toBeUndefined();
+  });
+
+  test('booking.calendar_reassigned fires when the organizer differs from coordinator_email (real reassign)', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        booking_id:        { S: BOOKING_ID },
+        tenantId:          { S: TENANT_ID },
+        resource_id:       { S: 'test-coordinator' },        // current resource_id (the lock condition value)
+        coordinator_email: { S: 'chris@myrecruiter.ai' },
+        start_at:          { S: '2026-05-30T09:00:00Z' },
+        end_at:            { S: '2026-05-30T10:00:00Z' },
+        status:            { S: 'booked' },
+      },
+    });
+    const evt = makeCalEvent({
+      start: { dateTime: '2026-05-30T09:00:00Z' },   // same instant — no move
+      organizer: { email: 'delegate@myrecruiter.ai' }, // DIFFERENT owner → reassigned
+    });
+    const envelopes = await _test.deriveTypedEnvelopes(evt, TENANT_ID, COORDINATOR_ID, PROVIDER);
+    const reassigned = envelopes.find(e => e.event_type === 'booking.calendar_reassigned');
+    expect(reassigned).toBeDefined();
+    expect(reassigned.previous_resource_id).toBe('test-coordinator');     // satisfies consumer `resource_id = :prev`
+    expect(reassigned.new_resource_id).toBe('delegate@myrecruiter.ai');   // the new organizer email
   });
 
   test('booking.calendar_moved does NOT fire on the same instant in a different format (UTC offset vs Z)', async () => {
@@ -833,12 +858,13 @@ describe('CI-3b: every exported event_type has a reachable derivation branch', (
       expect(envelopes.some(e => e.event_type === 'booking.calendar_moved')).toBe(true);
     }
 
-    // booking.calendar_reassigned is DISABLED — an organizer change emits nothing.
+    // booking.calendar_reassigned — organizer differs from coordinator_email.
     ddbMock.reset();
     ddbMock.on(GetItemCommand).resolves({
       Item: {
         booking_id: { S: 'bk-re' }, tenantId: { S: TENANT_ID },
-        resource_id: { S: 'old@x' }, start_at: { S: '2026-05-30T09:00:00Z' },
+        resource_id: { S: 'old@x' }, coordinator_email: { S: 'old@x' },
+        start_at: { S: '2026-05-30T09:00:00Z' },
         end_at: { S: '2026-05-30T10:00:00Z' }, status: { S: 'booked' },
       },
     });
@@ -849,7 +875,7 @@ describe('CI-3b: every exported event_type has a reachable derivation branch', (
           start: { dateTime: '2026-05-30T09:00:00Z' }, organizer: { email: 'new@x' } },
         TENANT_ID, COORDINATOR_ID, 'google'
       );
-      expect(envelopes.some(e => e.event_type === 'booking.calendar_reassigned')).toBe(false);
+      expect(envelopes.some(e => e.event_type === 'booking.calendar_reassigned')).toBe(true);
     }
 
     // booking.ooo_overlap_detected

@@ -203,18 +203,19 @@ async function lookupBooking(tenantId, bookingId) {
       // G3: project only the fields this function's callers actually use, so
       // future PII fields added to the Booking schema don't flow through unused.
       // tenantId (the PK) is read back for the cross-tenant guard.
-      ProjectionExpression: 'booking_id, tenantId, resource_id, start_at, end_at, #st',
+      ProjectionExpression: 'booking_id, tenantId, resource_id, coordinator_email, start_at, end_at, #st',
       ExpressionAttributeNames: { '#st': 'status' },
     })
   );
   if (!result.Item) return null;
   return {
-    bookingId:  result.Item.booking_id?.S  ?? bookingId,
-    tenantId:   result.Item.tenantId?.S    ?? null,
-    resourceId: result.Item.resource_id?.S ?? null,
-    startAt:    result.Item.start_at?.S    ?? null,
-    endAt:      result.Item.end_at?.S      ?? null,
-    status:     result.Item.status?.S      ?? null,
+    bookingId:        result.Item.booking_id?.S        ?? bookingId,
+    tenantId:         result.Item.tenantId?.S          ?? null,
+    resourceId:       result.Item.resource_id?.S       ?? null,
+    coordinatorEmail: result.Item.coordinator_email?.S ?? null,
+    startAt:          result.Item.start_at?.S          ?? null,
+    endAt:            result.Item.end_at?.S            ?? null,
+    status:           result.Item.status?.S            ?? null,
   };
 }
 
@@ -503,15 +504,25 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
       });
     }
 
-    // booking.calendar_reassigned is DISABLED (2026-06-05) pending an owner-identity
-    // contract decision. resolveResourceId(calEvent) returns the organizer EMAIL, but
-    // booking.resource_id is a routing LABEL (e.g. "test-coordinator") — comparing the
-    // two false-positives "reassigned" on every normal booking (an email never equals
-    // a label), and the consumer then overwrites resource_id with the email. Re-enabling
-    // requires deciding how "the assigned coordinator" is identified (label vs email),
-    // reconciling the previous_resource_id / new_resource_id envelope contract
-    // (FROZEN_CONTRACTS) and the Calendar_Lifecycle_Consumer reconcileReassigned handler.
-    // Tracked as a separate task.
+    // Reassigned: the meeting's current effective owner (organizer email, or first
+    // accepted attendee) differs from the coordinator who owns the booking. Compare
+    // against booking.coordinator_email (the coordinator's EMAIL) — NOT booking.resource_id,
+    // which is a routing LABEL (e.g. "test-coordinator") that an organizer email never
+    // equals, so the old resource_id compare false-positived on every normal booking and
+    // the consumer cancelled/repointed it. The envelope's previous_resource_id carries the
+    // booking's current resource_id (the Calendar_Lifecycle_Consumer reassignCoordinator
+    // optimistic-lock condition is `resource_id = :prev`); new_resource_id is the new
+    // organizer email (the consumer requires an email and overwrites resource_id +
+    // coordinator_email with it).
+    const newOwner = resolveResourceId(calEvent);
+    if (newOwner && booking.coordinatorEmail && newOwner !== booking.coordinatorEmail) {
+      envelopes.push({
+        event_type:            'booking.calendar_reassigned',
+        ...commonFields,
+        previous_resource_id:  booking.resourceId,
+        new_resource_id:       newOwner,
+      });
+    }
   }
 
   // ── Attendee status changes (independent of booking record) ──
