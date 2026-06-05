@@ -308,8 +308,53 @@ class AuditCollision(RuntimeError):
 
 
 def _normalize_email(email):
-    """Lower + strip — matches the Phase-1 subject-index writer normalization."""
+    """Lower + strip ONLY — used for the recipient-equality walker filters
+    (`recipient == normalized_email`), which match against stored notification
+    recipients that the walkers also lower()+strip() before comparing.
+
+    NOTE: this is NOT the subject-index key normalization. The index is keyed by
+    the writer's Gmail-aware `normalize_email` (pii_subject.py) — use
+    `_normalize_email_for_index` for the index lookup. (G1, phase-audit
+    2026-06-05: the prior docstring wrongly claimed this matched the writer; a
+    Gmail subject like Foo.Bar@Gmail.com strip+lowers to foo.bar@gmail.com but
+    the index key is foobar@gmail.com → the lookup missed every Gmail-with-dots
+    subject.)
+    """
     return email.strip().lower()
+
+
+# Gmail dot/plus collapsing — VERBATIM port of the subject-index writer's
+# normalize_email (Master_Function_Staging/pii_subject.py / pii_subject.js), so
+# the DSAR index lookup reproduces the exact key the writer stored. Only Gmail
+# is collapsed (provider-guaranteed alias delivery); non-Gmail locals get
+# lower/strip only. A parity test replays the writer's vectors.
+_GMAIL_DOMAINS = {"gmail.com", "googlemail.com"}
+
+
+def _normalize_email_for_index(email):
+    """Deterministic, Gmail-aware normalization for the subject-index KEY lookup
+    (G1). Mirrors pii_subject.py:normalize_email exactly. Returns None for a
+    non-usable address (→ no possible index entry → subject resolves to None)."""
+    if email is None:
+        return None
+    e = str(email).strip()
+    if not e or any(ch.isspace() for ch in e):
+        return None
+    if "@" not in e:
+        return None
+    local, _, domain = e.rpartition("@")
+    if not local or not domain or "@" in local:
+        return None
+    domain = domain.lower()
+    local = local.lower()
+    if domain in _GMAIL_DOMAINS:
+        domain = "gmail.com"
+        if "+" in local:
+            local = local.split("+", 1)[0]
+        local = local.replace(".", "")
+    if not local:
+        return None
+    return f"{local}@{domain}"
 
 
 def _validate(event):
@@ -426,6 +471,20 @@ def _validate(event):
             "DSARs)."
         )
 
+    # G2 (phase-audit 2026-06-05): dry_run must be a true boolean. The prior
+    # bool(event.get("dry_run", True)) coerced a numeric 0/0.0 to a REAL delete
+    # (bool(0) is False) despite this function's "a typo can never produce an
+    # unintended deletion" intent. Mirror the purge Lambda's strict isinstance
+    # guard: default True, reject any non-bool.
+    dry_run = event.get("dry_run", True)
+    if dry_run is None:
+        dry_run = True
+    if not isinstance(dry_run, bool):
+        raise InvalidInput(
+            f"dry_run must be boolean true/false; got "
+            f"{type(dry_run).__name__}={dry_run!r}"
+        )
+
     return {
         "subject_identifier": subject_identifier,
         "identifier_type": identifier_type,
@@ -439,7 +498,7 @@ def _validate(event):
         # walk). Normalize empty/whitespace to None so the dispatcher's
         # presence-check is unambiguous.
         "tenant_hash": (event.get("tenant_hash") or "").strip() or None,
-        "dry_run": bool(event.get("dry_run", True)),
+        "dry_run": dry_run,
         # Closeout-audit row #15: propagate the validated marker so the
         # audit writer can stamp a top-level `is_smoke_test` attribute on
         # every row this invocation writes. Operator scans can then
@@ -458,12 +517,22 @@ def _resolve_subject(tenant_id, normalized_email):
 
     Returns the pii_subject_id string, or None if no index entry exists.
     The subject-index Query is keyed on (tenant_id, normalized_email).
+
+    G1 (phase-audit 2026-06-05): the index key was written by the writer's
+    Gmail-aware normalize_email, so the lookup MUST apply the same Gmail dot/plus
+    collapsing — otherwise a Gmail-with-dots subject (foo.bar@gmail.com) never
+    matches its stored key (foobar@gmail.com). The incoming `normalized_email` is
+    only strip+lower'd (it's also reused for recipient-equality filters), so
+    re-normalize here for the index key without affecting that other use.
     """
+    index_key = _normalize_email_for_index(normalized_email)
+    if not index_key:
+        return None  # non-usable address → never indexed (writer mints UNINDEXED)
     table = ddb.Table(TABLE_SUBJECT_INDEX)
     try:
         resp = table.get_item(Key={
             "tenant_id": tenant_id,
-            "normalized_email": normalized_email,
+            "normalized_email": index_key,
         })
     except ClientError as exc:
         logger.error(
