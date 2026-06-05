@@ -21,6 +21,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# #1a: the account guard now reads EXPECTED_ACCOUNT from the env (fail-closed).
+# Set the staging value before the fixture re-imports lambda_function so the
+# module-level read picks it up; the "unset ⇒ refuse" case monkeypatches the
+# module attribute directly (test_env_guard_refuses_when_unset).
+os.environ.setdefault("EXPECTED_ACCOUNT", "525409062831")
+
 
 @pytest.fixture
 def dsar(monkeypatch):
@@ -93,6 +99,18 @@ def test_env_guard_refuses_wrong_account(dsar):
     mock_sts.get_caller_identity.return_value = {"Account": "614056832592"}
     with pytest.raises(RuntimeError, match="account 614056832592"):
         mod._assert_account()
+
+
+def test_env_guard_refuses_when_expected_account_unset(dsar):
+    """#1a fail-closed: an unset EXPECTED_ACCOUNT must REFUSE (never default to
+    an account), and must do so WITHOUT consulting STS."""
+    mod, _, mock_sts = dsar
+    mock_sts.get_caller_identity.reset_mock()
+    for unset in (None, ""):
+        mod.EXPECTED_ACCOUNT = unset
+        with pytest.raises(RuntimeError, match="EXPECTED_ACCOUNT env var is unset"):
+            mod._assert_account()
+    mock_sts.get_caller_identity.assert_not_called()
 
 
 # ───────────────────────────────────────────────────────────────────────────

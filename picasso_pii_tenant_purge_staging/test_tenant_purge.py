@@ -28,6 +28,11 @@ from botocore.exceptions import ClientError
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# #1a: the account guard now reads EXPECTED_ACCOUNT from the env (fail-closed).
+# Set the staging value before the fixture re-imports the module; the
+# "unset ⇒ refuse" case monkeypatches the module attribute directly.
+os.environ.setdefault("EXPECTED_ACCOUNT", "525409062831")
+
 
 @pytest.fixture
 def purge():
@@ -128,6 +133,20 @@ def test_account_guard_wrong_account_fails_no_ddb(purge):
     assert "614056832592" in resp["error"]
     # No surface or audit table touched.
     assert mock_ddb.Table.call_count == 0
+
+
+def test_account_guard_unset_expected_account_fails_closed(purge):
+    """#1a fail-closed: unset EXPECTED_ACCOUNT must REFUSE (no default to an
+    account), without consulting STS or touching any table."""
+    mod, mock_ddb, mock_sts = purge
+    mock_sts.get_caller_identity.reset_mock()
+    mod.EXPECTED_ACCOUNT = None
+    _wire_tables(mod, mock_ddb, {})
+    resp = mod.lambda_handler(_event(), None)
+    assert resp["status"] == "failed"
+    assert "EXPECTED_ACCOUNT env var is unset" in resp["error"]
+    assert mock_ddb.Table.call_count == 0
+    mock_sts.get_caller_identity.assert_not_called()
 
 
 # ───────────────────────────────────────────────────────────────────────────

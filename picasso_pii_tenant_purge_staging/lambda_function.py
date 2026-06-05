@@ -78,11 +78,13 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# CLAUDE.md account→env map. Refuse to run outside staging (525) until a prod
-# promotion gate fires — same env-guard posture as the DSAR Lambda. A
-# whole-tenant purge is far more destructive than a per-subject DSAR, so the
-# guard is non-negotiable.
-EXPECTED_ACCOUNT = "525409062831"
+# CLAUDE.md account→env map. Refuse to run unless the caller account matches
+# EXPECTED_ACCOUNT — same env-guard posture as the DSAR Lambda. Per prod-cutover
+# decision D1 (2026-06-04) this is an IaC-set env var (staging module → 525…,
+# prod module → 614…), replacing the former hardcoded constant; the env-var
+# guard is the prod-promotion gate. A whole-tenant purge is far more destructive
+# than a per-subject DSAR, so FAIL-CLOSED is non-negotiable: unset ⇒ refuse.
+EXPECTED_ACCOUNT = os.environ.get("EXPECTED_ACCOUNT")
 
 # Staging table names — single source of truth (matches infra/modules/* locals
 # and the DSAR Lambda's constants).
@@ -122,20 +124,27 @@ sts = boto3.client("sts")
 # Cold-start guard
 # ───────────────────────────────────────────────────────────────────────────
 def _assert_account():
-    """Refuse to run in any account other than staging; return caller ARN.
+    """Refuse to run unless the caller account matches EXPECTED_ACCOUNT; return
+    caller ARN.
 
-    Raises RuntimeError on mismatch — handler returns status=failed, no DDB
-    ops, no audit row. Returns the caller ARN (the Lambda execution role AWS
-    actually sees) so the audit row records the real identity alongside the
-    self-reported `operator` field. Mirrors DSAR `_assert_account`.
+    Raises RuntimeError when EXPECTED_ACCOUNT is unset (fail-closed) or on
+    account mismatch — handler returns status=failed, no DDB ops, no audit row.
+    Returns the caller ARN (the Lambda execution role AWS actually sees) so the
+    audit row records the real identity alongside the self-reported `operator`
+    field. Mirrors DSAR `_assert_account`.
     """
+    if not EXPECTED_ACCOUNT:
+        raise RuntimeError(
+            "tenant_purge_account_guard: EXPECTED_ACCOUNT env var is unset; "
+            "refusing to run (fail-closed). IaC must set it to the account this "
+            "Lambda is deployed in."
+        )
     identity = sts.get_caller_identity()
     actual = identity["Account"]
     if actual != EXPECTED_ACCOUNT:
         raise RuntimeError(
             f"tenant_purge_account_guard: refusing to run in account {actual}; "
-            f"expected staging account {EXPECTED_ACCOUNT}. "
-            f"Prod promotion requires an explicit code change."
+            f"expected account {EXPECTED_ACCOUNT} (set via EXPECTED_ACCOUNT env var)."
         )
     return identity.get("Arn")
 

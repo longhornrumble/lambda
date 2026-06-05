@@ -138,10 +138,13 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# CLAUDE.md account→env map. The Lambda must refuse to run outside staging
-# until the prod-promotion gate fires (see CONSUMER_PII_REMEDIATION.md
-# v2 §"Locked decisions" / Apply-1 module's env-guard pattern).
-EXPECTED_ACCOUNT = "525409062831"
+# CLAUDE.md account→env map. The Lambda refuses to run unless its caller
+# account matches EXPECTED_ACCOUNT. Per prod-cutover decision D1 (2026-06-04)
+# this is now an IaC-set env var (staging module → 525…, prod module → 614…),
+# replacing the former hardcoded constant ("Decision A — FLIP"): one codebase
+# serves both accounts and the env-var guard is the prod-promotion gate.
+# FAIL-CLOSED: unset ⇒ refuse (never default to an account). See _assert_account.
+EXPECTED_ACCOUNT = os.environ.get("EXPECTED_ACCOUNT")
 
 # Staging table names — single source of truth (matches infra/modules/* locals).
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
@@ -254,11 +257,13 @@ _archive_mfa_delete_enabled = None
 # Cold-start guard
 # ───────────────────────────────────────────────────────────────────────────
 def _assert_account():
-    """Refuse to run in any account other than staging; return caller ARN.
+    """Refuse to run unless the caller account matches EXPECTED_ACCOUNT; return
+    caller ARN.
 
-    Raises RuntimeError on mismatch — Lambda returns 500, no DDB ops happen,
-    no audit row written. The Lambda execution role grants sts:GetCallerIdentity
-    explicitly (lambda-pii-dsar-staging module).
+    Raises RuntimeError when EXPECTED_ACCOUNT is unset (fail-closed) or on
+    account mismatch — Lambda returns 500, no DDB ops happen, no audit row
+    written. The Lambda execution role grants sts:GetCallerIdentity explicitly
+    (lambda-pii-dsar module).
 
     Audit row 12 (Security SR3): returns the caller ARN so the handler can
     log it into the `request_received` audit row. The `operator` payload
@@ -267,13 +272,18 @@ def _assert_account():
     own service principal). This preserves accountability when the operator
     payload value can't be trusted.
     """
+    if not EXPECTED_ACCOUNT:
+        raise RuntimeError(
+            "dsar_account_guard: EXPECTED_ACCOUNT env var is unset; refusing to "
+            "run (fail-closed). IaC must set it to the account this Lambda is "
+            "deployed in."
+        )
     identity = sts.get_caller_identity()
     actual = identity["Account"]
     if actual != EXPECTED_ACCOUNT:
         raise RuntimeError(
             f"dsar_account_guard: refusing to run in account {actual}; "
-            f"expected staging account {EXPECTED_ACCOUNT}. "
-            f"Prod promotion requires explicit code change."
+            f"expected account {EXPECTED_ACCOUNT} (set via EXPECTED_ACCOUNT env var)."
         )
     return identity.get("Arn")
 
