@@ -467,6 +467,16 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
     return envelopes;
   }
 
+  // proceed-on-null (deliberate, not skip-on-null): when the booking_id from
+  // extendedProperties does not resolve to a row under this tenant, we still emit
+  // (deleted/private/attendee). Rationale (phase-completion-audit 2026-06-04,
+  // Security B-2 vs tech-lead): (1) the consumer keys its Booking write by the
+  // envelope's tenant_id (= the channel tenant), so a foreign booking_id is a
+  // conditional no-op — no cross-tenant data mutation; (2) attendee status changes
+  // are intentionally booking-record-independent (an invite may be accepted before
+  // C8 writes the Booking row); (3) the residual FIFO-group-stall vector requires a
+  // guessable booking_id, mitigated by C8's non-public UUID booking_ids. Skipping on
+  // null would drop legitimate pre-C8 attendee events, so it was rejected.
   if (!booking) {
     log('skipped_no_booking_record', { booking_id: bookingId, tenant_id: tenantId });
     // Still check attendee status changes below — those don't require booking comparison.
