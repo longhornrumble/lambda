@@ -2600,13 +2600,18 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
     truncated_session_count = rm.get("truncated_session_id_count", 0) if rm else 0
     exported_truncated = rm.get("exported_messages_truncated_count", 0) if rm else 0
     if failed_session_ids:
+        # PII redaction (follow-up to D2 audit SEC-2/SEC-7): do NOT emit the raw
+        # session_ids — on the psid path they are `meta:{pageId}:{psid}` (the
+        # PSID is PII per D5 G-H), and manual_followups are persisted into the
+        # IMMUTABLE dsar-audit `details`. The count is the operator signal; the
+        # specific session_ids + error codes are in CloudWatch (logged at the
+        # walker's recent_messages_query_failed line).
         manual_followups.append(
             f"recent-messages: {len(failed_session_ids)} session_id(s) "
             f"failed Query and were skipped (walker continued on remaining "
-            f"sessions). Failed session_ids: {failed_session_ids[:5]}"
-            f"{'...' if len(failed_session_ids) > 5 else ''}. "
-            f"Re-invoke with the same dsar_id (new event_timestamp) to retry, "
-            f"or inspect CloudWatch logs for the specific error codes."
+            f"sessions). Re-invoke with the same dsar_id (new event_timestamp) "
+            f"to retry; inspect CloudWatch logs for the specific session_ids "
+            f"and error codes."
         )
         existing = walker_results.get("recent-messages", {})
         walker_results["recent-messages"] = {
@@ -2817,13 +2822,16 @@ def _walk_psid_surfaces(tenant_id, psid, session_ids, request_type, dry_run):
         # to verify the PSID is correct, or the subject's TTL may have
         # purged the rows already (recent-messages has a 7-day
         # TTL per Meta_Response_Processor).
+        # PII redaction (follow-up to D2 audit SEC-2/SEC-7): the raw PSID is PII
+        # (D5 G-H) and manual_followups land in the IMMUTABLE dsar-audit
+        # `details`. The operator supplied the PSID, so it adds no value here —
+        # omit it; tenant_id alone scopes the followup.
         manual_followups.append(
-            f"psid path: 0 sessionIds resolved for tenant {tenant_id!r} + "
-            f"psid {psid!r}. Verify: (a) tenant has Messenger channel "
-            f"configured (channel-mappings TenantIndex GSI Query); (b) "
-            f"PSID belongs to a page in the tenant's channel mappings; "
-            f"(c) subject's messages may have aged out via 7-day TTL on "
-            f"recent-messages."
+            f"psid path: 0 sessionIds resolved for tenant {tenant_id!r} (PSID "
+            f"redacted). Verify: (a) tenant has Messenger channel configured "
+            f"(channel-mappings TenantIndex GSI Query); (b) the PSID belongs to "
+            f"a page in the tenant's channel mappings; (c) subject's messages "
+            f"may have aged out via 7-day TTL on recent-messages."
         )
         walker_results["recent-messages"] = {
             "status": "completed",
