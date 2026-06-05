@@ -50,6 +50,7 @@ const ENV                            = process.env.ENVIRONMENT || 'staging';
 const CHANNELS_TABLE                 = process.env.CALENDAR_WATCH_CHANNELS_TABLE || `picasso-calendar-watch-channels-${ENV}`;
 const BOOKING_TABLE                  = process.env.BOOKING_TABLE || `picasso-booking-${ENV}`;
 const BOOKING_TENANT_START_INDEX     = process.env.BOOKING_TENANT_START_INDEX || 'tenantId-start_at-index';
+const BOOKING_EXTERNAL_EVENT_INDEX   = process.env.BOOKING_EXTERNAL_EVENT_INDEX || 'external_event_id-index';
 const EVENTS_TOPIC_ARN               = process.env.EVENTS_TOPIC_ARN || '';
 const REPLAY_WINDOW_SECONDS          = Number(process.env.REPLAY_WINDOW_SECONDS || '300');
 // Y5: safety cap on Google Calendar list-pages loop (pilot calendars are tiny;
@@ -188,21 +189,28 @@ async function dispatchTypedEvent(envelope, channelId) {
 // write path yet (sub-phase C8 creates bookings), so lookups normally return
 // null for real events; tests seed fixtures to exercise derivation logic.
 
-async function lookupBooking(bookingId) {
+async function lookupBooking(tenantId, bookingId) {
   const result = await ddb.send(
     new GetItemCommand({
       TableName: BOOKING_TABLE,
-      Key: { booking_id: { S: bookingId } },
+      // The Booking table PK is (tenantId HASH, booking_id RANGE) — both key
+      // elements are required. The partition attribute is camelCase `tenantId`
+      // (NOT snake `tenant_id`); keying by booking_id alone throws a schema
+      // ValidationException. Keying by the channel's tenantId also makes this
+      // lookup inherently cross-tenant-safe: a foreign booking_id is simply not
+      // found under this tenant.
+      Key: { tenantId: { S: tenantId }, booking_id: { S: bookingId } },
       // G3: project only the fields this function's callers actually use, so
       // future PII fields added to the Booking schema don't flow through unused.
-      ProjectionExpression: 'booking_id, tenant_id, resource_id, start_at, end_at, #st',
+      // tenantId (the PK) is read back for the cross-tenant guard.
+      ProjectionExpression: 'booking_id, tenantId, resource_id, start_at, end_at, #st',
       ExpressionAttributeNames: { '#st': 'status' },
     })
   );
   if (!result.Item) return null;
   return {
     bookingId:  result.Item.booking_id?.S  ?? bookingId,
-    tenantId:   result.Item.tenant_id?.S   ?? null,
+    tenantId:   result.Item.tenantId?.S    ?? null,
     resourceId: result.Item.resource_id?.S ?? null,
     startAt:    result.Item.start_at?.S    ?? null,
     endAt:      result.Item.end_at?.S      ?? null,
@@ -210,18 +218,59 @@ async function lookupBooking(bookingId) {
   };
 }
 
+// Resolve a Booking by its Google event id, for the deletion path: Google strips
+// `extendedProperties` from cancelled-event delta items, so a hard-deleted booked
+// event arrives with no `extendedProperties.private.booking_id`. We recover the
+// booking via the `external_event_id` GSI (the delta item's `id` IS present).
+// The GSI key has no tenant element, so the caller MUST validate the returned
+// booking's tenantId against the channel's tenant (cross-tenant guard).
+async function lookupBookingByEventId(externalEventId) {
+  const result = await ddb.send(
+    new QueryCommand({
+      TableName: BOOKING_TABLE,
+      IndexName: BOOKING_EXTERNAL_EVENT_INDEX,
+      KeyConditionExpression: 'external_event_id = :eid',
+      ExpressionAttributeValues: { ':eid': { S: externalEventId } },
+      // G3: project only the fields used (the GSI projects ALL, but don't pull PII
+      // fields like attendee_email over the wire). Mirrors lookupBooking's projection.
+      ProjectionExpression: 'booking_id, tenantId, resource_id, start_at, end_at, #st',
+      ExpressionAttributeNames: { '#st': 'status' },
+      // Expect exactly one. >1 only if an event id were reused across rows
+      // (reschedule-in-place keeps the row, so this is defensive): prefer a
+      // still-`booked` row.
+      Limit: 2,
+    })
+  );
+  const items = result.Items ?? [];
+  if (items.length === 0) return null;
+  const chosen = items.find((it) => it.status?.S === 'booked') ?? items[0];
+  return {
+    bookingId:  chosen.booking_id?.S  ?? null,
+    tenantId:   chosen.tenantId?.S    ?? null,
+    resourceId: chosen.resource_id?.S ?? null,
+    startAt:    chosen.start_at?.S    ?? null,
+    endAt:      chosen.end_at?.S      ?? null,
+    status:     chosen.status?.S      ?? null,
+  };
+}
+
 // ─── OOO: booked-booking query by coordinator + time overlap ────────────────────
 // Queries the Booking GSI for all `booked`-status bookings in the time window
 // [oooStart, oooEnd) for the given tenant + coordinator, then filters to those
-// whose time range overlaps the OOO event.  We filter by coordinator_id as a
-// filter expression (not key condition) because the GSI key is tenantId+start_at.
-
+// whose time range overlaps the OOO event.  The GSI hash key is the camelCase
+// `tenantId` (NOT snake `tenant_id`). We filter by `resource_id` (the Booking
+// attribute that holds the assigned coordinator/resource id) — the booking has no
+// `coordinator_id` attribute, only `resource_id` + `coordinator_email`.
+// CONTRACT: this assumes `channel.coordinator_id` (the Onboarder's coordinator_id
+// input) equals `booking.resource_id` (BCH's candidateResourceIds entry). True for
+// the v1 single-coordinator pilot; if a tenant onboards a coordinator_id that
+// differs from its routing-policy resource ids, OOO-overlap silently finds nothing.
 async function queryBookedBookingsForOoo(tenantId, coordinatorId, oooStartAt, oooEndAt) {
   const params = {
     TableName: BOOKING_TABLE,
     IndexName: BOOKING_TENANT_START_INDEX,
-    KeyConditionExpression: 'tenant_id = :tid AND start_at < :ooo_end',
-    FilterExpression: '#st = :booked AND end_at > :ooo_start AND coordinator_id = :cid',
+    KeyConditionExpression: 'tenantId = :tid AND start_at < :ooo_end',
+    FilterExpression: '#st = :booked AND end_at > :ooo_start AND resource_id = :cid',
     ExpressionAttributeNames: { '#st': 'status' },
     ExpressionAttributeValues: {
       ':tid':      { S: tenantId },
@@ -327,7 +376,28 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
   }
 
   // ── Platform-owned booking path ──
-  const bookingId = calEvent.extendedProperties?.private?.booking_id ?? null;
+  let bookingId = calEvent.extendedProperties?.private?.booking_id ?? null;
+  let booking = null;
+
+  // Deletion fallback: Google strips `extendedProperties` from cancelled-event
+  // delta items, so a hard-deleted booked event carries no booking_id. Recover
+  // the booking by its Google event id (the delta item's `id`) via the
+  // external_event_id GSI. (Resolves the live-proven `skipped_non_platform_event`
+  // gap on real coordinator deletes.) The GSI key has no tenant element, so the
+  // cross-tenant guard below validates the resolved booking's tenantId.
+  if (!bookingId && calEvent.status === 'cancelled' && calEvent.id) {
+    try {
+      booking = await lookupBookingByEventId(calEvent.id);
+      if (booking) bookingId = booking.bookingId;
+    } catch (err) {
+      warn('booking_lookup_by_event_failed', {
+        google_event_id: calEvent.id,
+        tenant_id: tenantId,
+        error: err.message,
+      });
+    }
+  }
+
   if (!bookingId) {
     log('skipped_non_platform_event', {
       google_event_id: calEvent.id,
@@ -346,22 +416,29 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
   };
 
   // R1: cross-tenant booking guard — run ONCE up front, before any branch.
-  // booking_id comes from attacker-influenceable extendedProperties.private.booking_id.
-  // If the Booking record belongs to a different tenant, emit nothing and return.
-  // For a legitimately-deleted booking, lookupBooking returns null → we cannot
-  // verify tenant → proceed (consumer no-ops on a phantom foreign booking_id; the
-  // leak we're closing is emitting a *real* foreign-tenant booking's event).
-  let booking = null;
-  try {
-    booking = await lookupBooking(bookingId);
-  } catch (err) {
-    warn('booking_lookup_failed', {
-      booking_id: bookingId,
-      tenant_id: tenantId,
-      error: err.message,
-    });
+  // booking_id comes from attacker-influenceable extendedProperties.private.booking_id
+  // (or, on the deletion path, from the external_event_id GSI lookup above). If the
+  // Booking record belongs to a different tenant, emit nothing and return. For a
+  // booking not found under this tenant, lookup returns null → we cannot verify
+  // tenant → proceed (consumer no-ops on a phantom foreign booking_id; the leak we're
+  // closing is emitting a *real* foreign-tenant booking's event).
+  if (!booking) {
+    try {
+      booking = await lookupBooking(tenantId, bookingId);
+    } catch (err) {
+      warn('booking_lookup_failed', {
+        booking_id: bookingId,
+        tenant_id: tenantId,
+        error: err.message,
+      });
+    }
   }
 
+  // Cross-tenant booking guard. The envelope's tenant_id is the channel's tenant
+  // and the consumer keys its Booking update by (tenant_id, booking_id), so a
+  // foreign booking_id is already unreachable; this is defense-in-depth that also
+  // closes the event-id GSI path (which is NOT tenant-keyed): if the resolved
+  // booking belongs to a different tenant, emit nothing.
   if (booking !== null && booking.tenantId !== null && booking.tenantId !== tenantId) {
     warn('cross_tenant_booking_id_detected', {
       booking_id:        bookingId,
@@ -390,6 +467,16 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
     return envelopes;
   }
 
+  // proceed-on-null (deliberate, not skip-on-null): when the booking_id from
+  // extendedProperties does not resolve to a row under this tenant, we still emit
+  // (deleted/private/attendee). Rationale (phase-completion-audit 2026-06-04,
+  // Security B-2 vs tech-lead): (1) the consumer keys its Booking write by the
+  // envelope's tenant_id (= the channel tenant), so a foreign booking_id is a
+  // conditional no-op — no cross-tenant data mutation; (2) attendee status changes
+  // are intentionally booking-record-independent (an invite may be accepted before
+  // C8 writes the Booking row); (3) the residual FIFO-group-stall vector requires a
+  // guessable booking_id, mitigated by C8's non-public UUID booking_ids. Skipping on
+  // null would drop legitimate pre-C8 attendee events, so it was rejected.
   if (!booking) {
     log('skipped_no_booking_record', { booking_id: bookingId, tenant_id: tenantId });
     // Still check attendee status changes below — those don't require booking comparison.
