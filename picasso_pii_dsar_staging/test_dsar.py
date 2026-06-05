@@ -1858,6 +1858,10 @@ def test_walk_psid_surfaces_no_sessions_surfaces_completed_no_data(dsar):
     assert results["archive"]["status"] == "completed"
     assert results["archive"]["action"] == "no_sessions"
     assert any("0 sessionIds resolved" in f for f in followups)
+    # PII redaction (D2 audit follow-up SEC-2/SEC-7): the raw PSID must NOT
+    # appear in any followup — followups persist into the immutable dsar-audit
+    # `details`, and the PSID is PII (D5 G-H).
+    assert not any("psid_abc" in f for f in followups)
     # session-summaries explicitly NOT in walker_results (deferred per F-DSAR31)
     assert "session-summaries" not in results
 
@@ -2951,7 +2955,13 @@ def test_dispatcher_recent_messages_partial_error_taint_on_failed_session_ids(ds
     assert walker_results["recent-messages"]["status"] == "errored"
     assert walker_results["recent-messages"]["error"] == "partial_query_failures"
     assert walker_results["recent-messages"]["failed_session_ids_count"] == 1
-    assert any("recent-messages" in f and "failed Query" in f for f in followups)
+    rm_followup = next(f for f in followups if "recent-messages" in f and "failed Query" in f)
+    # PII redaction (D2 audit follow-up SEC-2/SEC-7): the raw failed session_id
+    # (on the psid path = meta:{pageId}:{psid}) must NOT appear — followups
+    # persist into the immutable dsar-audit `details`. Count only; specifics
+    # are in CloudWatch.
+    assert "sess-a" not in rm_followup
+    assert "1 session_id(s)" in rm_followup
 
 
 def test_dispatcher_recent_messages_truncation_taints_completed_to_errored(dsar):
