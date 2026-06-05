@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # Lambda silently falling back to this staging name would write to the wrong
 # account and orphan every subject. Recorded as a Phase-2/promotion gate item.
 PII_SUBJECT_INDEX_TABLE = os.environ.get(
-    "PII_SUBJECT_INDEX_TABLE", "picasso-pii-subject-index-staging"
+    "PII_SUBJECT_INDEX_TABLE", "picasso-pii-subject-index"
 )
 
 # Bounded retry for the get -> conditional-put race (gate blocker B1). 3 is ample:

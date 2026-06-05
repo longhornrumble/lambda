@@ -4,7 +4,7 @@ DSAR SLA Monitor Lambda — M3 done-bar #1 (master plan v0.3 §M3). Closes D5 G-
 
 ## What this Lambda does
 
-Daily EventBridge-triggered scan of `picasso-pii-dsar-audit-staging` looking for DSARs whose `request_received` event was written more than 25 days ago AND which have no `closed` event since. Emits a single SNS alert listing at-risk dsar_ids + intake timestamps. Operator subscribes to the topic via Console (no per-alarm subscription wired through IaC).
+Daily EventBridge-triggered scan of `picasso-pii-dsar-audit` looking for DSARs whose `request_received` event was written more than 25 days ago AND which have no `closed` event since. Emits a single SNS alert listing at-risk dsar_ids + intake timestamps. Operator subscribes to the topic via Console (no per-alarm subscription wired through IaC).
 
 ## Why this is a separate Lambda from `picasso_pii_dsar_staging`
 
@@ -50,7 +50,7 @@ AWS_PROFILE=myrecruiter-staging aws lambda get-function-configuration \
 
 | Var | Purpose | Default |
 |---|---|---|
-| `AUDIT_TABLE` | DDB table name to scan | `picasso-pii-dsar-audit-staging` |
+| `AUDIT_TABLE` | DDB table name to scan | `picasso-pii-dsar-audit` |
 | `SLA_DAYS_INTAKE_PLUS` | Days from intake before alarm fires | `25` |
 | `SNS_TOPIC_ARN` | Topic to publish at-risk alerts to | required (no default) |
 
@@ -62,7 +62,7 @@ Insert a synthetic `request_received` row past threshold:
 PAST_TS=$(python3 -c "from datetime import datetime, timezone, timedelta; print((datetime.now(timezone.utc) - timedelta(days=30)).isoformat())")
 
 AWS_PROFILE=myrecruiter-staging aws dynamodb put-item \
-  --table-name picasso-pii-dsar-audit-staging \
+  --table-name picasso-pii-dsar-audit \
   --item "{
     \"dsar_id\":{\"S\":\"smoke-sla-monitor-001\"},
     \"event_timestamp\":{\"S\":\"$PAST_TS\"},

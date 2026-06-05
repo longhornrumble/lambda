@@ -22,7 +22,7 @@ from botocore.exceptions import ClientError
 
 
 # Inject env vars BEFORE importing the module under test
-os.environ.setdefault('AUDIT_TABLE', 'picasso-pii-dsar-audit-staging')
+os.environ.setdefault('AUDIT_TABLE', 'picasso-pii-dsar-audit')
 os.environ.setdefault('SLA_DAYS_INTAKE_PLUS', '25')
 os.environ.setdefault('SNS_TOPIC_ARN', 'arn:aws:sns:us-east-1:525409062831:picasso-ops-alerts-staging')
 

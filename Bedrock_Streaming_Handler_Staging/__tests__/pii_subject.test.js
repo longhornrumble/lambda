@@ -252,8 +252,8 @@ describe('getOrCreatePiiSubjectId — knownEmail optimization', () => {
 });
 
 describe('PII_SUBJECT_INDEX_TABLE default', () => {
-  test('defaults to picasso-pii-subject-index-staging when env var unset', () => {
-    expect(PII_SUBJECT_INDEX_TABLE).toBe('picasso-pii-subject-index-staging');
+  test('defaults to picasso-pii-subject-index when env var unset', () => {
+    expect(PII_SUBJECT_INDEX_TABLE).toBe('picasso-pii-subject-index');
   });
 });
 

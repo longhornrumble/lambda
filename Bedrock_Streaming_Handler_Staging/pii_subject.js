@@ -31,7 +31,7 @@ const { GetCommand, PutCommand } = require('@aws-sdk/lib-dynamodb');
 // silent fallback to the staging name would write to the wrong account and
 // orphan every subject (mirrors the Python module's documented hazard).
 const PII_SUBJECT_INDEX_TABLE = process.env.PII_SUBJECT_INDEX_TABLE
-  || 'picasso-pii-subject-index-staging';
+  || 'picasso-pii-subject-index';
 
 // Bounded retry for the get → conditional-put race. 3 attempts is ample:
 // each lost race means a winner committed, so the next iteration's strongly-

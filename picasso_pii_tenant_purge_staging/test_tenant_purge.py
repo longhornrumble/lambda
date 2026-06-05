@@ -399,7 +399,7 @@ def test_subject_index_real_delete_key(purge):
     mod, mock_ddb, _ = purge
     t = _table_mock(items=[{"tenant_id": "TEN-X", "normalized_email": "a@b.c",
                             "pii_subject_id": "psid-1"}])
-    store = _wire_tables(mod, mock_ddb, {"picasso-pii-subject-index-staging": t})
+    store = _wire_tables(mod, mock_ddb, {"picasso-pii-subject-index": t})
     mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     t.delete_item.assert_called_once_with(
         Key={"tenant_id": "TEN-X", "normalized_email": "a@b.c"})

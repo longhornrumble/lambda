@@ -9,8 +9,8 @@ MFS-scoped surfaces. Capability-bundle item 1a per
 
 - Cold-start env-guard (refuses to run outside staging account 525)
 - Operator input validation (typed payload, `dry_run` default `true`)
-- Subject resolution via `picasso-pii-subject-index-staging`
-- **Idempotent audit writes** to `picasso-pii-dsar-audit-staging` — `ConditionExpression` refuses replay on identical (`dsar_id`, `event_timestamp`). Per-DSAR events: `request_received` → `surface_walked:<surface>` (one per non-deferred walker) → `closed`. Audit log is the legal trail; idempotency prevents silent overwrite.
+- Subject resolution via `picasso-pii-subject-index`
+- **Idempotent audit writes** to `picasso-pii-dsar-audit` — `ConditionExpression` refuses replay on identical (`dsar_id`, `event_timestamp`). Per-DSAR events: `request_received` → `surface_walked:<surface>` (one per non-deferred walker) → `closed`. Audit log is the legal trail; idempotency prevents silent overwrite.
 - **`form-submissions` walker** — tenant-scoped Query (PK=`tenant_id`) + FilterExpression on `pii_subject_id`:
   - `request_type=access` → matched rows in `exported_rows`
   - `request_type=delete` + `dry_run=true` → count only
@@ -102,7 +102,7 @@ aws lambda invoke \
 
 - **`dry_run` defaults to `true`.** Operator must explicitly set `"dry_run": false` to delete. Typo / missing field can never produce unintended deletion.
 - **Cold-start env-guard.** Lambda refuses to run in any account other than `525409062831` (staging). Promotion to prod requires explicit code change — never config-only.
-- **Audit writes never read or delete.** Role grants `PutItem` only on `picasso-pii-dsar-audit-staging`. Append-only event log. SLA-alarm Lambda (item 3) reads under a separate role.
+- **Audit writes never read or delete.** Role grants `PutItem` only on `picasso-pii-dsar-audit`. Append-only event log. SLA-alarm Lambda (item 3) reads under a separate role.
 - **`status` field duplicated to top-level attribute** so the `StatusIndex` GSI (PR #157) can be queried directly — no nested-attribute scan.
 - **Email normalization mirrors Phase-1 writer** (`.strip().lower()`) — required for subject-index `get_item` to hit.
 

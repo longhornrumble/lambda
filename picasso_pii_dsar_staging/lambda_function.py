@@ -47,11 +47,11 @@ STATUS SEMANTICS (audit fix-now #5):
 WHAT THIS LAMBDA DOES TODAY:
     - Cold-start env-guard (refuse to run outside account 525)
     - Input validation (required fields, supported types, dry_run default)
-    - Subject resolution: identifier → pii_subject_id via picasso-pii-subject-index-staging
+    - Subject resolution: identifier → pii_subject_id via picasso-pii-subject-index
     - Audit writes — append-only, idempotent (ConditionExpression refuses
       replay on identical (dsar_id, event_timestamp)). Per-DSAR events:
       request_received → surface_walked:<surface> (one per non-deferred
-      surface) → closed. All to picasso-pii-dsar-audit-staging.
+      surface) → closed. All to picasso-pii-dsar-audit.
     - form-submissions walker — tenant-scoped Query + FilterExpression on
       pii_subject_id; access returns rows in exported_rows; delete dry-runs by
       default; explicit dry_run=false performs DeleteItem per matched row;
@@ -147,8 +147,8 @@ logger.setLevel(logging.INFO)
 EXPECTED_ACCOUNT = os.environ.get("EXPECTED_ACCOUNT")
 
 # Staging table names — single source of truth (matches infra/modules/* locals).
-TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
-TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit-staging"
+TABLE_SUBJECT_INDEX = "picasso-pii-subject-index"
+TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit"
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events"
@@ -513,7 +513,7 @@ def _validate(event):
 # Subject resolution
 # ───────────────────────────────────────────────────────────────────────────
 def _resolve_subject(tenant_id, normalized_email):
-    """Look up pii_subject_id via picasso-pii-subject-index-staging.
+    """Look up pii_subject_id via picasso-pii-subject-index.
 
     Returns the pii_subject_id string, or None if no index entry exists.
     The subject-index Query is keyed on (tenant_id, normalized_email).
@@ -567,7 +567,7 @@ def _resolve_psid_subject(tenant_id, psid):
     sessionId list to the tenant.
 
     Why this returns sessionIds (not pii_subject_id): Meta-only subjects
-    have no entry in picasso-pii-subject-index-staging (the index is built
+    have no entry in picasso-pii-subject-index (the index is built
     from form-submission writes per Phase-1; PSID-only subjects never
     submit forms). The sessionId list IS the subject context for the
     psid-path walkers — _walk_recent_messages + _walk_session_events
@@ -627,7 +627,7 @@ def _resolve_psid_subject(tenant_id, psid):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Audit write (append-only event log to picasso-pii-dsar-audit-staging)
+# Audit write (append-only event log to picasso-pii-dsar-audit)
 # ───────────────────────────────────────────────────────────────────────────
 def _now_iso():
     # M9.G7 / F-DSAR27: PINNED format. The SLA monitor Lambda
@@ -657,7 +657,7 @@ def _write_audit_event(dsar_id, event_type, status, payload, is_smoke_test=False
 
     is_smoke_test (closeout-audit row #15): when True, stamps a top-level
     `is_smoke_test=True` attribute on the audit row so operator scans of
-    `picasso-pii-dsar-audit-staging` can FilterExpression them out without
+    `picasso-pii-dsar-audit` can FilterExpression them out without
     depending on the `dsar_id` prefix (which is a UX convention, not a
     schema guarantee). When False (default), no attribute is written
     (forward-compatible with pre-fix rows; readers MUST use .get()).
