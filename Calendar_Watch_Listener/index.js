@@ -485,7 +485,14 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
   if (booking) {
     const newStart = calEvent.start?.dateTime ?? calEvent.start?.date ?? null;
     const newEnd   = calEvent.end?.dateTime   ?? calEvent.end?.date   ?? null;
-    if (newStart && booking.startAt && newStart !== booking.startAt) {
+    // Compare INSTANTS, not strings: Google returns start.dateTime with a UTC
+    // offset (e.g. "...-05:00") while booking.start_at is stored Z-normalized, so a
+    // raw `!==` false-positives "moved" on every unchanged booking → the consumer's
+    // reconcileMoved would cancel it. Only a genuine instant change is a move. Skip
+    // on an unparseable date (NaN) rather than risk a false cancel.
+    const newStartMs     = newStart ? Date.parse(newStart) : NaN;
+    const bookingStartMs = booking.startAt ? Date.parse(booking.startAt) : NaN;
+    if (Number.isFinite(newStartMs) && Number.isFinite(bookingStartMs) && newStartMs !== bookingStartMs) {
       envelopes.push({
         event_type:          'booking.calendar_moved',
         ...commonFields,
@@ -496,16 +503,15 @@ async function deriveTypedEnvelopes(calEvent, tenantId, coordinatorId, calendarP
       });
     }
 
-    // Reassigned: determine current "effective owner" — organizer or first accepted attendee.
-    const newResourceId = resolveResourceId(calEvent);
-    if (newResourceId && booking.resourceId && newResourceId !== booking.resourceId) {
-      envelopes.push({
-        event_type:            'booking.calendar_reassigned',
-        ...commonFields,
-        previous_resource_id:  booking.resourceId,
-        new_resource_id:       newResourceId,
-      });
-    }
+    // booking.calendar_reassigned is DISABLED (2026-06-05) pending an owner-identity
+    // contract decision. resolveResourceId(calEvent) returns the organizer EMAIL, but
+    // booking.resource_id is a routing LABEL (e.g. "test-coordinator") — comparing the
+    // two false-positives "reassigned" on every normal booking (an email never equals
+    // a label), and the consumer then overwrites resource_id with the email. Re-enabling
+    // requires deciding how "the assigned coordinator" is identified (label vs email),
+    // reconciling the previous_resource_id / new_resource_id envelope contract
+    // (FROZEN_CONTRACTS) and the Calendar_Lifecycle_Consumer reconcileReassigned handler.
+    // Tracked as a separate task.
   }
 
   // ── Attendee status changes (independent of booking record) ──
