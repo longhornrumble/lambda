@@ -91,13 +91,13 @@ EXPECTED_ACCOUNT = os.environ.get("EXPECTED_ACCOUNT")
 TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events"
-TABLE_SUBJECT_INDEX = "picasso-pii-subject-index-staging"
+TABLE_SUBJECT_INDEX = "picasso-pii-subject-index"
 TABLE_SMS_USAGE = "picasso-sms-usage"
 # Class C (F-DSAR31): pseudonymized session summaries, partitioned by
 # pk=TENANT#{tenant_hash} (tenant_hash, NOT tenant_id). Reached only when the
 # caller (the dashboard UI, or a CLI operator) supplies tenant_hash.
 TABLE_SESSION_SUMMARIES = "picasso-session-summaries"
-TABLE_PURGE_AUDIT = "picasso-pii-tenant-purge-audit-staging"
+TABLE_PURGE_AUDIT = "picasso-pii-tenant-purge-audit"
 GSI_NOTIFICATION_EVENTS_BY_MESSAGE_ID = "ByMessageId"
 
 # Carve-outs surfaced in every response/audit so retention is explicit, not
@@ -229,7 +229,7 @@ def _validate(event):
 
 
 # ───────────────────────────────────────────────────────────────────────────
-# Audit write (append-only event log to picasso-pii-tenant-purge-audit-staging)
+# Audit write (append-only event log to picasso-pii-tenant-purge-audit)
 # ───────────────────────────────────────────────────────────────────────────
 def _now_iso():
     # Microsecond timespec for stable lexicographic ordering of audit rows

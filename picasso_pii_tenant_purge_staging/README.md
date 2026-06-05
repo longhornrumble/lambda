@@ -24,7 +24,7 @@ Cleanly tenant-partitioned DynamoDB surfaces, plus the notification-events chain
 | `picasso-form-submissions-staging` | Query `PK=tenant_id` → delete partition |
 | `picasso-notification-sends` | Query `PK=TENANT#{tenant_id}` → delete; yields `message_id`s |
 | `picasso-notification-events` | chained via `message_id`s (ByMessageId GSI) |
-| `picasso-pii-subject-index-staging` | Query `PK=tenant_id` → delete (re-id key) |
+| `picasso-pii-subject-index` | Query `PK=tenant_id` → delete (re-id key) |
 | `picasso-sms-usage` | Query `PK=tenant_id` → delete (also 30d TTL) |
 
 **Not in P1** (design §8 decisions, RESOLVED 2026-06-03):
@@ -71,7 +71,7 @@ aws lambda invoke --function-name picasso-pii-tenant-purge-staging \
 
 - **Account guard** — refuses to run outside staging account `525409062831`.
 - **Dual gate** + **dry-run default** (above).
-- **Append-only audit** to `picasso-pii-tenant-purge-audit-staging`: `purge_requested → surface_purged:<surface> → closed`, idempotent on `(purge_id, event_timestamp)`.
+- **Append-only audit** to `picasso-pii-tenant-purge-audit`: `purge_requested → surface_purged:<surface> → closed`, idempotent on `(purge_id, event_timestamp)`.
 - **Corrupted-row skip** + per-surface **delete-failure counts** — one bad row never aborts the cascade.
 - **Bounded fan-out** on the events chain; overflow surfaces as a followup (idempotent re-invoke drains it).
 - **Redaction in logs** — never logs row PII (email/content); key-field presence only.
