@@ -330,6 +330,44 @@ def test_purge_form_submissions_staging_composite_no_gsi(purge):
         "tenant_id": "TEN-X", "submission_id": "s1"}
 
 
+def test_purge_form_submissions_prod_single_key_paginates(purge):
+    """Audit GAP: the GSI (prod single-key) path must paginate — the IndexName
+    kwarg must not break ExclusiveStartKey threading in _query_partition."""
+    mod, mock_ddb, _ = purge
+    _set_form_schema(mock_ddb, single_key=True)
+    store = _wire_tables(mod, mock_ddb, {
+        "picasso-form-submissions-staging": _table_mock(query_pages=[
+            {"Items": [{"submission_id": "s1"}], "LastEvaluatedKey": {"submission_id": "s1"}},
+            {"Items": [{"submission_id": "s2"}]},
+        ]),
+    })
+    result = mod._purge_form_submissions("TEN-X", dry_run=False)
+    assert result["rows_deleted"] == 2
+    fs = store["picasso-form-submissions-staging"]
+    assert all(c.kwargs.get("IndexName") == mod.TENANT_TIMESTAMP_INDEX
+               for c in fs.query.call_args_list)
+    assert "ExclusiveStartKey" in fs.query.call_args_list[1].kwargs
+    for call in fs.delete_item.call_args_list:
+        assert set(call.kwargs["Key"].keys()) == {"submission_id"}
+
+
+def test_purge_form_submissions_prod_single_key_dry_run(purge):
+    """Audit GAP: dry-run on the prod single-key shape — query via the GSI,
+    count only, no DeleteItem."""
+    mod, mock_ddb, _ = purge
+    _set_form_schema(mock_ddb, single_key=True)
+    store = _wire_tables(mod, mock_ddb, {
+        "picasso-form-submissions-staging": _table_mock(
+            items=[{"submission_id": "s1"}, {"submission_id": "s2"}]),
+    })
+    result = mod._purge_form_submissions("TEN-X", dry_run=True)
+    assert result["rows_found"] == 2
+    assert result["action"] == "dry_run_count"
+    fs = store["picasso-form-submissions-staging"]
+    assert fs.query.call_args.kwargs["IndexName"] == mod.TENANT_TIMESTAMP_INDEX
+    fs.delete_item.assert_not_called()
+
+
 def test_purge_form_submissions_describe_failure_marks_error(purge):
     """A DescribeTable denial/outage surfaces the surface as errored (not a
     silent zero-row no-op) and never issues a Query."""

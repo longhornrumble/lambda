@@ -739,6 +739,14 @@ def _form_submissions_key_schema(table_name):
         keys = {k["KeyType"]: k["AttributeName"] for k in desc["KeySchema"]}
         cached = (keys["HASH"], keys.get("RANGE"))
         _form_key_schema_cache[table_name] = cached
+        # Observability (audit): log the resolved schema once so an operator can
+        # confirm the table name (FORM_SUBMISSIONS_TABLE env) resolved to the
+        # expected shape — a misconfigured name would otherwise surface only as
+        # a cryptic downstream ResourceNotFound/ValidationException. No PII.
+        logger.info(
+            "form_submissions_schema_resolved: table=%s hash=%s range=%s",
+            table_name, cached[0], cached[1],
+        )
     return cached
 
 
@@ -2165,9 +2173,14 @@ def _pre_phase1_cli_snippet(tenant_id):
     time from the DSAR ledger; prevents PII leak into operator response
     storage.
     """
+    # D2: reference the env-resolved table name (account-divergent — prod is
+    # picasso_form_submissions, staging is picasso-form-submissions-staging) and
+    # a profile placeholder, so the snippet is correct on whichever account the
+    # Lambda runs in (the prior hardcoded staging name + profile misdirected a
+    # prod operator).
     return (
-        f"  aws dynamodb scan --table-name picasso-form-submissions-staging \\\n"
-        f"    --profile myrecruiter-staging \\\n"
+        f"  aws dynamodb scan --table-name {TABLE_FORM_SUBMISSIONS} \\\n"
+        f"    --profile <AWS_PROFILE> \\\n"
         f"    --filter-expression 'submitter_email = :e AND tenant_id = :t' \\\n"
         f"    --expression-attribute-values "
         f"'{{\":e\":{{\"S\":\"<SUBJECT_EMAIL>\"}},\":t\":{{\"S\":\"{tenant_id}\"}}}}'"
@@ -2318,6 +2331,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "rows_touched": fs["rows_found"],
             "rows_deleted": fs.get("rows_deleted", 0),
             "rows_skipped_corrupted": fs.get("rows_skipped_corrupted", 0),
+            "rows_delete_failed": fs.get("rows_delete_failed", 0),
         }
         if fs.get("rows_skipped_corrupted", 0) > 0:
             manual_followups.append(
@@ -2329,6 +2343,18 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             # the delete batch was not exhaustive.
             result["status"] = "errored"
             result["error"] = "rows_skipped_corrupted"
+        # D2 (audit GAP-1): a failed DeleteItem (throttle/transient/AccessDenied)
+        # is also a non-exhaustive delete — taint status so the DSAR closes
+        # partial_error, not completed. More likely on the now-reachable prod
+        # table. Mirrors the session-events dispatcher contract.
+        if fs.get("rows_delete_failed", 0) > 0:
+            manual_followups.append(
+                f"form-submissions: {fs['rows_delete_failed']} row(s) matched "
+                f"but DeleteItem failed — see CloudWatch logs for error codes; "
+                f"re-invoke to retry the un-deleted rows."
+            )
+            result["status"] = "errored"
+            result["error"] = "rows_delete_failed"
         walker_results["form-submissions"] = result
 
     # Coverage gap noted whenever the walker ran (even with 0 rows): operator

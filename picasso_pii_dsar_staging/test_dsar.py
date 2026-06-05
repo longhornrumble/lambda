@@ -821,6 +821,53 @@ def test_walker_form_schema_described_once_per_container(dsar):
     assert mock_ddb.meta.client.describe_table.call_count == 1
 
 
+def test_walker_prod_single_key_paginates_through_last_evaluated_key(dsar):
+    """Audit GAP-1: the GSI (prod single-key) path must thread ExclusiveStartKey
+    across pages exactly like the base-table path — the IndexName kwarg must not
+    break pagination."""
+    mod, mock_ddb, _ = dsar
+    _set_form_schema(mock_ddb, single_key=True)
+    fs_table = MagicMock()
+    fs_table.query.side_effect = [
+        {"Items": [_row("s1")], "LastEvaluatedKey": {"submission_id": "s1"}},
+        {"Items": [_row("s2")]},
+    ]
+    mock_ddb.Table.return_value = fs_table
+    result = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="delete", dry_run=False,
+    )
+    assert result["rows_found"] == 2
+    assert result["rows_deleted"] == 2
+    assert fs_table.query.call_count == 2
+    # both pages queried the GSI; page 2 carried ExclusiveStartKey
+    assert all(c.kwargs.get("IndexName") == mod.TENANT_TIMESTAMP_INDEX
+               for c in fs_table.query.call_args_list)
+    assert "ExclusiveStartKey" in fs_table.query.call_args_list[1].kwargs
+
+
+def test_walker_prod_single_key_access_and_dry_run(dsar):
+    """Audit GAP-2: the access (export) + delete-dry_run branches on the prod
+    single-key shape — query goes through the GSI, no deletes occur, and the
+    matched rows are returned for export."""
+    mod, mock_ddb, _ = dsar
+    _set_form_schema(mock_ddb, single_key=True)
+    fs_table = MagicMock()
+    fs_table.query.return_value = {"Items": [_row("s1"), _row("s2")]}
+    mock_ddb.Table.return_value = fs_table
+
+    acc = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="access", dry_run=True)
+    assert acc["action"] == "exported"
+    assert len(acc["exported_rows"]) == 2
+    assert fs_table.query.call_args.kwargs["IndexName"] == mod.TENANT_TIMESTAMP_INDEX
+
+    dry = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="delete", dry_run=True)
+    assert dry["action"] == "dry_run_count"
+    assert dry["rows_found"] == 2
+    fs_table.delete_item.assert_not_called()
+
+
 def test_walker_empty_match_returns_zero(dsar):
     mod, mock_ddb, _ = dsar
     fs_table = MagicMock()
@@ -2511,6 +2558,29 @@ def test_dispatcher_emits_error_followup_on_walker_error(dsar):
     # so handler can compute partial_error close status.
     assert walker_results["form-submissions"]["status"] == "errored"
     assert walker_results["form-submissions"]["error"] == "query_failed"
+
+
+def test_dispatcher_form_submissions_delete_failed_taints_status(dsar):
+    """Audit GAP-1: a DeleteItem failure (not a corrupted row) on form-submissions
+    must taint the surface status to 'errored' so the DSAR closes partial_error,
+    not completed — otherwise a partial PII delete is silently reported done."""
+    mod, mock_ddb, _ = dsar
+    from botocore.exceptions import ClientError
+    tables = _stub_dispatch(mock_ddb, fs_items=[_row("s1"), _row("s2")])
+    fs_table = tables[0]
+    fs_table.delete_item.side_effect = [
+        ClientError({"Error": {"Code": "ThrottlingException"}}, "DeleteItem"),
+        {},
+    ]
+    _rows, followups, _exp, walker_results = mod._walk_mfs_surfaces(
+        pii_subject_id="subj_xyz", tenant_id="TEN",
+        normalized_email="test@x.co",
+        request_type="delete", dry_run=False,
+    )
+    assert walker_results["form-submissions"]["status"] == "errored"
+    assert walker_results["form-submissions"]["error"] == "rows_delete_failed"
+    assert walker_results["form-submissions"]["rows_delete_failed"] == 1
+    assert any("DeleteItem failed" in f for f in followups)
 
 
 def test_dispatcher_skips_all_walkers_when_subject_not_found(dsar):

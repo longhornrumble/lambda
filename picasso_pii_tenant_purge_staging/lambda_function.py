@@ -392,6 +392,13 @@ def _form_submissions_key_schema(table_name):
         keys = {k["KeyType"]: k["AttributeName"] for k in desc["KeySchema"]}
         cached = (keys["HASH"], keys.get("RANGE"))
         _form_key_schema_cache[table_name] = cached
+        # Observability (audit): log the resolved schema once so an operator can
+        # confirm the table name (FORM_SUBMISSIONS_TABLE env) resolved to the
+        # expected shape. No PII.
+        logger.info(
+            "form_submissions_schema_resolved: table=%s hash=%s range=%s",
+            table_name, cached[0], cached[1],
+        )
     return cached
 
 
