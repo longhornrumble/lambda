@@ -373,6 +373,84 @@ def test_resolve_subject_returns_none_when_not_found(dsar):
     assert mod._resolve_subject("TEN123", "a@b.co") is None
 
 
+# ── G1: Gmail-aware subject-index lookup (phase-audit 2026-06-05) ─────────────
+
+@pytest.mark.parametrize("raw,expected", [
+    ("foo.bar@gmail.com", "foobar@gmail.com"),         # gmail: drop dots
+    ("x+promo@gmail.com", "x@gmail.com"),              # gmail: strip +tag
+    ("a.b.c@googlemail.com", "abc@gmail.com"),         # googlemail alias + dots
+    ("Keep.Dots@example.com", "keep.dots@example.com"),  # non-gmail: lower only
+    ("CASE@Test.io", "case@test.io"),
+    ("  pad@gmail.com  ", "pad@gmail.com"),
+])
+def test_normalize_email_for_index_matches_writer(dsar, raw, expected):
+    mod, _, _ = dsar
+    assert mod._normalize_email_for_index(raw) == expected
+
+
+@pytest.mark.parametrize("bad", [None, "", "  ", "noat", "+tag@gmail.com", "a b@gmail.com"])
+def test_normalize_email_for_index_returns_none_for_unusable(dsar, bad):
+    mod, _, _ = dsar
+    assert mod._normalize_email_for_index(bad) is None
+
+
+def test_resolve_subject_gmail_dotted_looks_up_collapsed_key(dsar):
+    """The G1 bug: a Gmail-with-dots subject must look up the COLLAPSED index
+    key the writer stored, not the strip+lower form."""
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.get_item.return_value = {
+        "Item": {"pii_subject_id": "subj_gmail"}
+    }
+    mock_ddb.Table.return_value = mock_table
+    # Input is the strip+lower'd value the handler passes (foo.bar@gmail.com).
+    assert mod._resolve_subject("TEN123", "foo.bar@gmail.com") == "subj_gmail"
+    mock_table.get_item.assert_called_once_with(Key={
+        "tenant_id": "TEN123", "normalized_email": "foobar@gmail.com",
+    })
+
+
+def test_resolve_subject_non_gmail_key_unchanged(dsar):
+    """Non-Gmail addresses are unaffected (regression guard for the prior path)."""
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_table.get_item.return_value = {"Item": {"pii_subject_id": "s"}}
+    mock_ddb.Table.return_value = mock_table
+    mod._resolve_subject("TEN123", "keep.dots@example.com")
+    mock_table.get_item.assert_called_once_with(Key={
+        "tenant_id": "TEN123", "normalized_email": "keep.dots@example.com",
+    })
+
+
+def test_resolve_subject_unusable_email_returns_none_without_query(dsar):
+    """A non-usable address (writer would have minted UNINDEXED) resolves to None
+    without ever hitting the index."""
+    mod, mock_ddb, _ = dsar
+    mock_table = MagicMock()
+    mock_ddb.Table.return_value = mock_table
+    assert mod._resolve_subject("TEN123", "+tag@gmail.com") is None
+    mock_table.get_item.assert_not_called()
+
+
+# ── G2: strict dry_run validation (phase-audit 2026-06-05) ───────────────────
+
+@pytest.mark.parametrize("bad_dry_run", [0, 0.0, 1, "false", "true", []])
+def test_validate_rejects_non_bool_dry_run(dsar, bad_dry_run):
+    """numeric 0 previously coerced to a REAL delete (bool(0) is False)."""
+    mod, _, _ = dsar
+    with pytest.raises(mod.InvalidInput, match="dry_run must be boolean"):
+        mod._validate(_valid_event(dry_run=bad_dry_run))
+
+
+def test_validate_accepts_bool_dry_run_and_defaults_true(dsar):
+    mod, _, _ = dsar
+    assert mod._validate(_valid_event(dry_run=False))["dry_run"] is False
+    assert mod._validate(_valid_event(dry_run=True))["dry_run"] is True
+    ev = _valid_event()
+    del ev["dry_run"]
+    assert mod._validate(ev)["dry_run"] is True  # default safe
+
+
 # ── M2 Sprint B — psid subject resolution ──────────────────────────────────
 def test_resolve_psid_subject_returns_sessionIds_for_each_page(dsar):
     """Two-step lookup: TenantIndex GSI Query returns N PAGE# rows; resolver
