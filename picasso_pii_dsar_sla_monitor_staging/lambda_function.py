@@ -4,7 +4,7 @@ DSAR SLA Monitor Lambda — daily EventBridge-triggered scan for at-risk DSARs.
 M3 done-bar #1 (master plan v0.3 §M3). Closes D5 G-D.
 
 Behavior:
-- Queries `picasso-pii-dsar-audit-staging` via the StatusIndex GSI for
+- Queries `picasso-pii-dsar-audit` via the StatusIndex GSI for
   `status='in_progress'` audit rows whose `event_timestamp` is older than
   the SLA threshold (default: intake + 25 days, 5 days before CCPA 30-day
   combined SLA).
@@ -45,7 +45,7 @@ logger.setLevel(logging.INFO)
 # Env-var-driven config (set by Terraform module). Defaults match the
 # staging table + 25d SLA window so the module can omit these when the
 # defaults apply.
-AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'picasso-pii-dsar-audit-staging')
+AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'picasso-pii-dsar-audit')
 SLA_DAYS_INTAKE_PLUS = int(os.environ.get('SLA_DAYS_INTAKE_PLUS', '25'))
 INTAKE_EVENT_TYPE = 'request_received'  # status='in_progress' uniquely set on this event
 INTAKE_STATUS = 'in_progress'

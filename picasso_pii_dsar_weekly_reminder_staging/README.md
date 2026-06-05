@@ -57,7 +57,7 @@ state. If either surfaces something, the operator follows playbook §8.
 | `SNS_TOPIC_ARN` | yes | — | Ops-alerts topic to publish to. Fail-closed if unset. |
 | `PLAYBOOK_URL` | no | staging branch playbook URL | Reference URL in the reminder body. |
 | `SLA_MONITOR_FUNCTION_NAME` | no | `picasso-pii-dsar-sla-monitor-staging` | Used in the CloudWatch CLI snippet. |
-| `AUDIT_TABLE` | no | `picasso-pii-dsar-audit-staging` | Used in the audit-table CLI snippet. |
+| `AUDIT_TABLE` | no | `picasso-pii-dsar-audit` | Used in the audit-table CLI snippet. |
 | `SLA_DAYS_INTAKE_PLUS` | no | `25` | Days past intake at which a DSAR is "at risk". Mirrors the primary monitor. |
 
 ## Schedule

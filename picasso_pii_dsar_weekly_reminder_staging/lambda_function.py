@@ -65,7 +65,7 @@ SLA_MONITOR_FUNCTION_NAME = os.environ.get(
     'SLA_MONITOR_FUNCTION_NAME',
     'picasso-pii-dsar-sla-monitor-staging',
 )
-AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'picasso-pii-dsar-audit-staging')
+AUDIT_TABLE = os.environ.get('AUDIT_TABLE', 'picasso-pii-dsar-audit')
 SLA_DAYS_INTAKE_PLUS = os.environ.get('SLA_DAYS_INTAKE_PLUS', '25')
 
 sns = boto3.client('sns')

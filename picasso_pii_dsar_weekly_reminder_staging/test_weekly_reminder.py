@@ -111,7 +111,7 @@ class TestBuildMessage(_EnvIsolatedTestCase):
         mod = _reload_module({
             'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:000000000000:test',
             'SLA_MONITOR_FUNCTION_NAME': 'picasso-pii-dsar-sla-monitor-staging',
-            'AUDIT_TABLE': 'picasso-pii-dsar-audit-staging',
+            'AUDIT_TABLE': 'picasso-pii-dsar-audit',
             'SLA_DAYS_INTAKE_PLUS': '25',
         })
         body = mod._build_message()
@@ -120,10 +120,10 @@ class TestBuildMessage(_EnvIsolatedTestCase):
     def test_message_includes_audit_table_name(self):
         mod = _reload_module({
             'SNS_TOPIC_ARN': 'arn:aws:sns:us-east-1:000000000000:test',
-            'AUDIT_TABLE': 'picasso-pii-dsar-audit-staging',
+            'AUDIT_TABLE': 'picasso-pii-dsar-audit',
         })
         body = mod._build_message()
-        self.assertIn('picasso-pii-dsar-audit-staging', body)
+        self.assertIn('picasso-pii-dsar-audit', body)
 
     def test_message_uses_in_progress_status(self):
         """Regression guard: must NOT use status='open' (which is the bug
