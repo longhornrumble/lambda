@@ -135,12 +135,14 @@ def test_account_guard_wrong_account_fails_no_ddb(purge):
     assert mock_ddb.Table.call_count == 0
 
 
-def test_account_guard_unset_expected_account_fails_closed(purge):
-    """#1a fail-closed: unset EXPECTED_ACCOUNT must REFUSE (no default to an
-    account), without consulting STS or touching any table."""
+@pytest.mark.parametrize("unset", [None, ""])
+def test_account_guard_unset_expected_account_fails_closed(purge, unset):
+    """#1a fail-closed: an unset (None) OR empty ("") EXPECTED_ACCOUNT must
+    REFUSE (no default to an account), without consulting STS or touching any
+    table. os.environ.get returns "" when the var is set-but-empty."""
     mod, mock_ddb, mock_sts = purge
     mock_sts.get_caller_identity.reset_mock()
-    mod.EXPECTED_ACCOUNT = None
+    mod.EXPECTED_ACCOUNT = unset
     _wire_tables(mod, mock_ddb, {})
     resp = mod.lambda_handler(_event(), None)
     assert resp["status"] == "failed"
