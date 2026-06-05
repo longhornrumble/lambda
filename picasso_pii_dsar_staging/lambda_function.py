@@ -149,7 +149,14 @@ EXPECTED_ACCOUNT = os.environ.get("EXPECTED_ACCOUNT")
 # Staging table names — single source of truth (matches infra/modules/* locals).
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index"
 TABLE_DSAR_AUDIT = "picasso-pii-dsar-audit"
-TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
+# D2: form-submissions is the table-rename program's held carve-out — its NAME
+# diverges across accounts (staging picasso-form-submissions-staging vs prod
+# picasso_form_submissions), so the name is account-resolved via an IaC-set env
+# var (default = the staging name), mirroring the EXPECTED_ACCOUNT pattern. The
+# KEY SCHEMA also diverges; that is handled at access time by
+# _form_submissions_key_schema (no account branch).
+TABLE_FORM_SUBMISSIONS = os.environ.get(
+    "FORM_SUBMISSIONS_TABLE", "picasso-form-submissions-staging")
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events"
 TABLE_RECENT_MESSAGES = "picasso-recent-messages"
@@ -702,14 +709,57 @@ def _write_audit_event(dsar_id, event_type, status, payload, is_smoke_test=False
 # ───────────────────────────────────────────────────────────────────────────
 # Per-surface walkers
 # ───────────────────────────────────────────────────────────────────────────
-def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
-    """Walk picasso-form-submissions-staging for one subject under one tenant.
+# ── D2: form-submissions schema-adaptive access ────────────────────────────
+# The form-submissions table key schema DIVERGES across accounts (the schema +
+# naming carve-out held out of the table-rename program):
+#   - staging picasso-form-submissions-staging — composite key (tenant_id HASH,
+#     submission_id RANGE). A subject's rows are found by a base-table Query on
+#     tenant_id.
+#   - prod picasso_form_submissions — single key (submission_id HASH); tenant_id
+#     is a NON-key attribute, so a base-table Query on tenant_id raises
+#     ValidationException. The tenant's rows are reachable via the
+#     tenant-timestamp-index GSI (PK=tenant_id), present on BOTH tables with
+#     ProjectionType=ALL and full row coverage (verified 2026-06-05: prod 47/47,
+#     staging 5/5 rows present in the GSI).
+# One account-agnostic path adapts to whichever shape it runs against by
+# discovering the live table key schema once per container (DescribeTable is
+# cached — the schema is immutable for the table's life). No account-id branch,
+# no prod schema migration.
+TENANT_TIMESTAMP_INDEX = "tenant-timestamp-index"
+_form_key_schema_cache = {}
 
-    Access pattern: tenant-scoped Query (PK=tenant_id) + FilterExpression on
-    pii_subject_id. The PiiSubjectIdIndex GSI is forward-referenced in IAM but
-    not yet created (Apply-3 deferred per D5). Tenant-scoped Query bounds the
-    read to one partition — far cheaper than a full-table Scan, and matches
-    the v3 §F12 procedure-mitigated reachability pattern.
+
+def _form_submissions_key_schema(table_name):
+    """Return (hash_key, range_key|None) for the form-submissions table, cached
+    per container. Raises ClientError if DescribeTable is denied/unavailable —
+    callers wrap it the same as a query failure."""
+    cached = _form_key_schema_cache.get(table_name)
+    if cached is None:
+        desc = ddb.meta.client.describe_table(TableName=table_name)["Table"]
+        keys = {k["KeyType"]: k["AttributeName"] for k in desc["KeySchema"]}
+        cached = (keys["HASH"], keys.get("RANGE"))
+        _form_key_schema_cache[table_name] = cached
+        # Observability (audit): log the resolved schema once so an operator can
+        # confirm the table name (FORM_SUBMISSIONS_TABLE env) resolved to the
+        # expected shape — a misconfigured name would otherwise surface only as
+        # a cryptic downstream ResourceNotFound/ValidationException. No PII.
+        logger.info(
+            "form_submissions_schema_resolved: table=%s hash=%s range=%s",
+            table_name, cached[0], cached[1],
+        )
+    return cached
+
+
+def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
+    """Walk the form-submissions table for one subject under one tenant.
+
+    Access pattern: tenant-scoped Query + FilterExpression on pii_subject_id.
+    Schema-adaptive (D2): when tenant_id is the base-table HASH (staging) the
+    base table is queried directly; when the table is single-submission_id-keyed
+    (prod) the tenant-timestamp-index GSI is queried on tenant_id instead. Both
+    bound the read to one tenant — far cheaper than a full-table Scan — and yield
+    identical row coverage (GSI ProjectionType=ALL). See
+    _form_submissions_key_schema.
 
     request_type:
       - "access":            return matched rows in `exported_rows`
@@ -728,6 +778,16 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
     """
     table = ddb.Table(TABLE_FORM_SUBMISSIONS)
 
+    try:
+        hash_key, range_key = _form_submissions_key_schema(TABLE_FORM_SUBMISSIONS)
+    except ClientError as exc:
+        logger.error(
+            "form_submissions_describe_failed: tenant=%s code=%s",
+            tenant_id, exc.response.get("Error", {}).get("Code"),
+        )
+        return {"rows_found": 0, "session_ids": [], "error": "query_failed"}
+    index_name = None if hash_key == "tenant_id" else TENANT_TIMESTAMP_INDEX
+
     matched = []
     last_evaluated_key = None
     while True:
@@ -735,6 +795,8 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
             "KeyConditionExpression": Key("tenant_id").eq(tenant_id),
             "FilterExpression": Attr("pii_subject_id").eq(pii_subject_id),
         }
+        if index_name:
+            kwargs["IndexName"] = index_name
         if last_evaluated_key:
             kwargs["ExclusiveStartKey"] = last_evaluated_key
         try:
@@ -779,30 +841,33 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
     deleted = 0
     delete_failed = 0
     skipped_corrupted = 0
+    # D2: the DeleteItem Key is built from the discovered table key schema —
+    # composite {tenant_id, submission_id} on staging, single {submission_id}
+    # on prod. Passing the staging composite key against the prod single-key
+    # table (or vice versa) would itself raise ValidationException.
+    key_fields = [hash_key] + ([range_key] if range_key else [])
     for row in matched:
         # Schema discipline (CLAUDE.md §"Schema Discipline"): the walker MUST
-        # tolerate corrupted rows — a missing PK/SK indicates writer drift,
+        # tolerate corrupted rows — a missing key attr indicates writer drift,
         # not an operator-actionable failure. Log + continue so one bad row
         # never breaks the whole batch.
-        row_tenant_id = row.get("tenant_id")
-        row_submission_id = row.get("submission_id")
-        if row_tenant_id is None or row_submission_id is None:
+        key = {k: row.get(k) for k in key_fields}
+        if any(v is None for v in key.values()):
             skipped_corrupted += 1
-            # D1 (PR1 fix-now-4): pii_subject_id REDACTED — opaque PSID is
-            # still PII per current classification (D5 G-H). tenant_id + the
-            # corrupted PK/SK marker are sufficient for operator triage.
+            # D1 (PR1 fix-now-4): pii_subject_id REDACTED (opaque PSID is still
+            # PII per D5 G-H), but tenant_id + the present-key marker are
+            # operator-actionable and non-PII. tenant_id is read off the row
+            # attribute (present even on the prod single-submission_id-key shape
+            # where it is not part of the key).
+            present = {k: (row.get(k) is not None) for k in key_fields}
             logger.error(
-                "form_submissions_delete_skipped_corrupted: "
-                "tenant_id=%s submission_id=%s "
-                "— row missing PK/SK; cannot delete safely",
-                row_tenant_id, row_submission_id,
+                "form_submissions_delete_skipped_corrupted: tenant_id=%s "
+                "key_present=%s — row missing key; cannot delete safely",
+                row.get("tenant_id"), present,
             )
             continue
         try:
-            table.delete_item(Key={
-                "tenant_id": row_tenant_id,
-                "submission_id": row_submission_id,
-            })
+            table.delete_item(Key=key)
             deleted += 1
         except ClientError as exc:
             # Audit row 8 (code-reviewer SR1): count delete failures so the
@@ -811,9 +876,9 @@ def _walk_form_submissions(pii_subject_id, tenant_id, request_type, dry_run):
             # silently undercounts and the operator believes the delete
             # completed when it didn't.
             delete_failed += 1
+            # Redaction: log the error code only — never the key values.
             logger.error(
-                "form_submissions_delete_failed: submission=%s code=%s",
-                row_submission_id,
+                "form_submissions_delete_failed: code=%s",
                 exc.response.get("Error", {}).get("Code"),
             )
     return {
@@ -2108,9 +2173,14 @@ def _pre_phase1_cli_snippet(tenant_id):
     time from the DSAR ledger; prevents PII leak into operator response
     storage.
     """
+    # D2: reference the env-resolved table name (account-divergent — prod is
+    # picasso_form_submissions, staging is picasso-form-submissions-staging) and
+    # a profile placeholder, so the snippet is correct on whichever account the
+    # Lambda runs in (the prior hardcoded staging name + profile misdirected a
+    # prod operator).
     return (
-        f"  aws dynamodb scan --table-name picasso-form-submissions-staging \\\n"
-        f"    --profile myrecruiter-staging \\\n"
+        f"  aws dynamodb scan --table-name {TABLE_FORM_SUBMISSIONS} \\\n"
+        f"    --profile <AWS_PROFILE> \\\n"
         f"    --filter-expression 'submitter_email = :e AND tenant_id = :t' \\\n"
         f"    --expression-attribute-values "
         f"'{{\":e\":{{\"S\":\"<SUBJECT_EMAIL>\"}},\":t\":{{\"S\":\"{tenant_id}\"}}}}'"
@@ -2261,6 +2331,7 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "rows_touched": fs["rows_found"],
             "rows_deleted": fs.get("rows_deleted", 0),
             "rows_skipped_corrupted": fs.get("rows_skipped_corrupted", 0),
+            "rows_delete_failed": fs.get("rows_delete_failed", 0),
         }
         if fs.get("rows_skipped_corrupted", 0) > 0:
             manual_followups.append(
@@ -2272,6 +2343,18 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             # the delete batch was not exhaustive.
             result["status"] = "errored"
             result["error"] = "rows_skipped_corrupted"
+        # D2 (audit GAP-1): a failed DeleteItem (throttle/transient/AccessDenied)
+        # is also a non-exhaustive delete — taint status so the DSAR closes
+        # partial_error, not completed. More likely on the now-reachable prod
+        # table. Mirrors the session-events dispatcher contract.
+        if fs.get("rows_delete_failed", 0) > 0:
+            manual_followups.append(
+                f"form-submissions: {fs['rows_delete_failed']} row(s) matched "
+                f"but DeleteItem failed — see CloudWatch logs for error codes; "
+                f"re-invoke to retry the un-deleted rows."
+            )
+            result["status"] = "errored"
+            result["error"] = "rows_delete_failed"
         walker_results["form-submissions"] = result
 
     # Coverage gap noted whenever the walker ran (even with 0 rows): operator

@@ -44,6 +44,16 @@ def dsar(monkeypatch):
     mock_sts = MagicMock()
     mock_s3 = MagicMock()
     mock_sts.get_caller_identity.return_value = {"Account": "525409062831"}
+    # D2: default form-submissions key schema = staging composite
+    # (tenant_id HASH, submission_id RANGE), consumed by
+    # _form_submissions_key_schema via ddb.meta.client.describe_table.
+    # Prod-shape tests override this with the single submission_id key.
+    mock_ddb_resource.meta.client.describe_table.return_value = {
+        "Table": {"KeySchema": [
+            {"AttributeName": "tenant_id", "KeyType": "HASH"},
+            {"AttributeName": "submission_id", "KeyType": "RANGE"},
+        ]}
+    }
     # Default: empty archive (no Versions, no DeleteMarkers, not truncated).
     # Tests that exercise the archive walker override this on the per-test
     # mock_s3 (via mod.s3.list_object_versions.return_value = ...).
@@ -720,6 +730,142 @@ def test_walker_delete_real_calls_delete_item_per_row(dsar):
     for call in fs_table.delete_item.call_args_list:
         key = call.kwargs["Key"]
         assert set(key.keys()) == {"tenant_id", "submission_id"}
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# D2: schema-adaptive form-submissions access (staging composite vs prod single)
+# ───────────────────────────────────────────────────────────────────────────
+def _set_form_schema(mock_ddb, *, single_key):
+    """Override the form-submissions key schema the walker discovers.
+
+    single_key=True  → prod shape: PK=submission_id only.
+    single_key=False → staging shape: PK=tenant_id, SK=submission_id.
+    """
+    if single_key:
+        schema = [{"AttributeName": "submission_id", "KeyType": "HASH"}]
+    else:
+        schema = [
+            {"AttributeName": "tenant_id", "KeyType": "HASH"},
+            {"AttributeName": "submission_id", "KeyType": "RANGE"},
+        ]
+    mock_ddb.meta.client.describe_table.return_value = {"Table": {"KeySchema": schema}}
+
+
+def test_walker_staging_composite_queries_base_table_not_gsi(dsar):
+    """Staging shape (tenant_id is the table HASH): Query the base table — no
+    IndexName — and delete by the composite key."""
+    mod, mock_ddb, _ = dsar
+    _set_form_schema(mock_ddb, single_key=False)
+    fs_table = MagicMock()
+    fs_table.query.return_value = {"Items": [_row("s1")]}
+    mock_ddb.Table.return_value = fs_table
+    result = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="delete", dry_run=False,
+    )
+    assert result["rows_deleted"] == 1
+    # Query went to the base table (no GSI)
+    assert "IndexName" not in fs_table.query.call_args.kwargs
+    # Delete used the composite key
+    key = fs_table.delete_item.call_args.kwargs["Key"]
+    assert set(key.keys()) == {"tenant_id", "submission_id"}
+
+
+def test_walker_prod_single_key_queries_gsi_and_deletes_by_submission_id(dsar):
+    """Prod shape (single submission_id key): Query the tenant-timestamp-index
+    GSI on tenant_id, and delete by submission_id ONLY — passing the staging
+    composite key would raise ValidationException against the prod table."""
+    mod, mock_ddb, _ = dsar
+    _set_form_schema(mock_ddb, single_key=True)
+    fs_table = MagicMock()
+    fs_table.query.return_value = {"Items": [_row("s1"), _row("s2")]}
+    mock_ddb.Table.return_value = fs_table
+    result = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="delete", dry_run=False,
+    )
+    assert result["rows_deleted"] == 2
+    # Query routed through the tenant-timestamp-index GSI, still bounded by tenant
+    assert fs_table.query.call_args.kwargs["IndexName"] == mod.TENANT_TIMESTAMP_INDEX
+    # Delete used the single submission_id key — NO tenant_id
+    for call in fs_table.delete_item.call_args_list:
+        key = call.kwargs["Key"]
+        assert set(key.keys()) == {"submission_id"}
+
+
+def test_walker_describe_failure_returns_query_failed(dsar):
+    """A DescribeTable denial/outage surfaces as a clean query_failed error,
+    not an unhandled crash (the surface is marked errored, not silently empty)."""
+    mod, mock_ddb, _ = dsar
+    from botocore.exceptions import ClientError
+    mock_ddb.meta.client.describe_table.side_effect = ClientError(
+        {"Error": {"Code": "AccessDeniedException"}}, "DescribeTable")
+    fs_table = MagicMock()
+    mock_ddb.Table.return_value = fs_table
+    result = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="delete", dry_run=False,
+    )
+    assert result["error"] == "query_failed"
+    fs_table.query.assert_not_called()
+
+
+def test_walker_form_schema_described_once_per_container(dsar):
+    """The key schema is immutable for the table's life — DescribeTable is
+    cached so repeated walks don't re-describe."""
+    mod, mock_ddb, _ = dsar
+    _set_form_schema(mock_ddb, single_key=True)
+    fs_table = MagicMock()
+    fs_table.query.return_value = {"Items": []}
+    mock_ddb.Table.return_value = fs_table
+    for _ in range(3):
+        mod._walk_form_submissions(
+            pii_subject_id="s", tenant_id="TEN", request_type="access", dry_run=True)
+    assert mock_ddb.meta.client.describe_table.call_count == 1
+
+
+def test_walker_prod_single_key_paginates_through_last_evaluated_key(dsar):
+    """Audit GAP-1: the GSI (prod single-key) path must thread ExclusiveStartKey
+    across pages exactly like the base-table path — the IndexName kwarg must not
+    break pagination."""
+    mod, mock_ddb, _ = dsar
+    _set_form_schema(mock_ddb, single_key=True)
+    fs_table = MagicMock()
+    fs_table.query.side_effect = [
+        {"Items": [_row("s1")], "LastEvaluatedKey": {"submission_id": "s1"}},
+        {"Items": [_row("s2")]},
+    ]
+    mock_ddb.Table.return_value = fs_table
+    result = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="delete", dry_run=False,
+    )
+    assert result["rows_found"] == 2
+    assert result["rows_deleted"] == 2
+    assert fs_table.query.call_count == 2
+    # both pages queried the GSI; page 2 carried ExclusiveStartKey
+    assert all(c.kwargs.get("IndexName") == mod.TENANT_TIMESTAMP_INDEX
+               for c in fs_table.query.call_args_list)
+    assert "ExclusiveStartKey" in fs_table.query.call_args_list[1].kwargs
+
+
+def test_walker_prod_single_key_access_and_dry_run(dsar):
+    """Audit GAP-2: the access (export) + delete-dry_run branches on the prod
+    single-key shape — query goes through the GSI, no deletes occur, and the
+    matched rows are returned for export."""
+    mod, mock_ddb, _ = dsar
+    _set_form_schema(mock_ddb, single_key=True)
+    fs_table = MagicMock()
+    fs_table.query.return_value = {"Items": [_row("s1"), _row("s2")]}
+    mock_ddb.Table.return_value = fs_table
+
+    acc = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="access", dry_run=True)
+    assert acc["action"] == "exported"
+    assert len(acc["exported_rows"]) == 2
+    assert fs_table.query.call_args.kwargs["IndexName"] == mod.TENANT_TIMESTAMP_INDEX
+
+    dry = mod._walk_form_submissions(
+        pii_subject_id="subj_xyz", tenant_id="TEN", request_type="delete", dry_run=True)
+    assert dry["action"] == "dry_run_count"
+    assert dry["rows_found"] == 2
+    fs_table.delete_item.assert_not_called()
 
 
 def test_walker_empty_match_returns_zero(dsar):
@@ -2412,6 +2558,29 @@ def test_dispatcher_emits_error_followup_on_walker_error(dsar):
     # so handler can compute partial_error close status.
     assert walker_results["form-submissions"]["status"] == "errored"
     assert walker_results["form-submissions"]["error"] == "query_failed"
+
+
+def test_dispatcher_form_submissions_delete_failed_taints_status(dsar):
+    """Audit GAP-1: a DeleteItem failure (not a corrupted row) on form-submissions
+    must taint the surface status to 'errored' so the DSAR closes partial_error,
+    not completed — otherwise a partial PII delete is silently reported done."""
+    mod, mock_ddb, _ = dsar
+    from botocore.exceptions import ClientError
+    tables = _stub_dispatch(mock_ddb, fs_items=[_row("s1"), _row("s2")])
+    fs_table = tables[0]
+    fs_table.delete_item.side_effect = [
+        ClientError({"Error": {"Code": "ThrottlingException"}}, "DeleteItem"),
+        {},
+    ]
+    _rows, followups, _exp, walker_results = mod._walk_mfs_surfaces(
+        pii_subject_id="subj_xyz", tenant_id="TEN",
+        normalized_email="test@x.co",
+        request_type="delete", dry_run=False,
+    )
+    assert walker_results["form-submissions"]["status"] == "errored"
+    assert walker_results["form-submissions"]["error"] == "rows_delete_failed"
+    assert walker_results["form-submissions"]["rows_delete_failed"] == 1
+    assert any("DeleteItem failed" in f for f in followups)
 
 
 def test_dispatcher_skips_all_walkers_when_subject_not_found(dsar):

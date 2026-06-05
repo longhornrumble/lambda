@@ -88,7 +88,13 @@ EXPECTED_ACCOUNT = os.environ.get("EXPECTED_ACCOUNT")
 
 # Staging table names — single source of truth (matches infra/modules/* locals
 # and the DSAR Lambda's constants).
-TABLE_FORM_SUBMISSIONS = "picasso-form-submissions-staging"
+# D2: form-submissions is the table-rename program's held carve-out — its NAME
+# diverges across accounts (staging picasso-form-submissions-staging vs prod
+# picasso_form_submissions), so it is account-resolved via an IaC-set env var
+# (default = the staging name), mirroring EXPECTED_ACCOUNT. The KEY SCHEMA also
+# diverges; that is handled at access time by _form_submissions_key_schema.
+TABLE_FORM_SUBMISSIONS = os.environ.get(
+    "FORM_SUBMISSIONS_TABLE", "picasso-form-submissions-staging")
 TABLE_NOTIFICATION_SENDS = "picasso-notification-sends"
 TABLE_NOTIFICATION_EVENTS = "picasso-notification-events"
 TABLE_SUBJECT_INDEX = "picasso-pii-subject-index"
@@ -337,13 +343,17 @@ def _delete_partition_rows(table, matched, key_fields, surface, dry_run):
     }
 
 
-def _query_partition(table, key_condition):
+def _query_partition(table, key_condition, index_name=None):
     """Paginated Query collecting all items for one partition. Raises on error
-    (caller wraps to mark the surface errored)."""
+    (caller wraps to mark the surface errored). `index_name` routes the Query
+    through a GSI (D2: the prod single-key form-submissions table is reachable
+    by tenant only via the tenant-timestamp-index GSI)."""
     matched = []
     last_evaluated_key = None
     while True:
         kwargs = {"KeyConditionExpression": key_condition}
+        if index_name:
+            kwargs["IndexName"] = index_name
         if last_evaluated_key:
             kwargs["ExclusiveStartKey"] = last_evaluated_key
         resp = table.query(**kwargs)
@@ -354,17 +364,64 @@ def _query_partition(table, key_condition):
     return matched
 
 
+# ── D2: form-submissions schema-adaptive access ────────────────────────────
+# The form-submissions table key schema DIVERGES across accounts (the schema +
+# naming carve-out held out of the table-rename program):
+#   - staging picasso-form-submissions-staging — composite key (tenant_id HASH,
+#     submission_id RANGE). The tenant partition is queried on the base table.
+#   - prod picasso_form_submissions — single key (submission_id HASH); tenant_id
+#     is a NON-key attribute, so a base-table Query on tenant_id raises
+#     ValidationException. The tenant's rows are reachable via the
+#     tenant-timestamp-index GSI (PK=tenant_id), present on BOTH tables with
+#     ProjectionType=ALL and full row coverage (verified 2026-06-05: prod 47/47,
+#     staging 5/5 rows present in the GSI).
+# One account-agnostic path adapts by discovering the live table key schema once
+# per container (DescribeTable is cached — the schema is immutable for the
+# table's life). No account-id branch, no prod schema migration.
+TENANT_TIMESTAMP_INDEX = "tenant-timestamp-index"
+_form_key_schema_cache = {}
+
+
+def _form_submissions_key_schema(table_name):
+    """Return (hash_key, range_key|None) for the form-submissions table, cached
+    per container. Raises ClientError if DescribeTable is denied/unavailable —
+    the caller wraps it the same as a query failure."""
+    cached = _form_key_schema_cache.get(table_name)
+    if cached is None:
+        desc = ddb.meta.client.describe_table(TableName=table_name)["Table"]
+        keys = {k["KeyType"]: k["AttributeName"] for k in desc["KeySchema"]}
+        cached = (keys["HASH"], keys.get("RANGE"))
+        _form_key_schema_cache[table_name] = cached
+        # Observability (audit): log the resolved schema once so an operator can
+        # confirm the table name (FORM_SUBMISSIONS_TABLE env) resolved to the
+        # expected shape. No PII.
+        logger.info(
+            "form_submissions_schema_resolved: table=%s hash=%s range=%s",
+            table_name, cached[0], cached[1],
+        )
+    return cached
+
+
 def _purge_form_submissions(tenant_id, dry_run):
-    """form-submissions: Query PK=tenant_id → delete whole tenant partition."""
+    """form-submissions: find the tenant's rows → delete the whole partition.
+
+    Schema-adaptive (D2): the staging composite-key table is queried on its
+    tenant_id PK; the prod single-submission_id-key table is queried via the
+    tenant-timestamp-index GSI. The DeleteItem key is built from the discovered
+    table key schema (composite on staging, single on prod)."""
     table = ddb.Table(TABLE_FORM_SUBMISSIONS)
     try:
-        matched = _query_partition(table, Key("tenant_id").eq(tenant_id))
+        hash_key, range_key = _form_submissions_key_schema(TABLE_FORM_SUBMISSIONS)
+        index_name = None if hash_key == "tenant_id" else TENANT_TIMESTAMP_INDEX
+        matched = _query_partition(
+            table, Key("tenant_id").eq(tenant_id), index_name)
     except ClientError as exc:
         logger.error("form_submissions_query_failed: code=%s",
                      exc.response.get("Error", {}).get("Code"))
         return {"rows_found": 0, "action": "error", "error": "query_failed"}
+    key_fields = [hash_key] + ([range_key] if range_key else [])
     return _delete_partition_rows(
-        table, matched, ["tenant_id", "submission_id"], "form_submissions", dry_run)
+        table, matched, key_fields, "form_submissions", dry_run)
 
 
 def _purge_notification_sends(tenant_id, dry_run):
