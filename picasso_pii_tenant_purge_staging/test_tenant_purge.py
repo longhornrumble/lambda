@@ -45,6 +45,16 @@ def purge():
     mock_ddb_resource = MagicMock()
     mock_sts = MagicMock()
     mock_sts.get_caller_identity.return_value = {"Account": "525409062831"}
+    # D2: default form-submissions key schema = staging composite
+    # (tenant_id HASH, submission_id RANGE), consumed by
+    # _form_submissions_key_schema via ddb.meta.client.describe_table.
+    # Prod-shape tests override this with the single submission_id key.
+    mock_ddb_resource.meta.client.describe_table.return_value = {
+        "Table": {"KeySchema": [
+            {"AttributeName": "tenant_id", "KeyType": "HASH"},
+            {"AttributeName": "submission_id", "KeyType": "RANGE"},
+        ]}
+    }
 
     def _client_router(name, *args, **kwargs):
         if name == "sts":
@@ -262,6 +272,78 @@ def test_form_submissions_real_delete_uses_correct_key(purge):
     mod.lambda_handler(_event(dry_run=False, grace_confirmed=True), None)
     store["picasso-form-submissions-staging"].delete_item.assert_called_once_with(
         Key={"tenant_id": "TEN-X", "submission_id": "s1"})
+
+
+# ───────────────────────────────────────────────────────────────────────────
+# D2: schema-adaptive form-submissions purge (staging composite vs prod single)
+# ───────────────────────────────────────────────────────────────────────────
+def _set_form_schema(mock_ddb, *, single_key):
+    """Override the form-submissions key schema the purger discovers.
+
+    single_key=True  → prod shape: PK=submission_id only.
+    single_key=False → staging shape: PK=tenant_id, SK=submission_id.
+    """
+    if single_key:
+        schema = [{"AttributeName": "submission_id", "KeyType": "HASH"}]
+    else:
+        schema = [
+            {"AttributeName": "tenant_id", "KeyType": "HASH"},
+            {"AttributeName": "submission_id", "KeyType": "RANGE"},
+        ]
+    mock_ddb.meta.client.describe_table.return_value = {"Table": {"KeySchema": schema}}
+
+
+def test_purge_form_submissions_prod_single_key_uses_gsi_and_deletes_by_submission_id(purge):
+    """Prod shape: Query the tenant-timestamp-index GSI on tenant_id and delete
+    by submission_id ONLY (the prod single-key table). A base-table Query on
+    tenant_id, or a delete with the staging composite key, would raise
+    ValidationException against the prod table."""
+    mod, mock_ddb, _ = purge
+    _set_form_schema(mock_ddb, single_key=True)
+    store = _wire_tables(mod, mock_ddb, {
+        "picasso-form-submissions-staging": _table_mock(
+            items=[{"tenant_id": "TEN-X", "submission_id": "s1"},
+                   {"tenant_id": "TEN-X", "submission_id": "s2"}]),
+    })
+    result = mod._purge_form_submissions("TEN-X", dry_run=False)
+    assert result["rows_deleted"] == 2
+    fs = store["picasso-form-submissions-staging"]
+    assert fs.query.call_args.kwargs["IndexName"] == mod.TENANT_TIMESTAMP_INDEX
+    for call in fs.delete_item.call_args_list:
+        assert set(call.kwargs["Key"].keys()) == {"submission_id"}
+
+
+def test_purge_form_submissions_staging_composite_no_gsi(purge):
+    """Staging shape: Query the base table (no GSI) and delete by the composite
+    key — the proven path, unchanged."""
+    mod, mock_ddb, _ = purge
+    _set_form_schema(mock_ddb, single_key=False)
+    store = _wire_tables(mod, mock_ddb, {
+        "picasso-form-submissions-staging": _table_mock(
+            items=[{"tenant_id": "TEN-X", "submission_id": "s1"}]),
+    })
+    result = mod._purge_form_submissions("TEN-X", dry_run=False)
+    assert result["rows_deleted"] == 1
+    fs = store["picasso-form-submissions-staging"]
+    assert "IndexName" not in fs.query.call_args.kwargs
+    assert fs.delete_item.call_args.kwargs["Key"] == {
+        "tenant_id": "TEN-X", "submission_id": "s1"}
+
+
+def test_purge_form_submissions_describe_failure_marks_error(purge):
+    """A DescribeTable denial/outage surfaces the surface as errored (not a
+    silent zero-row no-op) and never issues a Query."""
+    mod, mock_ddb, _ = purge
+    mock_ddb.meta.client.describe_table.side_effect = _client_error(
+        code="AccessDeniedException", op="DescribeTable")
+    store = _wire_tables(mod, mock_ddb, {
+        "picasso-form-submissions-staging": _table_mock(
+            items=[{"tenant_id": "TEN-X", "submission_id": "s1"}]),
+    })
+    result = mod._purge_form_submissions("TEN-X", dry_run=False)
+    assert result["action"] == "error"
+    assert result["error"] == "query_failed"
+    store["picasso-form-submissions-staging"].query.assert_not_called()
 
 
 def test_form_submissions_corrupted_row_skipped(purge):
