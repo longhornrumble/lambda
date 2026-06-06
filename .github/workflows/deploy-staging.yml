@@ -488,6 +488,40 @@ jobs:
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
+          - source_dir: Calendar_Event_Consumer
+            # Scheduling sub-phase B (B9/B10) — SQS consumer of booking.* events.
+            # Node.js esbuild bundle; bundles ../shared/scheduling/* (notify.js etc.)
+            # with @aws-sdk/* externalized (Lambda runtime provides v3), so — like
+            # Scheduling_Redemption_Handler — NO shared/scheduling npm install needed.
+            # Was hand-deployed before (CI-manifest gap closed here so §E14's notify.js
+            # override-read deploys via CI). NOTE: a shared/scheduling-only change needs a
+            # manual trigger (no Calendar_Event_Consumer/** path change), same as C8:
+            #   gh workflow run "Deploy Lambda — Staging" -f lambda=Calendar_Event_Consumer
+            # Env vars Terraform-managed (infra/ lambda-calendar-event-consumer-staging).
+            staging_function: Calendar_Event_Consumer
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # SQS-invoked (no HTTP frontend); a synthetic invoke would attempt real DDB/SES.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Calendar_Lifecycle_Consumer
+            # Scheduling §14.2 calendar-reconciliation SQS consumer. Same build shape as
+            # Calendar_Event_Consumer (esbuild + shared/scheduling notify.js, aws-sdk
+            # externalized, no shared npm install). Hand-deployed before; added here so
+            # §E14 notify.js deploys via CI. shared-only change → manual trigger:
+            #   gh workflow run "Deploy Lambda — Staging" -f lambda=Calendar_Lifecycle_Consumer
+            # Env vars Terraform-managed (infra/ lambda-calendar-lifecycle-consumer-staging).
+            staging_function: Calendar_Lifecycle_Consumer
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
           - source_dir: Scheduling_Redemption_Handler
             # Scheduling sub-phase D Task D4 — the one-tap token-redemption edge
             # (Lambda Function URL behind the staging.schedule CloudFront dist).
