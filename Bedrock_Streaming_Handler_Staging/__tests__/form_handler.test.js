@@ -2008,3 +2008,47 @@ describe('Form Handler - Per-recipient email sends', () => {
     expect(failedRow.Item.error).toContain('SES throttle');
   });
 });
+
+describe('Form Handler - SMS consent record TTL (WS-E-TCPA, FROZEN_CONTRACTS §E3)', () => {
+  beforeEach(() => {
+    sesMock.reset();
+    snsMock.reset();
+    dynamoMock.reset();
+    lambdaMock.reset();
+    s3Mock.reset();
+  });
+
+  it('writeConsentRecord stamps ttl = now + 4yr+30d on the picasso-sms-consent PutCommand', async () => {
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+    dynamoMock.on(UpdateCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+    const FOUR_YEARS_30_DAYS = (4 * 365 + 30) * 24 * 3600;
+    const consentingFormData = {
+      first_name: 'John',
+      last_name: 'Doe',
+      email: 'john.doe@example.com',
+      phone: '+15551234567',     // clean E.164 so writeConsentRecord's strict gate passes
+      sms_consent_given: 'yes',  // legacy consent trigger (findSmsConsent fallback)
+    };
+
+    const before = Math.floor(Date.now() / 1000);
+    await submitForm('volunteer_apply', consentingFormData, mockTenantConfig);
+    // writeConsentRecord is fire-and-forget (.catch, not awaited) — flush microtasks.
+    await new Promise((r) => setImmediate(r));
+    const after = Math.floor(Date.now() / 1000);
+
+    const consentPut = dynamoMock
+      .commandCalls(PutCommand)
+      .map((c) => c.args[0].input)
+      .find((input) => input.TableName === (process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent'));
+
+    expect(consentPut).toBeDefined();
+    expect(consentPut.Item.consent_given).toBe(true);
+    expect(consentPut.Item.phone_e164).toBe('+15551234567');
+    // The new ttl field: now + 4yr+30d (bounded by the call window, no Date mocking).
+    expect(consentPut.Item.ttl).toBeGreaterThanOrEqual(before + FOUR_YEARS_30_DAYS);
+    expect(consentPut.Item.ttl).toBeLessThanOrEqual(after + FOUR_YEARS_30_DAYS);
+  });
+});
