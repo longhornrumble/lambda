@@ -1,0 +1,50 @@
+{
+  "name": "calendar-oauth-connect",
+  "version": "1.0.0",
+  "description": "Calendar_OAuth_Connect — scheduling sub-phase E Task E11 (WS-E-OAUTH backend). The per-coordinator Google Calendar 3LO consent flow behind the WS-D3 staging.schedule.myrecruiter.ai CloudFront distribution (Function URL origin). Routes: GET /connect (verify an HMAC init-token minted by the Clerk-authed dashboard backend → build the Google consent URL with a signed state, access_type=offline + prompt=consent, scope-minimized to calendar.events + calendar.freebusy per D2 → 302 to Google), GET /oauth/callback (verify state → exchange code for a refresh_token via the platform OAuth app → write the per-coordinator secret in the SHIPPED oauth-client.js shape + additive calendar_id/connected_at → fire the B5 Calendar_Watch_Onboarder → redirect back to the dashboard), GET /connection/status (probe the stored refresh_token; invalid_grant → mark the secret revoked + report bookable:false; 5xx → stale-connected). Coordinator identity comes ONLY from the signed init-token, never client params — calendar-slot poisoning is structurally impossible. Function URL + CloudFront routing + IAM + the init-token mint are the integrator's glue.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-lambda": "^3.600.0",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@smithy/node-http-handler": "^4.0.0",
+    "google-auth-library": "^10.6.2"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "index.js",
+      "state.js",
+      "oauth.js",
+      "secrets.js",
+      "revocation.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 85,
+        "functions": 100,
+        "lines": 90,
+        "statements": 90
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
