@@ -128,11 +128,15 @@ async function getAdminEmails(tenantId) {
 }
 
 // t7d digest enumerator: bounded GSI query (NO full-table scan — §E7 pattern). Returns the
-// still-pending_attendance, still-booked rows older than `olderThanDays` within a 90d window.
-// ⚑ Overlaps the WS-E-REMIND E9 reconciler's bounded scan — integrator may consolidate.
+// still-pending_attendance, still-booked rows whose start_at is between [window start] and
+// [the >7d cutoff]. start_at is ISO8601, so lexicographic BETWEEN == chronological order.
+// Hard-capped at MAX_PENDING rows so a huge backlog can't exhaust memory (S5; the digest
+// itself further caps the rendered rows). ⚑ Overlaps the WS-E-REMIND E9 reconciler's bounded
+// scan — integrator may consolidate.
+const MAX_PENDING = 500;
 async function queryPendingAttendance({ tenantId, olderThanDays = 7, now = Date.now() }) {
-  const hi = new Date(now - olderThanDays * DAY_MS).toISOString(); // older than the cutoff
-  const lo = new Date(now - 90 * DAY_MS).toISOString(); // bounded window
+  const cutoffEnd = new Date(now - olderThanDays * DAY_MS).toISOString(); // newest included (>7d old)
+  const windowStart = new Date(now - 90 * DAY_MS).toISOString(); // oldest included (90d bound)
   const out = [];
   let ExclusiveStartKey;
   do {
@@ -140,13 +144,13 @@ async function queryPendingAttendance({ tenantId, olderThanDays = 7, now = Date.
       new QueryCommand({
         TableName: BOOKING_TABLE,
         IndexName: START_AT_INDEX,
-        KeyConditionExpression: 'tenantId = :t AND start_at BETWEEN :lo AND :hi',
+        KeyConditionExpression: 'tenantId = :t AND start_at BETWEEN :windowStart AND :cutoffEnd',
         FilterExpression: 'attendance_state = :pending AND #st = :booked',
         ExpressionAttributeNames: { '#st': 'status' },
         ExpressionAttributeValues: {
           ':t': s(tenantId),
-          ':lo': s(lo),
-          ':hi': s(hi),
+          ':windowStart': s(windowStart),
+          ':cutoffEnd': s(cutoffEnd),
           ':pending': s(ATTENDANCE_STATE_PENDING),
           ':booked': s(STATUS_BOOKED),
         },
@@ -155,7 +159,7 @@ async function queryPendingAttendance({ tenantId, olderThanDays = 7, now = Date.
     );
     for (const it of res.Items || []) out.push(fromItem(it));
     ExclusiveStartKey = res.LastEvaluatedKey;
-  } while (ExclusiveStartKey);
+  } while (ExclusiveStartKey && out.length < MAX_PENDING);
   return out;
 }
 

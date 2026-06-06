@@ -174,7 +174,8 @@ async function runAttendanceCheck({ booking, deps }) {
 
   const tenantId = pick(booking, 'tenantId', 'tenant_id');
   const bookingId = pick(booking, 'bookingId', 'booking_id');
-  const status = pick(booking, 'status', 'status');
+  // `status` is named the same in both camel + snake shapes — read it directly.
+  const status = booking && booking.status != null ? booking.status : null;
 
   // Only an active (booked) appointment is eligible. A terminal/canceled booking (the
   // coordinator already dispositioned, or the volunteer canceled) must never be prompted.

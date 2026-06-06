@@ -298,17 +298,19 @@ async function sendInterviewerConfirmation({ tenantId, bookingId, purpose, item,
   if (!to) {
     return { email: 'skipped_no_recipient' };
   }
-  const applicant = notify.escapeHtml(attr(item, 'attendee_name') || 'the volunteer');
-  const program = notify.escapeHtml(attr(item, 'appointment_type_name') || 'appointment');
+  // Subject + text body are PLAIN TEXT — use raw values (HTML-escaping them would render
+  // `O'Brien` as `O&#39;Brien` in the subject line). Only the html body escapes (B1 fix).
+  const applicantRaw = attr(item, 'attendee_name') || 'the volunteer';
+  const programRaw = attr(item, 'appointment_type_name') || 'appointment';
   const action = ACTION_LABEL[purpose];
-  const subject = `Recorded: ${applicant} — ${action}`;
+  const subject = `Recorded: ${applicantRaw} — ${action}`;
   const text_body =
-    `Thanks — we've recorded that ${attr(item, 'attendee_name') || 'the volunteer'} ` +
-    `was marked "${action}" for the ${attr(item, 'appointment_type_name') || 'appointment'}. ` +
+    `Thanks — we've recorded that ${applicantRaw} ` +
+    `was marked "${action}" for the ${programRaw}. ` +
     `No further action is needed.`;
   const html_body =
-    `<p>Thanks — we've recorded that <strong>${applicant}</strong> was marked ` +
-    `"<strong>${notify.escapeHtml(action)}</strong>" for the ${program}.</p>` +
+    `<p>Thanks — we've recorded that <strong>${notify.escapeHtml(applicantRaw)}</strong> was marked ` +
+    `"<strong>${notify.escapeHtml(action)}</strong>" for the ${notify.escapeHtml(programRaw)}.</p>` +
     `<p>No further action is needed.</p>`;
   try {
     await sendEmail({ tenantId, to, subject, html_body, text_body });

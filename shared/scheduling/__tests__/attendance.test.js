@@ -206,4 +206,21 @@ describe('runAttendanceCheck', () => {
     const r = await runAttendanceCheck({ booking: snakeBooking, deps: d });
     expect(r.outcome).toBe('pending_attendance_set');
   });
+
+  // §11.1 NO auto-completion: the attendance check sets the flow label only — it has NO way to
+  // write Booking.status (setAttendanceState is its sole state mutation). A booking nobody
+  // dispositions can never be auto-advanced by this path.
+  test('NO auto-completion (§11.1): attendance check sets attendance_state only, never a status', async () => {
+    const writes = [];
+    const d = deps({
+      setAttendanceState: jest.fn(async (args) => { writes.push(args); return true; }),
+    });
+    const r = await runAttendanceCheck({ booking: snakeBooking, deps: d });
+    expect(r.outcome).toBe('pending_attendance_set');
+    // the only mutation is the attendance_state write — no status field anywhere in the dep call
+    expect(writes).toEqual([{ tenantId: 'AUS123957', bookingId: 'bk-1', now: 2000 }]);
+    expect(JSON.stringify(writes)).not.toMatch(/status/i);
+    // the module exposes no status-writing dep at all
+    expect(d.setBookingStatus).toBeUndefined();
+  });
 });

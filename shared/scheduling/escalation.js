@@ -48,6 +48,9 @@ const REDEMPTION_BASE_URL =
 
 const ATTENDANCE_STATE_PENDING = 'pending_attendance';
 const DAY_SECONDS = 24 * 60 * 60;
+// Cap the enumerated rows in the weekly digest email so a tenant with a huge backlog can't
+// produce an oversized SES message / exhaust memory (S5). The full count is still reported.
+const MAX_DIGEST_ROWS = 100;
 
 function nowSeconds(now) {
   return typeof now === 'number' ? now : Math.floor(Date.now() / 1000);
@@ -212,7 +215,9 @@ async function buildWeeklyDigest({ tenantId, pendingBookings, deps = {} } = {}) 
   }
 
   const nowS = nowSeconds(now);
-  const rows = list.map((b) => {
+  const capped = list.slice(0, MAX_DIGEST_ROWS);
+  const overflow = list.length - capped.length;
+  const rows = capped.map((b) => {
     const startAt = pick(b, 'startAt', 'start_at');
     const startMs = Date.parse(startAt || '');
     const daysPending = Number.isNaN(startMs)
@@ -223,14 +228,18 @@ async function buildWeeklyDigest({ tenantId, pendingBookings, deps = {} } = {}) 
     return { who, apptType, startAt: startAt || 'unknown', daysPending };
   });
 
+  const shown = overflow > 0 ? ` (showing oldest ${capped.length})` : '';
+  const overflowText = overflow > 0 ? `\n…and ${overflow} more.` : '';
+  const overflowHtml = overflow > 0 ? `<p>…and ${overflow} more.</p>` : '';
   const text_body =
-    `${list.length} appointment(s) still need an attendance answer (oldest first):\n\n` +
+    `${list.length} appointment(s) still need an attendance answer${shown} (oldest first):\n\n` +
     rows
       .map((r) => `• ${r.who} — ${r.apptType} — ${r.startAt} — ${r.daysPending}d pending`)
       .join('\n') +
+    overflowText +
     `\n\nOpen the Customer Portal to record outcomes.`;
   const html_body =
-    `<p>${list.length} appointment(s) still need an attendance answer (oldest first):</p>` +
+    `<p>${list.length} appointment(s) still need an attendance answer${shown} (oldest first):</p>` +
     `<ul>` +
     rows
       .map(
@@ -239,7 +248,9 @@ async function buildWeeklyDigest({ tenantId, pendingBookings, deps = {} } = {}) 
           `${escapeHtml(r.startAt)} — ${escapeHtml(String(r.daysPending))}d pending</li>`
       )
       .join('') +
-    `</ul><p>Open the Customer Portal to record outcomes.</p>`;
+    `</ul>` +
+    overflowHtml +
+    `<p>Open the Customer Portal to record outcomes.</p>`;
 
   const dispatched = {};
   try {

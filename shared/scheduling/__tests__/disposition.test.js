@@ -143,6 +143,12 @@ describe('no_show → no_show + volunteer reoffer', () => {
     expect(d.dispatchVolunteerNotice).not.toHaveBeenCalled();
   });
 
+  test('selectChannels receives moment:reschedule (GAP-8)', async () => {
+    const d = deps();
+    await applyDisposition({ tenantId: TENANT, bookingId: BOOKING, purpose: 'no_show', deps: d });
+    expect(d.selectChannels.mock.calls[0][0].moment).toBe('reschedule');
+  });
+
   test('selectChannels failure does not block the email floor', async () => {
     const d = deps({ selectChannels: jest.fn().mockRejectedValue(new Error('tcpa down')) });
     const r = await applyDisposition({ tenantId: TENANT, bookingId: BOOKING, purpose: 'no_show', deps: d });
@@ -188,6 +194,35 @@ describe('interviewer confirmation edge cases', () => {
   test('no coordinator email → skipped_no_recipient', async () => {
     const d = deps({ ddb: { send: jest.fn().mockResolvedValue(allNew({ coordinator_email: undefined, status: { S: 'completed' } })) } });
     const r = await applyDisposition({ tenantId: TENANT, bookingId: BOOKING, purpose: 'attended_yes', deps: d });
+    expect(r.interviewerConfirmation).toEqual({ email: 'skipped_no_recipient' });
+  });
+
+  test('B1: subject + text use RAW name (not HTML-escaped); html escapes', async () => {
+    const d = deps({
+      ddb: { send: jest.fn().mockResolvedValue(allNew({ status: { S: 'completed' }, attendee_name: { S: "Siobhan O'Brien" } })) },
+    });
+    await applyDisposition({ tenantId: TENANT, bookingId: BOOKING, purpose: 'attended_yes', deps: d });
+    const email = d.sendEmail.mock.calls[0][0];
+    expect(email.subject).toContain("O'Brien"); // raw apostrophe, NOT O&#39;Brien
+    expect(email.subject).not.toContain('&#39;');
+    expect(email.text_body).toContain("O'Brien");
+    expect(email.html_body).toContain('O&#39;Brien'); // html body IS escaped
+  });
+
+  test('GAP-3: missing attendee_name/appt_type → confirmation fallbacks render', async () => {
+    const d = deps({
+      ddb: { send: jest.fn().mockResolvedValue(allNew({ status: { S: 'completed' }, attendee_name: undefined, appointment_type_name: undefined })) },
+    });
+    await applyDisposition({ tenantId: TENANT, bookingId: BOOKING, purpose: 'attended_yes', deps: d });
+    const email = d.sendEmail.mock.calls[0][0];
+    expect(email.subject).toContain('the volunteer');
+    expect(email.text_body).toContain('appointment');
+  });
+
+  test('GAP-6: UpdateItem resolves without Attributes → confirmation skipped, transition still ok', async () => {
+    const d = deps({ ddb: { send: jest.fn().mockResolvedValue({}) } }); // no .Attributes
+    const r = await applyDisposition({ tenantId: TENANT, bookingId: BOOKING, purpose: 'attended_yes', deps: d });
+    expect(r.transitioned).toBe(true);
     expect(r.interviewerConfirmation).toEqual({ email: 'skipped_no_recipient' });
   });
 

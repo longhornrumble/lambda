@@ -54,13 +54,17 @@ describe('getBooking / fromItem', () => {
 });
 
 describe('setAttendanceState', () => {
-  test('success → true with idempotent guard', async () => {
+  test('success → true with idempotent guard; writes attendance_state ONLY (no status — §11.1)', async () => {
     ddbMock.on(UpdateItemCommand).resolves({});
     const r = await store.setAttendanceState({ tenantId: 'T', bookingId: 'bk-1' });
     expect(r).toBe(true);
     const cmd = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
     expect(cmd.ConditionExpression).toContain('attribute_not_exists(attendance_state)');
     expect(cmd.ExpressionAttributeValues[':pending'].S).toBe('pending_attendance');
+    // NO auto-completion: the UpdateExpression must NOT mutate Booking.status (status only
+    // appears in the read-side ConditionExpression guard, never in SET).
+    expect(cmd.UpdateExpression).not.toMatch(/status\s*=/i);
+    expect(cmd.UpdateExpression).toBe('SET attendance_state = :pending, attendance_check_at = :at');
   });
   test('ConditionalCheckFailed → false', async () => {
     const e = new Error('cond'); e.name = 'ConditionalCheckFailedException';
@@ -122,6 +126,17 @@ describe('sendEmail / sendSms (Lambda invoke)', () => {
     const inner = JSON.parse(JSON.parse(Buffer.from(lambdaMock.commandCalls(InvokeCommand)[0].args[0].input.Payload).toString()).body);
     expect(inner.to).toEqual(['x@x', 'y@x']);
     expect(inner.cc).toBeUndefined();
+  });
+  test('GAP-7: sendEmail with falsy to → empty recipient array', async () => {
+    await store.sendEmail({ tenantId: 'T', to: undefined, subject: 's', text_body: 't' });
+    const inner = JSON.parse(JSON.parse(Buffer.from(lambdaMock.commandCalls(InvokeCommand)[0].args[0].input.Payload).toString()).body);
+    expect(inner.to).toEqual([]);
+    expect(inner.cc).toBeUndefined();
+  });
+  test('GAP-7: sendEmail with cc as a string (non-array) → wrapped to array', async () => {
+    await store.sendEmail({ tenantId: 'T', to: 'a@x', cc: 'admin@x', subject: 's', text_body: 't' });
+    const inner = JSON.parse(JSON.parse(Buffer.from(lambdaMock.commandCalls(InvokeCommand)[0].args[0].input.Payload).toString()).body);
+    expect(inner.cc).toEqual(['admin@x']);
   });
   test('sendSms invokes SMS_Sender with sendType', async () => {
     await store.sendSms({ tenantId: 'T', to: '+1', body: 'hi', sendType: 'internal' });

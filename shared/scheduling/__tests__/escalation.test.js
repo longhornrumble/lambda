@@ -125,6 +125,14 @@ describe('escalateSilence — t72h urgent + portal inbox alert', () => {
     const r = await escalateSilence({ booking: { ...unresolved, when_label: undefined, coordinator_email: undefined }, tier: 't72h', deps: d });
     expect(r.dispatched.email).toBe('failed');
   });
+  test('GAP-5: missing attendee_name/appt_type → t72h fallbacks render (no crash)', async () => {
+    const d = deps();
+    const r = await escalateSilence({ booking: { ...unresolved, attendee_name: undefined, appointment_type_name: undefined }, tier: 't72h', deps: d });
+    expect(r.outcome).toBe('urgent');
+    expect(d.sendEmail.mock.calls[0][0].subject).toContain('a volunteer');
+    expect(d.sendEmail.mock.calls[0][0].text_body).toContain('appointment');
+  });
+
   test('portal-alert write failure → portalInboxAlert false (best-effort)', async () => {
     const d = deps({ writePortalInboxAlert: jest.fn().mockRejectedValue(new Error('ddb')) });
     const r = await escalateSilence({ booking: unresolved, tier: 't72h', deps: d });
@@ -179,6 +187,19 @@ describe('buildWeeklyDigest (t7d)', () => {
     const d = deps({ sendEmail: jest.fn().mockRejectedValue(new Error('ses')) });
     const r = await buildWeeklyDigest({ tenantId: TENANT, pendingBookings: [older], deps: d });
     expect(r.dispatched.email).toBe('failed');
+  });
+  test('S5: caps rendered rows at 100 + reports overflow; full count still returned', async () => {
+    const many = Array.from({ length: 130 }, (_, i) => ({
+      ...unresolved, booking_id: `bk-${i}`, start_at: `2026-05-${String((i % 28) + 1).padStart(2, '0')}T10:00:00Z`, attendee_name: `Vol${i}`,
+    }));
+    const d = deps({ now: NOW });
+    const r = await buildWeeklyDigest({ tenantId: TENANT, pendingBookings: many, deps: d });
+    expect(r.count).toBe(130); // full count reported
+    const body = d.sendEmail.mock.calls[0][0].text_body;
+    expect(body).toContain('showing oldest 100');
+    expect(body).toContain('…and 30 more.');
+    // exactly 100 bullet rows rendered
+    expect((body.match(/•/g) || []).length).toBe(100);
   });
   test('non-array pendingBookings tolerated → empty', async () => {
     const d = deps();

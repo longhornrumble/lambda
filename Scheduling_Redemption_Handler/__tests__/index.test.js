@@ -337,8 +337,8 @@ describe('interviewer attendance disposition (E6 — WS-E-ATTEND wires the actio
     const res = await handler(evt('/attended/noshow', t));
     expect(res.statusCode).toBe(200);
     expect(res.body).toMatch(/new time/i);
-    // reoffer email + interviewer confirmation both route through send_email (Lambda invoke)
-    expect(lambdaMock.commandCalls(InvokeCommand).length).toBeGreaterThanOrEqual(1);
+    // reoffer email + interviewer confirmation both route through send_email (≥2 Lambda invokes)
+    expect(lambdaMock.commandCalls(InvokeCommand).length).toBeGreaterThanOrEqual(2);
   });
 
   test('idempotent: already-resolved (ConditionalCheckFailed) → 200 already-recorded, no dispatch', async () => {
