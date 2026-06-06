@@ -963,36 +963,42 @@ class TestFormHandler(unittest.TestCase):
         self.assertIn('Item', response)
         self.assertEqual(response['Item']['count'], 1)
 
-    @mock_dynamodb
     def test_audit_submission(self):
-        """Test audit logging of form submission"""
-        # Set up audit table
-        dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-        audit_table = dynamodb.create_table(
-            TableName='picasso_audit_logs',
-            KeySchema=[
-                {'AttributeName': 'tenant_id', 'KeyType': 'HASH'},
-                {'AttributeName': 'timestamp', 'KeyType': 'RANGE'}
-            ],
-            AttributeDefinitions=[
-                {'AttributeName': 'tenant_id', 'AttributeType': 'S'},
-                {'AttributeName': 'timestamp', 'AttributeType': 'S'}
-            ],
-            BillingMode='PAY_PER_REQUEST'
-        )
+        """_audit_submission delegates to the canonical audit_logger (lambda#251).
 
+        The bespoke tenant_id+timestamp put_item matched no granted table and
+        silently failed; the fix routes form audits through audit_logger, which
+        writes the granted picasso-audit shape.
+        """
         handler = FormHandler(self.tenant_config)
 
-        handler._audit_submission(
-            submission_id='sub_123',
-            form_type='volunteer_signup',
-            notification_results=['email:test@example.com'],
-            fulfillment_result={'type': 'email', 'status': 'sent'}
-        )
+        with patch('form_handler.audit_logger') as mock_audit, \
+             patch('form_handler.AUDIT_LOGGER_AVAILABLE', True):
+            handler._audit_submission(
+                submission_id='sub_123',
+                form_type='volunteer_signup',
+                notification_results=['email:test@example.com', 'sms:+15551234567'],
+                fulfillment_result={'type': 'email', 'status': 'sent'},
+                session_id='sess_abc'
+            )
 
-        # Verify audit log was created
-        # Note: We can't easily verify the exact item due to timestamp generation
-        # But we can verify the method doesn't raise an exception
+            mock_audit.log_form_submission.assert_called_once_with(
+                tenant_id='test_tenant_123',
+                session_id='sess_abc',
+                submission_id='sub_123',
+                form_type='volunteer_signup',
+                notification_count=2,
+                fulfillment_status='sent',
+            )
+
+    def test_audit_submission_noop_when_logger_unavailable(self):
+        """Audit is best-effort: a missing audit_logger must not raise."""
+        handler = FormHandler(self.tenant_config)
+        with patch('form_handler.AUDIT_LOGGER_AVAILABLE', False):
+            handler._audit_submission(
+                submission_id='sub_1', form_type='contact',
+                notification_results=[], fulfillment_result={}, session_id=None
+            )
 
     def test_format_template_basic(self):
         """Test basic template formatting"""

@@ -35,12 +35,21 @@ lambda_client = boto3.client('lambda')
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+# Canonical audit trail. Form submissions are logged via audit_logger (which
+# writes the PII-free tenant_hash + timestamp_event_id shape to picasso-audit),
+# NOT a bespoke per-handler table. Best-effort import — audit is non-fatal.
+try:
+    from audit_logger import audit_logger
+    AUDIT_LOGGER_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"⚠️ audit_logger not available for form_handler: {e}")
+    AUDIT_LOGGER_AVAILABLE = False
+
 # DynamoDB tables — env-var-driven so staging routes to staging-suffixed
 # tables without code change. Defaults match the prod-account legacy names
 # (no suffix, underscored) so prod behavior is unchanged when env vars unset.
 SUBMISSIONS_TABLE = os.environ.get('FORM_SUBMISSIONS_TABLE', 'picasso_form_submissions')
 SMS_USAGE_TABLE = os.environ.get('SMS_USAGE_TABLE', 'picasso_sms_usage')
-AUDIT_TABLE = os.environ.get('FORM_AUDIT_TABLE', 'picasso_audit_logs')
 NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-notification-sends')
 
 notification_sends_table = dynamodb.Table(NOTIFICATION_SENDS_TABLE)
@@ -593,7 +602,8 @@ class FormHandler:
                 submission_id=submission_id,
                 form_type=form_type,
                 notification_results=notification_results,
-                fulfillment_result=fulfillment_result
+                fulfillment_result=fulfillment_result,
+                session_id=session_id
             )
 
             return {
@@ -1113,22 +1123,27 @@ class FormHandler:
             logger.error(f"Error incrementing SMS usage: {str(e)}")
 
     def _audit_submission(self, submission_id: str, form_type: str,
-                        notification_results: List[str], fulfillment_result: Dict[str, Any]):
-        """Log submission to audit table"""
+                        notification_results: List[str], fulfillment_result: Dict[str, Any],
+                        session_id: str = None):
+        """Log the submission to the canonical audit trail (PII-free, via audit_logger).
+
+        The previous bespoke put_item wrote a tenant_id+timestamp Item that
+        matched no table the MFS role can write (lambda#251) — every audit
+        silently failed. This delegates to audit_logger, which writes the
+        granted picasso-audit shape. Best-effort / non-fatal.
+        """
+        if not AUDIT_LOGGER_AVAILABLE:
+            return
         try:
-            table = dynamodb.Table(AUDIT_TABLE)
-            table.put_item(
-                Item={
-                    'tenant_id': self.tenant_id,
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                    'event_type': 'form_submission',
-                    'submission_id': submission_id,
-                    'form_type': form_type,
-                    'notifications': notification_results,
-                    'fulfillment': fulfillment_result
-                }
+            audit_logger.log_form_submission(
+                tenant_id=self.tenant_id,
+                session_id=session_id,
+                submission_id=submission_id,
+                form_type=form_type,
+                notification_count=len(notification_results) if notification_results else 0,
+                fulfillment_status=(fulfillment_result or {}).get('status'),
             )
-        except ClientError as e:
+        except Exception as e:
             logger.error(f"Audit log error: {str(e)}")
 
     def _format_template(self, template: str, data: Dict[str, Any]) -> str:

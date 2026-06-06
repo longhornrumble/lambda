@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """form_handler.py table-name env-var resolution tests.
 
-Verifies that the four DDB table constants resolve from environment variables
+Verifies that the DDB table constants resolve from environment variables
 when set, with fallback to the legacy prod-account hardcoded names. Lets
 staging route to staging-suffixed tables without touching prod behavior.
 """
@@ -30,14 +30,13 @@ class TestFormHandlerEnvTables(unittest.TestCase):
     def test_defaults_match_legacy_prod_names(self):
         """No env vars set → constants resolve to prod-account legacy names."""
         # Clear the four env vars to ensure defaults are exercised.
-        for key in ('FORM_SUBMISSIONS_TABLE', 'SMS_USAGE_TABLE', 'FORM_AUDIT_TABLE', 'NOTIFICATION_SENDS_TABLE'):
+        for key in ('FORM_SUBMISSIONS_TABLE', 'SMS_USAGE_TABLE', 'NOTIFICATION_SENDS_TABLE'):
             if key in os.environ:
                 del os.environ[key]
         fh = self._reload_with_env({})
 
         self.assertEqual(fh.SUBMISSIONS_TABLE, 'picasso_form_submissions')
         self.assertEqual(fh.SMS_USAGE_TABLE, 'picasso_sms_usage')
-        self.assertEqual(fh.AUDIT_TABLE, 'picasso_audit_logs')
         self.assertEqual(fh.NOTIFICATION_SENDS_TABLE, 'picasso-notification-sends')
 
     def test_env_vars_override_defaults(self):
@@ -45,19 +44,17 @@ class TestFormHandlerEnvTables(unittest.TestCase):
         fh = self._reload_with_env({
             'FORM_SUBMISSIONS_TABLE': 'picasso-form-submissions-staging',
             'SMS_USAGE_TABLE': 'picasso-sms-usage',
-            'FORM_AUDIT_TABLE': 'picasso-audit-staging',
             'NOTIFICATION_SENDS_TABLE': 'picasso-notification-sends',
         })
 
         self.assertEqual(fh.SUBMISSIONS_TABLE, 'picasso-form-submissions-staging')
         self.assertEqual(fh.SMS_USAGE_TABLE, 'picasso-sms-usage')
-        self.assertEqual(fh.AUDIT_TABLE, 'picasso-audit-staging')
         self.assertEqual(fh.NOTIFICATION_SENDS_TABLE, 'picasso-notification-sends')
 
     def test_partial_override_keeps_defaults_for_unset(self):
         """Setting one env var only changes that constant; others stay default."""
         # Clear the others first
-        for key in ('SMS_USAGE_TABLE', 'FORM_AUDIT_TABLE', 'NOTIFICATION_SENDS_TABLE'):
+        for key in ('SMS_USAGE_TABLE', 'NOTIFICATION_SENDS_TABLE'):
             if key in os.environ:
                 del os.environ[key]
 
@@ -67,7 +64,6 @@ class TestFormHandlerEnvTables(unittest.TestCase):
 
         self.assertEqual(fh.SUBMISSIONS_TABLE, 'only-this-overridden')
         self.assertEqual(fh.SMS_USAGE_TABLE, 'picasso_sms_usage')
-        self.assertEqual(fh.AUDIT_TABLE, 'picasso_audit_logs')
         self.assertEqual(fh.NOTIFICATION_SENDS_TABLE, 'picasso-notification-sends')
 
 
