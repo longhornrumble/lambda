@@ -67,6 +67,10 @@ const { redeem, TokenError } = require('../shared/scheduling/tokens.js');
 // Backend scheduling feature gate (fail-closed). Scheduling is OFF unless the tenant
 // config sets feature_flags.scheduling_enabled (like Forms).
 const { isSchedulingEnabledForTenant } = require('../shared/scheduling/featureGate');
+// WS-E-ATTEND E6 — interviewer disposition (wires this handler's stubbed /attended/* action
+// to a real Booking.status transition per §11.2). Self-contained (its own DDB + token-sign +
+// notify defaults), so this stays a one-line call.
+const { applyDisposition } = require('../shared/scheduling/disposition');
 
 // ─── config ───────────────────────────────────────────────────────────────────────
 
@@ -256,6 +260,24 @@ function failurePage(status, { coordinator } = {}) {
   return page(status, title, body);
 }
 
+// §11.2 disposition result page (interviewer-facing). Friendly, low-information; never leaks
+// volunteer PII (the no_show outreach detail is generic). already_resolved is the idempotent
+// second-click / admin-after-interviewer ack.
+function attendanceResultPage(purpose, disposition) {
+  if (disposition && disposition.outcome === 'already_resolved') {
+    return page(
+      200,
+      'Already recorded',
+      '<p>Thanks — this appointment was already recorded. No further action is needed.</p>'
+    );
+  }
+  const lead =
+    purpose === 'no_show'
+      ? "Thanks for letting us know — we've reached out to the volunteer about finding a new time."
+      : 'Thanks for letting us know. No further action is needed.';
+  return page(200, 'Thanks — got it', `<p>${lead}</p>`);
+}
+
 // ─── booking read (defensive — schema discipline) ───────────────────────────────────
 
 async function getBooking(tenantId, bookingId) {
@@ -363,20 +385,45 @@ exports.handler = async (event) => {
     );
   }
 
-  // ── Interviewer attendance: real security path, disposition deferred to E6. ──
+  // ── Interviewer attendance disposition (E6 — WS-E-ATTEND wires the stubbed action). ──
+  // attended_yes → completed · no_show → no_show (+ volunteer reoffer) · didnt_connect →
+  // coordinator_no_show. The transition is a conditional booked→terminal write (idempotent:
+  // a second click / admin-after-interviewer → already_resolved). NO auto-completion (§11.1).
   if (ATTENDANCE_PURPOSES.has(purpose)) {
-    // TODO(E6): record interviewer disposition + transition the booking. D4 does NOT
-    // transition the booking — E6 owns interviewer disposition (§11.2).
-    log('redemption_attendance_ack', {
+    // An attendance token without a booking_id targets no booking → benign ack (the jti is
+    // already burned by redeem(); nothing to transition).
+    if (claims.booking_id == null) {
+      log('redemption_attendance_no_booking', { purpose, tenant_id: claims.tenant_id });
+      return page(
+        200,
+        'Thanks — got it',
+        '<p>Thanks for letting us know. No further action is needed.</p>'
+      );
+    }
+    let disposition;
+    try {
+      disposition = await applyDisposition({
+        tenantId: claims.tenant_id,
+        bookingId: String(claims.booking_id),
+        purpose,
+      });
+    } catch (err) {
+      // The jti is already burned (redeem succeeded); a re-click will 410. Rare write failure.
+      warn('redemption_disposition_error', {
+        purpose,
+        tenant_id: claims.tenant_id,
+        booking_id: claims.booking_id,
+        name: err && err.name,
+      });
+      return failurePage(500);
+    }
+    log('redemption_attendance_dispositioned', {
       purpose,
       tenant_id: claims.tenant_id,
       booking_id: claims.booking_id,
+      outcome: disposition.outcome,
     });
-    return page(
-      200,
-      'Thanks — got it',
-      '<p>Thanks for letting us know. No further action is needed.</p>'
-    );
+    return attendanceResultPage(purpose, disposition);
   }
 
   // ── Volunteer-facing: bind + redirect into chat (no calendar op here, §13.4). ──

@@ -5,6 +5,7 @@
   "type": "module",
   "main": "index.mjs",
   "scripts": {
+    "test": "node --test *.test.mjs",
     "package": "zip -r deployment.zip index.mjs package.json node_modules/ -x '*.DS_Store' -x 'node_modules/.package-lock.json'"
   },
   "dependencies": {
