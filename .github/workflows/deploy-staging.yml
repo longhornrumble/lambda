@@ -34,6 +34,8 @@ on:
           - Calendar_Watch_Offboarder
           - Booking_Commit_Handler
           - Scheduling_Redemption_Handler
+          - Calendar_Event_Consumer
+          - Calendar_Lifecycle_Consumer
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
