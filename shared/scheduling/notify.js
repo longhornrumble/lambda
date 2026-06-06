@@ -56,13 +56,18 @@
  */
 
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 
 // Created once at module load; reused across warm invocations.
 const lambda = new LambdaClient({});
+const ddb = new DynamoDBClient({});
 
 const SEND_EMAIL_FUNCTION = process.env.SEND_EMAIL_FUNCTION || 'send_email';
 // The eventual SMS target (sub-phase-E/SMS twin). Referenced by the stub for clarity.
 const SMS_SENDER_FUNCTION = process.env.SMS_SENDER_FUNCTION || 'SMS_Sender';
+// §E14: tenant notification-template overrides (scheduling-notif-template DDB table).
+// Empty/unset → no overrides looked up (defaults always used). FAIL-SAFE by design.
+const SCHED_NOTIF_TEMPLATE_TABLE = process.env.SCHED_NOTIF_TEMPLATE_TABLE || '';
 
 // Value-add notices the platform sends (agent-of-CoR §5.1 — beyond Google's email).
 const EMAIL_KINDS = new Set(['reschedule_link', 'reoffer', 'cancel_notice', 'reengagement']);
@@ -116,52 +121,68 @@ const STOP_LINE_TEXT = '\n\nTo stop receiving these emails, reply STOP.';
 const STOP_LINE_HTML =
   '<p style="margin-top:24px;font-size:12px;color:#64748B;">To stop receiving these emails, reply STOP.</p>';
 
+// NB: STOP is NOT baked into these template bodies. It is appended (STOP_LINE_*) AFTER
+// render in buildEmailPayload, so a tenant E14 override (§E14) of subject/text/html can
+// never remove the unsubscribe line — the compliance footer is structurally outside the
+// editable body.
 const TEMPLATES = {
   reschedule_link: {
     subject: 'Need a different time? — {{org}}',
     text:
       'Hi {{firstName}},\n\nNeed to change your {{apptType}}{{whenSuffix}}? ' +
-      'You can pick a new time here:\n{{actionUrl}}' +
-      STOP_LINE_TEXT,
+      'You can pick a new time here:\n{{actionUrl}}',
     html:
       '<p>Hi {{firstName}},</p>' +
       '<p>Need to change your {{apptType}}{{whenSuffix}}? You can pick a new time here:</p>' +
-      '<p><a href="{{actionUrl}}">Reschedule</a></p>' +
-      STOP_LINE_HTML,
+      '<p><a href="{{actionUrl}}">Reschedule</a></p>',
   },
   reoffer: {
     subject: "Let's find you a new time — {{org}}",
     text:
       'Hi {{firstName}},\n\nThe time you picked for your {{apptType}} is no longer ' +
-      'available. Pick a new one here:\n{{actionUrl}}' +
-      STOP_LINE_TEXT,
+      'available. Pick a new one here:\n{{actionUrl}}',
     html:
       '<p>Hi {{firstName}},</p>' +
       '<p>The time you picked for your {{apptType}} is no longer available. ' +
       'Pick a new one here:</p>' +
-      '<p><a href="{{actionUrl}}">Choose a new time</a></p>' +
-      STOP_LINE_HTML,
+      '<p><a href="{{actionUrl}}">Choose a new time</a></p>',
   },
   cancel_notice: {
     subject: 'Your {{apptType}} was canceled — {{org}}',
     text:
       'Hi {{firstName}},\n\nYour {{apptType}}{{whenSuffix}} has been canceled.' +
-      '{{rebookText}}' +
-      STOP_LINE_TEXT,
+      '{{rebookText}}',
     html:
       '<p>Hi {{firstName}},</p>' +
       '<p>Your {{apptType}}{{whenSuffix}} has been canceled.</p>' +
-      '{{rebookHtml}}' +
-      STOP_LINE_HTML,
+      '{{rebookHtml}}',
   },
 };
+
+// §E14 overridable moments (the 3 with a full subject+body here). reengagement (AI body)
+// + SMS kinds are NOT overridable in v1. Keep in sync with the ADA write API allowlist.
+const OVERRIDABLE_MOMENTS = new Set(['reschedule_link', 'reoffer', 'cancel_notice']);
+
+// Merge a tenant override (§E14) over a default template. Per field: use the override's
+// value only when it is a non-empty string; otherwise keep the default. The override body
+// never contains STOP (appended separately), so this can't strip the footer.
+function mergeNoticeTemplate(base, override) {
+  if (!override || typeof override !== 'object') return base;
+  const pickField = (k) =>
+    typeof override[k] === 'string' && override[k].trim() ? override[k] : base[k];
+  return {
+    subject: pickField('subject'),
+    text: pickField('text'),
+    html: pickField('html'),
+  };
+}
 
 // ─── payload builders ────────────────────────────────────────────────────────────────
 
 // Returns { to, subject, html_body, text_body } for an email kind, or throws if a
 // required action link for the kind is missing (a caller contract error, distinct from
 // a best-effort send failure).
-function buildEmailPayload({ kind, booking }) {
+function buildEmailPayload({ kind, booking, templateOverride }) {
   const attendeeEmail = pick(booking, 'attendeeEmail', 'attendee_email');
   const firstName =
     pick(booking, 'attendeeFirstName', 'attendee_first_name') ||
@@ -224,7 +245,8 @@ function buildEmailPayload({ kind, booking }) {
     ? `<p>Want to rebook? <a href="${escapeHtml(rebookUrl)}">Find a new time</a></p>`
     : '';
 
-  const tpl = TEMPLATES[kind];
+  // §E14: merge the tenant override (if any) over the default, then ALWAYS append STOP.
+  const tpl = mergeNoticeTemplate(TEMPLATES[kind], templateOverride);
 
   // Text body uses raw values; HTML body uses HTML-escaped values (the rebook block is
   // pre-escaped above, so it is passed through render unescaped).
@@ -249,8 +271,9 @@ function buildEmailPayload({ kind, booking }) {
     to: attendeeEmail,
     // Subjects are plain text, not HTML — render with raw values (never HTML-escaped).
     subject: render(tpl.subject, textVars),
-    text_body: render(tpl.text, textVars),
-    html_body: render(tpl.html, htmlVars),
+    // STOP appended here (not in the template) so an override can never remove it.
+    text_body: render(tpl.text, textVars) + STOP_LINE_TEXT,
+    html_body: render(tpl.html, htmlVars) + STOP_LINE_HTML,
   };
 }
 
@@ -286,6 +309,33 @@ async function defaultInvokeSms({ tenantId, booking, kind, log }) {
   return { stub: true };
 }
 
+// §E14: default override loader — GetItem on the scheduling-notif-template table for an
+// overridable moment. DI: inject deps.loadTemplateOverride in tests. FAIL-SAFE — any
+// non-overridable kind / unset table / miss / error returns null (defaults are used), so a
+// template-store problem can NEVER block a notice send.
+async function defaultLoadTemplateOverride({ tenantId, kind, log = console } = {}) {
+  if (!OVERRIDABLE_MOMENTS.has(kind) || !SCHED_NOTIF_TEMPLATE_TABLE || !tenantId) {
+    return null;
+  }
+  try {
+    const res = await ddb.send(
+      new GetItemCommand({
+        TableName: SCHED_NOTIF_TEMPLATE_TABLE,
+        Key: { tenantId: { S: String(tenantId) }, moment: { S: kind } },
+      })
+    );
+    const it = res.Item;
+    if (!it) return null;
+    const s = (a) => (a && typeof a.S === 'string' ? a.S : undefined);
+    return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html) };
+  } catch (err) {
+    (log || console).warn(
+      `[notify] template override load failed kind=${kind}: ${err.message} (using default)`
+    );
+    return null;
+  }
+}
+
 // ─── dispatchVolunteerNotice ───────────────────────────────────────────────────────────
 
 /**
@@ -300,6 +350,7 @@ async function dispatchVolunteerNotice(
   const {
     invokeEmail = defaultInvokeEmail,
     invokeSms = defaultInvokeSms,
+    loadTemplateOverride = defaultLoadTemplateOverride,
     log = console,
   } = deps;
 
@@ -340,7 +391,15 @@ async function dispatchVolunteerNotice(
   const dispatched = {};
 
   if (attemptEmail) {
-    const payload = buildEmailPayload({ kind, booking }); // throws on missing required link
+    // §E14: best-effort tenant override (null → defaults). Defense-in-depth: even if the
+    // loader itself throws, fall back to defaults — a template-store problem never blocks a send.
+    let templateOverride = null;
+    try {
+      templateOverride = await loadTemplateOverride({ tenantId, kind, log });
+    } catch (err) {
+      log.warn(`[notify] template override load threw kind=${kind}: ${err.message} (using default)`);
+    }
+    const payload = buildEmailPayload({ kind, booking, templateOverride }); // throws on missing required link
     if (!payload.to) {
       log.warn(`[notify] no recipient email — kind=${kind} booking=${bookingId}`);
       dispatched.email = 'skipped_no_recipient';
@@ -380,11 +439,14 @@ module.exports = {
   buildEmailPayload,
   defaultInvokeEmail,
   defaultInvokeSms,
+  defaultLoadTemplateOverride,
+  mergeNoticeTemplate,
   render,
   escapeHtml,
   EMAIL_KINDS,
   SMS_KINDS,
   COR_NATIVE_KINDS,
+  OVERRIDABLE_MOMENTS,
   _SEND_EMAIL_FUNCTION: SEND_EMAIL_FUNCTION,
   _SMS_SENDER_FUNCTION: SMS_SENDER_FUNCTION,
 };

@@ -460,6 +460,14 @@ def lambda_handler(event, context):
             sched_employee_id = path.split('/scheduling/employees/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_scheduling_employee_settings_write(tenant_id, sched_employee_id, body, user_role, user_email)
+        # §G2/E14 scheduling notification-template overrides (admin; tenant from auth).
+        # {moment} PATCH uses `in path`; the list GET uses endswith — distinct routes.
+        elif path.endswith('/scheduling/notification-templates') and method == 'GET':
+            return handle_scheduling_notification_templates_get(tenant_id, user_role)
+        elif '/scheduling/notification-templates/' in path and method == 'PATCH':
+            sched_moment = path.split('/scheduling/notification-templates/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_notification_template_write(tenant_id, sched_moment, body, user_role, user_email)
         # Forms endpoints (more specific - check second)
         elif path.endswith('/forms/summary'):
             return handle_form_summary(tenant_id, params)
@@ -4273,6 +4281,159 @@ def handle_scheduling_tag_vocabulary_get(tenant_id: str, user_role: Optional[str
     if guard:
         return guard
     return cors_response(200, {'scheduling_tag_vocabulary': get_tag_vocabulary(tenant_id)})
+
+
+# --- G2 / E14: scheduling notification-template overrides (ui_plan Surface E14) -------- #
+# Per-tenant overrides of the scheduling lifecycle-notice email copy, stored in DDB (NOT
+# tenant config S3 — that store is form-scoped AND read-only on staging; scheduling config
+# lives in DDB per §E13b). notify.js reads these at dispatch (override → else local default);
+# STOP is appended by notify.js OUTSIDE the editable body, so an override can never drop it.
+# v1 = the 3 moments that actually dispatch with a full subject+body. Reminders/confirmation
+# (WS-E-REMIND) + the AI-bodied reengagement are out of scope.
+SCHED_NOTIF_TEMPLATE_TABLE = os.environ.get('SCHED_NOTIF_TEMPLATE_TABLE', 'picasso-scheduling-notif-template')
+_SCHED_NOTIF_MOMENTS = ('reschedule_link', 'reoffer', 'cancel_notice')
+_SCHED_TPL_FIELD_MAX = 5000
+_SCHED_TPL_FIELDS = ('subject', 'body_text', 'body_html')
+# Editor-display defaults — MIRROR shared/scheduling/notify.js TEMPLATES (STOP excluded, it
+# is appended at dispatch). notify.js is the AUTHORITATIVE default; this copy is only what the
+# editor shows for the unedited/"reset" state. Keep in sync (test asserts the moment keys).
+# Follow-up (noted in audit): extract to a shared JSON both sides read to remove drift risk.
+_SCHED_NOTIF_DEFAULTS = {
+    'reschedule_link': {
+        'subject': 'Need a different time? — {{org}}',
+        'body_text': 'Hi {{firstName}},\n\nNeed to change your {{apptType}}{{whenSuffix}}? '
+                     'You can pick a new time here:\n{{actionUrl}}',
+        'body_html': '<p>Hi {{firstName}},</p><p>Need to change your {{apptType}}{{whenSuffix}}? '
+                     'You can pick a new time here:</p><p><a href="{{actionUrl}}">Reschedule</a></p>',
+    },
+    'reoffer': {
+        'subject': "Let's find you a new time — {{org}}",
+        'body_text': 'Hi {{firstName}},\n\nThe time you picked for your {{apptType}} is no longer '
+                     'available. Pick a new one here:\n{{actionUrl}}',
+        'body_html': '<p>Hi {{firstName}},</p><p>The time you picked for your {{apptType}} is no '
+                     'longer available. Pick a new one here:</p><p><a href="{{actionUrl}}">Choose a new time</a></p>',
+    },
+    'cancel_notice': {
+        'subject': 'Your {{apptType}} was canceled — {{org}}',
+        'body_text': 'Hi {{firstName}},\n\nYour {{apptType}}{{whenSuffix}} has been canceled.{{rebookText}}',
+        'body_html': '<p>Hi {{firstName}},</p><p>Your {{apptType}}{{whenSuffix}} has been canceled.</p>{{rebookHtml}}',
+    },
+}
+_SCHED_NOTIF_VARIABLES = ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}',
+                          '{{actionUrl}}', '{{rebookText}}', '{{rebookHtml}}']
+
+
+def handle_scheduling_notification_templates_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
+    """
+    GET /scheduling/notification-templates (G2/E14; ADMIN-only).
+    Returns each overridable moment's EFFECTIVE copy (override field if set, else the default),
+    is_override per moment, the raw default (for the editor's reset/preview), modified_at, and
+    the available {{variables}}. STOP is appended at dispatch and is NOT part of the editable body.
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    overrides: Dict[str, Dict[str, Any]] = {}
+    try:
+        resp = dynamodb.query(
+            TableName=SCHED_NOTIF_TEMPLATE_TABLE,
+            KeyConditionExpression='tenantId = :t',
+            ExpressionAttributeValues={':t': {'S': tenant_id}},
+            Limit=_SCHED_CONFIG_LIST_LIMIT,
+        )
+        for it in resp.get('Items', []):
+            row = _unmarshal(it)
+            m = row.get('moment')
+            if m in _SCHED_NOTIF_DEFAULTS:
+                overrides[m] = row
+    except ClientError as e:
+        logger.error(f"[scheduling/notification-templates] query failed "
+                     f"(tenant={redact_tenant_id(tenant_id)}): {e}")
+        return cors_response(502, {'error': 'failed to load notification templates'})
+
+    moments_out: Dict[str, Any] = {}
+    for moment, default in _SCHED_NOTIF_DEFAULTS.items():
+        ov = overrides.get(moment, {})
+        effective = {}
+        is_override = False
+        for f in _SCHED_TPL_FIELDS:
+            val = ov.get(f)
+            if isinstance(val, str) and val.strip():
+                effective[f] = val
+                is_override = True
+            else:
+                effective[f] = default[f]
+        moments_out[moment] = {
+            **effective,
+            'is_override': is_override,
+            'default': dict(default),
+            'modified_at': ov.get('modified_at'),
+        }
+    return cors_response(200, {
+        'moments': moments_out,
+        'available_variables': _SCHED_NOTIF_VARIABLES,
+        'stop_footer_note': 'An unsubscribe (STOP) line is appended automatically and cannot be removed.',
+    })
+
+
+def handle_scheduling_notification_template_write(tenant_id: str, moment: str, body: Dict[str, Any],
+                                                  user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
+    """
+    PATCH /scheduling/notification-templates/{moment} (G2/E14; ADMIN-only).
+    Upsert-merge of subject / body_text / body_html for one moment (UpdateItem SET of only the
+    provided fields — a partial save preserves the others). An empty-string field clears that
+    field's override (reads fall back to the default). No optimistic lock (low-contention per-
+    tenant config, consistent with §E13c); modified_at stamped for display. STOP is appended at
+    dispatch and is NOT editable here.
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    if moment not in _SCHED_NOTIF_DEFAULTS:
+        return cors_response(404, {'error': f'unknown scheduling notification moment: {moment!r}',
+                                   'moments': list(_SCHED_NOTIF_MOMENTS)})
+    if not isinstance(body, dict):
+        return cors_response(400, {'error': 'request body must be an object'})
+
+    fields: Dict[str, Any] = {}
+    for f in _SCHED_TPL_FIELDS:
+        if f in body:
+            v = body[f]
+            if not isinstance(v, str):
+                return cors_response(400, {'error': f'{f} must be a string'})
+            if len(v) > _SCHED_TPL_FIELD_MAX:
+                return cors_response(400, {'error': f'{f} exceeds {_SCHED_TPL_FIELD_MAX} chars'})
+            fields[f] = v
+    if not fields:
+        return cors_response(400, {'error': 'provide at least one of subject, body_text, body_html'})
+
+    fields['modified_at'] = _modified_at(user_email)
+    names = {'#pk': 'tenantId'}
+    values = {}
+    sets = []
+    for i, (k, v) in enumerate(fields.items()):
+        nk, vk = f'#f{i}', f':v{i}'
+        names[nk] = k
+        values[vk] = _ddb_serialize(v)
+        sets.append(f'{nk} = {vk}')
+    try:
+        resp = dynamodb.update_item(
+            TableName=SCHED_NOTIF_TEMPLATE_TABLE,
+            Key={'tenantId': {'S': tenant_id}, 'moment': {'S': moment}},
+            UpdateExpression='SET ' + ', '.join(sets),
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+            ReturnValues='ALL_NEW',
+        )
+    except ClientError as e:
+        logger.error(f"[scheduling/notification-templates] write failed "
+                     f"(tenant={redact_tenant_id(tenant_id)}, moment={moment}): {e}")
+        return cors_response(502, {'error': 'failed to save notification template'})
+
+    logger.info(f"[scheduling/notification-templates] PATCH tenant={redact_tenant_id(tenant_id)} "
+                f"moment={moment} fields={sorted(f for f in fields if f != 'modified_at')} "
+                f"by={redact_email(user_email or '')}")
+    return cors_response(200, {'moment': moment, 'template': _unmarshal(resp.get('Attributes', {}))})
 
 
 def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
