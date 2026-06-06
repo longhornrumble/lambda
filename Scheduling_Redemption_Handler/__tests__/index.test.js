@@ -14,11 +14,13 @@ const {
   DynamoDBClient,
   GetItemCommand,
   PutItemCommand,
+  UpdateItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 const {
   SecretsManagerClient,
   GetSecretValueCommand,
 } = require('@aws-sdk/client-secrets-manager');
+const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 
 const tokens = require('../../shared/scheduling/tokens.js');
 // Feature gate: default-enabled so the existing redeem/bind/redirect tests exercise the
@@ -31,6 +33,7 @@ const { handler } = require('../index.js');
 
 const ddbMock = mockClient(DynamoDBClient);
 const smMock = mockClient(SecretsManagerClient);
+const lambdaMock = mockClient(LambdaClient); // E6 disposition → notify.js Lambda invokes
 
 const KEY = 'test-signing-key-0123456789abcdef'; // ≥16 chars (MIN_SIGNING_KEY_LENGTH)
 const JTI_TABLE = 'picasso-token-jti-blacklist-staging';
@@ -77,10 +80,23 @@ function bookingItem() {
 beforeEach(() => {
   ddbMock.reset();
   smMock.reset();
+  lambdaMock.reset();
   smMock.on(GetSecretValueCommand).resolves({ SecretString: KEY });
   // Default happy DDB: booking present, both PutItems succeed.
   ddbMock.on(GetItemCommand).resolves(bookingItem());
   ddbMock.on(PutItemCommand).resolves({});
+  // E6 disposition: conditional transition returns the booked→terminal ALL_NEW row by default.
+  ddbMock.on(UpdateItemCommand).resolves({
+    Attributes: {
+      status: { S: 'completed' },
+      coordinator_email: { S: 'maya@org.example' },
+      attendee_name: { S: 'Sam Patel' },
+      appointment_type_name: { S: 'intake call' },
+      start_at: { S: FAR_FUTURE_START },
+    },
+  });
+  // notify.js dispatches (email + reoffer) go through the send_email / SMS_Sender Lambdas.
+  lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
 });
 
 describe('feature gate: scheduling_enabled (OFF unless config opts in)', () => {
@@ -267,12 +283,21 @@ describe('SR-2: SESSION_BINDING_TTL_SECONDS validated at module load', () => {
   );
 });
 
-describe('interviewer attendance: real security path, disposition deferred', () => {
+describe('interviewer attendance disposition (E6 — WS-E-ATTEND wires the action)', () => {
   test.each([
-    ['/attended/met', 'attended_yes'],
-    ['/attended/noshow', 'no_show'],
-    ['/attended/noconnect', 'didnt_connect'],
-  ])('%s valid → 200 ack, no booking transition, no binding', async (path, purpose) => {
+    ['/attended/met', 'attended_yes', 'completed'],
+    ['/attended/noshow', 'no_show', 'no_show'],
+    ['/attended/noconnect', 'didnt_connect', 'coordinator_no_show'],
+  ])('%s valid → 200, transitions booking to %s (conditional write), no binding', async (path, purpose, target) => {
+    ddbMock.on(UpdateItemCommand).resolves({
+      Attributes: {
+        status: { S: target },
+        coordinator_email: { S: 'maya@org.example' },
+        attendee_name: { S: 'Sam Patel' },
+        appointment_type_name: { S: 'intake call' },
+        start_at: { S: FAR_FUTURE_START },
+      },
+    });
     const t = await tokens.sign(
       purpose,
       { tenant_id: TENANT, booking_id: BOOKING, event_end: FAR_FUTURE_START },
@@ -280,12 +305,78 @@ describe('interviewer attendance: real security path, disposition deferred', () 
     );
     const res = await handler(evt(path, t));
     expect(res.statusCode).toBe(200);
-    expect(res.body).toMatch(/got it/i);
-    // jti redeemed, but no binding write and no booking transition.
+    // a real conditional booked→terminal transition ran
+    const updates = ddbMock.commandCalls(UpdateItemCommand);
+    expect(updates).toHaveLength(1);
+    const u = updates[0].args[0].input;
+    expect(u.ExpressionAttributeValues[':target'].S).toBe(target);
+    expect(u.ConditionExpression).toContain('#st = :booked');
+    // attendance disposition writes NO §B10 session binding (that is the volunteer path)
     const bindPuts = ddbMock
       .commandCalls(PutItemCommand)
       .filter((c) => c.args[0].input.TableName === SESSION_TABLE);
     expect(bindPuts).toHaveLength(0);
+  });
+
+  test('no_show → 200 + volunteer reoffer dispatched (Lambda invoke)', async () => {
+    ddbMock.on(UpdateItemCommand).resolves({
+      Attributes: {
+        status: { S: 'no_show' },
+        coordinator_email: { S: 'maya@org.example' },
+        attendee_email: { S: 'sam@example.com' },
+        attendee_name: { S: 'Sam Patel' },
+        appointment_type_name: { S: 'intake call' },
+        start_at: { S: FAR_FUTURE_START },
+      },
+    });
+    const t = await tokens.sign(
+      'no_show',
+      { tenant_id: TENANT, booking_id: BOOKING, event_end: FAR_FUTURE_START },
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/attended/noshow', t));
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatch(/new time/i);
+    // reoffer email + interviewer confirmation both route through send_email (≥2 Lambda invokes)
+    expect(lambdaMock.commandCalls(InvokeCommand).length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('idempotent: already-resolved (ConditionalCheckFailed) → 200 already-recorded, no dispatch', async () => {
+    const condErr = new Error('cond'); condErr.name = 'ConditionalCheckFailedException';
+    ddbMock.on(UpdateItemCommand).rejects(condErr);
+    const t = await tokens.sign(
+      'attended_yes',
+      { tenant_id: TENANT, booking_id: BOOKING, event_end: FAR_FUTURE_START },
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/attended/met', t));
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatch(/already recorded/i);
+    expect(lambdaMock.commandCalls(InvokeCommand)).toHaveLength(0);
+  });
+
+  test('attendance token without booking_id → benign 200 ack, no transition', async () => {
+    const t = await tokens.sign(
+      'attended_yes',
+      { tenant_id: TENANT, event_end: FAR_FUTURE_START }, // no booking_id
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/attended/met', t));
+    expect(res.statusCode).toBe(200);
+    expect(res.body).toMatch(/got it/i);
+    expect(ddbMock.commandCalls(UpdateItemCommand)).toHaveLength(0);
+  });
+
+  test('disposition write error (non-conditional) → 500, no detail leak', async () => {
+    ddbMock.on(UpdateItemCommand).rejects(new Error('throttled'));
+    const t = await tokens.sign(
+      'attended_yes',
+      { tenant_id: TENANT, booking_id: BOOKING, event_end: FAR_FUTURE_START },
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/attended/met', t));
+    expect(res.statusCode).toBe(500);
+    expect(res.body).not.toMatch(/throttled|token|jwt/i);
   });
 });
 
