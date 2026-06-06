@@ -1150,6 +1150,7 @@ def handle_clerk_auth(body: Dict[str, Any]) -> Dict[str, Any]:
             'dashboard_attribution': True,
             'dashboard_notifications': True,
             'dashboard_settings': True,
+            'dashboard_scheduling': True,
         }
     else:
         features = get_tenant_features(user_info['tenant_id'])
@@ -1357,6 +1358,7 @@ def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
             'dashboard_attribution': False,
             'dashboard_notifications': False,
             'dashboard_settings': False,
+            'dashboard_scheduling': False,
         }
 
     features = config.get('features', {})
@@ -1369,6 +1371,8 @@ def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
         'dashboard_attribution': features.get('dashboard_attribution', False) or feature_flags.get('dashboard_attribution', False),
         'dashboard_notifications': features.get('dashboard_notifications', False) or feature_flags.get('dashboard_notifications', False),
         'dashboard_settings': features.get('dashboard_settings', False) or feature_flags.get('dashboard_settings', False),
+        # D1 Flag A scheduling entitlement — off until the tenant enables it (config features/feature_flags).
+        'dashboard_scheduling': features.get('dashboard_scheduling', False) or feature_flags.get('dashboard_scheduling', False),
     }
 
 
@@ -1387,6 +1391,7 @@ def handle_features(tenant_id: str) -> Dict[str, Any]:
             'dashboard_attribution': True,
             'dashboard_notifications': True,
             'dashboard_settings': True,
+            'dashboard_scheduling': True,
         }
     else:
         features = get_tenant_features(tenant_id)
