@@ -28,11 +28,20 @@
 
 const crypto = require('crypto');
 const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 const SIGNING_SECRET_NAME =
   process.env.OAUTH_STATE_SIGNING_SECRET_NAME || 'picasso/scheduling/oauth/_state-signing-key';
 
-const sm = new SecretsManagerClient({});
+// Bounded client (mirror index.js): a slow Secrets Manager must not hang the route to the full
+// Lambda timeout.
+const sm = new SecretsManagerClient({
+  maxAttempts: Number(process.env.AWS_MAX_ATTEMPTS || 2),
+  requestHandler: new NodeHttpHandler({
+    connectionTimeout: Number(process.env.AWS_CONNECTION_TIMEOUT_MS || 3000),
+    requestTimeout: Number(process.env.AWS_REQUEST_TIMEOUT_MS || 5000),
+  }),
+});
 
 // Container-lifetime cache of the raw signing key. A rotated key needs a cold start to pick
 // up — acceptable for an HMAC signing key (rotation is rare + operator-driven).

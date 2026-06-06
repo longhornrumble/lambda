@@ -89,3 +89,25 @@ describe('probeRefresh', () => {
     });
   });
 });
+
+describe('withTimeout (bounds the google-auth calls)', () => {
+  afterEach(() => jest.useRealTimers());
+
+  test('a hanging getAccessToken rejects with a timeout (not an infinite hang)', async () => {
+    jest.useFakeTimers();
+    spies.getAccessToken.mockReturnValue(new Promise(() => {})); // never settles
+    const p = oauth.probeRefresh({ clientId: 'c', clientSecret: 's', refreshToken: '1//rt' });
+    p.catch(() => {}); // pre-attach so the eventual reject is not "unhandled"
+    await jest.advanceTimersByTimeAsync(8001);
+    await expect(p).rejects.toThrow(/timed out/);
+  });
+
+  test('a hanging getToken rejects with a timeout', async () => {
+    jest.useFakeTimers();
+    spies.getToken.mockReturnValue(new Promise(() => {}));
+    const p = oauth.exchangeCode({ clientId: 'c', clientSecret: 's', redirectUri: 'https://x', code: 'authcode' });
+    p.catch(() => {});
+    await jest.advanceTimersByTimeAsync(8001);
+    await expect(p).rejects.toThrow(/timed out/);
+  });
+});

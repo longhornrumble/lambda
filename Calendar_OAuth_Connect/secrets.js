@@ -30,6 +30,7 @@ const {
   PutSecretValueCommand,
   DescribeSecretCommand,
 } = require('@aws-sdk/client-secrets-manager');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 
 const OAUTH_SECRET_PATH_PREFIX = process.env.OAUTH_SECRET_PATH_PREFIX || 'picasso/scheduling/oauth';
 const OAUTH_PLATFORM_SECRET_NAME =
@@ -40,7 +41,15 @@ const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const TENANT_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const COORDINATOR_ID_RE = /^[A-Za-z0-9._@+-]{1,128}$/;
 
-const sm = new SecretsManagerClient({});
+// Bounded client (mirror index.js): a slow Secrets Manager must not hang the route to the full
+// Lambda timeout.
+const sm = new SecretsManagerClient({
+  maxAttempts: Number(process.env.AWS_MAX_ATTEMPTS || 2),
+  requestHandler: new NodeHttpHandler({
+    connectionTimeout: Number(process.env.AWS_CONNECTION_TIMEOUT_MS || 3000),
+    requestTimeout: Number(process.env.AWS_REQUEST_TIMEOUT_MS || 5000),
+  }),
+});
 
 function buildSecretPath(tenantId, coordinatorId) {
   if (!TENANT_ID_RE.test(tenantId || '')) throw new Error('invalid tenantId');

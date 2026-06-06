@@ -158,11 +158,19 @@ to the EXISTING `picasso-token-jti-blacklist` table (the §B4 one-time-use patte
 → first use wins, replay → reject). Adds a DDB `PutItem` grant on that table to the role. Keep the
 TTL short (≤300s) regardless. Lock the single-use requirement into FROZEN_CONTRACTS §E0.
 
-**Operational note (`invalid_client`):** `revocation.js` mirrors the shipped BCH `classifyAuthError`,
-which treats `invalid_client` as a permanent (→ disconnect) marker. `invalid_client` actually means
-the PLATFORM app credentials are wrong — so if the platform-app secret breaks, `/connection/status`
-would mark EVERY coordinator revoked. Harmless for the one-coordinator staging pilot; before Beta,
-surface `invalid_client` as a platform-level alarm rather than a per-coordinator disconnect.
+**Operational note (`invalid_client`) — FIXED 2026-06-06 (integrator directive #3):** `revocation.js`
+classifies `invalid_client` as **PLATFORM** (not a per-coordinator `PERMANENT_MARKER`), deliberately
+diverging from the shipped BCH `classifyAuthError`. So a broken platform-app credential makes
+`/connection/status` log `status_platform_credential_error` + report `stale_connected` (NO secret
+stamp) instead of mass-revoking every polling coordinator. Wire `status_platform_credential_error`
+to an operator alarm before Beta.
+
+**⚠️ Beta-gated PII (track; NOT a staging blocker):** the signed `state`/`init` token's base64 payload
+carries `coordinator_email`/`coordinator_id`, and `state` rides in the `/oauth/callback?state=` query
+string → **CloudFront access logs would capture the email**. Before Beta either disable query-string
+logging on the D3 distribution for these paths, or carry an opaque reference instead of the email in
+the token payload. (In v1 `coordinator_id === coordinator_email`, so dropping `coordinator_email`
+alone does not remove the PII — the id is the email.)
 
 ---
 

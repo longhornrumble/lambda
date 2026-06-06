@@ -18,16 +18,27 @@
  *     This is exactly the work-order's "401 invalid_grant → disconnect" vs "5xx → stale-connected".
  */
 
+// PERMANENT = a per-COORDINATOR revocation: this coordinator's grant is gone → stamp their
+// secret revoked. NOTE the deliberate divergence from the shipped BCH classifyAuthError, which
+// also lists `invalid_client`: that error means the PLATFORM app credentials are wrong, NOT a
+// per-coordinator revocation. Treating it as permanent here would mass-stamp EVERY polling
+// coordinator `revoked` (irreversible) the moment the platform-app secret breaks. So
+// `invalid_client` is classified PLATFORM (transient for the per-coordinator decision) and
+// surfaced separately for an operator alarm (integrator directive #3).
 const PERMANENT_MARKERS = [
   'invalid_grant',
   'unauthorized_client',
-  'invalid_client',
   'Token has been expired or revoked',
 ];
 
+// Platform-level credential failure — NOT a per-coordinator revocation.
+const PLATFORM_MARKERS = ['invalid_client'];
+
 /**
  * @param {any} err - a thrown GaxiosError (or any error) from a refresh/probe attempt
- * @returns {{ permanent: boolean, httpStatus: number|null }}
+ * @returns {{ permanent: boolean, platform: boolean, httpStatus: number|null }}
+ *   permanent = per-coordinator revocation (stamp the secret revoked)
+ *   platform  = platform-app credential failure (operator alarm; do NOT stamp the coordinator)
  */
 function classifyTokenError(err) {
   const httpStatus = err?.code ?? err?.response?.status ?? null;
@@ -41,14 +52,17 @@ function classifyTokenError(err) {
       ? rawOauthError
       : (rawOauthError && (rawOauthError.message || rawOauthError.status)) || '';
   const message = String(err?.message || '');
+  const matches = (markers) => markers.some((m) => oauthError.includes(m) || message.includes(m));
 
-  const permanent = PERMANENT_MARKERS.some(
-    (m) => oauthError.includes(m) || message.includes(m)
-  );
-  return { permanent, httpStatus: typeof httpStatus === 'number' ? httpStatus : null };
+  return {
+    permanent: matches(PERMANENT_MARKERS),
+    platform: matches(PLATFORM_MARKERS),
+    httpStatus: typeof httpStatus === 'number' ? httpStatus : null,
+  };
 }
 
 module.exports = {
   classifyTokenError,
   PERMANENT_MARKERS,
+  PLATFORM_MARKERS,
 };

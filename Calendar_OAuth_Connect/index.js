@@ -261,24 +261,30 @@ async function handleConnect(event) {
 async function handleCallback(event) {
   const q = getQuery(event);
 
-  // User declined consent (or Google returned an error) → friendly "not connected", no write.
-  if (q.error) {
-    // Log only from the known OAuth error vocabulary; anything else → 'unknown' (no log-injection
-    // of an attacker-controlled query value into the structured log stream).
-    const known = KNOWN_OAUTH_ERRORS.has(String(q.error)) ? String(q.error) : 'unknown';
-    log('callback_user_declined', { error: known });
-    return page(200, 'Calendar not connected', '<p>You didn’t finish connecting your calendar. You can return to the dashboard and try again anytime.</p>');
-  }
-  if (!q.code || !q.state) {
+  // `state` is REQUIRED and verified FIRST — on the success AND the error path. Google echoes
+  // `state` on error redirects (RFC 6749 §4.1.2.1), so a genuine decline still carries a valid
+  // signed state; an anonymous caller hitting /oauth/callback?error=… with no/forged state gets
+  // a 400, not a free 200 page (integrator directive #2).
+  if (!q.state) {
     log('callback_missing_params', {});
     return genericFailure(400);
   }
-
   let claims;
   try {
     claims = await state.verify(q.state, { expectedType: 'state' });
   } catch (err) {
     log('callback_state_rejected', { code: err && err.code });
+    return genericFailure(400);
+  }
+
+  // User declined consent (or Google returned an error) → friendly "not connected", no write.
+  if (q.error) {
+    const known = KNOWN_OAUTH_ERRORS.has(String(q.error)) ? String(q.error) : 'unknown';
+    log('callback_user_declined', { tenant_id: claims.tenant_id, error: known });
+    return page(200, 'Calendar not connected', '<p>You didn’t finish connecting your calendar. You can return to the dashboard and try again anytime.</p>');
+  }
+  if (!q.code) {
+    log('callback_missing_code', { tenant_id: claims.tenant_id });
     return genericFailure(400);
   }
 
@@ -315,7 +321,17 @@ async function handleCallback(event) {
     return page(400, 'Couldn’t finish connecting', '<p>We didn’t receive the access we need. Please return to the dashboard and connect again.</p>');
   }
 
-  const grantedScopes = tokens.scope ? tokens.scope.split(' ').filter(Boolean) : oauth.SCOPES;
+  // Granted-scope validation (integrator directive #5 / Security N-1): the user can grant a SUBSET
+  // of the requested scopes (deselect on the consent screen / a manipulated screen). Writing a
+  // "connected" secret missing calendar.events or calendar.freebusy would silently fail every
+  // downstream booking/availability call. Require BOTH before persisting; else fail loudly.
+  const grantedScopes = tokens.scope ? tokens.scope.split(' ').filter(Boolean) : [];
+  const missing = oauth.SCOPES.filter((s) => !grantedScopes.includes(s));
+  if (missing.length > 0) {
+    warn('callback_insufficient_scope', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id), granted_count: grantedScopes.length });
+    return page(403, 'Couldn’t finish connecting', '<p>We need access to your calendar’s events and free/busy times to schedule. Please return to the dashboard and connect again, accepting all the requested permissions.</p>');
+  }
+
   const nowIso = new Date().toISOString();
   try {
     await secrets.writeCoordinator({
@@ -383,9 +399,15 @@ async function handleStatus(event) {
     log('status_connected', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
     return json(200, { status: 'connected', scopes: secret.scopes || null });
   } catch (err) {
-    const { permanent, httpStatus } = classifyTokenError(err);
+    const { permanent, platform, httpStatus } = classifyTokenError(err);
+    if (platform) {
+      // Platform-app credential failure (invalid_client) — NOT this coordinator's fault. Do NOT
+      // stamp the secret (that would mass-revoke everyone). Loud operator-alarm log; report stale.
+      warn('status_platform_credential_error', { tenant_id: claims.tenant_id, http_status: httpStatus });
+      return json(200, { status: 'stale_connected' });
+    }
     if (permanent) {
-      // Confirmed revocation → stamp the secret + report disconnected (bookable:false).
+      // Confirmed per-coordinator revocation → stamp the secret + report disconnected (bookable:false).
       try {
         await secrets.markDisconnected({ tenantId: claims.tenant_id, coordinatorId: claims.coordinator_id, nowIso: new Date().toISOString() });
       } catch (markErr) {

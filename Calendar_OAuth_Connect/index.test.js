@@ -41,7 +41,7 @@ beforeEach(() => {
   state.verify.mockResolvedValue(INIT_CLAIMS);
   state.sign.mockResolvedValue('signed-state');
   oauth.buildAuthUrl.mockReturnValue('https://accounts.google.com/o/oauth2/v2/auth?state=signed-state');
-  oauth.exchangeCode.mockResolvedValue({ refresh_token: '1//refresh-secret', scope: 'a b', token_type: 'Bearer' });
+  oauth.exchangeCode.mockResolvedValue({ refresh_token: '1//refresh-secret', scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.freebusy', token_type: 'Bearer' });
   oauth.probeRefresh.mockResolvedValue(undefined);
   secrets.readPlatformApp.mockResolvedValue({ client_id: 'cid', client_secret: 'cs', redirect_uri: 'https://staging.schedule.myrecruiter.ai/oauth/callback' });
   secrets.writeCoordinator.mockResolvedValue('picasso/scheduling/oauth/MYR384719/maya@example.org');
@@ -142,10 +142,35 @@ describe('GET /connect', () => {
 });
 
 describe('GET /oauth/callback', () => {
-  test('user declined (error param) → friendly 200, no exchange/write', async () => {
-    const res = await handler(ev('/oauth/callback', { error: 'access_denied' }));
+  test('user declined (error + valid state) → friendly 200, no exchange/write', async () => {
+    const res = await handler(ev('/oauth/callback', { error: 'access_denied', state: 's' }));
     expect(res.statusCode).toBe(200);
     expect(oauth.exchangeCode).not.toHaveBeenCalled();
+    expect(secrets.writeCoordinator).not.toHaveBeenCalled();
+  });
+
+  test('error WITHOUT state → 400 (no free page to anonymous callers; directive #2)', async () => {
+    const res = await handler(ev('/oauth/callback', { error: 'access_denied' }));
+    expect(res.statusCode).toBe(400);
+  });
+
+  test('error with FORGED state → 400 (state verified before the decline page)', async () => {
+    state.verify.mockRejectedValue(Object.assign(new Error('bad_signature'), { code: 'bad_signature' }));
+    const res = await handler(ev('/oauth/callback', { error: 'access_denied', state: 'forged' }));
+    expect(res.statusCode).toBe(400);
+  });
+
+  test('partial granted scope → 403, NO secret written (directive #5)', async () => {
+    oauth.exchangeCode.mockResolvedValue({ refresh_token: '1//r', scope: 'https://www.googleapis.com/auth/calendar.events' }); // freebusy missing
+    const res = await handler(ev('/oauth/callback', { code: 'c', state: 's' }));
+    expect(res.statusCode).toBe(403);
+    expect(secrets.writeCoordinator).not.toHaveBeenCalled();
+  });
+
+  test('no scope returned at all → 403, NO secret written', async () => {
+    oauth.exchangeCode.mockResolvedValue({ refresh_token: '1//r', scope: null });
+    const res = await handler(ev('/oauth/callback', { code: 'c', state: 's' }));
+    expect(res.statusCode).toBe(403);
     expect(secrets.writeCoordinator).not.toHaveBeenCalled();
   });
 
@@ -172,7 +197,7 @@ describe('GET /oauth/callback', () => {
         refreshToken: '1//refresh-secret',
         clientId: 'cid',
         clientSecret: 'cs',
-        scopes: ['a', 'b'],
+        scopes: ['https://www.googleapis.com/auth/calendar.events', 'https://www.googleapis.com/auth/calendar.freebusy'],
         calendarId: 'primary',
       })
     );
@@ -225,7 +250,7 @@ describe('GET /oauth/callback', () => {
   test('unknown ?error= is logged as "unknown" (no log-injection of attacker value)', async () => {
     const lines = [];
     const logSpy = jest.spyOn(console, 'log').mockImplementation((...a) => lines.push(a.join(' ')));
-    await handler(ev('/oauth/callback', { error: 'INJECT"}{evil' }));
+    await handler(ev('/oauth/callback', { error: 'INJECT"}{evil', state: 's' }));
     logSpy.mockRestore();
     const all = lines.join('\n');
     expect(all).toContain('"error":"unknown"');
@@ -308,6 +333,14 @@ describe('GET /connection/status (revocation detection)', () => {
   test('probe 5xx (transient) → stale_connected, secret NOT touched', async () => {
     secrets.readCoordinator.mockResolvedValue({ refresh_token: 'rt', client_id: 'c', client_secret: 's', status: 'connected' });
     oauth.probeRefresh.mockRejectedValue({ code: 503, response: { status: 503, data: { error: 'backendError' } } });
+    const res = await handler(ev('/connection/status', { init: 'ok' }));
+    expect(secrets.markDisconnected).not.toHaveBeenCalled();
+    expect(JSON.parse(res.body)).toEqual({ status: 'stale_connected' });
+  });
+
+  test('probe invalid_client (PLATFORM) → stale_connected, secret NOT stamped (no mass-revoke)', async () => {
+    secrets.readCoordinator.mockResolvedValue({ refresh_token: 'rt', client_id: 'c', client_secret: 's', status: 'connected' });
+    oauth.probeRefresh.mockRejectedValue({ code: 401, response: { status: 401, data: { error: 'invalid_client' } } });
     const res = await handler(ev('/connection/status', { init: 'ok' }));
     expect(secrets.markDisconnected).not.toHaveBeenCalled();
     expect(JSON.parse(res.body)).toEqual({ status: 'stale_connected' });

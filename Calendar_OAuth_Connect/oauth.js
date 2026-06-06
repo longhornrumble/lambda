@@ -24,6 +24,20 @@ const SCOPES = [
   'https://www.googleapis.com/auth/calendar.freebusy',
 ];
 
+// google-auth-library / gaxios has no easily-injectable global timeout across versions, so we bound
+// each network call with a race (the index.js timeout intent, library-agnostic). On timeout the
+// rejection classifies as transient (httpStatus null) → stale_connected / 502, never a false revoke.
+const HTTP_TIMEOUT_MS = Number(process.env.OAUTH_HTTP_TIMEOUT_MS || 8000);
+
+function withTimeout(promise, label, ms = HTTP_TIMEOUT_MS) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  // Promise.race attaches a handler to `promise`, so a later settle is not an unhandled rejection.
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 function makeClient({ clientId, clientSecret, redirectUri }) {
   return new OAuth2Client({ clientId, clientSecret, redirectUri });
 }
@@ -51,7 +65,7 @@ function buildAuthUrl({ clientId, clientSecret, redirectUri, state }) {
  */
 async function exchangeCode({ clientId, clientSecret, redirectUri, code }) {
   const client = makeClient({ clientId, clientSecret, redirectUri });
-  const { tokens } = await client.getToken(code);
+  const { tokens } = await withTimeout(client.getToken(code), 'getToken');
   return {
     refresh_token: (tokens && tokens.refresh_token) || null,
     scope: (tokens && tokens.scope) || null,
@@ -68,7 +82,7 @@ async function probeRefresh({ clientId, clientSecret, refreshToken }) {
   const client = makeClient({ clientId, clientSecret });
   client.setCredentials({ refresh_token: refreshToken });
   // getAccessToken() refreshes when needed; an invalid_grant (revoked/expired) throws here.
-  await client.getAccessToken();
+  await withTimeout(client.getAccessToken(), 'getAccessToken');
 }
 
 module.exports = {
