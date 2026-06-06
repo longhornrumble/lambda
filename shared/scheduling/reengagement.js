@@ -88,14 +88,19 @@ function firstNameOf(fullName) {
 // https-only gate (mirrors notify.js safeUrl): a non-https scheme (javascript:/data:/
 // mailto:/…) is dropped to '' so a malformed or hostile link can never become an href.
 function safeUrl(url) {
-  return typeof url === 'string' && /^https:\/\//i.test(url.trim()) ? url.trim() : '';
+  if (typeof url !== 'string') return '';
+  const t = url.trim();
+  // Reject ANY embedded whitespace: a value like 'https://real\nhttps://evil' would
+  // otherwise pass the prefix test and put a second clickable URL in the body.
+  if (/\s/.test(t)) return '';
+  return /^https:\/\//i.test(t) ? t : '';
 }
 
 // Strip control chars (keep \n,\t) + zero-width unicode. Shared by prompt-input and
 // model-output sanitization (defense-in-depth, mirrors §B5 sub-steps b).
 function stripUnsafeChars(s) {
   return String(s == null ? '' : s)
-    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, '') // incl. \r (\u000D); keeps \t,\n
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
     // Bidi control/override/isolate chars (visual spoofing in subject + body).
     .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '')
@@ -110,6 +115,8 @@ function sanitizeForPrompt(value, maxLen) {
   let s = stripUnsafeChars(value);
   s = s.replace(/<\/?(?:system|context|user_application_context)>/gi, '');
   s = s.replace(/\[\/?INST\]/gi, '');
+  // Llama-family system markers (defense-in-depth if the model is ever swapped).
+  s = s.replace(/<<\/?\s*SYS\s*>>/gi, '');
   // Strip any remaining HTML tags so attacker markup never reaches the prompt (and
   // can't be echoed raw into the text/plain body). Defense-in-depth atop the API's
   // structural system/user-turn isolation.
@@ -126,6 +133,9 @@ function sanitizeModelText(text) {
   // -> the deterministic fallback fires (parity with defaultInvokeModel's typeof guard).
   if (typeof text !== 'string') return '';
   let s = stripUnsafeChars(text);
+  // Strip HTML tags from model output so raw markup (e.g. <script>...) never reaches
+  // the text/plain body (html_body is escaped separately). Mirrors sanitizeForPrompt.
+  s = s.replace(/<[^>]*>/g, '');
   // Strip any bare URL the model emitted despite the prompt's "no URLs" rule. The
   // authoritative reschedule link is injected programmatically AFTER this step; a URL
   // left in prose is model non-compliance or a prompt-injection artifact, and email
@@ -189,12 +199,15 @@ async function defaultInvokeModel({ system, prompt, maxTokens }) {
       accept: 'application/json',
       body: JSON.stringify({
         anthropic_version: 'bedrock-2023-05-31',
-        max_tokens: maxTokens || MAX_MODEL_TOKENS,
+        max_tokens: maxTokens ?? MAX_MODEL_TOKENS,
         system,
         messages: [{ role: 'user', content: prompt }],
       }),
     })
   );
+  if (!res || res.body == null) {
+    throw new Error('empty Bedrock response');
+  }
   const parsed = JSON.parse(Buffer.from(res.body).toString('utf8'));
   const text = parsed && Array.isArray(parsed.content) && parsed.content[0]
     ? parsed.content[0].text
