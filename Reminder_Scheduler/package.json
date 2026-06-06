@@ -1,0 +1,43 @@
+{
+  "name": "reminder-scheduler",
+  "version": "1.0.0",
+  "description": "Reminder_Scheduler — sub-phase E (WS-E-REMIND). Owns the per-booking EventBridge Scheduler rule lifecycle (FROZEN_CONTRACTS §E1): create reminder + attendance schedules and their picasso-scheduled-messages rows at booking commit (§E2 cadence tiers), re-bind on token-reschedule, delete on any cancel (incl. booking.calendar_moved = cancel). Plus the E9 nightly reconciler: bounded tenantId-start_at-index scan (prior-7d, NEVER full-table) for the attendance backstop, terminal-booking schedule cleanup, and D6-outcome-(ii) orphan recovery. The dispatch CONSUMER (Scheduled_Message_Sender) already exists; this module creates the schedules + rows it reads. The EventBridge Scheduler IAM execution role is integrator glue (see DEPLOY_NOTE.md).",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/client-scheduler": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov"
+  },
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "cadence.js",
+      "scheduler.js",
+      "reconciler.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 80,
+        "functions": 85,
+        "lines": 85,
+        "statements": 85
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
