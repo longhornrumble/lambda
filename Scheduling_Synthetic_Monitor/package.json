@@ -1,0 +1,53 @@
+{
+  "name": "scheduling-synthetic-monitor",
+  "version": "1.0.0",
+  "description": "Scheduling_Synthetic_Monitor — CI-6 §5.1 synthetic monitoring Lambda (Phase 1). Continuously exercises the live staging scheduling surfaces: cancel cycle (book→cancel→§14.2 status flip), operator-triggered token-revocation observer (one-time-use success→410, §13.7), and nightly synthetic test-data cleanup (>7d, §5.1 hygiene). HARD prod-guard refuses init when STAGING_TEST_MODE is set in production. Phase 2 (attendance/reminder/disposition cycles) is deferred to WS-E-REMIND + WS-E-ATTEND landing + the FROZEN_CONTRACTS §E1/§E6 lock.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.600.0",
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-lambda": "^3.600.0",
+    "@aws-sdk/client-sns": "^3.600.0",
+    "@smithy/node-http-handler": "^4.0.0"
+  },
+  "scripts": {
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && zip -j deployment.zip dist/index.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov",
+    "test:verbose": "jest --verbose"
+  },
+  "author": "",
+  "license": "MIT",
+  "jest": {
+    "collectCoverageFrom": [
+      "prod-guard.js",
+      "cancel-cycle.js",
+      "revocation-observer.js",
+      "cleanup.js",
+      "synthetic-booking.js",
+      "booking-table.js",
+      "bch-client.js",
+      "index.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "branches": 80,
+        "functions": 90,
+        "lines": 85,
+        "statements": 85
+      }
+    }
+  },
+  "devDependencies": {
+    "@types/jest": "^30.0.0",
+    "aws-sdk-client-mock": "^4.1.0",
+    "aws-sdk-client-mock-jest": "^4.1.0",
+    "esbuild": "^0.27.7",
+    "jest": "^30.2.0"
+  }
+}
