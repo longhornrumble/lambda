@@ -96,7 +96,11 @@ function safeUrl(url) {
 function stripUnsafeChars(s) {
   return String(s == null ? '' : s)
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
-    .replace(/[\u200B-\u200D\uFEFF]/g, '');
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    // Bidi control/override/isolate chars (visual spoofing in subject + body).
+    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '')
+    // Unicode line/paragraph separators (inconsistent SMTP/MIME handling).
+    .replace(/[\u2028\u2029]/g, '');
 }
 
 // Sanitize a booking value before interpolating it into the model prompt. Booking
@@ -106,6 +110,10 @@ function sanitizeForPrompt(value, maxLen) {
   let s = stripUnsafeChars(value);
   s = s.replace(/<\/?(?:system|context|user_application_context)>/gi, '');
   s = s.replace(/\[\/?INST\]/gi, '');
+  // Strip any remaining HTML tags so attacker markup never reaches the prompt (and
+  // can't be echoed raw into the text/plain body). Defense-in-depth atop the API's
+  // structural system/user-turn isolation.
+  s = s.replace(/<[^>]*>/g, '');
   s = s.replace(/\s+/g, ' ').trim();
   if (s.length > maxLen) s = s.slice(0, maxLen).trim();
   return s;
@@ -114,7 +122,15 @@ function sanitizeForPrompt(value, maxLen) {
 // Sanitize prose returned by the model before it lands in an email body. Returns '' for
 // empty/whitespace-only (→ caller substitutes the deterministic fallback).
 function sanitizeModelText(text) {
+  // Non-string returns (number/object/etc. from an injected invokeModel) become empty
+  // -> the deterministic fallback fires (parity with defaultInvokeModel's typeof guard).
+  if (typeof text !== 'string') return '';
   let s = stripUnsafeChars(text);
+  // Strip any bare URL the model emitted despite the prompt's "no URLs" rule. The
+  // authoritative reschedule link is injected programmatically AFTER this step; a URL
+  // left in prose is model non-compliance or a prompt-injection artifact, and email
+  // clients auto-linkify bare URLs in a text/plain body -> a competing clickable link.
+  s = s.replace(/\bhttps?:\/\/\S+/gi, '[link removed]');
   s = s.replace(/\n{3,}/g, '\n\n').trim();
   if (s.length > MAX_BODY_CHARS) s = s.slice(0, MAX_BODY_CHARS).trim();
   return s;
@@ -159,7 +175,7 @@ function fallbackBody({ firstName, apptType }) {
  * installed. Returns the model's text. Throws on any failure (no model id, missing dep,
  * IAM denial, unparseable response) — the caller catches and falls back.
  */
-async function defaultInvokeModel({ system, prompt }) {
+async function defaultInvokeModel({ system, prompt, maxTokens }) {
   if (!MODEL_ID) {
     throw new Error('no model id configured (set REENGAGEMENT_MODEL_ID or BEDROCK_MODEL_ID)');
   }
@@ -173,7 +189,7 @@ async function defaultInvokeModel({ system, prompt }) {
       accept: 'application/json',
       body: JSON.stringify({
         anthropic_version: 'bedrock-2023-05-31',
-        max_tokens: MAX_MODEL_TOKENS,
+        max_tokens: maxTokens || MAX_MODEL_TOKENS,
         system,
         messages: [{ role: 'user', content: prompt }],
       }),
@@ -216,12 +232,13 @@ async function generateReengagementCopy({ tenantId, booking, rescheduleUrl } = {
       firstNameOf(pick(booking, 'attendeeName', 'attendee_name')),
     50
   );
-  const org = sanitizeForPrompt(
+  const orgKnown = sanitizeForPrompt(
     pick(booking, 'organizationName', 'organization_name') ||
       pick(booking, 'orgName', 'org_name') ||
-      'us',
+      '',
     50
   );
+  const org = orgKnown || 'your organization';
   const apptType = sanitizeForPrompt(
     pick(booking, 'appointmentTypeName', 'appointment_type_name') || 'appointment',
     60
@@ -253,7 +270,11 @@ async function generateReengagementCopy({ tenantId, booking, rescheduleUrl } = {
     `<p>${escapeHtml(prose).replace(/\n+/g, '</p><p>')}</p>` +
     `<p>Pick a new time here: <a href="${escapeHtml(url)}">Choose a new time</a></p>`;
 
-  const subject = `Let's find a time that works — ${org}`;
+  // Omit the org suffix when the booking has no real org name (avoids a broken
+  // "works — your organization" default subject).
+  const subject = orgKnown
+    ? `Let's find a time that works — ${orgKnown}`
+    : "Let's find a time that works";
 
   return { subject, text_body, html_body };
 }
