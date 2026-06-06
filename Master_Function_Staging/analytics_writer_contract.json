@@ -219,6 +219,29 @@
       }
     },
     {
+      "name": "FORM_COMPLETED_with_pii_subject_id",
+      "_doc": "F-DSAR31 completion: when event_payload carries pii_subject_id, the FORM_COMPLETED row stamps it (if_not_exists) so the DSAR session-summaries walker can reach the row. The FORM_COMPLETED_with_form_id fixture above (no pii_subject_id in input) proves the field is additive — absent input yields no stamp, old behavior preserved.",
+      "input": {
+        "event_type": "FORM_COMPLETED",
+        "session_id": "sess_abc123XYZ",
+        "tenant_hash": "my87674d777bf9",
+        "tenant_id": "MYR384719",
+        "client_timestamp": "2026-05-04T20:01:00.000Z",
+        "request_id": "req-cccc-3333",
+        "event_payload": { "form_id": "volunteer_signup", "pii_subject_id": "psub_84c9386add7b4b099bee11b750f5c13c" }
+      },
+      "expected": {
+        "UpdateExpression": "SET ended_at = :ended_at, session_id = if_not_exists(session_id, :session_id), tenant_id = if_not_exists(tenant_id, :tenant_id), started_at = if_not_exists(started_at, :started_at), #ttl = :ttl, #outcome = :outcome, last_request_id_form_completed = :request_id, form_id = :form_id, pii_subject_id = if_not_exists(pii_subject_id, :pii_subject_id)",
+        "ConditionExpression": "attribute_not_exists(last_request_id_form_completed) OR last_request_id_form_completed <> :request_id",
+        "ExpressionAttributeNames": { "#ttl": "ttl", "#outcome": "outcome" },
+        "ExpressionAttributeValues": {
+          ":outcome": { "S": "form_completed" },
+          ":form_id": { "S": "volunteer_signup" },
+          ":pii_subject_id": { "S": "psub_84c9386add7b4b099bee11b750f5c13c" }
+        }
+      }
+    },
+    {
       "name": "validation_invalid_session_id",
       "_doc": "session_id contains a space — regex rejects. Writer returns false; emits log with reason from REASON_ENUM. NO UpdateItem call should be made.",
       "input": {

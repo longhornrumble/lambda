@@ -135,6 +135,16 @@ function buildUpdateParams({ event_type, session_id, tenant_hash, tenant_id, cli
       setParts.push('form_id = :form_id');
       expressionValues[':form_id'] = { S: String(payload.form_id) };
     }
+
+    // F-DSAR31 completion: stamp pii_subject_id so the DSAR session-summaries
+    // walker (FilterExpression on pii_subject_id) can reach form-completion
+    // rows. if_not_exists: the subject link is stable once set — never clobber.
+    // Optional/additive: absent input -> no stamp (parity with the Python
+    // writer; old callers unaffected, field stays missing as before).
+    if (payload.pii_subject_id) {
+      setParts.push('pii_subject_id = if_not_exists(pii_subject_id, :pii_subject_id)');
+      expressionValues[':pii_subject_id'] = { S: String(payload.pii_subject_id) };
+    }
   } else {
     return { error: 'unknown_event_type' };
   }
