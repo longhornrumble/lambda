@@ -318,58 +318,49 @@ class TestDynamoDBSchemas(unittest.TestCase):
         self.assertEqual(handler2._get_monthly_sms_usage(), 1)
 
     def test_audit_logging_form_submission(self):
-        """Test audit logging for form submissions"""
+        """Form-submission audit delegates to the canonical audit_logger (lambda#251).
+
+        Previously this asserted a tenant_id+timestamp row in picasso_audit_logs
+        — a shape that matched no granted table, so the write silently failed in
+        the real account. The fix routes audits through audit_logger.
+        """
         handler = FormHandler(self.tenant_config)
 
-        handler._audit_submission(
-            submission_id='sub_123',
-            form_type='volunteer_signup',
-            notification_results=['email:admin@test.com', 'sms:+15551234567'],
-            fulfillment_result={'type': 'email', 'status': 'sent'}
-        )
-
-        # Verify audit log was created
-        # Query by tenant_id (note: timestamp will vary, so we scan)
-        response = self.audit_table.query(
-            KeyConditionExpression='tenant_id = :tid',
-            ExpressionAttributeValues={':tid': 'test_tenant_123'}
-        )
-
-        self.assertEqual(len(response['Items']), 1)
-        item = response['Items'][0]
-
-        self.assertEqual(item['event_type'], 'form_submission')
-        self.assertEqual(item['submission_id'], 'sub_123')
-        self.assertEqual(item['form_type'], 'volunteer_signup')
-        self.assertIn('email:admin@test.com', item['notifications'])
-        self.assertEqual(item['fulfillment']['type'], 'email')
-
-    def test_audit_logging_multiple_events(self):
-        """Test multiple audit log entries"""
-        handler = FormHandler(self.tenant_config)
-
-        # Create multiple audit entries
-        for i in range(3):
+        with patch('form_handler.audit_logger') as mock_audit, \
+             patch('form_handler.AUDIT_LOGGER_AVAILABLE', True):
             handler._audit_submission(
-                submission_id=f'sub_{i}',
-                form_type='contact',
-                notification_results=[f'email:user{i}@test.com'],
-                fulfillment_result={'type': 'none'}
+                submission_id='sub_123',
+                form_type='volunteer_signup',
+                notification_results=['email:admin@test.com', 'sms:+15551234567'],
+                fulfillment_result={'type': 'email', 'status': 'sent'},
+                session_id='sess_x'
             )
 
-        # Verify all entries were created. Query with ScanIndexForward=False
-        # to get DESC order by sort key (timestamp) — DDB default is ASC.
-        response = self.audit_table.query(
-            KeyConditionExpression='tenant_id = :tid',
-            ExpressionAttributeValues={':tid': 'test_tenant_123'},
-            ScanIndexForward=False,
-        )
+            mock_audit.log_form_submission.assert_called_once_with(
+                tenant_id='test_tenant_123',
+                session_id='sess_x',
+                submission_id='sub_123',
+                form_type='volunteer_signup',
+                notification_count=2,
+                fulfillment_status='sent',
+            )
 
-        self.assertEqual(len(response['Items']), 3)
+    def test_audit_logging_multiple_events(self):
+        """Each submission emits exactly one audit_logger call."""
+        handler = FormHandler(self.tenant_config)
 
-        # Verify they're sorted by timestamp (most recent first)
-        timestamps = [item['timestamp'] for item in response['Items']]
-        self.assertEqual(timestamps, sorted(timestamps, reverse=True))
+        with patch('form_handler.audit_logger') as mock_audit, \
+             patch('form_handler.AUDIT_LOGGER_AVAILABLE', True):
+            for i in range(3):
+                handler._audit_submission(
+                    submission_id=f'sub_{i}',
+                    form_type='contact',
+                    notification_results=[f'email:user{i}@test.com'],
+                    fulfillment_result={'type': 'none'},
+                    session_id=f'sess_{i}'
+                )
+
+            self.assertEqual(mock_audit.log_form_submission.call_count, 3)
 
     def test_error_handling_dynamodb_failures(self):
         """Test error handling when DynamoDB operations fail"""
