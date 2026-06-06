@@ -54,6 +54,8 @@ jobs:
       reminder_scheduler: ${{ steps.filter.outputs.reminder_scheduler }}
       attendance_disposition_handler: ${{ steps.filter.outputs.attendance_disposition_handler }}
       scheduling_redemption_handler: ${{ steps.filter.outputs.scheduling_redemption_handler }}
+      # WS-E-CI6 synthetic monitor (jest; self-contained — no shared imports).
+      scheduling_synthetic_monitor: ${{ steps.filter.outputs.scheduling_synthetic_monitor }}
       # Python Lambdas with tests
       meta_oauth:                ${{ steps.filter.outputs.meta_oauth }}
       master:                    ${{ steps.filter.outputs.master }}
@@ -139,6 +141,9 @@ jobs:
             scheduled_message_sender:
               # WS-E-REMIND dispatcher. node:test runner; no shared imports.
               - 'Scheduled_Message_Sender/**'
+            scheduling_synthetic_monitor:
+              # WS-E-CI6 synthetic monitor. Self-contained; no shared/** trigger.
+              - 'Scheduling_Synthetic_Monitor/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
             master:
@@ -199,7 +204,8 @@ jobs:
       needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true' ||
       needs.detect-changes.outputs.reminder_scheduler == 'true' ||
       needs.detect-changes.outputs.attendance_disposition_handler == 'true' ||
-      needs.detect-changes.outputs.scheduling_redemption_handler == 'true'
+      needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -233,6 +239,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.attendance_disposition_handler }}
           - lambda: Scheduling_Redemption_Handler
             changed: ${{ needs.detect-changes.outputs.scheduling_redemption_handler }}
+          - lambda: Scheduling_Synthetic_Monitor
+            changed: ${{ needs.detect-changes.outputs.scheduling_synthetic_monitor }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -627,6 +635,7 @@ jobs:
           - lambda: Attendance_Disposition_Handler # WS-E-ATTEND — jest tests + deps
           - lambda: Scheduled_Message_Sender # WS-E-REMIND dispatcher — node:test + deps
           - lambda: Scheduling_Redemption_Handler # token redemption — jest tests + deps
+          - lambda: Scheduling_Synthetic_Monitor # WS-E-CI6 synthetic monitor — jest tests + deps
 
     steps:
       - name: Checkout
@@ -691,7 +700,8 @@ jobs:
       needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true' ||
       needs.detect-changes.outputs.reminder_scheduler == 'true' ||
       needs.detect-changes.outputs.attendance_disposition_handler == 'true' ||
-      needs.detect-changes.outputs.scheduling_redemption_handler == 'true'
+      needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true'
 
     strategy:
       fail-fast: false
@@ -725,6 +735,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.attendance_disposition_handler }}
           - lambda: Scheduling_Redemption_Handler
             changed: ${{ needs.detect-changes.outputs.scheduling_redemption_handler }}
+          - lambda: Scheduling_Synthetic_Monitor
+            changed: ${{ needs.detect-changes.outputs.scheduling_synthetic_monitor }}
 
     steps:
       - name: Skip unchanged Lambda
