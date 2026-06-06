@@ -760,12 +760,15 @@ def _save_conversation_to_db(session_id, tenant_id, delta, expected_turn):
                 ('assistant', delta.get('appendAssistant'))
             ]):
                 if message_data:
+                    content_value = message_data.get('text', '')
                     message_item = {
                         'sessionId': {'S': session_id},
                         'messageTimestamp': {'N': str(timestamp_base + i)},
                         'messageId': {'S': str(uuid.uuid4())},
                         'role': {'S': role},
-                        'content': {'S': message_data.get('text', '')},
+                        'content': {'S': content_value},
+                        # §E5 Chain 1: English-equivalent slot (v1: text_en = content, verbatim). Readers tolerate absence.
+                        'text_en': {'S': content_value},
                         'expires_at': {'N': str(message_ttl)}
                     }
                     
