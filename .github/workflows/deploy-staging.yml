@@ -238,6 +238,7 @@ jobs:
               form_handler.py
               intent_router.py
               lambda_function.py
+              pii_subject.py
               redact_pii.py
               response_formatter.py
               session_utils.py
