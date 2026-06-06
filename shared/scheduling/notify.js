@@ -120,6 +120,13 @@ function safeUrl(url) {
 const STOP_LINE_TEXT = '\n\nTo stop receiving these emails, reply STOP.';
 const STOP_LINE_HTML =
   '<p style="margin-top:24px;font-size:12px;color:#64748B;">To stop receiving these emails, reply STOP.</p>';
+// Compliance: STOP must appear EXACTLY once. It is always appended (so an override can't
+// remove it), but if a tenant override body already contains an unsubscribe line we must
+// NOT double-inject. Detect the canonical "reply STOP" phrase (case-insensitive).
+const _STOP_MARKER_RE = /reply\s+STOP/i;
+function appendStopOnce(rendered, stopLine) {
+  return _STOP_MARKER_RE.test(rendered) ? rendered : rendered + stopLine;
+}
 
 // NB: STOP is NOT baked into these template bodies. It is appended (STOP_LINE_*) AFTER
 // render in buildEmailPayload, so a tenant E14 override (§E14) of subject/text/html can
@@ -203,16 +210,15 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
     if (typeof body !== 'string' || !body.trim()) {
       throw new Error('reengagement requires booking.reengagement_body (WS-E-COPY generates it)');
     }
-    const htmlBody =
+    const htmlInner =
       '<p>' +
       escapeHtml(body).replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>') +
-      '</p>' +
-      STOP_LINE_HTML;
+      '</p>';
     return {
       to: attendeeEmail,
       subject: render('A note about your {{apptType}} — {{org}}', { org, apptType }),
-      text_body: body + STOP_LINE_TEXT,
-      html_body: htmlBody,
+      text_body: appendStopOnce(body, STOP_LINE_TEXT),
+      html_body: appendStopOnce(htmlInner, STOP_LINE_HTML),
     };
   }
 
@@ -241,6 +247,11 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
   // cancel_notice: rebook link is optional (the cancellation confirmation stands alone).
   const rebookUrl = rescheduleUrl;
   const rebookText = rebookUrl ? ` Want to rebook? ${rebookUrl}` : '';
+  // INVARIANT: rebookHtml is the ONE htmlVar passed to render() as raw (un-re-escaped) HTML.
+  // It is safe ONLY because it is platform-built here from rebookUrl, which is already
+  // safeUrl()-filtered (https-only) AND escapeHtml()-encoded in the href. If anything
+  // attendee-controlled is ever interpolated into rebookHtml, it must be escaped first or
+  // this becomes an HTML-injection vector. Every other htmlVar is escapeHtml()'d below.
   const rebookHtml = rebookUrl
     ? `<p>Want to rebook? <a href="${escapeHtml(rebookUrl)}">Find a new time</a></p>`
     : '';
@@ -271,9 +282,10 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
     to: attendeeEmail,
     // Subjects are plain text, not HTML — render with raw values (never HTML-escaped).
     subject: render(tpl.subject, textVars),
-    // STOP appended here (not in the template) so an override can never remove it.
-    text_body: render(tpl.text, textVars) + STOP_LINE_TEXT,
-    html_body: render(tpl.html, htmlVars) + STOP_LINE_HTML,
+    // STOP appended here (not in the template) so an override can never remove it —
+    // appendStopOnce avoids a double footer if an override body already includes one.
+    text_body: appendStopOnce(render(tpl.text, textVars), STOP_LINE_TEXT),
+    html_body: appendStopOnce(render(tpl.html, htmlVars), STOP_LINE_HTML),
   };
 }
 

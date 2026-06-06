@@ -154,3 +154,68 @@ describe('defaultLoadTemplateOverride guards', () => {
     expect([...OVERRIDABLE_MOMENTS].sort()).toEqual(['cancel_notice', 'reoffer', 'reschedule_link']);
   });
 });
+
+
+// --------------------------------------------------------------------------- #
+// phase-completion-audit fixes — STOP-once (B3), all-3-merge, reoffer, SMS-not-loaded
+// --------------------------------------------------------------------------- #
+
+describe('STOP appears EXACTLY once (no double-injection)', () => {
+  function stopCount(s) { return (s.match(/reply\s+STOP/gi) || []).length; }
+
+  test('override body that already contains "reply STOP" is not double-footed', () => {
+    const p = buildEmailPayload({
+      kind: 'reschedule_link',
+      booking: baseBooking(),
+      templateOverride: {
+        text: 'Hi — to opt out, reply STOP.',
+        html: '<p>Hi — to opt out, reply STOP.</p>',
+      },
+    });
+    expect(stopCount(p.text_body)).toBe(1);
+    expect(stopCount(p.html_body)).toBe(1);
+  });
+
+  test('default (no override) has exactly one STOP', () => {
+    const p = buildEmailPayload({ kind: 'cancel_notice', booking: baseBooking() });
+    expect(stopCount(p.text_body)).toBe(1);
+    expect(stopCount(p.html_body)).toBe(1);
+  });
+
+  test('all three overridable moments keep exactly one STOP under a full body override', () => {
+    for (const kind of ['reschedule_link', 'reoffer', 'cancel_notice']) {
+      const p = buildEmailPayload({
+        kind,
+        booking: baseBooking({ reoffer_url: 'https://example.com/o/x' }),
+        templateOverride: { text: 'custom body', html: '<p>custom body</p>' },
+      });
+      expect(stopCount(p.text_body)).toBe(1);
+      expect(stopCount(p.html_body)).toBe(1);
+      expect(p.text_body).toContain(STOP_TEXT); // still present (cannot be removed)
+    }
+  });
+});
+
+test('mergeNoticeTemplate: all three fields override at once', () => {
+  const base = { subject: 'S', text: 'T', html: 'H' };
+  expect(mergeNoticeTemplate(base, { subject: 'NS', text: 'NT', html: 'NH' }))
+    .toEqual({ subject: 'NS', text: 'NT', html: 'NH' });
+});
+
+test('mergeNoticeTemplate: an override with only unknown keys keeps base', () => {
+  const base = { subject: 'S', text: 'T', html: 'H' };
+  expect(mergeNoticeTemplate(base, { bogus: 'x' })).toEqual(base);
+});
+
+test('override loader is NOT called for an SMS kind (only the email path loads overrides)', async () => {
+  let loaderCalls = 0;
+  await dispatchVolunteerNotice(
+    { kind: 'move_optin_sms', tenantId: 'TEN1', booking: baseBooking(), channels: { sms: true } },
+    {
+      invokeSms: async () => ({ ok: true }),
+      loadTemplateOverride: async () => { loaderCalls++; return null; },
+      log: { info() {}, warn() {}, error() {} },
+    }
+  );
+  expect(loaderCalls).toBe(0);
+});

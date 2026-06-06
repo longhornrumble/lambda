@@ -4319,8 +4319,15 @@ _SCHED_NOTIF_DEFAULTS = {
         'body_html': '<p>Hi {{firstName}},</p><p>Your {{apptType}}{{whenSuffix}} has been canceled.</p>{{rebookHtml}}',
     },
 }
-_SCHED_NOTIF_VARIABLES = ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}',
-                          '{{actionUrl}}', '{{rebookText}}', '{{rebookHtml}}']
+# Variables are PER-MOMENT (notify.js renders different vars per kind): a var used in the
+# wrong moment renders as an empty string. {{rebookText}} is text-only, {{rebookHtml}}
+# html-only — so the editor must scope them to the right field; the UI surfaces this list.
+_SCHED_NOTIF_MOMENT_VARS = {
+    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}',
+                      '{{rebookText}}', '{{rebookHtml}}'],
+}
 
 
 def handle_scheduling_notification_templates_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
@@ -4346,6 +4353,11 @@ def handle_scheduling_notification_templates_get(tenant_id: str, user_role: Opti
             m = row.get('moment')
             if m in _SCHED_NOTIF_DEFAULTS:
                 overrides[m] = row
+        if resp.get('LastEvaluatedKey'):
+            # Consistency with the §E13b list endpoints. This table holds <=3 rows/tenant
+            # so the cap is unreachable; the guard catches a future moment-count change.
+            logger.warning(f"[scheduling/notification-templates] tenant={redact_tenant_id(tenant_id)} "
+                           f"hit the {_SCHED_CONFIG_LIST_LIMIT}-row list cap — result truncated")
     except ClientError as e:
         logger.error(f"[scheduling/notification-templates] query failed "
                      f"(tenant={redact_tenant_id(tenant_id)}): {e}")
@@ -4368,10 +4380,10 @@ def handle_scheduling_notification_templates_get(tenant_id: str, user_role: Opti
             'is_override': is_override,
             'default': dict(default),
             'modified_at': ov.get('modified_at'),
+            'available_variables': _SCHED_NOTIF_MOMENT_VARS[moment],
         }
     return cors_response(200, {
         'moments': moments_out,
-        'available_variables': _SCHED_NOTIF_VARIABLES,
         'stop_footer_note': 'An unsubscribe (STOP) line is appended automatically and cannot be removed.',
     })
 
@@ -4408,7 +4420,9 @@ def handle_scheduling_notification_template_write(tenant_id: str, moment: str, b
         return cors_response(400, {'error': 'provide at least one of subject, body_text, body_html'})
 
     fields['modified_at'] = _modified_at(user_email)
-    names = {'#pk': 'tenantId'}
+    # No ConditionExpression (no optimistic lock per §E13c) → no '#pk' alias: DynamoDB rejects
+    # any ExpressionAttributeNames entry not referenced by an expression.
+    names = {}
     values = {}
     sets = []
     for i, (k, v) in enumerate(fields.items()):

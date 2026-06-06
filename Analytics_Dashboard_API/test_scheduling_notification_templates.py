@@ -53,9 +53,18 @@ def test_get_no_overrides_returns_defaults(mock_ddb):
     rl = body['moments']['reschedule_link']
     assert rl['is_override'] is False
     assert rl['subject'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['subject']
+    assert rl['body_html'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['body_html']  # GAP-6
     assert rl['default']['subject'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['subject']
     assert rl['modified_at'] is None
-    assert '{{firstName}}' in body['available_variables']
+    # per-moment available_variables (reschedule has actionUrl, NOT rebook*)
+    assert '{{firstName}}' in rl['available_variables']
+    assert '{{actionUrl}}' in rl['available_variables']
+    assert '{{rebookHtml}}' not in rl['available_variables']
+    # cancel_notice exposes the rebook vars, not actionUrl
+    cn = body['moments']['cancel_notice']
+    assert '{{rebookHtml}}' in cn['available_variables']
+    assert '{{actionUrl}}' not in cn['available_variables']
+    assert 'cannot be removed' in body['stop_footer_note']  # GAP-6 compliance signal
 
 
 @patch('lambda_function.dynamodb')
@@ -180,3 +189,37 @@ def test_patch_write_error_502(mock_ddb):
     mock_ddb.update_item.side_effect = ClientError({'Error': {'Code': 'X'}}, 'UpdateItem')
     assert handle_scheduling_notification_template_write(
         TENANT, 'reschedule_link', {'subject': 'x'}, ADMIN, EMAIL)['statusCode'] == 502
+
+
+# =========================================================================== #
+# phase-completion-audit fixes — B1 (unused alias) + GAP-7/8
+# =========================================================================== #
+
+@patch('lambda_function.dynamodb')
+def test_patch_no_unused_expression_alias_b1(mock_ddb):
+    # B1 regression: a stray ExpressionAttributeNames entry not referenced by any expression
+    # makes DynamoDB reject every UpdateItem (ValidationException). Assert names contains ONLY
+    # the SET field aliases (no 'tenantId'/'moment' key alias).
+    mock_ddb.update_item.return_value = _attrs(subject='x')
+    handle_scheduling_notification_template_write(TENANT, 'reschedule_link', {'subject': 'x'}, ADMIN, EMAIL)
+    names = mock_ddb.update_item.call_args.kwargs['ExpressionAttributeNames']
+    assert 'tenantId' not in names.values()
+    assert 'moment' not in names.values()
+    # every alias must appear in the UpdateExpression
+    expr = mock_ddb.update_item.call_args.kwargs['UpdateExpression']
+    for alias in names:
+        assert alias in expr
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_200_body_shape_gap7(mock_ddb):
+    mock_ddb.update_item.return_value = _attrs(moment='cancel_notice', subject='Bye {{org}}')
+    r = handle_scheduling_notification_template_write(TENANT, 'cancel_notice', {'subject': 'Bye {{org}}'}, ADMIN, EMAIL)
+    body = json.loads(r['body'])
+    assert body['moment'] == 'cancel_notice'
+    assert body['template']['subject'] == 'Bye {{org}}'
+
+
+def test_patch_non_dict_body_400_gap8():
+    assert handle_scheduling_notification_template_write(
+        TENANT, 'reschedule_link', "not-a-dict", ADMIN, EMAIL)['statusCode'] == 400
