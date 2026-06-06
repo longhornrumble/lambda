@@ -285,6 +285,8 @@ async function storeConversationContext(pageId, psid, userText, assistantText) {
         messageTimestamp: now,
         role: 'user',
         content: userText,
+        // §E5 Chain 1: English-equivalent slot (v1: text_en = content, verbatim). Readers tolerate absence.
+        text_en: userText,
         ttl,
       },
     })
@@ -299,6 +301,8 @@ async function storeConversationContext(pageId, psid, userText, assistantText) {
         messageTimestamp: now + 1,
         role: 'assistant',
         content: assistantText,
+        // §E5 Chain 1: English-equivalent slot (v1: text_en = content, verbatim). Readers tolerate absence.
+        text_en: assistantText,
         ttl,
       },
     })

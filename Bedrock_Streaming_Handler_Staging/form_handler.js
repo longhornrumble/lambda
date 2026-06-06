@@ -1210,6 +1210,13 @@ async function writeConsentRecord(tenantId, phoneE164, formId, submissionId, con
         consent_method: 'web_form',
         consent_language: consentLanguage,
         consent_type: 'transactional',
+        // TCPA retention: auto-expire 4yr + 30d after capture (FROZEN_CONTRACTS §E3 —
+        // "TTL = now + 4yr + 30d"; data-minimization per CLAUDE.md PII goal). Epoch
+        // seconds, mirroring the form-submissions ttl idiom at L602. The table TTL
+        // attribute is enabled in IaC (infra/modules/picasso-form-tables); pre-existing
+        // records without `ttl` are untouched (DynamoDB only expires items that carry it),
+        // so writer-and-enable are order-independent.
+        ttl: Math.floor(Date.now() / 1000) + (4 * 365 + 30) * 24 * 3600,
         opted_out_at: null,
         opt_out_source: null,
         form_id: formId || 'unknown',

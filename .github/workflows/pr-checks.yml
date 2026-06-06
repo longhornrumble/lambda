@@ -42,6 +42,22 @@ jobs:
       calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
       calendar_watch_offboarder: ${{ steps.filter.outputs.calendar_watch_offboarder }}
       booking_commit_handler: ${{ steps.filter.outputs.booking_commit_handler }}
+      # These 3 SQS/lifecycle consumers had filters + matrix entries but were
+      # never declared as outputs — so a change to ONLY their own dir (no
+      # shared/** change) left the output empty and their suites silently
+      # skipped. Declaring them here closes that pre-existing gap.
+      calendar_event_consumer: ${{ steps.filter.outputs.calendar_event_consumer }}
+      stranded_booking_remediator: ${{ steps.filter.outputs.stranded_booking_remediator }}
+      calendar_lifecycle_consumer: ${{ steps.filter.outputs.calendar_lifecycle_consumer }}
+      # Sub-phase E jest Lambdas (Reminder_Scheduler self-contained; Attendance
+      # + Redemption import shared/scheduling/* so their filters add shared/**).
+      reminder_scheduler: ${{ steps.filter.outputs.reminder_scheduler }}
+      attendance_disposition_handler: ${{ steps.filter.outputs.attendance_disposition_handler }}
+      scheduling_redemption_handler: ${{ steps.filter.outputs.scheduling_redemption_handler }}
+      # WS-E-CI6 synthetic monitor (jest; self-contained — no shared imports).
+      scheduling_synthetic_monitor: ${{ steps.filter.outputs.scheduling_synthetic_monitor }}
+      # WS-E-OAUTH (E11) 3LO consent Lambda (jest; imports shared/scheduling/featureGate).
+      calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
       # Python Lambdas with tests
       meta_oauth:                ${{ steps.filter.outputs.meta_oauth }}
       master:                    ${{ steps.filter.outputs.master }}
@@ -56,6 +72,7 @@ jobs:
       # Node.js Lambda using node:test runner (no Jest)
       applier:        ${{ steps.filter.outputs.applier }}
       notification_hub: ${{ steps.filter.outputs.notification_hub }}
+      scheduled_message_sender: ${{ steps.filter.outputs.scheduled_message_sender }}
       # Shared module — triggers full Node.js test run when changed
       shared:         ${{ steps.filter.outputs.shared }}
       # True when shared/ changed (forces all Node.js tests)
@@ -108,6 +125,30 @@ jobs:
             calendar_lifecycle_consumer:
               # WS-CAL-LIFECYCLE §14.2 consumer. Imports ../shared/booking-status.
               - 'Calendar_Lifecycle_Consumer/**'
+              - 'shared/**'
+            reminder_scheduler:
+              # WS-E-REMIND. Self-contained (EventBridge Scheduler facade is
+              # dependency-injected), so no shared/** trigger needed.
+              - 'Reminder_Scheduler/**'
+            attendance_disposition_handler:
+              # WS-E-ATTEND. Imports ../shared/scheduling/{tokens,attendance,
+              # escalation,zoomOutagePaging,featureGate}, so shared/** must trip it.
+              - 'Attendance_Disposition_Handler/**'
+              - 'shared/**'
+            scheduling_redemption_handler:
+              # Imports ../shared/scheduling/{tokens,featureGate,disposition},
+              # so shared/** must trip it.
+              - 'Scheduling_Redemption_Handler/**'
+              - 'shared/**'
+            scheduled_message_sender:
+              # WS-E-REMIND dispatcher. node:test runner; no shared imports.
+              - 'Scheduled_Message_Sender/**'
+            scheduling_synthetic_monitor:
+              # WS-E-CI6 synthetic monitor. Self-contained; no shared/** trigger.
+              - 'Scheduling_Synthetic_Monitor/**'
+            calendar_oauth_connect:
+              # WS-E-OAUTH. Imports ../shared/scheduling/featureGate, so shared/** must trip it.
+              - 'Calendar_OAuth_Connect/**'
               - 'shared/**'
             meta_oauth:
               - 'Meta_OAuth_Handler/**'
@@ -166,7 +207,12 @@ jobs:
       needs.detect-changes.outputs.booking_commit_handler == 'true' ||
       needs.detect-changes.outputs.calendar_event_consumer == 'true' ||
       needs.detect-changes.outputs.stranded_booking_remediator == 'true' ||
-      needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true'
+      needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true' ||
+      needs.detect-changes.outputs.reminder_scheduler == 'true' ||
+      needs.detect-changes.outputs.attendance_disposition_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true' ||
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -194,6 +240,16 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.stranded_booking_remediator }}
           - lambda: Calendar_Lifecycle_Consumer
             changed: ${{ needs.detect-changes.outputs.calendar_lifecycle_consumer }}
+          - lambda: Reminder_Scheduler
+            changed: ${{ needs.detect-changes.outputs.reminder_scheduler }}
+          - lambda: Attendance_Disposition_Handler
+            changed: ${{ needs.detect-changes.outputs.attendance_disposition_handler }}
+          - lambda: Scheduling_Redemption_Handler
+            changed: ${{ needs.detect-changes.outputs.scheduling_redemption_handler }}
+          - lambda: Scheduling_Synthetic_Monitor
+            changed: ${{ needs.detect-changes.outputs.scheduling_synthetic_monitor }}
+          - lambda: Calendar_OAuth_Connect
+            changed: ${{ needs.detect-changes.outputs.calendar_oauth_connect }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -228,9 +284,9 @@ jobs:
         working-directory: shared
         run: npm install
 
-      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator + Calendar_Event_Consumer + Calendar_Lifecycle_Consumer consume them)
+      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator + Calendar_Event_Consumer + Calendar_Lifecycle_Consumer + Attendance_Disposition_Handler + Scheduling_Redemption_Handler + Calendar_OAuth_Connect consume them)
         if: |
-          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator' || matrix.lambda == 'Calendar_Event_Consumer' || matrix.lambda == 'Calendar_Lifecycle_Consumer') &&
+          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator' || matrix.lambda == 'Calendar_Event_Consumer' || matrix.lambda == 'Calendar_Lifecycle_Consumer' || matrix.lambda == 'Attendance_Disposition_Handler' || matrix.lambda == 'Scheduling_Redemption_Handler' || matrix.lambda == 'Calendar_OAuth_Connect') &&
           (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
         working-directory: shared/scheduling
         run: npm install
@@ -509,7 +565,8 @@ jobs:
     needs: detect-changes
     if: |
       needs.detect-changes.outputs.applier == 'true' ||
-      needs.detect-changes.outputs.notification_hub == 'true'
+      needs.detect-changes.outputs.notification_hub == 'true' ||
+      needs.detect-changes.outputs.scheduled_message_sender == 'true'
 
     strategy:
       fail-fast: false
@@ -519,6 +576,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.applier }}
           - lambda: notification_hub
             changed: ${{ needs.detect-changes.outputs.notification_hub }}
+          - lambda: Scheduled_Message_Sender
+            changed: ${{ needs.detect-changes.outputs.scheduled_message_sender }}
 
     steps:
       - name: Skip unchanged lambda
@@ -581,6 +640,12 @@ jobs:
           - lambda: Calendar_Event_Consumer # B9/B10 booking-event consumer — jest tests + deps
           - lambda: Stranded_Booking_Remediator # B11 stranded-booking remediator — jest tests + deps
           - lambda: Calendar_Lifecycle_Consumer # WS-CAL-LIFECYCLE §14.2 consumer — jest tests + deps
+          - lambda: Reminder_Scheduler # WS-E-REMIND scheduler — jest tests + deps
+          - lambda: Attendance_Disposition_Handler # WS-E-ATTEND — jest tests + deps
+          - lambda: Scheduled_Message_Sender # WS-E-REMIND dispatcher — node:test + deps
+          - lambda: Scheduling_Redemption_Handler # token redemption — jest tests + deps
+          - lambda: Scheduling_Synthetic_Monitor # WS-E-CI6 synthetic monitor — jest tests + deps
+          - lambda: Calendar_OAuth_Connect # WS-E-OAUTH 3LO consent — jest tests + deps
 
     steps:
       - name: Checkout
@@ -642,7 +707,12 @@ jobs:
       needs.detect-changes.outputs.booking_commit_handler == 'true' ||
       needs.detect-changes.outputs.calendar_event_consumer == 'true' ||
       needs.detect-changes.outputs.stranded_booking_remediator == 'true' ||
-      needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true'
+      needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true' ||
+      needs.detect-changes.outputs.reminder_scheduler == 'true' ||
+      needs.detect-changes.outputs.attendance_disposition_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true' ||
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true'
 
     strategy:
       fail-fast: false
@@ -670,6 +740,16 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.stranded_booking_remediator }}
           - lambda: Calendar_Lifecycle_Consumer
             changed: ${{ needs.detect-changes.outputs.calendar_lifecycle_consumer }}
+          - lambda: Reminder_Scheduler
+            changed: ${{ needs.detect-changes.outputs.reminder_scheduler }}
+          - lambda: Attendance_Disposition_Handler
+            changed: ${{ needs.detect-changes.outputs.attendance_disposition_handler }}
+          - lambda: Scheduling_Redemption_Handler
+            changed: ${{ needs.detect-changes.outputs.scheduling_redemption_handler }}
+          - lambda: Scheduling_Synthetic_Monitor
+            changed: ${{ needs.detect-changes.outputs.scheduling_synthetic_monitor }}
+          - lambda: Calendar_OAuth_Connect
+            changed: ${{ needs.detect-changes.outputs.calendar_oauth_connect }}
 
     steps:
       - name: Skip unchanged Lambda
@@ -695,9 +775,9 @@ jobs:
           cache: 'npm'
           cache-dependency-path: ${{ matrix.lambda }}/package-lock.json
 
-      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator + Calendar_Event_Consumer + Calendar_Lifecycle_Consumer bundle them)
+      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator + Calendar_Event_Consumer + Calendar_Lifecycle_Consumer + Attendance_Disposition_Handler + Scheduling_Redemption_Handler + Calendar_OAuth_Connect bundle them)
         if: |
-          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator' || matrix.lambda == 'Calendar_Event_Consumer' || matrix.lambda == 'Calendar_Lifecycle_Consumer') &&
+          (matrix.lambda == 'Booking_Commit_Handler' || matrix.lambda == 'Stranded_Booking_Remediator' || matrix.lambda == 'Calendar_Event_Consumer' || matrix.lambda == 'Calendar_Lifecycle_Consumer' || matrix.lambda == 'Attendance_Disposition_Handler' || matrix.lambda == 'Scheduling_Redemption_Handler' || matrix.lambda == 'Calendar_OAuth_Connect') &&
           (matrix.changed == 'true' || needs.detect-changes.outputs.shared == 'true')
         working-directory: shared/scheduling
         run: npm install
