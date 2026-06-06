@@ -205,6 +205,26 @@ describe('Meta_Response_Processor handler', () => {
       expect(ddbMock).toHaveReceivedCommandTimes(UpdateCommand, 1);
     });
 
+    test('§E5 Chain 1: each recent-messages row carries text_en === content (v1 verbatim)', async () => {
+      await handler(buildEvent());
+
+      // The 2 PutCommands are the recent-messages rows (user + assistant).
+      const putCalls = ddbMock.commandCalls(PutCommand);
+      expect(putCalls).toHaveLength(2);
+
+      for (const call of putCalls) {
+        const item = call.args[0].input.Item;
+        expect(item).toHaveProperty('text_en');
+        expect(item.text_en).toBe(item.content);
+      }
+
+      // Roles are distinct and text_en mirrors each row's content verbatim.
+      const items = putCalls.map((c) => c.args[0].input.Item);
+      const byRole = Object.fromEntries(items.map((it) => [it.role, it]));
+      expect(byRole.user.text_en).toBe(byRole.user.content);
+      expect(byRole.assistant.text_en).toBe(byRole.assistant.content);
+    });
+
     test('passes tenant config to Bedrock with correct model_id', async () => {
       loadConfig.mockResolvedValueOnce({
         model_id: 'custom-model-id',
