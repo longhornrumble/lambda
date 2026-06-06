@@ -347,8 +347,15 @@ def get_employee_by_email(email):
     return _unmarshall(items[0]) if items else None
 
 
-def update_employee(tenant_id, employee_id, fields):
-    """Update specific fields on an employee record. Always sets updatedAt."""
+def update_employee(tenant_id, employee_id, fields, condition_expression=None):
+    """Update specific fields on an employee record. Always sets updatedAt.
+
+    condition_expression (optional): a DynamoDB ConditionExpression string. Callers that must
+    NOT create a record when the key was deleted out from under them pass
+    'attribute_exists(tenantId)' — without it, UpdateItem silently upserts a partial stub on a
+    non-existent key. Default None preserves the historical unconditional behavior for existing
+    callers (role/status writes).
+    """
     if not fields:
         return
 
@@ -365,7 +372,7 @@ def update_employee(tenant_id, employee_id, fields):
         names[alias] = key
         values[val_alias] = _marshall_value(value)
 
-    dynamodb.update_item(
+    kwargs = dict(
         TableName=EMPLOYEE_TABLE,
         Key={
             'tenantId': {'S': tenant_id},
@@ -375,6 +382,10 @@ def update_employee(tenant_id, employee_id, fields):
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
     )
+    if condition_expression:
+        kwargs['ConditionExpression'] = condition_expression
+
+    dynamodb.update_item(**kwargs)
 
 
 def delete_employee(tenant_id, employee_id):
