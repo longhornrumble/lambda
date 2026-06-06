@@ -41,6 +41,7 @@ jobs:
       calendar_watch_onboarder: ${{ steps.filter.outputs.calendar_watch_onboarder }}
       calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
       calendar_watch_offboarder: ${{ steps.filter.outputs.calendar_watch_offboarder }}
+      calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
       booking_commit_handler: ${{ steps.filter.outputs.booking_commit_handler }}
       # Python Lambdas with tests
       meta_oauth:                ${{ steps.filter.outputs.meta_oauth }}
@@ -89,6 +90,11 @@ jobs:
               # shared/** so a vocabulary drift there trips this Lambda's test job
               # (phase-audit row GD — the tripwire was inert without this).
               - 'shared/**'
+            calendar_oauth_connect:
+              # WS-E-OAUTH (E11). Imports ../shared/scheduling/featureGate but MOCKS
+              # it in tests (like the Onboarder), so no shared/** trigger is needed
+              # for the test job; the build bundles featureGate from the repo tree.
+              - 'Calendar_OAuth_Connect/**'
             booking_commit_handler:
               # C8 commit keystone. Imports shared/scheduling/* (pool/routing/
               # availability/tokens) + shared/booking-status, so a shared/** change
@@ -163,6 +169,7 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
       needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true' ||
       needs.detect-changes.outputs.booking_commit_handler == 'true' ||
       needs.detect-changes.outputs.calendar_event_consumer == 'true' ||
       needs.detect-changes.outputs.stranded_booking_remediator == 'true' ||
@@ -186,6 +193,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
           - lambda: Calendar_Watch_Offboarder
             changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
+          - lambda: Calendar_OAuth_Connect
+            changed: ${{ needs.detect-changes.outputs.calendar_oauth_connect }}
           - lambda: Booking_Commit_Handler
             changed: ${{ needs.detect-changes.outputs.booking_commit_handler }}
           - lambda: Calendar_Event_Consumer
@@ -578,6 +587,7 @@ jobs:
           - lambda: Calendar_Watch_Onboarder # B5 onboarding hook — jest tests + deps
           - lambda: Calendar_Watch_Renewer # B3 watch-channel renewer — jest tests + deps
           - lambda: Calendar_Watch_Offboarder # B6 offboarding hook — jest tests + deps
+          - lambda: Calendar_OAuth_Connect # E11 OAuth consent flow — jest tests + deps (google-auth)
           - lambda: Calendar_Event_Consumer # B9/B10 booking-event consumer — jest tests + deps
           - lambda: Stranded_Booking_Remediator # B11 stranded-booking remediator — jest tests + deps
           - lambda: Calendar_Lifecycle_Consumer # WS-CAL-LIFECYCLE §14.2 consumer — jest tests + deps
@@ -639,6 +649,7 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
       needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true' ||
       needs.detect-changes.outputs.booking_commit_handler == 'true' ||
       needs.detect-changes.outputs.calendar_event_consumer == 'true' ||
       needs.detect-changes.outputs.stranded_booking_remediator == 'true' ||
@@ -662,6 +673,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_watch_renewer }}
           - lambda: Calendar_Watch_Offboarder
             changed: ${{ needs.detect-changes.outputs.calendar_watch_offboarder }}
+          - lambda: Calendar_OAuth_Connect
+            changed: ${{ needs.detect-changes.outputs.calendar_oauth_connect }}
           - lambda: Booking_Commit_Handler
             changed: ${{ needs.detect-changes.outputs.booking_commit_handler }}
           - lambda: Calendar_Event_Consumer
