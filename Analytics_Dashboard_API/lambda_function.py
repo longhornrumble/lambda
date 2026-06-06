@@ -100,6 +100,15 @@ TENANT_PURGE_FUNCTION = os.environ.get('TENANT_PURGE_FUNCTION', f'picasso-pii-te
 NOTIFICATION_EVENTS_TABLE = os.environ.get('NOTIFICATION_EVENTS_TABLE', 'picasso-notification-events')
 NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-notification-sends')
 
+# Scheduling — Booking table (FROZEN_CONTRACTS §A) + its two GSIs (already shipped,
+# used by Booking_Commit_Handler / Stranded_Booking_Remediator / Calendar_Watch_Listener).
+# §E7 read API: bounded GSI queries only, NEVER a full-tenant scan.
+BOOKING_TABLE = os.environ.get('BOOKING_TABLE', 'picasso-booking')
+BOOKING_TENANT_START_INDEX = os.environ.get('BOOKING_TENANT_START_INDEX', 'tenantId-start_at-index')
+BOOKING_TENANT_COORD_INDEX = os.environ.get('BOOKING_TENANT_COORD_INDEX', 'tenantId-coordinator_email-index')
+# tenant_aggregate (all-coordinator) read window — bounded, no unbounded scan.
+BOOKING_WINDOW_DAYS = int(os.environ.get('BOOKING_WINDOW_DAYS', '90'))
+
 # S3 Tenant Configuration
 S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
 
@@ -382,6 +391,9 @@ def lambda_handler(event, context):
             return handle_recent_conversations(tenant_id, params)
         elif path.endswith('/conversations/trend'):
             return handle_conversation_trend(tenant_id, params)
+        # Scheduling endpoints (§E7 bookings read API — Clerk-authed, scope-gated)
+        elif path.endswith('/scheduling/bookings'):
+            return handle_scheduling_bookings(tenant_id, params, user_role, user_email)
         # Forms endpoints (more specific - check second)
         elif path.endswith('/forms/summary'):
             return handle_form_summary(tenant_id, params)
@@ -3559,6 +3571,99 @@ def parse_date_range(range_str: str, start_date_param: str = None, end_date_para
 # =============================================================================
 # Response Helpers
 # =============================================================================
+
+# =============================================================================
+# Scheduling Endpoint Handlers (§E7 bookings read API)
+# =============================================================================
+
+def _booking_projection(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a DDB Booking item (§A) to the §E7 client shape. Schema-discipline:
+    every field tolerates absence — older rows may lack attendee_name/phone, html_link,
+    last_calendar_mutation_at — so a missing attribute yields None, never a crash."""
+    def g(field: str) -> Optional[str]:
+        return item.get(field, {}).get('S')
+    return {
+        'booking_id': g('booking_id'),
+        'tenant_id': g('tenantId'),
+        'status': g('status'),
+        'start_at': g('start_at'),
+        'end_at': g('end_at'),
+        'coordinator_email': g('coordinator_email'),
+        'resource_id': g('resource_id'),
+        'appointment_type_id': g('appointment_type_id'),
+        'attendee': {
+            'name': g('attendee_name'),
+            'email': g('attendee_email'),
+            'phone': g('attendee_phone'),
+        },
+        'created_at': g('created_at'),
+        'last_calendar_mutation_at': g('last_calendar_mutation_at'),
+        'html_link': g('html_link'),
+    }
+
+
+def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
+                               user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
+    """
+    GET /scheduling/bookings?scope=staff_self|tenant_aggregate[&cursor=<opaque>]
+
+    §E7 Customer-Portal bookings read API (consumed by the E12/E15 dashboard).
+    BOUNDED GSI queries ONLY — never a full-tenant scan:
+      staff_self       -> tenantId-coordinator_email-index, the viewer's OWN coordinator_email.
+      tenant_aggregate -> tenantId-start_at-index, start_at within +/-BOOKING_WINDOW_DAYS.
+                          ADMIN ROLE ONLY, enforced server-side (the client filter is advisory).
+    Returns { bookings: [<§E7 projection>], nextCursor? }. tenant_id comes from the
+    authenticated session (never a query param), so cross-tenant reads are impossible.
+    """
+    scope = (params.get('scope') or 'staff_self').strip()
+
+    if scope == 'tenant_aggregate':
+        if user_role not in ('admin', 'super_admin'):
+            return cors_response(403, {'error': 'tenant_aggregate scope requires an admin role'})
+        now = datetime.now(timezone.utc)
+        lo = (now - timedelta(days=BOOKING_WINDOW_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        hi = (now + timedelta(days=BOOKING_WINDOW_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+        index_name = BOOKING_TENANT_START_INDEX
+        key_condition = 'tenantId = :t AND start_at BETWEEN :lo AND :hi'
+        expr_values = {':t': {'S': tenant_id}, ':lo': {'S': lo}, ':hi': {'S': hi}}
+    elif scope == 'staff_self':
+        email = (user_email or '').strip().lower()
+        if not email or email == 'unknown':
+            # No resolvable coordinator identity -> nothing to show (not an error).
+            return cors_response(200, {'bookings': []})
+        index_name = BOOKING_TENANT_COORD_INDEX
+        key_condition = 'tenantId = :t AND coordinator_email = :email'
+        expr_values = {':t': {'S': tenant_id}, ':email': {'S': email}}
+    else:
+        return cors_response(400, {'error': f'invalid scope: {scope}'})
+
+    query_params: Dict[str, Any] = {
+        'TableName': BOOKING_TABLE,
+        'IndexName': index_name,
+        'KeyConditionExpression': key_condition,
+        'ExpressionAttributeValues': expr_values,
+    }
+
+    cursor = params.get('cursor')
+    if cursor:
+        try:
+            query_params['ExclusiveStartKey'] = json.loads(base64.b64decode(cursor).decode('utf-8'))
+        except Exception:
+            return cors_response(400, {'error': 'invalid cursor'})
+
+    try:
+        response = dynamodb.query(**query_params)
+    except ClientError as e:
+        logger.error(f"§E7 bookings query failed (tenant={tenant_id}, scope={scope}): {e}")
+        return cors_response(502, {'error': 'failed to load bookings'})
+
+    bookings = [_booking_projection(item) for item in response.get('Items', [])]
+    body: Dict[str, Any] = {'bookings': bookings}
+    last_key = response.get('LastEvaluatedKey')
+    if last_key:
+        body['nextCursor'] = base64.b64encode(json.dumps(last_key).encode('utf-8')).decode('utf-8')
+    return cors_response(200, body)
+
 
 def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
     """Build response with JSON content type.
