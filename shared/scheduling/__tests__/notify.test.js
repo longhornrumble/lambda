@@ -163,6 +163,48 @@ describe('buildEmailPayload', () => {
     expect(p.subject).toContain('us'); // default org
     expect(p.text_body).toContain('Hi ,'); // empty first name tolerated
   });
+
+  test('reengagement wraps the WS-E-COPY body with the STOP footer (no second CTA)', () => {
+    const body = 'Hi Sam,\n\nWe missed you for your intake call. You can reschedule here: https://x/r?token=abc';
+    const p = buildEmailPayload({
+      kind: 'reengagement',
+      booking: {
+        attendeeEmail: 'vol@example.com',
+        reengagementBody: body,
+        organizationName: 'Austin Angels',
+        appointmentTypeName: 'intake call',
+      },
+    });
+    expect(p.to).toBe('vol@example.com');
+    expect(p.subject).toContain('intake call');
+    expect(p.subject).toContain('Austin Angels');
+    expect(p.text_body).toContain('We missed you'); // COPY body verbatim
+    expect(p.text_body).toContain('reply STOP'); // notify owns the footer (§E8)
+    expect(p.html_body).toContain('reply STOP');
+    // notify must NOT inject a SECOND reschedule CTA — COPY owns the in-body link (§E8).
+    expect((p.text_body.match(/reschedule/gi) || []).length).toBeLessThanOrEqual(1);
+  });
+
+  test('reengagement throws when the body is absent (caller contract error)', () => {
+    expect(() =>
+      buildEmailPayload({ kind: 'reengagement', booking: { attendeeEmail: 'a@b.com' } })
+    ).toThrow(/reengagement requires booking\.reengagement_body/);
+    expect(() =>
+      buildEmailPayload({ kind: 'reengagement', booking: { attendeeEmail: 'a@b.com', reengagementBody: '   ' } })
+    ).toThrow(/reengagement requires/);
+  });
+
+  test('reengagement HTML-escapes the COPY body (XSS-safe) + reads snake_case', () => {
+    const p = buildEmailPayload({
+      kind: 'reengagement',
+      booking: { attendee_email: 'v@e.com', reengagement_body: 'Hi <script>alert(1)</script>\n\nsee you' },
+    });
+    expect(p.to).toBe('v@e.com'); // snake_case forward-compat read
+    expect(p.html_body).not.toContain('<script>'); // escaped, no raw markup
+    expect(p.html_body).toContain('&lt;script&gt;');
+    expect(p.html_body).toContain('</p><p>'); // paragraph break preserved
+    expect(p.html_body).toContain('reply STOP');
+  });
 });
 
 // ─── dispatchVolunteerNotice — agent-of-CoR guard ─────────────────────────────────────
