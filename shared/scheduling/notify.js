@@ -10,7 +10,7 @@
  * the caller's job.
  *
  *   dispatchVolunteerNotice({ kind, tenantId, booking, channels }, deps)
- *     kind ∈ { reschedule_link, reoffer, cancel_notice, move_optin_sms }
+ *     kind ∈ { reschedule_link, reoffer, cancel_notice, reengagement, move_optin_sms }
  *
  * ── Agent-of-CoR guard (§5.1) ──
  *   We notify the volunteer ONLY where the platform adds value beyond Google's native
@@ -65,7 +65,7 @@ const SEND_EMAIL_FUNCTION = process.env.SEND_EMAIL_FUNCTION || 'send_email';
 const SMS_SENDER_FUNCTION = process.env.SMS_SENDER_FUNCTION || 'SMS_Sender';
 
 // Value-add notices the platform sends (agent-of-CoR §5.1 — beyond Google's email).
-const EMAIL_KINDS = new Set(['reschedule_link', 'reoffer', 'cancel_notice']);
+const EMAIL_KINDS = new Set(['reschedule_link', 'reoffer', 'cancel_notice', 'reengagement']);
 const SMS_KINDS = new Set(['move_optin_sms']);
 // Mutations Google's native email already covers → never platform-notified (§5.1).
 const COR_NATIVE_KINDS = new Set(['reassigned', 'moved']);
@@ -172,6 +172,29 @@ function buildEmailPayload({ kind, booking }) {
     'us';
   const apptType =
     pick(booking, 'appointmentTypeName', 'appointment_type_name') || 'appointment';
+
+  // reengagement (§E8): WS-E-COPY's reengagement.js generates the diplomatic body WITH the
+  // reschedule CTA already embedded (its compliance invariant). notify owns ONLY the STOP
+  // footer — it never injects a second CTA (no double-injection). The body is REQUIRED
+  // (a caller contract error if absent, like the missing-link kinds).
+  if (kind === 'reengagement') {
+    const body = pick(booking, 'reengagementBody', 'reengagement_body');
+    if (typeof body !== 'string' || !body.trim()) {
+      throw new Error('reengagement requires booking.reengagement_body (WS-E-COPY generates it)');
+    }
+    const htmlBody =
+      '<p>' +
+      escapeHtml(body).replace(/\n{2,}/g, '</p><p>').replace(/\n/g, '<br>') +
+      '</p>' +
+      STOP_LINE_HTML;
+    return {
+      to: attendeeEmail,
+      subject: render('A note about your {{apptType}} — {{org}}', { org, apptType }),
+      text_body: body + STOP_LINE_TEXT,
+      html_body: htmlBody,
+    };
+  }
+
   const whenLabel = pick(booking, 'whenLabel', 'when_label');
   // https-only: a non-https (javascript:/data:/…) link is dropped to '' → it is then
   // treated as a MISSING link (throws for the kinds that require one, omitted for the
