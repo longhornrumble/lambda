@@ -103,11 +103,32 @@ NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-n
 # Scheduling — Booking table (FROZEN_CONTRACTS §A) + its two GSIs (already shipped,
 # used by Booking_Commit_Handler / Stranded_Booking_Remediator / Calendar_Watch_Listener).
 # §E7 read API: bounded GSI queries only, NEVER a full-tenant scan.
+# NOTE: BOOKING_TABLE default is the BARE name; the prod/staging accounts may still
+# use the env-suffixed name (picasso-booking-<env>) until the table-naming-alignment
+# program reaches it — the operator sets BOOKING_TABLE explicitly at deploy if so.
+# IAM: the Analytics_Dashboard_API execution role needs dynamodb:Query on BOOKING_TABLE
+# AND both GSIs (table ARN + /index/* ) — a NEW grant, owed at deploy.
 BOOKING_TABLE = os.environ.get('BOOKING_TABLE', 'picasso-booking')
 BOOKING_TENANT_START_INDEX = os.environ.get('BOOKING_TENANT_START_INDEX', 'tenantId-start_at-index')
 BOOKING_TENANT_COORD_INDEX = os.environ.get('BOOKING_TENANT_COORD_INDEX', 'tenantId-coordinator_email-index')
 # tenant_aggregate (all-coordinator) read window — bounded, no unbounded scan.
-BOOKING_WINDOW_DAYS = int(os.environ.get('BOOKING_WINDOW_DAYS', '90'))
+try:
+    BOOKING_WINDOW_DAYS = int(os.environ.get('BOOKING_WINDOW_DAYS', '90'))
+except (TypeError, ValueError):
+    BOOKING_WINDOW_DAYS = 90
+# Per-page cap so one request can never read an unbounded result set (Lambda 6 MB cap).
+try:
+    BOOKING_PAGE_SIZE = int(os.environ.get('BOOKING_PAGE_SIZE', '50'))
+except (TypeError, ValueError):
+    BOOKING_PAGE_SIZE = 50
+BOOKING_PAGE_SIZE_MAX = 200
+# Allowed key attrs in a pagination cursor (LastEvaluatedKey) per index — a GSI query's
+# LEK carries the GSI keys + the base-table keys. Used to reject a crafted cursor that
+# would seek into another tenant's partition or another index.
+_BOOKING_CURSOR_KEYS = {
+    BOOKING_TENANT_START_INDEX: {'tenantId', 'start_at', 'booking_id'},
+    BOOKING_TENANT_COORD_INDEX: {'tenantId', 'coordinator_email', 'booking_id'},
+}
 
 # S3 Tenant Configuration
 S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
@@ -3581,7 +3602,8 @@ def _booking_projection(item: Dict[str, Any]) -> Dict[str, Any]:
     every field tolerates absence — older rows may lack attendee_name/phone, html_link,
     last_calendar_mutation_at — so a missing attribute yields None, never a crash."""
     def g(field: str) -> Optional[str]:
-        return item.get(field, {}).get('S')
+        # (... or {}) defends against both a missing key AND a None-valued key.
+        return (item.get(field) or {}).get('S')
     return {
         'booking_id': g('booking_id'),
         'tenant_id': g('tenantId'),
@@ -3621,6 +3643,10 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
         if user_role not in ('admin', 'super_admin'):
             return cors_response(403, {'error': 'tenant_aggregate scope requires an admin role'})
         now = datetime.now(timezone.utc)
+        # start_at is stored ISO8601 'YYYY-MM-DDTHH:MM:SS(.fff)Z' (Booking_Commit_Handler
+        # toISOString, FROZEN_CONTRACTS §A). Bare-Z bounds compare correctly against the
+        # fractional form ('.' < 'Z'), so the lexicographic BETWEEN is exact. A future
+        # writer MUST keep the Z-suffixed UTC format or this window silently misbehaves.
         lo = (now - timedelta(days=BOOKING_WINDOW_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
         hi = (now + timedelta(days=BOOKING_WINDOW_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
         index_name = BOOKING_TENANT_START_INDEX
@@ -3637,24 +3663,39 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
     else:
         return cors_response(400, {'error': f'invalid scope: {scope}'})
 
+    try:
+        page_size = int(params.get('page_size', BOOKING_PAGE_SIZE))
+    except (TypeError, ValueError):
+        return cors_response(400, {'error': 'invalid page_size'})
+    page_size = max(1, min(page_size, BOOKING_PAGE_SIZE_MAX))
+
     query_params: Dict[str, Any] = {
         'TableName': BOOKING_TABLE,
         'IndexName': index_name,
         'KeyConditionExpression': key_condition,
         'ExpressionAttributeValues': expr_values,
+        'Limit': page_size,
     }
 
     cursor = params.get('cursor')
     if cursor:
+        # Opaque to clients but server-validated: the cursor must decode to a key for
+        # THIS index AND carry THIS tenant's partition — a crafted cursor can never seek
+        # into another tenant's partition or another index.
         try:
-            query_params['ExclusiveStartKey'] = json.loads(base64.b64decode(cursor).decode('utf-8'))
+            decoded = json.loads(base64.b64decode(cursor).decode('utf-8'))
         except Exception:
             return cors_response(400, {'error': 'invalid cursor'})
+        if (not isinstance(decoded, dict)
+                or set(decoded.keys()) - _BOOKING_CURSOR_KEYS.get(index_name, set())
+                or decoded.get('tenantId', {}).get('S') != tenant_id):
+            return cors_response(400, {'error': 'invalid cursor'})
+        query_params['ExclusiveStartKey'] = decoded
 
     try:
         response = dynamodb.query(**query_params)
     except ClientError as e:
-        logger.error(f"§E7 bookings query failed (tenant={tenant_id}, scope={scope}): {e}")
+        logger.error(f"§E7 bookings query failed (tenant={redact_tenant_id(tenant_id)}, scope={scope}): {e}")
         return cors_response(502, {'error': 'failed to load bookings'})
 
     bookings = [_booking_projection(item) for item in response.get('Items', [])]
@@ -3662,6 +3703,7 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
     last_key = response.get('LastEvaluatedKey')
     if last_key:
         body['nextCursor'] = base64.b64encode(json.dumps(last_key).encode('utf-8')).decode('utf-8')
+    logger.info(f"[scheduling/bookings] tenant={redact_tenant_id(tenant_id)} scope={scope} count={len(bookings)}")
     return cors_response(200, body)
 
 

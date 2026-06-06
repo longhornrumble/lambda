@@ -197,3 +197,74 @@ def test_ddb_clienterror_is_502_not_500(mock_ddb):
     mock_ddb.query.side_effect = ClientError({'Error': {'Code': 'ProvisionedThroughputExceeded'}}, 'Query')
     resp = handle_scheduling_bookings('TEN1', {'scope': 'staff_self'}, 'member', 'coord@example.com')
     assert resp['statusCode'] == 502
+
+
+# --------------------------------------------------------------------------- #
+# Audit-hardening: page-size cap, cursor tenant-binding, role=None
+# --------------------------------------------------------------------------- #
+
+@patch('lambda_function.dynamodb')
+def test_query_sets_a_limit(mock_ddb):
+    mock_ddb.query.return_value = {'Items': []}
+    handle_scheduling_bookings('TEN1', {'scope': 'staff_self'}, 'member', 'c@example.com')
+    assert mock_ddb.query.call_args.kwargs['Limit'] == lambda_function.BOOKING_PAGE_SIZE
+
+
+@patch('lambda_function.dynamodb')
+def test_page_size_is_capped(mock_ddb):
+    mock_ddb.query.return_value = {'Items': []}
+    handle_scheduling_bookings('TEN1', {'scope': 'staff_self', 'page_size': '99999'}, 'member', 'c@example.com')
+    assert mock_ddb.query.call_args.kwargs['Limit'] == lambda_function.BOOKING_PAGE_SIZE_MAX
+
+
+@patch('lambda_function.dynamodb')
+def test_invalid_page_size_is_400(mock_ddb):
+    resp = handle_scheduling_bookings('TEN1', {'scope': 'staff_self', 'page_size': 'lots'}, 'member', 'c@example.com')
+    assert resp['statusCode'] == 400
+    mock_ddb.query.assert_not_called()
+
+
+def _cursor(d):
+    return base64.b64encode(json.dumps(d).encode()).decode()
+
+
+@patch('lambda_function.dynamodb')
+def test_cursor_pointing_at_another_tenant_is_rejected(mock_ddb):
+    """A crafted cursor carrying a DIFFERENT tenantId must be refused (no cross-tenant seek)."""
+    bad = _cursor({'tenantId': {'S': 'OTHER'}, 'booking_id': {'S': 'X'}, 'coordinator_email': {'S': 'c@example.com'}})
+    resp = handle_scheduling_bookings('TEN1', {'scope': 'staff_self', 'cursor': bad}, 'member', 'c@example.com')
+    assert resp['statusCode'] == 400
+    mock_ddb.query.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_cursor_with_unexpected_keys_is_rejected(mock_ddb):
+    bad = _cursor({'tenantId': {'S': 'TEN1'}, 'booking_id': {'S': 'X'}, 'evil': {'S': 'inject'}})
+    resp = handle_scheduling_bookings('TEN1', {'scope': 'staff_self', 'cursor': bad}, 'member', 'c@example.com')
+    assert resp['statusCode'] == 400
+    mock_ddb.query.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_valid_same_tenant_cursor_is_accepted(mock_ddb):
+    mock_ddb.query.return_value = {'Items': []}
+    good = _cursor({'tenantId': {'S': 'TEN1'}, 'booking_id': {'S': 'X'}, 'coordinator_email': {'S': 'c@example.com'}})
+    resp = handle_scheduling_bookings('TEN1', {'scope': 'staff_self', 'cursor': good}, 'member', 'c@example.com')
+    assert resp['statusCode'] == 200
+    assert mock_ddb.query.call_args.kwargs['ExclusiveStartKey']['tenantId'] == {'S': 'TEN1'}
+
+
+@patch('lambda_function.dynamodb')
+def test_tenant_aggregate_role_none_is_forbidden(mock_ddb):
+    resp = handle_scheduling_bookings('TEN1', {'scope': 'tenant_aggregate'}, None, 'x@example.com')
+    assert resp['statusCode'] == 403
+    mock_ddb.query.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_projection_handles_fractional_z_start_at(mock_ddb):
+    """BCH writes start_at as '...:00.000Z'; the bare-Z BETWEEN bounds must still bracket it."""
+    item = _item(start_at={'S': '2026-06-10T18:00:00.000Z'})
+    mock_ddb.query.return_value = {'Items': [item]}
+    body = _body(handle_scheduling_bookings('TEN1', {'scope': 'tenant_aggregate'}, 'admin', 'a@example.com'))
+    assert body['bookings'][0]['start_at'] == '2026-06-10T18:00:00.000Z'
