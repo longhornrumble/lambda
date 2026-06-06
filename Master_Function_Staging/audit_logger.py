@@ -67,7 +67,10 @@ EVENT_SEVERITY_MAP = {
     
     # Handoff Events (LOW-MEDIUM)
     'HANDOFF_TO_SECURE_FORM': AuditSeverity.MEDIUM,
-    'HANDOFF_COMPLETED': AuditSeverity.LOW
+    'HANDOFF_COMPLETED': AuditSeverity.LOW,
+
+    # Form Events (LOW)
+    'FORM_SUBMISSION': AuditSeverity.LOW
 }
 
 class AuditLogger:
@@ -311,6 +314,27 @@ class AuditLogger:
             'operation': 'unauthorized_access_denied'
         }
         return self._log_audit_event(tenant_id, 'SECURITY_UNAUTHORIZED_ACCESS', session_id, context, AuditSeverity.HIGH)
+
+    # Form Events
+
+    def log_form_submission(self, tenant_id: str, session_id: str = None,
+                            submission_id: str = None, form_type: str = None,
+                            notification_count: int = None,
+                            fulfillment_status: str = None) -> bool:
+        """Log a form submission to the audit trail (PII-free).
+
+        Context is metadata only — submission_id, form_type, a notification
+        count, and the fulfillment status — never the raw responses. Whatever
+        is passed is still run through the PII scanner before storage.
+        """
+        context = {
+            'submission_id': submission_id,
+            'form_type': form_type,
+            'notification_count': notification_count,
+            'fulfillment_status': fulfillment_status,
+            'operation': 'form_submission'
+        }
+        return self._log_audit_event(tenant_id, 'FORM_SUBMISSION', session_id, context)
 
     # Performance and Metrics
     
