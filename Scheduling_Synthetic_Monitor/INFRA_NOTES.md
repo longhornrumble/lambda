@@ -29,6 +29,19 @@ hard-stops a prod run with test-mode on).
 > signing key. BCH owns all calendar/conference I/O; the redemption endpoint is reached over
 > plain HTTPS (outbound, no IAM). The revocation cycle is operator-triggered with a supplied
 > token (no minting).
+>
+> ⚠️ **Do NOT copy an adjacent role's policy wholesale** (e.g. BCH's role): this role MUST
+> NOT have `secretsmanager:GetSecretValue` or any Google/SES grant — it has no use for them
+> and they would broaden the blast radius. Build the role from the table above only.
+> **Recommended hardening:** scope the DynamoDB grant with a `Condition` on
+> `aws:ResourceAccount = <staging account id>` so an accidental prod deploy can't reach a
+> future prod booking table (the prod-guard covers the test-mode case; this covers the
+> test-mode-OFF-in-prod case at the IAM layer).
+
+> **`BOOKING_TABLE` is a required env var, not a safe default.** The code falls back to
+> `picasso-booking-${ENV}` only as a staging convenience; under the table-naming-alignment
+> program a future bare-name rename would make the fallback mispoint. Always set
+> `BOOKING_TABLE` explicitly in the function config.
 
 ## EventBridge schedules
 

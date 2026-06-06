@@ -81,6 +81,25 @@ describe('revocation-observer (operator-triggered token cycle, §13.7)', () => {
     expect(deps.alert).toHaveBeenCalled();
   });
 
+  test('rejects a malformed base URL without leaking the token, before fetch', async () => {
+    const fetch = jest.fn();
+    const deps = makeDeps({ fetch, baseUrl: 'http://[bad' });
+    const res = await runRevocationObserve({ slug: '/cancel', token: 'SECRET' }, deps);
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/URL malformed/);
+    expect(JSON.stringify(res)).not.toContain('SECRET');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test('on failure, the warn log does not contain the token', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetch = jest.fn().mockResolvedValueOnce({ status: 401 });
+    await runRevocationObserve({ slug: '/cancel', token: 'SUPER.SECRET.TOKEN' }, makeDeps({ fetch }));
+    const logged = warnSpy.mock.calls.map((c) => JSON.stringify(c)).join('|');
+    expect(logged).not.toContain('SUPER.SECRET.TOKEN');
+    warnSpy.mockRestore();
+  });
+
   test('fails cleanly when no fetch implementation is available (older runtime)', async () => {
     const orig = globalThis.fetch;
     globalThis.fetch = undefined;

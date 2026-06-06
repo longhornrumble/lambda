@@ -98,6 +98,32 @@ describe('cancel-cycle', () => {
     const res = await runCancelCycle(deps);
     expect(res.success).toBe(false);
     expect(deps.invokeBch).not.toHaveBeenCalled();
+    expect(deps.emitCycleResult).toHaveBeenCalledWith('cancel', false);
+    expect(deps.alert).toHaveBeenCalled();
+  });
+
+  test('fails when createSyntheticBooking returns booking:null (read-back miss)', async () => {
+    const deps = makeDeps({
+      createSyntheticBooking: jest.fn().mockResolvedValue({ tenantId: 'TEN-SYNTH', bookingId: 'booking#abc', booking: null }),
+    });
+    const res = await runCancelCycle(deps);
+    expect(res.success).toBe(false);
+    expect(deps.invokeBch).not.toHaveBeenCalled();
+    expect(deps.emitCycleResult).toHaveBeenCalledWith('cancel', false);
+    expect(deps.alert).toHaveBeenCalled();
+  });
+
+  test('fails when external_event_id is missing (coordinator present)', async () => {
+    const deps = makeDeps({
+      createSyntheticBooking: jest.fn().mockResolvedValue({
+        tenantId: 'TEN-SYNTH',
+        bookingId: 'booking#abc',
+        booking: baseBooking({ external_event_id: null }),
+      }),
+    });
+    const res = await runCancelCycle(deps);
+    expect(res.success).toBe(false);
+    expect(deps.invokeBch).not.toHaveBeenCalled();
   });
 
   test('fails + alerts when booking creation throws', async () => {
@@ -106,5 +132,17 @@ describe('cancel-cycle', () => {
     expect(res).toMatchObject({ cycle: 'cancel', success: false });
     expect(res.error).toMatch(/no slots/);
     expect(deps.emitCycleResult).toHaveBeenCalledWith('cancel', false);
+    expect(deps.alert).toHaveBeenCalled();
+  });
+
+  test('pollAttempts:1 → single GET, no sleep, clean failure if not yet canceled', async () => {
+    const deps = makeDeps({
+      pollAttempts: 1,
+      getBooking: jest.fn().mockResolvedValue(baseBooking({ status: 'booked' })),
+    });
+    const res = await runCancelCycle(deps);
+    expect(res.success).toBe(false);
+    expect(deps.getBooking).toHaveBeenCalledTimes(1);
+    expect(deps.sleep).not.toHaveBeenCalled();
   });
 });

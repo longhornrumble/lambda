@@ -7,19 +7,17 @@
  * STAGING_TEST_MODE time-compression that fires reminder/attendance windows in seconds.
  * NONE of that may ever touch a production environment. §5.1's hygiene is a double-gate —
  * `is_synthetic` on the row AND `STAGING_TEST_MODE` on the dispatcher; this module is the
- * ENVIRONMENT half of that gate, asserted by the monitor itself:
+ * ENVIRONMENT half of that gate, asserted by the monitor itself.
  *
- *   if STAGING_TEST_MODE is enabled while ENVIRONMENT is production → REFUSE to initialize.
+ * FAIL-CLOSED posture: if `STAGING_TEST_MODE` is enabled, the monitor refuses to initialize
+ * UNLESS `ENVIRONMENT` is a recognized safe (non-production) environment. So production,
+ * the legacy `prod` typo, AND any unknown/misspelled value (`prd`, `prod-1`, `qa`, …) all
+ * refuse — only the known-safe set passes. A safety guard must fail safe on the unknown,
+ * not allow it (the 2026-06 `ENVIRONMENT=staging` prod defect is precedent that env values
+ * get misconfigured in this platform).
  *
  * index.js calls assertSafeMode() at MODULE LOAD (a true init refusal — the Lambda
- * cold-start throws, so the function is structurally incapable of running synthetic logic
- * in prod) AND again at handler entry (defense-in-depth against a mutated runtime env).
- *
- * Safety bias: the production check matches BOTH the platform-canonical `production` and
- * the legacy `prod` typo (case-insensitive). The naming-alignment convention forbids
- * `prod`, but a SAFETY guard must fail safe — a misconfigured `ENVIRONMENT=prod` must not
- * slip the gate. (The 2026-06 `ENVIRONMENT=staging` prod defect is precedent that env
- * values do get misconfigured in this platform.)
+ * cold-start throws) AND at handler entry (defense-in-depth against a mutated runtime env).
  */
 
 class ProdGuardError extends Error {
@@ -29,35 +27,49 @@ class ProdGuardError extends Error {
   }
 }
 
+// Recognized NON-production environments. An empty/unset ENVIRONMENT is staging-class
+// (booking-table.js defaults the table suffix to `staging` when unset) → safe.
+const KNOWN_SAFE_ENVIRONMENTS = new Set(['staging', 'development', 'dev', 'test', 'local', '']);
+
+function normalizeEnv(value) {
+  return String(value == null ? '' : value).trim().toLowerCase();
+}
+
 // Truthy forms a deployer might use for the flag. Anything else (unset, 'false', '0',
 // 'no', arbitrary) is treated as OFF — the guard only fires on an explicit enable.
 function isTestModeOn(value) {
   if (value === true) return true;
-  const v = String(value == null ? '' : value).trim().toLowerCase();
+  const v = normalizeEnv(value);
   return v === 'true' || v === '1' || v === 'yes' || v === 'on';
 }
 
-// Production-like environment. Matches the canonical `production` and the legacy `prod`
-// alias (see header — safety bias). Case-insensitive; whitespace-tolerant.
+// Production-like (used only to phrase the refusal message; the gate is isKnownSafeEnv).
 function isProduction(value) {
-  const v = String(value == null ? '' : value).trim().toLowerCase();
+  const v = normalizeEnv(value);
   return v === 'production' || v === 'prod';
 }
 
+function isKnownSafeEnv(value) {
+  return KNOWN_SAFE_ENVIRONMENTS.has(normalizeEnv(value));
+}
+
 /**
- * Throw ProdGuardError iff STAGING_TEST_MODE is enabled in a production environment.
- * Pure (no env reads, no I/O) so it is exhaustively unit-testable; callers pass the env.
+ * Throw ProdGuardError when STAGING_TEST_MODE is enabled and ENVIRONMENT is NOT a
+ * recognized safe environment (fail-closed). Pure (no env reads, no I/O) — exhaustively
+ * unit-testable; callers pass the env.
  *
  * @param {{environment?: string, stagingTestMode?: string|boolean}} env
  */
 function assertSafeMode({ environment, stagingTestMode } = {}) {
-  if (isTestModeOn(stagingTestMode) && isProduction(environment)) {
-    throw new ProdGuardError(
-      'REFUSING to initialize Scheduling_Synthetic_Monitor: STAGING_TEST_MODE is enabled ' +
-        `in a production environment (ENVIRONMENT=${environment}). Synthetic bookings and ` +
-        'time-compression must never run against production.'
-    );
-  }
+  if (!isTestModeOn(stagingTestMode)) return; // test-mode off → always safe
+  if (isKnownSafeEnv(environment)) return; // explicitly recognized non-prod env → safe
+  const detail = isProduction(environment)
+    ? `in a production environment (ENVIRONMENT=${environment})`
+    : `but ENVIRONMENT=${JSON.stringify(environment)} is not a recognized safe environment (fail-closed)`;
+  throw new ProdGuardError(
+    'REFUSING to initialize Scheduling_Synthetic_Monitor: STAGING_TEST_MODE is enabled ' +
+      `${detail}. Synthetic bookings and time-compression must never run outside staging/dev.`
+  );
 }
 
 module.exports = {
@@ -65,4 +77,6 @@ module.exports = {
   ProdGuardError,
   _isTestModeOn: isTestModeOn,
   _isProduction: isProduction,
+  _isKnownSafeEnv: isKnownSafeEnv,
+  _KNOWN_SAFE_ENVIRONMENTS: KNOWN_SAFE_ENVIRONMENTS,
 };

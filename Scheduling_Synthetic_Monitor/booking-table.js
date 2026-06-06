@@ -116,6 +116,7 @@ async function querySyntheticOlderThan(tenantId, cutoffIso, { client = ddb } = {
         tenantId: str(it.tenantId),
         booking_id: str(it.booking_id),
         created_at: str(it.created_at),
+        status: str(it.status), // for straggler visibility (non-canceled = possible orphan event)
       });
     }
     ExclusiveStartKey = res.LastEvaluatedKey;
@@ -123,9 +124,18 @@ async function querySyntheticOlderThan(tenantId, cutoffIso, { client = ddb } = {
   return out;
 }
 
+// Defense-in-depth: the delete is CONDITIONAL on the row being synthetic, so even if a
+// caller ever passed a non-synthetic key (a query bug, a stale row), DynamoDB rejects it
+// (ConditionalCheckFailed) rather than deleting a real booking. `is_synthetic` is not a
+// reserved word (cf. Stranded_Booking_Remediator's unaliased `item_type` filter).
 async function deleteBooking(tenantId, bookingId, { client = ddb } = {}) {
   await client.send(
-    new DeleteItemCommand({ TableName: BOOKING_TABLE, Key: key(tenantId, bookingId) })
+    new DeleteItemCommand({
+      TableName: BOOKING_TABLE,
+      Key: key(tenantId, bookingId),
+      ConditionExpression: 'is_synthetic = :true',
+      ExpressionAttributeValues: { ':true': { BOOL: true } },
+    })
   );
 }
 

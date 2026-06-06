@@ -55,6 +55,13 @@ async function runRevocationObserve(input = {}, deps = {}) {
     }
 
     const url = `${baseUrl}${slug}?t=${encodeURIComponent(token)}`;
+    // Validate the URL up front so a malformed REDEMPTION_BASE_URL can't surface the token
+    // inside a URL-parse error message (which would then be logged/alerted).
+    try {
+      new URL(url); // eslint-disable-line no-new
+    } catch (_) {
+      throw new Error('invalid REDEMPTION_BASE_URL or slug — URL malformed (token withheld)');
+    }
 
     // First redemption: a volunteer purpose redirects (302), an attendance purpose renders
     // a 200 "got it" page. Either counts as a successful one-time use.

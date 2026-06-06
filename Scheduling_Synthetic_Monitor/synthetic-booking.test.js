@@ -2,12 +2,21 @@
 
 const { createSyntheticBooking } = require('./synthetic-booking');
 
+// §B3-shipped chip shape: { slotId, start, end, label, candidateResourceIds } (pool.js:314).
 const PROPOSE_OK = {
   outcome: 'ok',
   poolSize: 2,
   tieBreaker: 'round_robin',
   roundRobinCursor: { routingPolicyId: 'rp1' },
-  slots: [{ slotId: 's1', start: '2026-07-01T15:00:00Z', end: '2026-07-01T15:30:00Z', resourceId: 'coord@example.org' }],
+  slots: [
+    {
+      slotId: 'slot#2026-07-01T15:00:00Z',
+      start: '2026-07-01T15:00:00Z',
+      end: '2026-07-01T15:30:00Z',
+      label: 'Tue, Jul 1 · 3:00 PM',
+      candidateResourceIds: ['coord@example.org', 'coord2@example.org'],
+    },
+  ],
 };
 
 function makeDeps(overrides = {}) {
@@ -32,16 +41,18 @@ describe('synthetic-booking.createSyntheticBooking', () => {
 
     expect(res).toMatchObject({ tenantId: 'TEN-SYNTH', bookingId: 'booking#xyz', coordinatorId: 'coord@example.org' });
 
-    // propose call
     expect(deps.invokeBch).toHaveBeenNthCalledWith(1, expect.objectContaining({ action: 'scheduling_propose', appointmentTypeId: 'apt-1' }));
-    // commit call carries the chip's slot + candidateResourceIds + pool_size
+    // commit passes the chip's FULL candidateResourceIds pool (not just [0]) + pool_size.
     expect(deps.invokeBch).toHaveBeenNthCalledWith(2, expect.objectContaining({
       tenant_id: 'TEN-SYNTH',
-      slot: { start: '2026-07-01T15:00:00Z', end: '2026-07-01T15:30:00Z', candidateResourceIds: ['coord@example.org'] },
+      slot: {
+        start: '2026-07-01T15:00:00Z',
+        end: '2026-07-01T15:30:00Z',
+        candidateResourceIds: ['coord@example.org', 'coord2@example.org'],
+      },
       pool_size: 2,
       tie_breaker: 'round_robin',
     }));
-    // session id is namespaced + carries the cycle prefix
     expect(deps.invokeBch.mock.calls[1][0].session_id).toMatch(/^synthetic-cancel-/);
     expect(deps.stampSynthetic).toHaveBeenCalledWith('TEN-SYNTH', 'booking#xyz');
   });
@@ -65,7 +76,18 @@ describe('synthetic-booking.createSyntheticBooking', () => {
     expect(deps.stampSynthetic).not.toHaveBeenCalled();
   });
 
-  test('throws when a propose slot is missing resourceId', async () => {
+  test('throws when a propose slot has empty candidateResourceIds', async () => {
+    const deps = makeDeps({
+      invokeBch: jest.fn(async (p) =>
+        p.action === 'scheduling_propose'
+          ? { outcome: 'ok', poolSize: 1, slots: [{ start: 'a', end: 'b', candidateResourceIds: [] }] }
+          : { status: 'BOOKED' }
+      ),
+    });
+    await expect(createSyntheticBooking({ cyclePrefix: 'cancel' }, deps)).rejects.toThrow(/candidateResourceIds/);
+  });
+
+  test('throws when a propose slot is missing candidateResourceIds entirely', async () => {
     const deps = makeDeps({
       invokeBch: jest.fn(async (p) =>
         p.action === 'scheduling_propose'
@@ -73,6 +95,18 @@ describe('synthetic-booking.createSyntheticBooking', () => {
           : { status: 'BOOKED' }
       ),
     });
-    await expect(createSyntheticBooking({ cyclePrefix: 'cancel' }, deps)).rejects.toThrow(/resourceId/);
+    await expect(createSyntheticBooking({ cyclePrefix: 'cancel' }, deps)).rejects.toThrow(/candidateResourceIds/);
+  });
+
+  test('propagates a stampSynthetic failure (commit ok but row not stampable)', async () => {
+    const deps = makeDeps({ stampSynthetic: jest.fn().mockRejectedValue(new Error('ConditionalCheckFailed')) });
+    await expect(createSyntheticBooking({ cyclePrefix: 'cancel' }, deps)).rejects.toThrow(/ConditionalCheckFailed/);
+  });
+
+  test('returns booking:null when read-back finds no row (caller guards)', async () => {
+    const deps = makeDeps({ getBooking: jest.fn().mockResolvedValue(null) });
+    const res = await createSyntheticBooking({ cyclePrefix: 'cancel' }, deps);
+    expect(res.booking).toBeNull();
+    expect(res.coordinatorId).toBeFalsy();
   });
 });

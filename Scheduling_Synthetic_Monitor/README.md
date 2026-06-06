@@ -22,7 +22,7 @@ regressions surface within hours instead of at a customer (§5.2).
 | `cleanup` | EventBridge, nightly | delete synthetic bookings older than 7 days (§5.1 test-data hygiene) | — (this Lambda owns it) |
 
 ### `cancel` cycle
-Drives the **real** booking path at the commit boundary — invokes BCH `scheduling_propose`
+Exercises the **BCH commit/cancel boundary directly** — invokes BCH `scheduling_propose`
 (real availability) → default commit (live freeBusy → slot-lock → conference → Google
 Calendar insert → Booking write → confirmation email), stamps `is_synthetic=true` on its
 own row (§E6), then invokes BCH `scheduling_mutate` cancel. The §14.2 cal-lifecycle listener
@@ -30,12 +30,21 @@ flips `Booking.status=canceled` **asynchronously** on the calendar-delete push, 
 monitor **polls** the row (bounded retry) until it flips. A flip that never arrives is a real
 finding (listener lag/breakage) — exactly what burn-in should catch.
 
+> **Coverage boundary (honest scope):** this exercises BCH and the cal-lifecycle chain, **not**
+> the full public path. The BSH conversation flow, the §B14 action boundary, and the
+> widget/session threading are **bypassed** (covered by §5.2 manual exercise until a BSH-level
+> cycle lands). The `cancel` cycle does book/cancel **real** staging calendar events.
+
 ### `revocation_observe` cycle (operator-triggered)
 **The monitor never mints or auto-revokes tokens** — it does not hold the JWT signing key and
 must not consume jtis on a schedule. The **operator** supplies one real one-time token (e.g.
 a cancel link from a synthetic booking's confirmation email) and its slug; the observer
 redeems it twice against the redemption endpoint and asserts success → 410. The token is a
 one-time credential and is **never logged**.
+
+> It is a **diagnostic spot-check, not a scheduled cycle** — it fires only when an operator
+> invokes it, so it does **not** contribute to the §4.3 "24h of green hourly cycles" window
+> (that window is satisfied by `cancel` + `cleanup`).
 
 Invoke:
 ```json
@@ -86,6 +95,7 @@ returns no slots and the cycle reports a **clean failure** (no crash).
 | `SYNTHETIC_CONFERENCE_TYPE` | `null` | `null` \| `google_meet` \| `zoom` |
 | `BOOKING_TABLE` | `picasso-booking-${ENV}` | Booking table (FROZEN §A) |
 | `BOOKING_COMMIT_FUNCTION_NAME` | `Booking_Commit_Handler` | BCH invoke target |
+| `BCH_INVOKE_TIMEOUT_MS` | `30000` | per-invoke request timeout for the BCH call (heavy I/O) |
 | `REDEMPTION_BASE_URL` | `https://schedule.myrecruiter.ai` | revocation endpoint base |
 | `OPS_ALERTS_TOPIC_ARN` | (unset → alerts skipped) | SNS ops-alerts topic |
 | `MONITOR_METRIC_NAMESPACE` | `Picasso/SchedulingSynthetic` | CloudWatch metric namespace |

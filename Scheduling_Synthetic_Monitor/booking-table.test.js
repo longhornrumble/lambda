@@ -74,8 +74,8 @@ describe('booking-table.querySyntheticOlderThan', () => {
 
     const rows = await bookingTable.querySyntheticOlderThan('TEN-SYNTH', '2026-07-01T00:00:00Z');
     expect(rows).toEqual([
-      { tenantId: 'TEN-SYNTH', booking_id: 'b1', created_at: '2026-06-01T00:00:00Z' },
-      { tenantId: 'TEN-SYNTH', booking_id: 'b2', created_at: '2026-06-02T00:00:00Z' },
+      { tenantId: 'TEN-SYNTH', booking_id: 'b1', created_at: '2026-06-01T00:00:00Z', status: null },
+      { tenantId: 'TEN-SYNTH', booking_id: 'b2', created_at: '2026-06-02T00:00:00Z', status: null },
     ]);
     const call = ddbMock.commandCalls(QueryCommand)[0].args[0].input;
     expect(call.KeyConditionExpression).toBe('tenantId = :t');
@@ -92,11 +92,24 @@ describe('booking-table.querySyntheticOlderThan', () => {
 });
 
 describe('booking-table.deleteBooking', () => {
-  test('deletes by composite key', async () => {
+  test('deletes by composite key, conditional on is_synthetic (defense-in-depth)', async () => {
     ddbMock.on(DeleteItemCommand).resolves({});
     await bookingTable.deleteBooking('TEN-SYNTH', 'booking#1');
     expect(ddbMock).toHaveReceivedCommandWith(DeleteItemCommand, {
       Key: { tenantId: { S: 'TEN-SYNTH' }, booking_id: { S: 'booking#1' } },
+      ConditionExpression: 'is_synthetic = :true',
+      ExpressionAttributeValues: { ':true': { BOOL: true } },
     });
+  });
+});
+
+describe('booking-table.getBooking — key fallbacks', () => {
+  test('falls back to the param tenantId/bookingId when the Item omits them', async () => {
+    ddbMock.on(GetItemCommand).resolves({ Item: { status: { S: 'booked' } } });
+    const row = await bookingTable.getBooking('TEN-FALLBACK', 'booking#fb');
+    expect(row.tenantId).toBe('TEN-FALLBACK');
+    expect(row.tenant_id).toBe('TEN-FALLBACK');
+    expect(row.booking_id).toBe('booking#fb');
+    expect(row.is_synthetic).toBe(false); // absent attr → forward-compatible default
   });
 });

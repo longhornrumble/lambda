@@ -28,4 +28,9 @@ describe('bch-client.invokeBch', () => {
     lambdaMock.on(InvokeCommand).resolves({ Payload: new TextEncoder().encode('not json') });
     await expect(invokeBch({})).rejects.toThrow(/non-JSON/);
   });
+
+  test('returns null when the response has no Payload', async () => {
+    lambdaMock.on(InvokeCommand).resolves({});
+    await expect(invokeBch({})).resolves.toBeNull();
+  });
 });

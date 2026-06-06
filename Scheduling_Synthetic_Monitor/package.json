@@ -32,6 +32,7 @@
       "synthetic-booking.js",
       "booking-table.js",
       "bch-client.js",
+      "alerts.js",
       "index.js"
     ],
     "coverageThreshold": {

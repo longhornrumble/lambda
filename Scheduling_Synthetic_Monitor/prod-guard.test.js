@@ -1,6 +1,6 @@
 'use strict';
 
-const { assertSafeMode, ProdGuardError, _isTestModeOn, _isProduction } = require('./prod-guard');
+const { assertSafeMode, ProdGuardError, _isTestModeOn, _isProduction, _isKnownSafeEnv } = require('./prod-guard');
 
 describe('prod-guard — assertSafeMode (HARD production safety guard, §5.1)', () => {
   // ── THE refusal: test-mode ON in a production environment ───────────────────────────
@@ -25,6 +25,25 @@ describe('prod-guard — assertSafeMode (HARD production safety guard, §5.1)', 
         expect(err.name).toBe('ProdGuardError');
         expect(err.message).toMatch(/production/i);
         expect(err.message).toMatch(/REFUSING/);
+      }
+    });
+  });
+
+  // ── FAIL-CLOSED: test-mode ON + an UNKNOWN/unrecognized env must also REFUSE ─────────
+  describe('FAIL-CLOSED: STAGING_TEST_MODE enabled + unknown/unrecognized environment → throws', () => {
+    const unknownEnvs = ['prd', 'prod-1', 'production-2', 'qa', 'sandbox', 'pr0d', 'PRODUCTON', 'stagingg'];
+    for (const environment of unknownEnvs) {
+      test(`environment=${JSON.stringify(environment)} + test-mode on → throws (fail-closed)`, () => {
+        expect(() => assertSafeMode({ environment, stagingTestMode: 'true' })).toThrow(ProdGuardError);
+      });
+    }
+    test('fail-closed message names the unrecognized env', () => {
+      try {
+        assertSafeMode({ environment: 'qa', stagingTestMode: 'true' });
+        throw new Error('expected throw');
+      } catch (err) {
+        expect(err).toBeInstanceOf(ProdGuardError);
+        expect(err.message).toMatch(/not a recognized safe environment/);
       }
     });
   });
@@ -80,6 +99,17 @@ describe('prod-guard — assertSafeMode (HARD production safety guard, §5.1)', 
     test.each([['staging', false], ['development', false], ['', false], [undefined, false], [null, false], ['productionish', false]])(
       '%s → not production',
       (v, expected) => expect(_isProduction(v)).toBe(expected)
+    );
+  });
+
+  describe('_isKnownSafeEnv', () => {
+    test.each([['staging', true], ['development', true], ['dev', true], ['test', true], ['local', true], ['', true], [undefined, true], ['STAGING', true]])(
+      '%s → known-safe',
+      (v, expected) => expect(_isKnownSafeEnv(v)).toBe(expected)
+    );
+    test.each([['production', false], ['prod', false], ['qa', false], ['prd', false], ['anything', false]])(
+      '%s → NOT known-safe',
+      (v, expected) => expect(_isKnownSafeEnv(v)).toBe(expected)
     );
   });
 });

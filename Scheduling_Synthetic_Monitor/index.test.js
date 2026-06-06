@@ -26,6 +26,14 @@ describe('index — module-load prod-guard (INIT refusal)', () => {
     expect(() => loadIndexWith({ ENVIRONMENT: 'production', STAGING_TEST_MODE: 'true' })).toThrow(/REFUSING/);
   });
 
+  test('REFUSES to load with the legacy `prod` alias + test-mode', () => {
+    expect(() => loadIndexWith({ ENVIRONMENT: 'prod', STAGING_TEST_MODE: 'true' })).toThrow(/REFUSING/);
+  });
+
+  test('REFUSES to load on an unknown env + test-mode (fail-closed)', () => {
+    expect(() => loadIndexWith({ ENVIRONMENT: 'qa', STAGING_TEST_MODE: 'true' })).toThrow(/REFUSING/);
+  });
+
   test('loads fine in staging with test-mode on', () => {
     expect(() => loadIndexWith(SAFE_ENV)).not.toThrow();
   });
@@ -62,6 +70,12 @@ describe('index — handler cycle dispatch', () => {
 
   test('unknown cycle → structured failure (no throw)', async () => {
     const res = await handler({ cycle: 'nope' }, {});
+    expect(res).toMatchObject({ success: false });
+    expect(res.error).toMatch(/unknown cycle/);
+  });
+
+  test('undefined event → default {} → unknown cycle (no throw)', async () => {
+    const res = await handler(undefined, {});
     expect(res).toMatchObject({ success: false });
     expect(res.error).toMatch(/unknown cycle/);
   });

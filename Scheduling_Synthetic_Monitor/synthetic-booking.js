@@ -66,15 +66,20 @@ async function createSyntheticBooking({ cyclePrefix }, deps = {}) {
     throw new Error(`propose returned no slots (outcome=${proposed && proposed.outcome})`);
   }
   const chip = proposed.slots[0];
-  if (!chip || !chip.start || !chip.end || !chip.resourceId) {
-    throw new Error('propose slot missing start/end/resourceId');
+  // §B3-shipped chip shape is { slotId, start, end, label, candidateResourceIds } — the
+  // tie-broken pool the commit route locks against (shared/scheduling/pool.js:314). NOTE:
+  // FROZEN_CONTRACTS §B3 prose still says singular `resourceId`; the shipped producer uses
+  // `candidateResourceIds` (flag to integrator to tighten §B3 — built to shipped reality).
+  const candidateResourceIds = chip && chip.candidateResourceIds;
+  if (!chip || !chip.start || !chip.end || !Array.isArray(candidateResourceIds) || candidateResourceIds.length === 0) {
+    throw new Error('propose slot missing start/end/candidateResourceIds[]');
   }
 
   // 2. commit — the full transactional path (snake_case keys per the commit route).
   const committed = await invoke({
     tenant_id: tenantId,
     session_id: sessionId,
-    slot: { start: chip.start, end: chip.end, candidateResourceIds: [chip.resourceId] },
+    slot: { start: chip.start, end: chip.end, candidateResourceIds },
     attendee: { email: SYNTHETIC_ATTENDEE_EMAIL, first_name: 'Synthetic', last_name: 'Monitor' },
     conference_type: SYNTHETIC_CONFERENCE_TYPE,
     pool_size: proposed.poolSize || 1,
