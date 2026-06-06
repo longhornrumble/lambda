@@ -57,6 +57,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
 from decimal import Decimal
 from botocore.exceptions import ClientError
+from boto3.dynamodb.types import TypeSerializer, TypeDeserializer
 import tenant_registry_ops
 
 # Configure logging
@@ -129,6 +130,16 @@ _BOOKING_CURSOR_KEYS = {
     BOOKING_TENANT_START_INDEX: {'tenantId', 'start_at', 'booking_id'},
     BOOKING_TENANT_COORD_INDEX: {'tenantId', 'coordinator_email', 'booking_id'},
 }
+
+# §E13b AppointmentType/RoutingPolicy write API (FROZEN_CONTRACTS §E13b — LOCKED 2026-06-06).
+# Bare-name defaults; staging/prod may use the env-suffixed name until the table-naming-alignment
+# program reaches them — the operator sets these explicitly at deploy if so. These mirror the
+# candidate-resolver.js / routing.js read-side env (ROUTING_POLICY_TABLE / APPOINTMENT_TYPE_TABLE),
+# so the write API and the live booking router address the SAME tables.
+# IAM: the Analytics_Dashboard_API execution role needs dynamodb:Query/GetItem/PutItem/UpdateItem on
+# BOTH tables — a NEW grant, owed at deploy.
+APPOINTMENT_TYPE_TABLE = os.environ.get('APPOINTMENT_TYPE_TABLE', 'picasso-appointment-type')
+ROUTING_POLICY_TABLE = os.environ.get('ROUTING_POLICY_TABLE', 'picasso-routing-policy')
 
 # S3 Tenant Configuration
 S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
@@ -386,6 +397,9 @@ def lambda_handler(event, context):
     # Parse query parameters
     params = event.get('queryStringParameters') or {}
 
+    # §E13b optimistic-lock header (last-seen modified_at.at) for scheduling-config PATCH.
+    if_match = headers.get('If-Match') or headers.get('if-match')
+
     # Route to appropriate handler
     # NOTE: More specific routes must come before generic ones
     # (e.g., /forms/summary before /summary)
@@ -415,6 +429,27 @@ def lambda_handler(event, context):
         # Scheduling endpoints (§E7 bookings read API — Clerk-authed, scope-gated)
         elif path.endswith('/scheduling/bookings'):
             return handle_scheduling_bookings(tenant_id, params, user_role, user_email)
+        # §E13b scheduling-config write API (AppointmentType/RoutingPolicy; ADMIN-only).
+        # Specific {id} PATCH routes use `in path`; list/create use endswith — all are
+        # distinct from /scheduling/bookings above.
+        elif path.endswith('/scheduling/appointment-types') and method == 'GET':
+            return handle_scheduling_appointment_types_get(tenant_id, user_role)
+        elif path.endswith('/scheduling/appointment-types') and method == 'POST':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_appointment_type_write(tenant_id, None, body, user_role, user_email, None)
+        elif '/scheduling/appointment-types/' in path and method == 'PATCH':
+            at_id = path.split('/scheduling/appointment-types/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_appointment_type_write(tenant_id, at_id, body, user_role, user_email, if_match)
+        elif path.endswith('/scheduling/routing-policies') and method == 'GET':
+            return handle_scheduling_routing_policies_get(tenant_id, user_role)
+        elif path.endswith('/scheduling/routing-policies') and method == 'POST':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_routing_policy_write(tenant_id, None, body, user_role, user_email, None)
+        elif '/scheduling/routing-policies/' in path and method == 'PATCH':
+            rp_id = path.split('/scheduling/routing-policies/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_routing_policy_write(tenant_id, rp_id, body, user_role, user_email, if_match)
         # Forms endpoints (more specific - check second)
         elif path.endswith('/forms/summary'):
             return handle_form_summary(tenant_id, params)
@@ -3710,6 +3745,373 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
         body['nextCursor'] = base64.b64encode(json.dumps(last_key).encode('utf-8')).decode('utf-8')
     logger.info(f"[scheduling/bookings] tenant={redact_tenant_id(tenant_id)} scope={scope} count={len(bookings)}")
     return cors_response(200, body)
+
+
+# =============================================================================
+# §E13b — AppointmentType / RoutingPolicy write API (FROZEN_CONTRACTS §E13b)
+#
+# Admin-only CRUD over the EXISTING scheduling routing tables the live booking
+# router reads (candidate-resolver.js / routing.js / pool.select). Writes the DDB
+# tables — NEVER tenant config S3. Consumed by the WS-E-PORTAL E13 Settings sub-tab.
+#   PATCH uses UpdateItem (SET only editable fields) so the COMMIT-OWNED round-robin
+#   state (last_assigned_resource_id/last_assigned_at) survives a config edit — a
+#   full-replace PutItem would wipe it. POST uses PutItem + attribute_not_exists.
+# =============================================================================
+
+_ddb_serialize = TypeSerializer().serialize
+_ddb_deserialize = TypeDeserializer().deserialize
+
+_TIE_BREAKERS = {'round_robin', 'first_available'}
+_TAG_OPERATORS = {'in_any', 'equals'}
+_AT_DURATION_MAX = 480  # minutes — scheduling_config_schema.md appointmentTypeSchema
+_AT_NAME_MAX = 200      # appointment-type display-name length cap (app-level guard)
+_SCHED_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+
+
+def _marshal(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Python dict -> DynamoDB AttributeValue map (nested-safe via TypeSerializer)."""
+    return {k: _ddb_serialize(v) for k, v in item.items()}
+
+
+def _native(value: Any) -> Any:
+    """Recursively convert DynamoDB-deserialized values (Decimal) to JSON-native."""
+    if isinstance(value, Decimal):
+        # Scheduling numerics are whole minutes; keep ints int, fall back to float.
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, list):
+        return [_native(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _native(v) for k, v in value.items()}
+    return value
+
+
+def _unmarshal(item: Dict[str, Any]) -> Dict[str, Any]:
+    """DynamoDB AttributeValue map -> JSON-native Python dict."""
+    return {k: _native(_ddb_deserialize(v)) for k, v in item.items()}
+
+
+def _now_iso() -> str:
+    # MICROSECOND precision: modified_at.at is the optimistic-lock token. Second
+    # precision let two edits within the same wall-clock second share a token, so
+    # the later write satisfies the If-Match of the earlier and silently clobbers
+    # it (S2). Microseconds make a same-instant collision between admin edits
+    # practically impossible. (This is a standalone stamp — NOT compared against
+    # the §E7 booking start_at format, so the extra precision is safe.)
+    return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+
+def _modified_at(editor_email: Optional[str]) -> Dict[str, str]:
+    """The §E13b optimistic-lock stamp written on every create/update."""
+    return {'at': _now_iso(), 'by': (editor_email or 'unknown')}
+
+
+def get_tag_vocabulary(tenant_id: str) -> List[str]:
+    """
+    The closed tag vocabulary = tenant config S3 scheduling.scheduling_tag_vocabulary.
+    Reads are allowed on staging (the config bucket is a read-only prod replica), so
+    vocab-validation works there even though the vocabulary is not EDITABLE from staging.
+    Missing config / block -> empty vocabulary (only solo policies may then be written).
+    """
+    config = get_tenant_config(tenant_id) or {}
+    scheduling = config.get('scheduling') or {}
+    vocab = scheduling.get('scheduling_tag_vocabulary') or []
+    return [t for t in vocab if isinstance(t, str)]
+
+
+def _validate_tag_conditions(tag_conditions: Any, vocabulary: List[str]):
+    """
+    §E13b vocab-validation (FAIL-CLOSED). Validates the runtime tag_conditions shape
+    [{operator: 'in_any'|'equals', values: [tag]}] AND that every tag is in the closed
+    vocabulary. Returns (normalized_conditions, error_response_or_None).
+    """
+    if tag_conditions is None:
+        return [], None
+    if not isinstance(tag_conditions, list):
+        return None, cors_response(400, {'error': 'tag_conditions must be a list'})
+    vocab = set(vocabulary)
+    normalized: List[Dict[str, Any]] = []
+    unknown: List[str] = []
+    for cond in tag_conditions:
+        if not isinstance(cond, dict):
+            return None, cors_response(400, {'error': 'each tag_condition must be an object'})
+        operator = cond.get('operator', 'equals')
+        if operator not in _TAG_OPERATORS:
+            return None, cors_response(400, {'error': f'invalid tag_condition operator: {operator!r}'})
+        values = cond.get('values', [])
+        if not isinstance(values, list) or not values or not all(isinstance(v, str) and v for v in values):
+            return None, cors_response(400, {'error': 'tag_condition.values must be a non-empty list of non-empty strings'})
+        unknown.extend([v for v in values if v not in vocab])
+        normalized.append({'operator': operator, 'values': values})
+    if unknown:
+        # closed-vocabulary integrity: a typo'd tag would silently empty a routing pool.
+        return None, cors_response(422, {
+            'error': 'tag(s) not in scheduling_tag_vocabulary',
+            'unknownTags': sorted(set(unknown)),
+        })
+    return normalized, None
+
+
+def _create_scheduling_row(table: str, key_attr: str, row: Dict[str, Any], label: str):
+    """POST create — PutItem guarded by attribute_not_exists(<key_attr>) (409 on dup)."""
+    try:
+        dynamodb.put_item(
+            TableName=table,
+            Item=_marshal(row),
+            ConditionExpression=f'attribute_not_exists({key_attr})',
+        )
+    except ClientError as e:
+        if e.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+            return None, cors_response(409, {'error': f'{label} already exists'})
+        logger.error(f"[{label}] create failed: {e}")
+        return None, cors_response(502, {'error': f'failed to create {label}'})
+    return row, None
+
+
+def _update_scheduling_row(table: str, key: Dict[str, Any], fields: Dict[str, Any],
+                           if_match: Optional[str], label: str):
+    """
+    PATCH update — UpdateItem SET only `fields`, guarded by the §E13b optimistic lock:
+    the row must exist AND its stored modified_at.at must equal the caller's If-Match.
+    Untouched attributes (incl. the commit-owned round-robin state) are preserved.
+    """
+    if not if_match:
+        return None, cors_response(428, {'error': 'If-Match (last-seen modified_at.at) required for update'})
+    names = {'#mod': 'modified_at', '#at': 'at'}
+    values = {}
+    sets = []
+    for i, (k, v) in enumerate(fields.items()):
+        nk, vk = f'#f{i}', f':v{i}'
+        names[nk] = k
+        values[vk] = _ddb_serialize(v)
+        sets.append(f'{nk} = {vk}')
+    # The row must EXIST (attribute_exists on the partition key) — separates the
+    # "not found" case from the lock-mismatch case (S5).
+    key_attr = next(iter(key))
+    names['#pk'] = key_attr
+    if if_match == '*':
+        # B1: first edit of a LEGACY/fixture row that predates E13b and has no
+        # modified_at stamp. The UI sends "*" only when GET returned a row with no
+        # modified_at.at (nothing else to echo). Still guarded: the row must exist
+        # AND must NOT already carry a stamp, so this can never silently clobber a
+        # concurrently-stamped edit.
+        condition = 'attribute_exists(#pk) AND attribute_not_exists(#mod)'
+    else:
+        condition = 'attribute_exists(#pk) AND attribute_exists(#mod) AND #mod.#at = :ifmatch'
+        values[':ifmatch'] = {'S': if_match}
+    try:
+        resp = dynamodb.update_item(
+            TableName=table,
+            Key=key,
+            UpdateExpression='SET ' + ', '.join(sets),
+            ConditionExpression=condition,
+            ExpressionAttributeNames=names,
+            ExpressionAttributeValues=values,
+            ReturnValues='ALL_NEW',
+        )
+    except ClientError as e:
+        if e.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+            return None, cors_response(409, {
+                'error': f'{label} not found, already stamped, or modified by another edit (stale If-Match)'})
+        logger.error(f"[{label}] update failed: {e}")
+        return None, cors_response(502, {'error': f'failed to update {label}'})
+    return _unmarshal(resp.get('Attributes', {})), None
+
+
+# §E13b routing config is admin-curated (canonical UI plan §8); the GET list
+# endpoints expose team/pool structure, so they are ADMIN-only like the writes.
+# Hard cap: these tables are expected tiny (a handful of rows); the Limit is a
+# safety guard against an unbounded read (no GSI, no pagination cursor in v1).
+_SCHED_CONFIG_LIST_LIMIT = 500
+
+
+def handle_scheduling_appointment_types_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
+    """GET /scheduling/appointment-types -> { appointment_types: [<row>] } (ADMIN-only, tenant-scoped)."""
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    try:
+        resp = dynamodb.query(
+            TableName=APPOINTMENT_TYPE_TABLE,
+            KeyConditionExpression='tenantId = :t',
+            ExpressionAttributeValues={':t': {'S': tenant_id}},
+            Limit=_SCHED_CONFIG_LIST_LIMIT,
+        )
+    except ClientError as e:
+        logger.error(f"[scheduling/appointment-types] query failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return cors_response(502, {'error': 'failed to load appointment types'})
+    if resp.get('LastEvaluatedKey'):
+        logger.warning(f"[scheduling/appointment-types] tenant={redact_tenant_id(tenant_id)} hit the "
+                       f"{_SCHED_CONFIG_LIST_LIMIT}-row list cap — result truncated")
+    return cors_response(200, {'appointment_types': [_unmarshal(i) for i in resp.get('Items', [])]})
+
+
+def handle_scheduling_routing_policies_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
+    """GET /scheduling/routing-policies -> { routing_policies: [<row>] } (ADMIN-only, tenant-scoped)."""
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    try:
+        resp = dynamodb.query(
+            TableName=ROUTING_POLICY_TABLE,
+            KeyConditionExpression='tenantId = :t',
+            ExpressionAttributeValues={':t': {'S': tenant_id}},
+            Limit=_SCHED_CONFIG_LIST_LIMIT,
+        )
+    except ClientError as e:
+        logger.error(f"[scheduling/routing-policies] query failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return cors_response(502, {'error': 'failed to load routing policies'})
+    if resp.get('LastEvaluatedKey'):
+        logger.warning(f"[scheduling/routing-policies] tenant={redact_tenant_id(tenant_id)} hit the "
+                       f"{_SCHED_CONFIG_LIST_LIMIT}-row list cap — result truncated")
+    return cors_response(200, {'routing_policies': [_unmarshal(i) for i in resp.get('Items', [])]})
+
+
+def _validate_nonneg_int(body: Dict[str, Any], field: str):
+    """A non-negative int field with default 0. Returns (value, error_response_or_None)."""
+    v = body.get(field, 0)
+    if not isinstance(v, int) or isinstance(v, bool) or v < 0:
+        return None, cors_response(400, {'error': f'{field} must be a non-negative integer'})
+    return v, None
+
+
+def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id: Optional[str],
+                                             body: Dict[str, Any], user_role: Optional[str],
+                                             user_email: Optional[str], if_match: Optional[str]) -> Dict[str, Any]:
+    """
+    POST /scheduling/appointment-types            (create; mints appointment_type_id if absent)
+    PATCH /scheduling/appointment-types/{id}      (update; optimistic-lock via If-Match)
+    §E13b — ADMIN-only. routing_policy_id is a required FK (validated to exist).
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    if not isinstance(body, dict):
+        return cors_response(400, {'error': 'body must be a JSON object'})
+    is_create = appointment_type_id is None
+    # S1: contract allows the optimistic-lock token via the If-Match header OR a body field.
+    effective_if_match = if_match or body.get('expected_modified_at')
+
+    # Cheapest checks first; DDB calls (FK GetItem) only after the request is well-formed.
+    name = body.get('name')
+    if not isinstance(name, str) or not name.strip() or len(name.strip()) > _AT_NAME_MAX:
+        return cors_response(400, {'error': f'name is required and must be 1..{_AT_NAME_MAX} characters'})
+    duration = body.get('duration_minutes')
+    if not isinstance(duration, int) or isinstance(duration, bool) or not (1 <= duration <= _AT_DURATION_MAX):
+        return cors_response(400, {'error': f'duration_minutes must be an integer in 1..{_AT_DURATION_MAX}'})
+    buf_before, err = _validate_nonneg_int(body, 'buffer_before_minutes')
+    if err:
+        return err
+    buf_after, err = _validate_nonneg_int(body, 'buffer_after_minutes')
+    if err:
+        return err
+    lead, err = _validate_nonneg_int(body, 'lead_time_minutes')
+    if err:
+        return err
+
+    routing_policy_id = body.get('routing_policy_id')
+    if not isinstance(routing_policy_id, str) or not routing_policy_id.strip():
+        return cors_response(400, {'error': 'routing_policy_id is required (FK to a routing policy)'})
+    routing_policy_id = routing_policy_id.strip()
+    # S3: the FK reference is a DDB key — bound its charset/length before the GetItem.
+    if not _SCHED_ID_RE.match(routing_policy_id):
+        return cors_response(400, {'error': 'invalid routing_policy_id format'})
+
+    # Validate the row id (mint on create) BEFORE any DDB call — a doomed request
+    # should not pay a GetItem round-trip (validation-ordering fix).
+    if is_create:
+        appointment_type_id = (body.get('appointment_type_id') or f'at_{uuid.uuid4().hex[:12]}')
+    if not isinstance(appointment_type_id, str) or not _SCHED_ID_RE.match(appointment_type_id):
+        return cors_response(400, {'error': 'invalid appointment_type_id'})
+
+    # FK integrity: the policy must exist for THIS tenant (an orphan FK = broken
+    # routing). Runs on BOTH create and update — a PATCH that re-points
+    # routing_policy_id is re-validated, so it can never point at a deleted/foreign policy.
+    try:
+        fk = dynamodb.get_item(
+            TableName=ROUTING_POLICY_TABLE,
+            Key={'tenantId': {'S': tenant_id}, 'routing_policy_id': {'S': routing_policy_id}},
+        )
+    except ClientError as e:
+        logger.error(f"[appointment-type] FK check failed: {e}")
+        return cors_response(502, {'error': 'failed to validate routing_policy_id'})
+    if 'Item' not in fk:
+        return cors_response(422, {'error': f'routing_policy_id {routing_policy_id!r} does not exist'})
+
+    fields = {
+        'name': name.strip(),
+        'duration_minutes': duration,
+        'buffer_before_minutes': buf_before,
+        'buffer_after_minutes': buf_after,
+        'lead_time_minutes': lead,
+        'routing_policy_id': routing_policy_id,
+        'modified_at': _modified_at(user_email),
+    }
+    if is_create:
+        row = {'tenantId': tenant_id, 'appointment_type_id': appointment_type_id, **fields}
+        created, err = _create_scheduling_row(APPOINTMENT_TYPE_TABLE, 'appointment_type_id', row, 'appointment type')
+        if err:
+            return err
+        logger.info(f"[appointment-type] created {appointment_type_id} tenant={redact_tenant_id(tenant_id)} by={user_email}")
+        return cors_response(201, {'appointment_type': created})
+    key = {'tenantId': {'S': tenant_id}, 'appointment_type_id': {'S': appointment_type_id}}
+    updated, err = _update_scheduling_row(APPOINTMENT_TYPE_TABLE, key, fields, effective_if_match, 'appointment type')
+    if err:
+        return err
+    logger.info(f"[appointment-type] updated {appointment_type_id} tenant={redact_tenant_id(tenant_id)} by={user_email}")
+    return cors_response(200, {'appointment_type': updated})
+
+
+def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Optional[str],
+                                           body: Dict[str, Any], user_role: Optional[str],
+                                           user_email: Optional[str], if_match: Optional[str]) -> Dict[str, Any]:
+    """
+    POST /scheduling/routing-policies            (create; mints routing_policy_id if absent)
+    PATCH /scheduling/routing-policies/{id}      (update; optimistic-lock via If-Match)
+    §E13b — ADMIN-only. tag_conditions vocab-validated FAIL-CLOSED; round-robin state never touched.
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    if not isinstance(body, dict):
+        return cors_response(400, {'error': 'body must be a JSON object'})
+    is_create = routing_policy_id is None
+    # S1: optimistic-lock token via If-Match header OR body field.
+    effective_if_match = if_match or body.get('expected_modified_at')
+
+    tie_breaker = body.get('tie_breaker', 'round_robin')
+    if tie_breaker not in _TIE_BREAKERS:
+        return cors_response(400, {'error': f"tie_breaker must be one of {sorted(_TIE_BREAKERS)}"})
+
+    # Validate the row id (mint on create) BEFORE the vocabulary S3 read — a
+    # malformed id should not pay a config fetch (validation-ordering fix).
+    if is_create:
+        routing_policy_id = (body.get('routing_policy_id') or f'rp_{uuid.uuid4().hex[:12]}')
+    if not isinstance(routing_policy_id, str) or not _SCHED_ID_RE.match(routing_policy_id):
+        return cors_response(400, {'error': 'invalid routing_policy_id'})
+
+    vocabulary = get_tag_vocabulary(tenant_id)
+    normalized_conditions, err = _validate_tag_conditions(body.get('tag_conditions'), vocabulary)
+    if err:
+        return err
+
+    fields = {
+        'tie_breaker': tie_breaker,
+        'tag_conditions': normalized_conditions,
+        'modified_at': _modified_at(user_email),
+    }
+    if is_create:
+        row = {'tenantId': tenant_id, 'routing_policy_id': routing_policy_id, **fields}
+        created, err = _create_scheduling_row(ROUTING_POLICY_TABLE, 'routing_policy_id', row, 'routing policy')
+        if err:
+            return err
+        logger.info(f"[routing-policy] created {routing_policy_id} tenant={redact_tenant_id(tenant_id)} by={user_email}")
+        return cors_response(201, {'routing_policy': created})
+    key = {'tenantId': {'S': tenant_id}, 'routing_policy_id': {'S': routing_policy_id}}
+    updated, err = _update_scheduling_row(ROUTING_POLICY_TABLE, key, fields, effective_if_match, 'routing policy')
+    if err:
+        return err
+    logger.info(f"[routing-policy] updated {routing_policy_id} tenant={redact_tenant_id(tenant_id)} by={user_email}")
+    return cors_response(200, {'routing_policy': updated})
 
 
 def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
