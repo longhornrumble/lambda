@@ -212,6 +212,16 @@ def build_update_params(input_data):
         if form_id:
             set_parts.append('form_id = :form_id')
             expression_values[':form_id'] = {'S': str(form_id)}
+
+        # F-DSAR31 completion: stamp pii_subject_id so the DSAR session-summaries
+        # walker (FilterExpression on pii_subject_id) can reach form-completion
+        # rows. if_not_exists: the subject link is stable once set — never clobber
+        # an existing value. Optional/additive: absent input → no stamp (old
+        # callers unaffected; the field stays missing exactly as before).
+        pii_subject_id = event_payload.get('pii_subject_id')
+        if pii_subject_id:
+            set_parts.append('pii_subject_id = if_not_exists(pii_subject_id, :pii_subject_id)')
+            expression_values[':pii_subject_id'] = {'S': str(pii_subject_id)}
     else:
         return {'error': 'unknown_event_type'}
 

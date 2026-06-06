@@ -252,8 +252,12 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
 
     // Save to DynamoDB
     const submissionId = `${formId}_${Date.now()}`;
+    // F-DSAR31: capture the subject id from the writer so it can be threaded
+    // into the FORM_COMPLETED session-summary write below. Undefined if the
+    // save failed/skipped — the writer guards on presence, so no stamp then.
+    let piiSubjectId;
     try {
-      await saveFormSubmission(submissionId, formId, formData, config, priority, sessionId, conversationId);
+      piiSubjectId = await saveFormSubmission(submissionId, formId, formData, config, priority, sessionId, conversationId);
     } catch (dbError) {
       console.error('❌ DynamoDB save failed:', dbError);
       // Continue with fulfillment even if DynamoDB save fails
@@ -272,7 +276,7 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
         tenant_id: config.tenant_id || '',
         client_timestamp: clientTimestamp || new Date().toISOString(),
         request_id: requestId,
-        event_payload: { form_id: formId },
+        event_payload: { form_id: formId, pii_subject_id: piiSubjectId },
       });
     }
 
@@ -628,6 +632,10 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
     );
     // Don't fail the submission if DynamoDB fails (UX preservation).
   }
+
+  // F-DSAR31 completion: return the subject id so the caller can thread it into
+  // the FORM_COMPLETED session-summary write (makes that row DSAR-reachable).
+  return piiSubjectId;
 }
 
 /**

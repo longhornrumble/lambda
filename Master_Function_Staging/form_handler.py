@@ -686,7 +686,7 @@ class FormHandler:
                         'tenant_id': self.tenant_id or '',
                         'client_timestamp': timestamp,
                         'request_id': request_id,
-                        'event_payload': {'form_id': form_type},
+                        'event_payload': {'form_id': form_type, 'pii_subject_id': pii_subject_id},
                     })
                 except Exception as analytics_err:  # noqa: BLE001
                     logger.warning(f"Analytics write failed (non-fatal): {analytics_err}")
