@@ -60,6 +60,24 @@ describe('selectChannels — sms requires ALL of org-flag AND consent AND not-qu
     expect(r.sms).toBe(false);
   });
 
+  test('sms false for an opted-out consent record (end-to-end, not just consentValid)', () => {
+    const r = selectChannels({
+      orgSmsEnabled: true,
+      consentRecord: { consent_given: true, opted_out_at: '2026-06-01T00:00:00Z' },
+      ...ALLOWED,
+    });
+    expect(r).toEqual({ email: true, sms: false });
+  });
+
+  test('sms true for an old-shape consent record without a ttl field (reader tolerates absence)', () => {
+    const r = selectChannels({
+      orgSmsEnabled: true,
+      consentRecord: { consent_given: true }, // pre-TTL row: no ttl, no opted_out_at
+      ...ALLOWED,
+    });
+    expect(r).toEqual({ email: true, sms: true });
+  });
+
   test('sms false when inside quiet hours even with org+consent', () => {
     const r = selectChannels({
       orgSmsEnabled: true,
@@ -82,15 +100,26 @@ describe('consentValid — fail-closed (§E3)', () => {
     expect(consentValid(undefined)).toBe(false);
   });
 
-  test('false when consent_given is not strictly true', () => {
+  test('false when consent_given is not strictly true (incl. truthy non-true)', () => {
     expect(consentValid({ consent_given: false })).toBe(false);
     expect(consentValid({ consent_given: undefined })).toBe(false);
     expect(consentValid({})).toBe(false);
     expect(consentValid({ consent_given: 'true' })).toBe(false);
+    expect(consentValid({ consent_given: 1 })).toBe(false); // truthy but not === true
   });
 
   test('false when opted_out_at is present', () => {
     expect(consentValid({ consent_given: true, opted_out_at: '2026-06-01T00:00:00Z' })).toBe(false);
+  });
+
+  test('empty-string opted_out_at counts as still opted-in (no opt-out recorded)', () => {
+    // The opt-out sink writes a timestamp; an empty string is "never opted out".
+    expect(consentValid({ consent_given: true, opted_out_at: '' })).toBe(true);
+  });
+
+  test('old-shape record without a ttl field still reads as valid (schema discipline)', () => {
+    // Pre-TTL consent rows carry no `ttl`; the reader must tolerate its absence.
+    expect(consentValid({ consent_given: true })).toBe(true);
   });
 });
 

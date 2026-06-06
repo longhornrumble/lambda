@@ -69,9 +69,20 @@ const CONSENT_TTL_SECONDS = (4 * 365 + 30) * 24 * 60 * 60;
 function toE164(raw) {
   if (typeof raw !== 'string' || raw.trim() === '') return null;
   const trimmed = raw.trim();
-  const phone = trimmed.startsWith('+')
-    ? trimmed
-    : `+1${trimmed.replace(/\D/g, '')}`;
+  let phone;
+  if (trimmed.startsWith('+')) {
+    phone = trimmed;
+  } else {
+    const digits = trimmed.replace(/\D/g, '');
+    // A bare 11-digit number already carrying the US country code (leading 1) keeps it
+    // (just prepend +); a bare 10-digit local number gets +1. Without this, an 11-digit
+    // "15125551234" would become "+115125551234" — a double country code that mis-keys
+    // the consent record and silently suppresses the legit SMS (fail-closed, but wrong).
+    phone =
+      digits.length === 11 && digits.startsWith('1')
+        ? `+${digits}`
+        : `+1${digits}`;
+  }
   return /^\+\d{10,15}$/.test(phone) ? phone : null;
 }
 

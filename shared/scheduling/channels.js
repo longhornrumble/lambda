@@ -40,6 +40,13 @@
  *   forward-compatibility but defaults to that fixed window in v1. SMS is dropped in-window;
  *   email always sends. An unresolvable timezone or fireTime FAILS CLOSED (treated as
  *   in-window ⇒ SMS suppressed) — the TCPA-safe direction; the email floor is unaffected.
+ *
+ * ── Timezone resolution (SEAM-1 drops tenantPrefs) ──
+ *   §E3 specifies `booking.timezone → tenant scheduling.timezone → UTC`. SEAM-1's params do
+ *   not carry tenant prefs, so this module does only `booking.timezone || 'UTC'`. The CALLER
+ *   (WS-E-REMIND's fire-time call-site) owns resolving the tenant-scheduling-timezone middle
+ *   hop INTO `booking.timezone` before calling — keeping this module pure. `tenantId` is part
+ *   of the locked SEAM-1 signature (caller symmetry + log context); it carries no I/O here.
  */
 
 // v1 fixed quiet-hours window (SEAM-1): 8pm–8am, volunteer-local. Hour granularity —
@@ -97,6 +104,9 @@ function inQuietHours(fireTime, timezone, quietHours = DEFAULT_QUIET_HOURS) {
  * @param {{ tenantId?: string, booking?: object, orgSmsEnabled?: boolean,
  *           consentRecord?: object|null, quietHours?: {startHour:number,endHour:number},
  *           fireTime?: Date|string|number }} args
+ *   - tenantId: part of the locked SEAM-1 signature; unused in the pure decision (caller
+ *     symmetry + log context). The caller pre-resolves the tenant-tz middle hop into
+ *     booking.timezone (see "Timezone resolution" above).
  * @param {object} [deps] - reserved for log; the decision itself is pure.
  * @returns {{ email: true, sms: boolean }}
  */

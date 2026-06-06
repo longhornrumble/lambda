@@ -29,8 +29,13 @@ describe('toE164 — E.164-before-write', () => {
     expect(toE164('5125551234')).toBe('+15125551234');
     expect(toE164('(512) 555-1234')).toBe('+15125551234');
   });
+  test('keeps the country code on a bare 11-digit US number (no double +1)', () => {
+    expect(toE164('15125551234')).toBe('+15125551234');
+    expect(toE164('1 (512) 555-1234')).toBe('+15125551234');
+  });
   test('keeps an already-+-prefixed international number', () => {
     expect(toE164('+447911123456')).toBe('+447911123456');
+    expect(toE164('+15125551234')).toBe('+15125551234');
   });
   test('rejects un-normalizable input → null', () => {
     expect(toE164('')).toBeNull();
@@ -167,7 +172,9 @@ describe('defaultPutConsent — AWS-touching default (aws-sdk-client-mock)', () 
     booking_id: 'b-9',
     created_at: '2026-06-05T00:00:00.000Z',
     updated_at: '2026-06-05T00:00:00.000Z',
-    ttl: 1877817600,
+    // Computed, never hardcoded: the prior literal silently encoded 3yr+30d. Source the
+    // value from the same constant the prod code uses so the fixture can't drift again.
+    ttl: Math.floor(FIXED_MS / 1000) + CONSENT_TTL_SECONDS,
   };
 
   test('marshals the item + conditional put, returns true', async () => {
@@ -182,7 +189,7 @@ describe('defaultPutConsent — AWS-touching default (aws-sdk-client-mock)', () 
         consent_given: { BOOL: true },
         opted_out_at: { NULL: true },
         opt_out_source: { NULL: true },
-        ttl: { N: '1877817600' },
+        ttl: { N: String(Math.floor(FIXED_MS / 1000) + CONSENT_TTL_SECONDS) },
       }),
     });
   });
