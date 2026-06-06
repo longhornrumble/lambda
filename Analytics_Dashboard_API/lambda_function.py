@@ -450,6 +450,16 @@ def lambda_handler(event, context):
             rp_id = path.split('/scheduling/routing-policies/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_scheduling_routing_policy_write(tenant_id, rp_id, body, user_role, user_email, if_match)
+        # §G4 tag-vocabulary read (dropdown source for E13b/E13) + §G1 per-staff scheduling
+        # settings write. Tenant comes from auth (super-admin via X-Tenant-Override), not path.
+        # Substring match (consistent with the sibling /scheduling/* routes); no collision with
+        # the super-admin /admin/employees/* routes (different literal) or /scheduling/bookings.
+        elif path.endswith('/scheduling/tag-vocabulary') and method == 'GET':
+            return handle_scheduling_tag_vocabulary_get(tenant_id, user_role)
+        elif '/scheduling/employees/' in path and method == 'PATCH':
+            sched_employee_id = path.split('/scheduling/employees/')[1].split('/')[0]
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_employee_settings_write(tenant_id, sched_employee_id, body, user_role, user_email)
         # Forms endpoints (more specific - check second)
         elif path.endswith('/forms/summary'):
             return handle_form_summary(tenant_id, params)
@@ -4114,6 +4124,157 @@ def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Op
     return cors_response(200, {'routing_policy': updated})
 
 
+# --- G1 / G4: per-staff scheduling settings (ui_plan Surface 3, §8 permission matrix) ---
+# These settings live on the AdminEmployee registry record (additive fields), NOT on a
+# standalone scheduling table — so a Team (= a scheduling_tag, written via §E13b) can be
+# assigned to staff and routing.js can resolve a candidate pool. No optimistic-lock token
+# here (unlike §E13b's standalone tables): the shared employee-registry update path has no
+# conditional-write support and these per-staff edits are low-contention with no commit-
+# owned state to protect; the registry stamps updatedAt globally.
+_SCHED_EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+_SCHED_EMAIL_MAX = 254
+_SCHED_TAG_MAX = 50     # sanity cap on per-staff tag count (the closed vocab is small; guards abuse)
+
+
+def _validate_scheduling_tags(tags: Any, vocabulary: List[str]):
+    """
+    G1 flat-list vocab-validation (FAIL-CLOSED). scheduling_tags is a string[] assigned to a
+    staff member; every tag must be in the closed scheduling_tag_vocabulary. Returns
+    (normalized_deduped_tags, error_response_or_None).
+    """
+    if not isinstance(tags, list) or not all(isinstance(t, str) and t for t in tags):
+        return None, cors_response(400, {'error': 'scheduling_tags must be a list of non-empty strings'})
+    if len(tags) > _SCHED_TAG_MAX:
+        return None, cors_response(400, {'error': f'scheduling_tags may not exceed {_SCHED_TAG_MAX} entries'})
+    vocab = set(vocabulary)
+    unknown = sorted({t for t in tags if t not in vocab})
+    if unknown:
+        # closed-vocabulary integrity: a typo'd tag would route this staffer to nothing.
+        return None, cors_response(422, {
+            'error': 'tag(s) not in scheduling_tag_vocabulary',
+            'unknownTags': unknown,
+        })
+    seen, normalized = set(), []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            normalized.append(t)
+    return normalized, None
+
+
+def handle_scheduling_employee_settings_write(tenant_id: str, employee_id: str, body: Dict[str, Any],
+                                              user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
+    """
+    PATCH /scheduling/employees/{employee_id} — set per-staff scheduling settings on the
+    AdminEmployee registry record (G1 / ui_plan Surface 3). Tenant comes from the
+    authenticated session (super-admin via X-Tenant-Override), NOT the path.
+
+    Fields (all optional; at least one required):
+      scheduling_tags          string[]    ADMIN-only; fail-closed vocab -> 422 {unknownTags}
+      bookable_override        'off'|null   ADMIN-only force-OFF; `bookable` itself is DERIVED
+                                            (connected calendar AND >=1 team) and never written here
+      calendar_email_override  string|null  SELF (own record) or ADMIN
+
+    §8 permission matrix (scheduling_ui_plan.md, resolved 2026-05-02): scheduling_tags +
+    bookable_override are admin-curated; calendar_email_override is staff-self-editable.
+    """
+    if not employee_id or not _SCHED_ID_RE.match(employee_id):
+        return cors_response(400, {'error': 'invalid employee id'})
+
+    # Presence (not truthiness) — null is a valid clear for the override fields.
+    wants_tags = 'scheduling_tags' in body
+    wants_bookable = 'bookable_override' in body
+    wants_cal_email = 'calendar_email_override' in body
+    if not (wants_tags or wants_bookable or wants_cal_email):
+        return cors_response(400, {'error': 'provide scheduling_tags, bookable_override, or calendar_email_override'})
+
+    # Load target employee (tenant-scoped composite key) — also the self-check source.
+    try:
+        employee = tenant_registry_ops.get_employee(tenant_id, employee_id)
+    except Exception as exc:
+        logger.error(f"[scheduling/employees] lookup failed tenant={redact_tenant_id(tenant_id)}: {exc}")
+        return cors_response(502, {'error': 'failed to load employee'})
+    if not employee:
+        return cors_response(404, {'error': 'employee not found'})
+
+    is_admin = user_role in _WRITE_ROLES
+    # 'unknown' is the auth-layer fallback when a (stale) JWT lacks an email claim — it must NOT
+    # match an empty/placeholder record email and accidentally grant self-access.
+    is_self = (
+        bool(user_email) and user_email != 'unknown'
+        and (employee.get('email', '') or '').lower() == user_email.lower()
+    )
+
+    # Authorize per field (§8 matrix) BEFORE building update_fields, so a member can't smuggle
+    # an admin field alongside their own calendar email.
+    if (wants_tags or wants_bookable) and not is_admin:
+        return cors_response(403, {'error': 'scheduling_tags and bookable_override are admin-only'})
+    if wants_cal_email and not (is_admin or is_self):
+        return cors_response(403, {'error': 'calendar_email_override is editable by the staff member or an admin'})
+
+    update_fields: Dict[str, Any] = {}
+
+    if wants_tags:
+        raw_tags = body.get('scheduling_tags')
+        if raw_tags is None:
+            update_fields['scheduling_tags'] = []   # null clears, for parity with the override fields
+        else:
+            normalized, err = _validate_scheduling_tags(raw_tags, get_tag_vocabulary(tenant_id))
+            if err:
+                return err
+            update_fields['scheduling_tags'] = normalized
+
+    if wants_bookable:
+        bv = body.get('bookable_override')
+        if bv not in ('off', None):
+            return cors_response(400, {'error': "bookable_override must be 'off' or null"})
+        update_fields['bookable_override'] = bv
+
+    if wants_cal_email:
+        cv = body.get('calendar_email_override')
+        if cv is None or (isinstance(cv, str) and not cv.strip()):
+            cv = None   # null / empty / whitespace-only all clear the override
+        elif not isinstance(cv, str) or len(cv.strip()) > _SCHED_EMAIL_MAX or not _SCHED_EMAIL_RE.match(cv.strip()):
+            return cors_response(400, {'error': 'calendar_email_override must be a valid email or null'})
+        else:
+            cv = cv.strip().lower()
+        update_fields['calendar_email_override'] = cv
+
+    try:
+        # Pass a copy — update_employee mutates its arg (adds updatedAt); keep the response clean.
+        # ConditionExpression guards a delete racing between the 404-check above and this write
+        # (without it UpdateItem would upsert a partial stub on the now-missing key).
+        tenant_registry_ops.update_employee(
+            tenant_id, employee_id, dict(update_fields),
+            condition_expression='attribute_exists(tenantId)')
+    except ClientError as e:
+        if e.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+            return cors_response(404, {'error': 'employee not found'})
+        logger.error(f"[scheduling/employees] update failed tenant={redact_tenant_id(tenant_id)} "
+                     f"emp={employee_id}: {e}")
+        return cors_response(502, {'error': 'failed to update employee scheduling settings'})
+    except Exception as exc:
+        logger.error(f"[scheduling/employees] update failed tenant={redact_tenant_id(tenant_id)} "
+                     f"emp={employee_id}: {exc}")
+        return cors_response(502, {'error': 'failed to update employee scheduling settings'})
+
+    logger.info(f"[scheduling/employees] updated {employee_id} tenant={redact_tenant_id(tenant_id)} "
+                f"fields={sorted(update_fields)} by={redact_email(user_email or '')}")
+    return cors_response(200, {'employee_id': employee_id, **update_fields})
+
+
+def handle_scheduling_tag_vocabulary_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
+    """
+    GET /scheduling/tag-vocabulary -> { scheduling_tag_vocabulary: [<tag>] } (G4; ADMIN-only).
+    Lets E13b (team create) + E13 (staff tagging) render a dropdown instead of free text.
+    The fail-closed server validation on write stays authoritative regardless.
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    return cors_response(200, {'scheduling_tag_vocabulary': get_tag_vocabulary(tenant_id)})
+
+
 def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
     """Build response with JSON content type.
     CORS headers are handled by Lambda Function URL configuration.
@@ -6782,6 +6943,9 @@ def handle_team_members_list(auth_result: Dict[str, Any], tenant_id: str) -> Dic
         return err
 
     user_role = auth_result.get('role')
+    # G1 read-gate inputs for the PII calendar_email_override field (admin-or-self).
+    caller_is_admin = user_role in _WRITE_ROLES
+    caller_email_l = (auth_result.get('email') or '').lower()
 
     # --- 1. Load all active employees from the registry ---
     try:
@@ -6841,6 +7005,18 @@ def handle_team_members_list(auth_result: Dict[str, Any], tenant_id: str) -> Dic
             'joined_at': record.get('createdAt', ''),
             'phone': clerk_phone if rec_type == 'clerk_user' else record.get('phone'),
             'sms_opted_in': clerk_sms_opted_in,
+            # G1 (ui_plan Surface 3): per-staff scheduling settings ride the registry record;
+            # readers tolerate absence (schema discipline) so pre-G1 records read as defaults.
+            # calendar_email_override is PII (a personal calendar address) + §8-writable only by
+            # admin-or-self, so it's READ-gated the same way: admins see all, a member sees only
+            # their own (matched by auth email); everyone else gets None.
+            'scheduling_tags': record.get('scheduling_tags', []),
+            'calendar_email_override': (
+                record.get('calendar_email_override')
+                if (caller_is_admin or (caller_email_l and caller_email_l == (record.get('email', '') or '').lower()))
+                else None
+            ),
+            'bookable_override': record.get('bookable_override'),
         })
 
     return cors_response(200, {
