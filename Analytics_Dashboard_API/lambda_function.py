@@ -437,6 +437,9 @@ def lambda_handler(event, context):
         # Scheduling endpoints (§E7 bookings read API — Clerk-authed, scope-gated)
         elif path.endswith('/scheduling/bookings'):
             return handle_scheduling_bookings(tenant_id, params, user_role, user_email)
+        # §G5/E15 scheduling metrics (Phase 1: per-type + status breakdown; admin, tenant-wide).
+        elif path.endswith('/scheduling/metrics') and method == 'GET':
+            return handle_scheduling_metrics(tenant_id, params, user_role)
         # §E13b scheduling-config write API (AppointmentType/RoutingPolicy; ADMIN-only).
         # Specific {id} PATCH routes use `in path`; list/create use endswith — all are
         # distinct from /scheduling/bookings above.
@@ -3774,6 +3777,96 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
     if last_key:
         body['nextCursor'] = base64.b64encode(json.dumps(last_key).encode('utf-8')).decode('utf-8')
     logger.info(f"[scheduling/bookings] tenant={redact_tenant_id(tenant_id)} scope={scope} count={len(bookings)}")
+    return cors_response(200, body)
+
+
+# Page cap for the metrics aggregation. Bounded by the start_at window + Limit; v1 pilot scale
+# is a handful of bookings (1 page). The cap stops a runaway loop and is LOGGED if hit (no silent
+# truncation — a hit means the window holds > cap*Limit bookings and the counts are partial).
+_SCHED_METRICS_MAX_PAGES = 50
+
+
+def handle_scheduling_metrics(tenant_id: str, params: Dict[str, str],
+                              user_role: Optional[str]) -> Dict[str, Any]:
+    """
+    GET /scheduling/metrics — tenant-wide scheduling metrics (G5/E15 Phase 1).
+
+    Computes the booking COUNTS derivable from the §A booking rows over the start_at window:
+    a status breakdown + a per-appointment-type breakdown. ADMIN-only (tenant-wide aggregate,
+    same posture as §E7 tenant_aggregate) + feature-gated. Reads the SAME bounded
+    tenantId-start_at-index as §E7 — never a full-tenant scan — looping the window's pages.
+
+    NOT in Phase 1 (need booking-lifecycle instrumentation that doesn't exist yet — there is no
+    proposal-start timestamp nor a reschedule_count on the row): time_to_book, reschedule_rate.
+    They are listed under `unavailable` so the UI can hide them until Phase 2 lands them.
+    """
+    if user_role not in ('admin', 'super_admin'):
+        return cors_response(403, {'error': 'scheduling metrics require an admin role'})
+    access_error = validate_feature_access(tenant_id, 'dashboard_scheduling', user_role)
+    if access_error:
+        return access_error
+
+    now = datetime.now(timezone.utc)
+    # Same Z-suffixed lexicographic BETWEEN window as §E7 (see that handler's note: the bare-Z
+    # bounds compare correctly against the fractional-second stored form).
+    lo = (now - timedelta(days=BOOKING_WINDOW_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    hi = (now + timedelta(days=BOOKING_WINDOW_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    by_status: Dict[str, int] = {}
+    by_type: Dict[str, Dict[str, Any]] = {}
+    total = 0
+    start_key = None
+    pages = 0
+    truncated = False
+    while True:
+        query_params: Dict[str, Any] = {
+            'TableName': BOOKING_TABLE,
+            'IndexName': BOOKING_TENANT_START_INDEX,
+            'KeyConditionExpression': 'tenantId = :t AND start_at BETWEEN :lo AND :hi',
+            'ExpressionAttributeValues': {':t': {'S': tenant_id}, ':lo': {'S': lo}, ':hi': {'S': hi}},
+            # `status` is a DDB reserved word → alias. Project only what we aggregate.
+            'ProjectionExpression': '#s, appointment_type_id',
+            'ExpressionAttributeNames': {'#s': 'status'},
+            'Limit': BOOKING_PAGE_SIZE_MAX,
+        }
+        if start_key:
+            query_params['ExclusiveStartKey'] = start_key
+        try:
+            response = dynamodb.query(**query_params)
+        except ClientError as e:
+            logger.error(f"[scheduling/metrics] query failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+            return cors_response(502, {'error': 'failed to load scheduling metrics'})
+
+        for item in response.get('Items', []):
+            status = (item.get('status') or {}).get('S') or 'unknown'
+            atype = (item.get('appointment_type_id') or {}).get('S') or 'unassigned'
+            total += 1
+            by_status[status] = by_status.get(status, 0) + 1
+            bucket = by_type.setdefault(atype, {'appointment_type_id': atype, 'count': 0, 'by_status': {}})
+            bucket['count'] += 1
+            bucket['by_status'][status] = bucket['by_status'].get(status, 0) + 1
+
+        start_key = response.get('LastEvaluatedKey')
+        pages += 1
+        if not start_key:
+            break
+        if pages >= _SCHED_METRICS_MAX_PAGES:
+            truncated = True
+            logger.warning(f"[scheduling/metrics] page cap hit (tenant={redact_tenant_id(tenant_id)}, "
+                           f"pages={pages}) — counts are PARTIAL")
+            break
+
+    body: Dict[str, Any] = {
+        'window': {'from': lo, 'to': hi, 'days': BOOKING_WINDOW_DAYS},
+        'total': total,
+        'by_status': by_status,
+        'by_type': sorted(by_type.values(), key=lambda b: (-b['count'], b['appointment_type_id'])),
+        # Phase-2 metrics that need booking-lifecycle instrumentation not present in v1.
+        'unavailable': ['time_to_book', 'reschedule_rate'],
+    }
+    if truncated:
+        body['partial'] = True
+    logger.info(f"[scheduling/metrics] tenant={redact_tenant_id(tenant_id)} total={total} types={len(by_type)}")
     return cors_response(200, body)
 
 
