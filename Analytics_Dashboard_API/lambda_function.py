@@ -468,6 +468,10 @@ def lambda_handler(event, context):
             sched_moment = path.split('/scheduling/notification-templates/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_scheduling_notification_template_write(tenant_id, sched_moment, body, user_role, user_email)
+        # §G3/E0 scheduling OAuth init-token mint (any authenticated staff; self-mint, tenant +
+        # identity from auth). Returns the connect + status URLs the E16 calendar UI drives.
+        elif path.endswith('/scheduling/connection/init') and method == 'GET':
+            return handle_scheduling_connection_init(tenant_id, user_email)
         # Forms endpoints (more specific - check second)
         elif path.endswith('/forms/summary'):
             return handle_form_summary(tenant_id, params)
@@ -4448,6 +4452,106 @@ def handle_scheduling_notification_template_write(tenant_id: str, moment: str, b
                 f"moment={moment} fields={sorted(f for f in fields if f != 'modified_at')} "
                 f"by={redact_email(user_email or '')}")
     return cors_response(200, {'moment': moment, 'template': _unmarshal(resp.get('Attributes', {}))})
+
+
+# --- G3 / E0: scheduling OAuth init-token MINT (ui_plan Surface E16 connect) ---------- #
+# The Clerk-authed dashboard backend mints the short-lived, HMAC-signed init token that the
+# E16 calendar-connect UI uses to drive the public Calendar_OAuth_Connect flow (FROZEN_CONTRACTS
+# §E11/§E0). SELF-MINT ONLY: the coordinator identity comes from the VERIFIED Clerk auth (tenant
+# from the org, coordinator = the caller's own email) — NEVER client-supplied. That is the
+# anti-slot-poisoning property: a caller can only ever connect THEIR OWN calendar. (An admin
+# viewing ANOTHER staff member's connection status is a SEPARATE read, NOT this mint.)
+#
+# The token wire format MUST match Calendar_OAuth_Connect/state.js byte-for-byte (its state.verify
+# consumes these): `<payloadB64url>.<sigB64url>` where payload = compact JSON
+# {typ, ...claims, iat, exp, nonce}, b64url = urlsafe base64 with '=' padding stripped, and
+# sig = HMAC-SHA256(rawKeyString, payloadB64) b64url-encoded. The HMAC key is the secret's RAW
+# string (matching JS crypto.createHmac('sha256', keyString)). state.verify re-HMACs the RECEIVED
+# payloadB64 literally, so JSON key order is irrelevant to verification.
+OAUTH_FUNCTION_URL = os.environ.get('OAUTH_FUNCTION_URL', '')
+OAUTH_STATE_SIGNING_SECRET_NAME = os.environ.get(
+    'OAUTH_STATE_SIGNING_SECRET_NAME', 'picasso/scheduling/oauth/_state-signing-key')
+_OAUTH_STATE_TTL_SECONDS = 300
+_oauth_state_key_cache: Dict[str, str] = {}
+
+
+def _b64url_no_pad(raw: bytes) -> str:
+    """urlsafe base64 with trailing '=' padding stripped (matches state.js b64urlEncode)."""
+    return base64.urlsafe_b64encode(raw).rstrip(b'=').decode('ascii')
+
+
+def get_oauth_state_signing_key() -> str:
+    """Fetch the HMAC state-signing key from Secrets Manager (container-lifetime cache).
+    Accepts either a raw-string secret or a JSON {"key": "..."} object — mirrors state.js."""
+    if 'value' in _oauth_state_key_cache:
+        return _oauth_state_key_cache['value']
+    resp = _secrets_client.get_secret_value(SecretId=OAUTH_STATE_SIGNING_SECRET_NAME)
+    raw = resp.get('SecretString', '')
+    if not raw:
+        raise ValueError('OAuth state signing key secret has no SecretString')
+    key = raw
+    trimmed = raw.strip()
+    if trimmed.startswith('{'):
+        try:
+            parsed = json.loads(trimmed)
+        except (json.JSONDecodeError, ValueError):
+            raise ValueError('OAuth state signing key looks like JSON but does not parse')
+        key = parsed.get('key') if isinstance(parsed, dict) else None
+        if not isinstance(key, str) or not key:
+            raise ValueError('OAuth state signing key JSON is missing a non-empty "key" field')
+    if not key:
+        raise ValueError('OAuth state signing key is empty')
+    _oauth_state_key_cache['value'] = key
+    return key
+
+
+def _sign_oauth_state(typ: str, claims: Dict[str, Any], ttl_seconds: int,
+                      now_ms: Optional[int] = None) -> str:
+    """Sign a compact HMAC token matching Calendar_OAuth_Connect/state.js sign()."""
+    key = get_oauth_state_signing_key()
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    iat = now_ms // 1000
+    payload: Dict[str, Any] = {'typ': typ}
+    payload.update(claims)
+    payload['iat'] = iat
+    payload['exp'] = iat + ttl_seconds
+    payload['nonce'] = os.urandom(16).hex()
+    payload_b64 = _b64url_no_pad(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+    sig = _b64url_no_pad(hmac.new(key.encode('utf-8'), payload_b64.encode('ascii'),
+                                  hashlib.sha256).digest())
+    return f'{payload_b64}.{sig}'
+
+
+def handle_scheduling_connection_init(tenant_id: str, user_email: Optional[str]) -> Dict[str, Any]:
+    """
+    GET /scheduling/connection/init (G3/E0; any authenticated staff member; tenant + identity
+    from auth). Mints a short-lived init token for the CALLER'S OWN calendar and returns the
+    public connect + status URLs the E16 UI drives. SELF-ONLY per §E0 — the coordinator identity
+    is never client-supplied (anti-slot-poisoning).
+
+    The returned token is pure base64url + a '.' separator (all RFC-3986-unreserved), so it needs
+    no URL-encoding to ride in the query string.
+    """
+    if not user_email or user_email == 'unknown':
+        return cors_response(400, {'error': 'no verified caller identity'})
+    base = OAUTH_FUNCTION_URL.rstrip('/')
+    if not base:
+        # OAUTH_FUNCTION_URL is wired post-apply (the Function URL only exists after PR-1's
+        # terraform apply). Until then the connect flow is unreachable — report unconfigured
+        # rather than mint a token that points nowhere.
+        return cors_response(503, {'error': 'calendar connect not configured'})
+    coordinator_id = user_email.strip().lower()
+    token = _sign_oauth_state('init', {
+        'tenant_id': tenant_id,
+        'coordinator_id': coordinator_id,
+        'coordinator_email': user_email,
+    }, _OAUTH_STATE_TTL_SECONDS)
+    return cors_response(200, {
+        'connect_url': f'{base}/connect?init={token}',
+        'status_url': f'{base}/connection/status?init={token}',
+        'expires_in': _OAUTH_STATE_TTL_SECONDS,
+    })
 
 
 def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
