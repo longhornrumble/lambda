@@ -36,6 +36,7 @@ on:
           - Scheduling_Redemption_Handler
           - Calendar_Event_Consumer
           - Calendar_Lifecycle_Consumer
+          - Calendar_OAuth_Connect
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -540,6 +541,27 @@ jobs:
             # Public Function URL, but every path is token-gated — an unauthenticated
             # synthetic probe would 4xx (no token) rather than exercise a real flow.
             # Live smoke is the integrator's curl of the redemption host post-deploy.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Calendar_OAuth_Connect
+            # Scheduling sub-phase E (E11) — the per-staff Google Calendar 3LO consent
+            # flow (G3); public Function URL, also fronted by the staging.schedule
+            # CloudFront dist (D3 routing is a separate picasso IaC PR). Node.js esbuild
+            # bundle; bundles ../shared/scheduling/featureGate.js with @aws-sdk/*
+            # externalized (Lambda runtime provides v3), so — like the sibling calendar
+            # consumers + redemption handler — NO shared/scheduling npm install needed.
+            # Env vars Terraform-managed (picasso infra/ lambda-calendar-oauth-connect-staging).
+            # shared-only change → manual trigger (no Calendar_OAuth_Connect/** change):
+            #   gh workflow run "Deploy Lambda — Staging" -f lambda=Calendar_OAuth_Connect
+            staging_function: Calendar_OAuth_Connect
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # Public Function URL, but /connect + /connection/status are init-token-gated
+            # and /oauth/callback needs a Google code — a synthetic probe 4xx/503s rather
+            # than exercise a real flow. Live smoke is the integrator's curl post-deploy.
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
