@@ -71,6 +71,15 @@ def _seed_key():
     lf._oauth_state_key_cache.clear()
 
 
+@pytest.fixture(autouse=True)
+def _grant_feature_and_role():
+    """The mint is feature-gated (validate_feature_access) + reads the _request_user_role module
+    global. Default every test to: role set + scheduling granted. The gate-denied test overrides."""
+    lf._request_user_role = 'admin'
+    with patch.object(lf, 'validate_feature_access', return_value=None):
+        yield
+
+
 # --------------------------------------------------------------------------- #
 # wire-format compat
 # --------------------------------------------------------------------------- #
@@ -161,6 +170,14 @@ def test_key_empty_raises():
             lf.get_oauth_state_signing_key()
 
 
+def test_key_whitespace_only_raises():
+    # A whitespace-only key is a useless/misconfigured secret (G3 SR2).
+    lf._oauth_state_key_cache.clear()
+    with patch.object(lf._secrets_client, 'get_secret_value', return_value={'SecretString': '   \t\n'}):
+        with pytest.raises(ValueError):
+            lf.get_oauth_state_signing_key()
+
+
 def test_key_json_missing_field_raises():
     lf._oauth_state_key_cache.clear()
     with patch.object(lf._secrets_client, 'get_secret_value',
@@ -200,10 +217,44 @@ def test_handler_strips_trailing_slash_on_base_url():
 
 
 def test_handler_no_identity_400():
+    # includes whitespace-only + padded-'unknown' — must NOT mint a token with an empty
+    # coordinator_id (G3 test-B2).
     with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL):
-        for bad in (None, '', 'unknown'):
+        for bad in (None, '', '   ', '\t\n', 'unknown', '  unknown  '):
             resp = handle_scheduling_connection_init('TEN1', bad)
-            assert resp['statusCode'] == 400
+            assert resp['statusCode'] == 400, f'expected 400 for {bad!r}'
+
+
+def test_handler_empty_tenant_400():
+    # tenant_id from auth should never be blank, but guard it anyway (G3 SR1).
+    with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL):
+        for bad_tid in (None, '', '   '):
+            resp = handle_scheduling_connection_init(bad_tid, 'staff@example.com')
+            assert resp['statusCode'] == 400, f'expected 400 for tenant {bad_tid!r}'
+
+
+def test_handler_feature_gate_denied_returns_403():
+    # A tenant without scheduling must be refused BEFORE minting (G3 code-High).
+    denied = lf.cors_response(403, {'error': 'Feature not available'})
+    with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL), \
+         patch.object(lf, 'validate_feature_access', return_value=denied) as gate:
+        resp = handle_scheduling_connection_init('TEN1', 'staff@example.com')
+    assert resp['statusCode'] == 403
+    gate.assert_called_once_with('TEN1', 'dashboard_scheduling', lf._request_user_role)
+
+
+def test_handler_secrets_error_503_no_secret_name_leak():
+    # A Secrets Manager failure must NOT bubble to the router's 500 (which echoes str(e),
+    # leaking the secret name). Handler catches -> generic 503. (G3 test-B1.)
+    from botocore.exceptions import ClientError
+    lf._oauth_state_key_cache.clear()
+    err = ClientError({'Error': {'Code': 'ResourceNotFoundException', 'Message': 'x'}}, 'GetSecretValue')
+    with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL), \
+         patch.object(lf._secrets_client, 'get_secret_value', side_effect=err):
+        resp = handle_scheduling_connection_init('TEN1', 'staff@example.com')
+    assert resp['statusCode'] == 503
+    assert 'picasso/scheduling/oauth' not in resp['body']  # secret name must not leak
+    assert '_state-signing-key' not in resp['body']
 
 
 def test_handler_oauth_not_configured_503():
@@ -218,4 +269,4 @@ def test_token_is_url_safe_no_encoding_needed():
     with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL):
         resp = handle_scheduling_connection_init('TEN1', 'staff@example.com')
     token = json.loads(resp['body'])['connect_url'].split('init=')[1]
-    assert re.fullmatch(r'[A-Za-z0-9._~-]+', token)  # unreserved set; '.' separator included
+    assert re.fullmatch(r'[A-Za-z0-9_.-]+', token)  # base64url alphabet + the '.' separator

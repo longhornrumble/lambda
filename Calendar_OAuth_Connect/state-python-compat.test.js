@@ -44,4 +44,13 @@ describe('state.verify accepts a Python-ADA-minted init token (G3/E0 cross-langu
       state.verify(GOLDEN, { expectedType: 'init', nowMs: 1_900_000_301_000, deps })
     ).rejects.toMatchObject({ code: 'expired' });
   });
+
+  test('rejects the Python-minted init token when verified as the wrong type (wrong_type)', async () => {
+    // The typ-confusion defense (an 'init' token can never be replayed as a 'state' token) must
+    // hold at the cross-language boundary — the Node verifier consuming a Python-minted token.
+    // (G3 audit test-B3.)
+    await expect(
+      state.verify(GOLDEN, { expectedType: 'state', nowMs: 1_900_000_100_000, deps })
+    ).rejects.toMatchObject({ code: 'wrong_type' });
+  });
 });

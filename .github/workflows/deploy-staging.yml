@@ -68,6 +68,7 @@ jobs:
       calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
       calendar_watch_offboarder: ${{ steps.filter.outputs.calendar_watch_offboarder }}
       booking_commit_handler: ${{ steps.filter.outputs.booking_commit_handler }}
+      calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -111,6 +112,12 @@ jobs:
               # after such a change:
               #   gh workflow run "Deploy Lambda — Staging" -f lambda=Booking_Commit_Handler
               - 'Booking_Commit_Handler/**'
+            calendar_oauth_connect:
+              # E11 per-staff Google consent Lambda (G3). Dir-only — like C8/redemption it
+              # *bundles* shared/scheduling/featureGate.js, so a shared/scheduling-only change
+              # WITHOUT a Calendar_OAuth_Connect/** change won't auto-rebundle; redeploy manually:
+              #   gh workflow run "Deploy Lambda — Staging" -f lambda=Calendar_OAuth_Connect
+              - 'Calendar_OAuth_Connect/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -142,7 +149,8 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_onboarder == 'true' ||
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
       needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
-      needs.detect-changes.outputs.booking_commit_handler == 'true'
+      needs.detect-changes.outputs.booking_commit_handler == 'true' ||
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true'
     strategy:
       fail-fast: false
       matrix:

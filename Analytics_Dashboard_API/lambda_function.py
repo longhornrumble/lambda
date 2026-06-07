@@ -57,6 +57,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, Any, Optional, List
 from decimal import Decimal
 from botocore.exceptions import ClientError
+from botocore.config import Config
 from boto3.dynamodb.types import TypeSerializer, TypeDeserializer
 import tenant_registry_ops
 
@@ -162,7 +163,14 @@ CLERK_JWKS_CACHE_TTL = 3600  # 1 hour
 # when set (backwards compat) and falls back to AWS Secrets Manager.
 _clerk_secret_cache: Dict[str, str] = {}
 CLERK_SECRET_ID = os.environ.get('CLERK_SECRET_KEY_SECRET_ID', 'prod/clerk/picasso/secret_key')
-_secrets_client = boto3.client('secretsmanager', region_name='us-east-1')
+# Bounded so a slow/unreachable Secrets Manager can't hang a request to the full Lambda
+# timeout (the OAuth init-token mint + the Clerk secret fetch both ride this client on the
+# request path). Audit G3 Sec-S4/code-S4.
+_secrets_client = boto3.client(
+    'secretsmanager',
+    region_name='us-east-1',
+    config=Config(connect_timeout=3, read_timeout=5, retries={'max_attempts': 2}),
+)
 
 
 def get_clerk_secret_key() -> str:
@@ -4499,7 +4507,10 @@ def get_oauth_state_signing_key() -> str:
         key = parsed.get('key') if isinstance(parsed, dict) else None
         if not isinstance(key, str) or not key:
             raise ValueError('OAuth state signing key JSON is missing a non-empty "key" field')
-    if not key:
+    # Reject a whitespace-only key (a useless/misconfigured secret). NOTE: we do NOT strip the
+    # key used for the HMAC — state.js HMACs the raw secret string verbatim, so stripping here
+    # would break cross-language verification for a key with incidental edge whitespace. (G3 SR2.)
+    if not key or not key.strip():
         raise ValueError('OAuth state signing key is empty')
     _oauth_state_key_cache['value'] = key
     return key
@@ -4531,22 +4542,39 @@ def handle_scheduling_connection_init(tenant_id: str, user_email: Optional[str])
     is never client-supplied (anti-slot-poisoning).
 
     The returned token is pure base64url + a '.' separator (all RFC-3986-unreserved), so it needs
-    no URL-encoding to ride in the query string.
+    no URL-encoding to ride in the query string. Defense-in-depth feature-gated.
     """
-    if not user_email or user_email == 'unknown':
+    # Identity comes from verified auth ONLY (never client-supplied). Strip first so a blank /
+    # whitespace-only Clerk email can't mint a token with an empty coordinator_id. (G3 test-B2.)
+    email = (user_email or '').strip()
+    if not email or email.lower() == 'unknown':
         return cors_response(400, {'error': 'no verified caller identity'})
+    if not tenant_id or not str(tenant_id).strip():
+        return cors_response(400, {'error': 'no verified tenant'})
+    # Refuse to mint for a tenant without scheduling — defense-in-depth consistent with the sibling
+    # /scheduling/* routes (the OAuth Lambda also Flag-A-gates downstream). (G3 code-High.)
+    access_error = validate_feature_access(tenant_id, 'dashboard_scheduling', _request_user_role)
+    if access_error:
+        return access_error
     base = OAUTH_FUNCTION_URL.rstrip('/')
     if not base:
         # OAUTH_FUNCTION_URL is wired post-apply (the Function URL only exists after PR-1's
         # terraform apply). Until then the connect flow is unreachable — report unconfigured
         # rather than mint a token that points nowhere.
         return cors_response(503, {'error': 'calendar connect not configured'})
-    coordinator_id = user_email.strip().lower()
-    token = _sign_oauth_state('init', {
-        'tenant_id': tenant_id,
-        'coordinator_id': coordinator_id,
-        'coordinator_email': user_email,
-    }, _OAUTH_STATE_TTL_SECONDS)
+    coordinator_id = email.lower()
+    try:
+        token = _sign_oauth_state('init', {
+            'tenant_id': tenant_id,
+            'coordinator_id': coordinator_id,
+            'coordinator_email': email,
+        }, _OAUTH_STATE_TTL_SECONDS)
+    except Exception:
+        # A Secrets Manager failure or misconfigured signing key must NOT bubble to the router's
+        # generic 500 handler (which echoes str(e) — leaking the secret name). Log server-side,
+        # return a generic 503. (G3 test-B1.)
+        logger.exception('[scheduling/connection/init] init-token mint failed')
+        return cors_response(503, {'error': 'calendar connect unavailable'})
     return cors_response(200, {
         'connect_url': f'{base}/connect?init={token}',
         'status_url': f'{base}/connection/status?init={token}',
