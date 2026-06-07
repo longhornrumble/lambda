@@ -19,14 +19,23 @@ const {
   GetItemCommand,
   QueryCommand,
 } = require('@aws-sdk/client-dynamodb');
+const {
+  SecretsManagerClient,
+  GetSecretValueCommand,
+} = require('@aws-sdk/client-secrets-manager');
 
 const ddbMock = mockClient(DynamoDBClient);
+// §B7: the resolver's default getCoordinatorStatus reads a per-coordinator OAuth secret for every
+// eligible candidate. Default it to a non-revoked ('connected') status so the pre-existing
+// candidate-returning tests keep their whole pool without touching real Secrets Manager.
+const smMock = mockClient(SecretsManagerClient);
 
 const {
   resolveCandidates,
   defaultGetRoutingPolicy,
   defaultGetAppointmentType,
   defaultQueryEmployees,
+  defaultGetCoordinatorStatus,
   isEligible,
   unmarshalItem,
 } = require('../candidate-resolver');
@@ -38,6 +47,10 @@ const quietLog = { warn: jest.fn(), info: jest.fn(), error: jest.fn() };
 
 beforeEach(() => {
   ddbMock.reset();
+  smMock.reset();
+  smMock.on(GetSecretValueCommand).resolves({
+    SecretString: JSON.stringify({ status: 'connected' }),
+  });
   jest.clearAllMocks();
 });
 
@@ -456,6 +469,105 @@ describe('unmarshalItem', () => {
       ss: ['x', 'y'],
       ns: [1, 2],
       unknown: undefined,
+    });
+  });
+});
+
+// ─── §B7 revoked → pool-exclusion ────────────────────────────────────────────────────
+describe('§B7 revoked-exclusion', () => {
+  // DI seam: a solo policy (empty tag_conditions) over a 3-employee pool, with an injectable
+  // getCoordinatorStatus so we can assert exclusion without touching Secrets Manager.
+  const soloPolicyDeps = (statusByEmail, extra = {}) => ({
+    getRoutingPolicy: async () => ({ routing_policy_id: 'rp1', tag_conditions: [] }),
+    queryEmployees: async () => [
+      emp('u1', 'Alice@example.com', ['sched']),
+      emp('u2', 'bob@example.com', ['sched']),
+      emp('u3', 'carol@example.com', ['sched']),
+    ],
+    getCoordinatorStatus: async ({ coordinatorId }) => statusByEmail[coordinatorId] ?? null,
+    log: quietLog,
+    ...extra,
+  });
+
+  it('excludes a coordinator whose secret status is revoked', async () => {
+    const out = await resolveCandidates(
+      { tenantId: TENANT, routingPolicyId: 'rp1' },
+      soloPolicyDeps({ 'bob@example.com': 'revoked', 'alice@example.com': 'connected' })
+    );
+    const ids = out.map((c) => c.resourceId).sort();
+    expect(ids).toEqual(['alice@example.com', 'carol@example.com']); // bob excluded
+  });
+
+  it('keeps coordinators on any non-revoked status (connected / null / unknown) — fail-open', async () => {
+    const out = await resolveCandidates(
+      { tenantId: TENANT, routingPolicyId: 'rp1' },
+      soloPolicyDeps({ 'alice@example.com': 'connected', 'bob@example.com': null, 'carol@example.com': 'stale' })
+    );
+    expect(out).toHaveLength(3);
+  });
+
+  it('keeps a candidate when the status read THROWS (fail-open, never mass-excludes)', async () => {
+    const out = await resolveCandidates(
+      { tenantId: TENANT, routingPolicyId: 'rp1' },
+      soloPolicyDeps(
+        {},
+        { getCoordinatorStatus: async () => { throw new Error('SM unavailable'); } }
+      )
+    );
+    expect(out).toHaveLength(3); // a transient/platform failure must not empty the pool
+  });
+
+  it('queries status once per ELIGIBLE candidate (not per registry row)', async () => {
+    const getCoordinatorStatus = jest.fn(async () => 'connected');
+    await resolveCandidates(
+      { tenantId: TENANT, routingPolicyId: 'rp1' },
+      {
+        getRoutingPolicy: async () => ({ routing_policy_id: 'rp1', tag_conditions: [{ operator: 'in_any', values: ['sched'] }] }),
+        queryEmployees: async () => [
+          emp('u1', 'alice@example.com', ['sched']),
+          emp('u2', 'bob@example.com', ['other']),   // not eligible → no status read
+          emp('u3', 'carol@example.com', ['sched']),
+        ],
+        getCoordinatorStatus,
+        log: quietLog,
+      }
+    );
+    expect(getCoordinatorStatus).toHaveBeenCalledTimes(2); // alice + carol only
+  });
+
+  it('no candidates → no status reads', async () => {
+    const getCoordinatorStatus = jest.fn();
+    const out = await resolveCandidates(
+      { tenantId: TENANT, routingPolicyId: 'rp1' },
+      {
+        getRoutingPolicy: async () => ({ routing_policy_id: 'rp1', tag_conditions: [] }),
+        queryEmployees: async () => [],
+        getCoordinatorStatus,
+        log: quietLog,
+      }
+    );
+    expect(out).toEqual([]);
+    expect(getCoordinatorStatus).not.toHaveBeenCalled();
+  });
+
+  describe('defaultGetCoordinatorStatus (Secrets Manager)', () => {
+    it('returns the status field from the per-coordinator secret', async () => {
+      smMock.on(GetSecretValueCommand).resolves({
+        SecretString: JSON.stringify({ status: 'revoked', refresh_token: 'x' }),
+      });
+      const s = await defaultGetCoordinatorStatus({ tenantId: TENANT, coordinatorId: 'a@b.com' });
+      expect(s).toBe('revoked');
+    });
+
+    it('returns null on a missing secret / unparseable / no status field', async () => {
+      smMock.on(GetSecretValueCommand).rejects(new Error('ResourceNotFoundException'));
+      await expect(
+        defaultGetCoordinatorStatus({ tenantId: TENANT, coordinatorId: 'gone@b.com' })
+      ).rejects.toThrow(); // the resolver's try/catch fail-opens; the default itself surfaces the error
+      smMock.on(GetSecretValueCommand).resolves({ SecretString: 'not-json' });
+      expect(await defaultGetCoordinatorStatus({ tenantId: TENANT, coordinatorId: 'x@b.com' })).toBeNull();
+      smMock.on(GetSecretValueCommand).resolves({ SecretString: JSON.stringify({ refresh_token: 'x' }) });
+      expect(await defaultGetCoordinatorStatus({ tenantId: TENANT, coordinatorId: 'y@b.com' })).toBeNull();
     });
   });
 });
