@@ -59,15 +59,25 @@ const {
   GetItemCommand,
   QueryCommand,
 } = require('@aws-sdk/client-dynamodb');
+const {
+  SecretsManagerClient,
+  GetSecretValueCommand,
+} = require('@aws-sdk/client-secrets-manager');
 
 // Created once at module load; reused across warm invocations (Calendar_Watch_* style).
 const ddb = new DynamoDBClient({});
+// The §B7 revoked-exclusion runs on the booking-propose path; reads are best-effort, parallel,
+// and fail-open (see resolveCandidates), and maxAttempts is capped so a flaky Secrets Manager
+// can't multiply retries on a hot path.
+const sm = new SecretsManagerClient({ maxAttempts: 2 });
 
 const ENV = process.env.ENVIRONMENT || 'staging';
 const ROUTING_POLICY_TABLE =
   process.env.ROUTING_POLICY_TABLE || `picasso-routing-policy-${ENV}`;
 const APPOINTMENT_TYPE_TABLE =
   process.env.APPOINTMENT_TYPE_TABLE || `picasso-appointment-type-${ENV}`;
+const OAUTH_SECRET_PATH_PREFIX =
+  process.env.OAUTH_SECRET_PATH_PREFIX || 'picasso/scheduling/oauth';
 const EMPLOYEE_REGISTRY_TABLE =
   process.env.EMPLOYEE_REGISTRY_TABLE || `picasso-employee-registry-v2-${ENV}`;
 
@@ -167,6 +177,26 @@ async function defaultQueryEmployees({ tenantId }) {
   return employees;
 }
 
+// Read a coordinator's per-coordinator OAuth secret `status` field (§B7). Returns the status
+// string, or null if the secret is missing / unreadable / shapeless. The secret path mirrors
+// secrets.buildSecretPath: `${OAUTH_SECRET_PATH_PREFIX}/{tenantId}/{coordinatorId}` where
+// coordinatorId is the v1 calendar id (= the lower-cased email = resourceId).
+async function defaultGetCoordinatorStatus({ tenantId, coordinatorId }) {
+  const res = await sm.send(
+    new GetSecretValueCommand({
+      SecretId: `${OAUTH_SECRET_PATH_PREFIX}/${tenantId}/${coordinatorId}`,
+    })
+  );
+  if (!res || typeof res.SecretString !== 'string' || !res.SecretString) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(res.SecretString);
+  } catch {
+    return null;
+  }
+  return parsed && typeof parsed.status === 'string' ? parsed.status : null;
+}
+
 // ─── resolveCandidates ───────────────────────────────────────────────────────────────
 
 /**
@@ -189,6 +219,7 @@ async function resolveCandidates(
     getRoutingPolicy = defaultGetRoutingPolicy,
     getAppointmentType = defaultGetAppointmentType,
     queryEmployees = defaultQueryEmployees,
+    getCoordinatorStatus = defaultGetCoordinatorStatus,
     log = console,
   } = deps;
 
@@ -246,7 +277,32 @@ async function resolveCandidates(
     });
   }
 
-  return candidates;
+  // 5. §B7 revoked→pool-exclusion: never offer a calendar whose per-coordinator OAuth secret is
+  //    explicitly status:'revoked' (set by Calendar_OAuth_Connect /connection/status when a
+  //    refresh probe returns invalid_grant). FAIL-OPEN: a missing secret / read error / any other
+  //    status keeps the candidate — only an explicit 'revoked' excludes. This matches the §E11
+  //    caution that a transient/platform failure (e.g. invalid_client) must NOT mass-exclude the
+  //    whole pool; the cost of a stray offer to a just-revoked coordinator is a failed commit, not
+  //    a silent outage. Reads run in parallel over the (small, v1-pilot) eligible pool.
+  if (candidates.length === 0) {
+    return candidates;
+  }
+  const statuses = await Promise.all(
+    candidates.map(async (c) => {
+      try {
+        return await getCoordinatorStatus({ tenantId, coordinatorId: c.resourceId });
+      } catch (err) {
+        log.warn(
+          `[candidate-resolver] status read failed for a candidate (fail-open, kept): ${
+            (err && err.name) || 'error'
+          }`
+        );
+        return null; // fail-open
+      }
+    })
+  );
+  const bookable = candidates.filter((_, i) => statuses[i] !== 'revoked');
+  return bookable;
 }
 
 module.exports = {
@@ -255,6 +311,7 @@ module.exports = {
   defaultGetRoutingPolicy,
   defaultGetAppointmentType,
   defaultQueryEmployees,
+  defaultGetCoordinatorStatus,
   isEligible,
   unmarshalItem,
   _ROUTING_POLICY_TABLE: ROUTING_POLICY_TABLE,
