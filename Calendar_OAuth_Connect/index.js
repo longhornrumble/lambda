@@ -397,7 +397,16 @@ async function handleStatus(event) {
       refreshToken: secret.refresh_token,
     });
     log('status_connected', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
-    return json(200, { status: 'connected', scopes: secret.scopes || null });
+    // calendar_id (G3/E16): the ACTUALLY-connected calendar's id (D2 field, written at connect).
+    // The E16 embed renders this calendar — it may differ from the login email (calendar_email_
+    // override / a different connected Google account), so the UI must read it from here, not
+    // assume coordinator_id. Falls back to coordinator_id (= v1 calendar id) for older secrets
+    // written before the D2 field landed (schema-discipline).
+    return json(200, {
+      status: 'connected',
+      scopes: secret.scopes || null,
+      calendar_id: secret.calendar_id || claims.coordinator_id || null,
+    });
   } catch (err) {
     const { permanent, platform, httpStatus } = classifyTokenError(err);
     if (platform) {
