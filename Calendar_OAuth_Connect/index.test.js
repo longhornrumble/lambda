@@ -307,10 +307,16 @@ describe('GET /connection/status (revocation detection)', () => {
     expect(oauth.probeRefresh).not.toHaveBeenCalled();
   });
 
-  test('probe success → connected', async () => {
-    secrets.readCoordinator.mockResolvedValue({ refresh_token: 'rt', client_id: 'c', client_secret: 's', status: 'connected', scopes: ['a'] });
+  test('probe success → connected (calendar_id from the secret; G3/E16)', async () => {
+    secrets.readCoordinator.mockResolvedValue({ refresh_token: 'rt', client_id: 'c', client_secret: 's', status: 'connected', scopes: ['a'], calendar_id: 'maya.work@gmail.com' });
     const res = await handler(ev('/connection/status', { init: 'ok' }));
-    expect(JSON.parse(res.body)).toMatchObject({ status: 'connected' });
+    expect(JSON.parse(res.body)).toEqual({ status: 'connected', scopes: ['a'], calendar_id: 'maya.work@gmail.com' });
+  });
+
+  test('connected with NO calendar_id on the secret → falls back to coordinator_id (G3/E16, schema-discipline)', async () => {
+    secrets.readCoordinator.mockResolvedValue({ refresh_token: 'rt', client_id: 'c', client_secret: 's', status: 'connected' });
+    const res = await handler(ev('/connection/status', { init: 'ok' }));
+    expect(JSON.parse(res.body)).toMatchObject({ status: 'connected', calendar_id: 'maya@example.org' });
   });
 
   test('probe invalid_grant (permanent) → marks revoked + disconnected/bookable:false', async () => {
