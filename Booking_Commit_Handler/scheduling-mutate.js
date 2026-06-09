@@ -13,11 +13,16 @@
  * provider, the §B15 Zoom start-time PATCH, and — for reschedule — the Booking-row
  * write (option A; cancel's Booking.status flip is the §14.2 listener's job).
  *
- * Invocation payload (BSH → BCH):
- *   { action:'scheduling_mutate', mutation:'reschedule'|'cancel', tenantId,
- *     coordinatorId, bookingId, booking, newSlot? }
+ * Invocation payload (BSH → BCH, or ADA → BCH for the G6 portal actions):
+ *   { action:'scheduling_mutate', mutation:'reschedule'|'cancel'|'reschedule_link', tenantId,
+ *     coordinatorId, bookingId, booking, newSlot?, reason?, canceled_by? }
+ *   - cancel        : delete the calendar event (listener flips status); G6 also persists
+ *                     reason/canceled_by (audit-only attribute write — not the status flip).
+ *   - reschedule_link: NO calendar op — mint a fresh §B4 reschedule token + email the guest a
+ *                     self-serve link (G6 admin/staff "send reschedule link"). short-circuits
+ *                     before the OAuth/facade build.
  * Response:
- *   { outcome:'success'|'pending_calendar_sync'|'failed'|'canceled'|..., booking?, error? }
+ *   { outcome:'success'|'pending_calendar_sync'|'failed'|'canceled'|..., booking?, sent?, error? }
  */
 
 const calendarEventsModule = require('./calendar-events');
@@ -27,6 +32,10 @@ const oauthClientModule = require('./oauth-client');
 const bookingStoreModule = require('./booking-store');
 const { executeReschedule } = require('../shared/scheduling/reschedule');
 const { executeCancel } = require('../shared/scheduling/cancel');
+// G6 reschedule_link: mint a fresh §B4 reschedule token + email the guest a self-serve link.
+// Reuses the SoT signer (tokens.sign) + notice dispatcher — never re-implemented.
+const { sign: signRescheduleToken } = require('../shared/scheduling/tokens');
+const { dispatchVolunteerNotice } = require('../shared/scheduling/notify');
 
 // tolerate camel OR snake on the inbound booking (schema discipline)
 function pick(b, camel, snake) {
@@ -42,6 +51,8 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   const _executeReschedule = injected.executeReschedule || executeReschedule;
   const _executeCancel = injected.executeCancel || executeCancel;
   const _resolveProvider = injected.resolveProvider || resolveProvider;
+  const _signRescheduleToken = injected.signRescheduleToken || signRescheduleToken;
+  const _dispatchVolunteerNotice = injected.dispatchVolunteerNotice || dispatchVolunteerNotice;
   const logger = injected.logger || console;
 
   const { mutation, tenantId, coordinatorId, booking } = event;
@@ -51,7 +62,7 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   if (mutation === 'reschedule' && (!event.newSlot || !event.newSlot.start || !event.newSlot.end)) {
     return { outcome: 'failed', error: 'missing_newSlot' };
   }
-  if (mutation !== 'reschedule' && mutation !== 'cancel') {
+  if (mutation !== 'reschedule' && mutation !== 'cancel' && mutation !== 'reschedule_link') {
     return { outcome: 'failed', error: 'unknown_mutation' };
   }
   // SR-1 (cross-tenant): BCH trusts the BSH payload, so assert the outer tenantId (used for
@@ -69,6 +80,18 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   // FunctionError (which would trip the Errors alarm). A calendar-op that fails the
   // normal way already returns outcome:'failed'/'pending_calendar_sync' from execute*.
   try {
+    // reschedule_link is a notify-only action (mint a fresh §B4 token + email the guest a
+    // self-serve link) — it performs NO calendar mutation, so it short-circuits BEFORE the
+    // per-tenant OAuth/facade build that cancel/reschedule require.
+    if (mutation === 'reschedule_link') {
+      return await handleRescheduleLink({
+        booking,
+        tenantId,
+        signRescheduleToken: _signRescheduleToken,
+        dispatchVolunteerNotice: _dispatchVolunteerNotice,
+        logger,
+      });
+    }
     // Per-tenant Google auth + the §B13 facade (auth curried; BSH cannot build this).
     // NOTE: the calendarId for cancel/reschedule is resolved by cancel.js/reschedule.js
     // from Booking.coordinator_email (persisted by the commit path), NOT re-fetched from
@@ -85,7 +108,19 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
     if (mutation === 'cancel') {
       const result = await _executeCancel({ booking, deps: { calendar, logger } });
       // §14.2: the cal-lifecycle listener flips Booking.status on the calendar delete —
-      // NOT us (cancel.js deliberately doesn't flip status). No Booking write here.
+      // NOT us (cancel.js deliberately doesn't flip status). We DO persist the audit-only
+      // G6 cancel-with-reason fields (an attribute write, never the status flip). Non-fatal:
+      // the calendar delete already succeeded; a failed reason write must not undo the cancel.
+      if (event.reason) {
+        try {
+          await bookingStore.updateBookingCancelReason(tenantId, pick(booking, 'bookingId', 'booking_id'), {
+            reason: event.reason,
+            canceledBy: event.canceled_by,
+          });
+        } catch (err) {
+          (logger.warn || logger.error || (() => {}))('cancel_reason_persist_failed', { error_name: (err && err.name) || 'unknown' });
+        }
+      }
       return { outcome: result.outcome, booking: result.booking };
     }
 
@@ -132,6 +167,48 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   } catch (err) {
     (logger.error || (() => {}))('scheduling_mutate_failed', { mutation, error_name: (err && err.name) || 'unknown' });
     return { outcome: 'failed', error: 'executor_error' };
+  }
+}
+
+// G6 reschedule_link — notify-only (NO calendar mutation). Mints a fresh §B4 reschedule token
+// (MINT is stateless: NO jti write — the jti is written only at REDEEM) and emails the guest a
+// self-serve reschedule link. Mirrors Attendance_Disposition_Handler's reschedule-link flow.
+async function handleRescheduleLink({ booking, tenantId, signRescheduleToken, dispatchVolunteerNotice, logger }) {
+  const bookingId = pick(booking, 'bookingId', 'booking_id');
+  const startAt = pick(booking, 'startAt', 'start_at');
+
+  let rescheduleUrl;
+  try {
+    const token = await signRescheduleToken('reschedule', {
+      tenant_id: tenantId,
+      booking_id: bookingId,
+      start_at: startAt,
+    });
+    // BCH already sets SCHEDULE_BASE_URL (the staging redemption / WS-D3 domain); reuse it
+    // rather than introduce a second base-URL env. Falls back to the prod redemption host.
+    const baseUrl = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
+    rescheduleUrl = `${baseUrl}/reschedule?t=${encodeURIComponent(token)}`;
+  } catch (err) {
+    // A token we can't mint (e.g. missing start_at) — surface as a clean failure; no calendar
+    // state changed, so nothing to roll back.
+    (logger.error || (() => {}))('reschedule_link_mint_failed', { error_name: (err && err.name) || 'unknown' });
+    return { outcome: 'failed', error: 'token_mint_failed' };
+  }
+
+  // Email the guest the self-serve link (best-effort — notify appends the STOP footer and never
+  // throws on a send failure). buildEmailPayload requires booking.rescheduleUrl, supplied here.
+  try {
+    const result = await dispatchVolunteerNotice(
+      { kind: 'reschedule_link', tenantId, booking: { ...booking, rescheduleUrl } },
+      {}
+    );
+    const sent = !!(result && result.dispatched && result.dispatched.email === 'sent');
+    return { outcome: 'success', sent };
+  } catch (err) {
+    // Defensive: dispatch is best-effort and shouldn't throw, but a throw here must not become
+    // a Lambda FunctionError — the token was minted; report sent:false.
+    (logger.error || (() => {}))('reschedule_link_notify_failed', { error_name: (err && err.name) || 'unknown' });
+    return { outcome: 'success', sent: false };
   }
 }
 

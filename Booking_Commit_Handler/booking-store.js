@@ -185,6 +185,23 @@ async function updateBookingReschedule(tenantId, bookingId, { startAt, externalE
   }));
 }
 
+// G6 cancel-with-reason — persist the audit-only cancel reason + actor. The Booking.status
+// flip is the §14.2 listener's job (the calendar delete drives it); this writes ONLY the
+// reason/actor attributes. ConditionExpression guards a vanished row (a concurrent delete).
+async function updateBookingCancelReason(tenantId, bookingId, { reason, canceledBy } = {}) {
+  if (!tenantId || !bookingId) throw new Error('updateBookingCancelReason requires tenantId and bookingId');
+  const sets = ['cancel_reason = :r'];
+  const vals = { ':r': s(reason) };
+  if (canceledBy) { sets.push('canceled_by = :by'); vals[':by'] = s(canceledBy); }
+  await ddb.send(new UpdateItemCommand({
+    TableName: BOOKING_TABLE,
+    Key: BOOKING_KEY(tenantId, bookingId),
+    UpdateExpression: 'SET ' + sets.join(', '),
+    ExpressionAttributeValues: vals,
+    ConditionExpression: 'attribute_exists(booking_id)',
+  }));
+}
+
 // Stamp a TTL on the lock item right after acquisition (the lock is created by C6
 // pool.lockSlot, which this module must not modify — so C8 adds the TTL attribute
 // via UpdateItem). DynamoDB TTL then garbage-collects any lock orphaned by a crash
@@ -252,6 +269,7 @@ module.exports = {
   getBookingById,
   writeBooking,
   updateBookingReschedule,
+  updateBookingCancelReason,
   readLock,
   recordConferenceOnLock,
   setLockTtl,

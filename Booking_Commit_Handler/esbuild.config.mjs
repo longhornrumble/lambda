@@ -8,6 +8,7 @@ import * as esbuild from 'esbuild';
 // so bundling it is safe. Matches the Calendar_Event_Consumer precedent (lambda#195).
 const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
+  '@aws-sdk/client-lambda', // G6 reschedule_link: scheduling-mutate.js → notify.js dispatches via Lambda invoke
   '@aws-sdk/client-s3',
   '@aws-sdk/client-secrets-manager',
   '@aws-sdk/client-ses',

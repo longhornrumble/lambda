@@ -4,7 +4,7 @@ const { handleSchedulingMutate } = require('../scheduling-mutate');
 
 // Minimal fakes for the injected seam (no real Google/Zoom/DDB).
 function baseInjected(overrides = {}) {
-  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [] };
+  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [] };
   const calendarEvents = {
     buildEventBody: (x) => ({ built: x }),
     insertEvent: (calId, body) => { calls.facade.push(['insert', calId]); return { id: 'evt-new' }; },
@@ -18,9 +18,15 @@ function baseInjected(overrides = {}) {
       getOAuthClient: async ({ tenantId, coordinatorId }) => { calls.facade.push(['auth', tenantId, coordinatorId]); return { auth: true }; },
       resolveProvider: () => ({ createConference: async () => ({ provider: 'google_meet' }) }),
       zoomClient: { updateMeeting: async (a) => { calls.zoom.push(a); } },
-      bookingStore: { updateBookingReschedule: async (t, id, f) => { calls.persist.push([t, id, f]); } },
+      bookingStore: {
+        updateBookingReschedule: async (t, id, f) => { calls.persist.push([t, id, f]); },
+        updateBookingCancelReason: async (t, id, f) => { calls.cancelReason.push([t, id, f]); },
+      },
       executeReschedule: async ({ booking, newSlot }) => { calls.reschedule.push({ booking, newSlot }); return { outcome: 'success', booking: { ...booking, external_event_id: 'evt-new', start_at: newSlot.start } }; },
       executeCancel: async ({ booking }) => { calls.cancel.push({ booking }); return { outcome: 'deleted', booking }; },
+      // G6 reschedule_link seams.
+      signRescheduleToken: async (purpose, claims) => { calls.token.push([purpose, claims]); return 'mock.jwt.token'; },
+      dispatchVolunteerNotice: async ({ kind, tenantId, booking }) => { calls.notify.push({ kind, tenantId, booking }); return { kind, dispatched: { email: 'sent' } }; },
       logger: { warn: () => {}, error: () => {} },
       ...overrides,
     },
@@ -61,7 +67,7 @@ describe('handleSchedulingMutate — validation', () => {
 });
 
 describe('handleSchedulingMutate — cancel', () => {
-  it('runs executeCancel with the auth-curried facade and does NOT persist (listener owns status)', async () => {
+  it('runs executeCancel with the auth-curried facade and does NOT persist status (listener owns it)', async () => {
     const { injected, calls } = baseInjected();
     const out = await handleSchedulingMutate(
       { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1', booking: { booking_id: 'bk1' } },
@@ -69,7 +75,87 @@ describe('handleSchedulingMutate — cancel', () => {
     );
     expect(out.outcome).toBe('deleted');
     expect(calls.cancel).toHaveLength(1);
-    expect(calls.persist).toHaveLength(0); // §14.2 listener flips status; executor doesn't write
+    expect(calls.persist).toHaveLength(0); // §14.2 listener flips status; executor doesn't write it
+    expect(calls.cancelReason).toHaveLength(0); // no reason supplied → no audit write
+  });
+
+  it('G6: persists cancel_reason + canceled_by when a reason is supplied (audit-only, not the status flip)', async () => {
+    const { injected, calls } = baseInjected();
+    const out = await handleSchedulingMutate(
+      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1',
+        booking: { booking_id: 'bk1' }, reason: 'Volunteer requested', canceled_by: 'admin@org.com' },
+      injected
+    );
+    expect(out.outcome).toBe('deleted');
+    expect(calls.cancelReason).toHaveLength(1);
+    const [t, id, fields] = calls.cancelReason[0];
+    expect(t).toBe('T1');
+    expect(id).toBe('bk1');
+    expect(fields).toEqual({ reason: 'Volunteer requested', canceledBy: 'admin@org.com' });
+  });
+
+  it('G6: a cancel_reason persist failure is non-fatal (the calendar delete already succeeded)', async () => {
+    const { injected } = baseInjected({
+      bookingStore: {
+        updateBookingReschedule: async () => {},
+        updateBookingCancelReason: async () => { throw new Error('ddb down'); },
+      },
+    });
+    const out = await handleSchedulingMutate(
+      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1',
+        booking: { booking_id: 'bk1' }, reason: 'x' },
+      injected
+    );
+    expect(out.outcome).toBe('deleted'); // swallowed; cancel still reported success
+  });
+});
+
+describe('handleSchedulingMutate — reschedule_link (G6, notify-only)', () => {
+  const RL_EVENT = {
+    action: 'scheduling_mutate', mutation: 'reschedule_link',
+    tenantId: 'T1', coordinatorId: 'coord@x.com', bookingId: 'bk1',
+    booking: { booking_id: 'bk1', tenant_id: 'T1', start_at: '2026-07-01T15:00:00Z', attendee_email: 'guest@x.com' },
+  };
+
+  it('mints a §B4 reschedule token and emails the guest the self-serve link (no calendar op)', async () => {
+    const { injected, calls } = baseInjected();
+    const out = await handleSchedulingMutate(RL_EVENT, injected);
+    expect(out).toEqual({ outcome: 'success', sent: true });
+    // minted with the right purpose + claims
+    expect(calls.token).toHaveLength(1);
+    expect(calls.token[0][0]).toBe('reschedule');
+    expect(calls.token[0][1]).toMatchObject({ tenant_id: 'T1', booking_id: 'bk1', start_at: '2026-07-01T15:00:00Z' });
+    // notified with kind + a booking carrying the freshly-built rescheduleUrl
+    expect(calls.notify).toHaveLength(1);
+    expect(calls.notify[0].kind).toBe('reschedule_link');
+    expect(calls.notify[0].booking.rescheduleUrl).toMatch(/\/reschedule\?t=mock\.jwt\.token$/);
+    // NEVER builds the calendar facade for a notify-only action
+    expect(calls.facade).toHaveLength(0);
+  });
+
+  it('a token-mint failure returns token_mint_failed and never notifies', async () => {
+    const { injected, calls } = baseInjected({
+      signRescheduleToken: async () => { throw new Error('missing start_at'); },
+    });
+    const out = await handleSchedulingMutate(RL_EVENT, injected);
+    expect(out).toEqual({ outcome: 'failed', error: 'token_mint_failed' });
+    expect(calls.notify).toHaveLength(0);
+  });
+
+  it('reports sent:false when the notice dispatch did not send (best-effort)', async () => {
+    const { injected } = baseInjected({
+      dispatchVolunteerNotice: async () => ({ kind: 'reschedule_link', dispatched: { email: 'skipped_no_recipient' } }),
+    });
+    const out = await handleSchedulingMutate(RL_EVENT, injected);
+    expect(out).toEqual({ outcome: 'success', sent: false });
+  });
+
+  it('a thrown dispatch folds to sent:false (token already minted; no FunctionError)', async () => {
+    const { injected } = baseInjected({
+      dispatchVolunteerNotice: async () => { throw new Error('lambda invoke 500'); },
+    });
+    const out = await handleSchedulingMutate(RL_EVENT, injected);
+    expect(out).toEqual({ outcome: 'success', sent: false });
   });
 });
 
