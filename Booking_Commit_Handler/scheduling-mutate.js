@@ -22,7 +22,9 @@
  *                     self-serve link (G6 admin/staff "send reschedule link"). short-circuits
  *                     before the OAuth/facade build.
  * Response:
- *   { outcome:'success'|'pending_calendar_sync'|'failed'|'canceled'|..., booking?, sent?, error? }
+ *   { outcome:'success'|'deleted'|'pending_calendar_sync'|'failed'|'rate_limited', booking?, sent?, error? }
+ *   (executeCancel emits 'deleted'|'pending_calendar_sync'; reschedule emits 'success'|'pending_calendar_sync';
+ *    reschedule_link emits 'success'|'failed'|'rate_limited'. There is NO 'canceled' outcome.)
  */
 
 const calendarEventsModule = require('./calendar-events');
@@ -69,8 +71,11 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   // OAuth-secret lookup + the DDB write) matches the booking's own tenant_id (used by
   // executeReschedule for calendar resolution). A divergent payload would auth as tenant A
   // against tenant B's calendar — refuse it. tenant_id is in the §B-projected booking.
+  // STRICT: refuse if the booking's own tenant is ABSENT or mismatched (defense-in-depth — a
+  // booking row missing tenantId must not silently bypass the cross-tenant guard). tenantId is
+  // the PK on every real booking row + the §B-projected booking, so absence = a malformed call.
   const bookingTenant = pick(booking, 'tenantId', 'tenant_id');
-  if (bookingTenant && bookingTenant !== tenantId) {
+  if (!bookingTenant || bookingTenant !== tenantId) {
     (injected.logger || console).error('scheduling_mutate_tenant_mismatch', { mutation });
     return { outcome: 'failed', error: 'tenant_mismatch' };
   }
@@ -87,6 +92,7 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
       return await handleRescheduleLink({
         booking,
         tenantId,
+        bookingStore,
         signRescheduleToken: _signRescheduleToken,
         dispatchVolunteerNotice: _dispatchVolunteerNotice,
         logger,
@@ -118,7 +124,12 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
             canceledBy: event.canceled_by,
           });
         } catch (err) {
-          (logger.warn || logger.error || (() => {}))('cancel_reason_persist_failed', { error_name: (err && err.name) || 'unknown' });
+          // Log the booking_id so an operator can backfill the lost attribution (the calendar
+          // delete + the listener status-flip already succeeded; only the audit field is missing).
+          (logger.warn || logger.error || (() => {}))('cancel_reason_persist_failed', {
+            booking_id: pick(booking, 'bookingId', 'booking_id'),
+            error_name: (err && err.name) || 'unknown',
+          });
         }
       }
       return { outcome: result.outcome, booking: result.booking };
@@ -170,20 +181,38 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   }
 }
 
-// G6 reschedule_link — notify-only (NO calendar mutation). Mints a fresh §B4 reschedule token
-// (MINT is stateless: NO jti write — the jti is written only at REDEEM) and emails the guest a
-// self-serve reschedule link. Mirrors Attendance_Disposition_Handler's reschedule-link flow.
-async function handleRescheduleLink({ booking, tenantId, signRescheduleToken, dispatchVolunteerNotice, logger }) {
+// Reschedule-link anti-abuse cooldown: at most one send per booking per this window (a second
+// portal click within the window is refused WITHOUT minting a fresh token → no email-bombing).
+const RESCHEDULE_LINK_COOLDOWN_SECONDS = 60;
+
+// G6 reschedule_link — notify-only (NO calendar mutation). Rate-limited; mints a fresh §B4
+// reschedule token (MINT is stateless: NO jti write — the jti is written only at REDEEM) and
+// emails the guest a self-serve reschedule link. Mirrors Attendance_Disposition_Handler's flow.
+async function handleRescheduleLink({ booking, tenantId, bookingStore, signRescheduleToken, dispatchVolunteerNotice, logger }) {
   const bookingId = pick(booking, 'bookingId', 'booking_id');
   const startAt = pick(booking, 'startAt', 'start_at');
+  // §B4 reschedule expiry = start_at − cancellation_window_hours (MIN-floored to 15min in tokens.js).
+  // Source the window from the booking like disposition.js does (was hard-0, giving exp=start_at).
+  const cancellationWindowHours = pick(booking, 'cancellationWindowHours', 'cancellation_window_hours');
+
+  // Anti email-bombing (atomic claim BEFORE minting): refuse a repeat send within the cooldown.
+  try {
+    const allowed = await bookingStore.touchRescheduleLinkSentAt(tenantId, bookingId, RESCHEDULE_LINK_COOLDOWN_SECONDS);
+    if (!allowed) {
+      return { outcome: 'rate_limited' };
+    }
+  } catch (err) {
+    // A failed cooldown write must not become a FunctionError; treat as a clean failure (no token
+    // minted, no email sent). The booking row may have vanished or DDB is unreachable.
+    (logger.error || (() => {}))('reschedule_link_cooldown_failed', { booking_id: bookingId, error_name: (err && err.name) || 'unknown' });
+    return { outcome: 'failed', error: 'cooldown_write_failed' };
+  }
 
   let rescheduleUrl;
   try {
-    const token = await signRescheduleToken('reschedule', {
-      tenant_id: tenantId,
-      booking_id: bookingId,
-      start_at: startAt,
-    });
+    const claims = { tenant_id: tenantId, booking_id: bookingId, start_at: startAt };
+    if (cancellationWindowHours != null) claims.cancellation_window_hours = cancellationWindowHours;
+    const token = await signRescheduleToken('reschedule', claims);
     // BCH already sets SCHEDULE_BASE_URL (the staging redemption / WS-D3 domain); reuse it
     // rather than introduce a second base-URL env. Falls back to the prod redemption host.
     const baseUrl = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';

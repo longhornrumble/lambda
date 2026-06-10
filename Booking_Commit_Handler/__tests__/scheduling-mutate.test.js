@@ -4,7 +4,7 @@ const { handleSchedulingMutate } = require('../scheduling-mutate');
 
 // Minimal fakes for the injected seam (no real Google/Zoom/DDB).
 function baseInjected(overrides = {}) {
-  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [] };
+  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [] };
   const calendarEvents = {
     buildEventBody: (x) => ({ built: x }),
     insertEvent: (calId, body) => { calls.facade.push(['insert', calId]); return { id: 'evt-new' }; },
@@ -21,6 +21,7 @@ function baseInjected(overrides = {}) {
       bookingStore: {
         updateBookingReschedule: async (t, id, f) => { calls.persist.push([t, id, f]); },
         updateBookingCancelReason: async (t, id, f) => { calls.cancelReason.push([t, id, f]); },
+        touchRescheduleLinkSentAt: async (t, id, cd) => { calls.cooldown.push([t, id, cd]); return true; },
       },
       executeReschedule: async ({ booking, newSlot }) => { calls.reschedule.push({ booking, newSlot }); return { outcome: 'success', booking: { ...booking, external_event_id: 'evt-new', start_at: newSlot.start } }; },
       executeCancel: async ({ booking }) => { calls.cancel.push({ booking }); return { outcome: 'deleted', booking }; },
@@ -70,7 +71,7 @@ describe('handleSchedulingMutate — cancel', () => {
   it('runs executeCancel with the auth-curried facade and does NOT persist status (listener owns it)', async () => {
     const { injected, calls } = baseInjected();
     const out = await handleSchedulingMutate(
-      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1', booking: { booking_id: 'bk1' } },
+      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1', booking: { booking_id: 'bk1', tenant_id: 'T1' } },
       injected
     );
     expect(out.outcome).toBe('deleted');
@@ -83,7 +84,7 @@ describe('handleSchedulingMutate — cancel', () => {
     const { injected, calls } = baseInjected();
     const out = await handleSchedulingMutate(
       { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1',
-        booking: { booking_id: 'bk1' }, reason: 'Volunteer requested', canceled_by: 'admin@org.com' },
+        booking: { booking_id: 'bk1', tenant_id: 'T1' }, reason: 'Volunteer requested', canceled_by: 'admin@org.com' },
       injected
     );
     expect(out.outcome).toBe('deleted');
@@ -103,10 +104,20 @@ describe('handleSchedulingMutate — cancel', () => {
     });
     const out = await handleSchedulingMutate(
       { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1',
-        booking: { booking_id: 'bk1' }, reason: 'x' },
+        booking: { booking_id: 'bk1', tenant_id: 'T1' }, reason: 'x' },
       injected
     );
     expect(out.outcome).toBe('deleted'); // swallowed; cancel still reported success
+  });
+
+  it('STRICT tenant guard: a booking row MISSING tenantId/tenant_id is refused (not silently allowed)', async () => {
+    const { injected, calls } = baseInjected();
+    const out = await handleSchedulingMutate(
+      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1', booking: { booking_id: 'bk1' } },
+      injected
+    );
+    expect(out).toEqual({ outcome: 'failed', error: 'tenant_mismatch' });
+    expect(calls.cancel).toHaveLength(0); // never reached the calendar op
   });
 });
 
@@ -131,6 +142,46 @@ describe('handleSchedulingMutate — reschedule_link (G6, notify-only)', () => {
     expect(calls.notify[0].booking.rescheduleUrl).toMatch(/\/reschedule\?t=mock\.jwt\.token$/);
     // NEVER builds the calendar facade for a notify-only action
     expect(calls.facade).toHaveLength(0);
+    // claimed the anti-bombing cooldown slot BEFORE minting
+    expect(calls.cooldown).toHaveLength(1);
+    expect(calls.cooldown[0][0]).toBe('T1');
+    expect(calls.cooldown[0][1]).toBe('bk1');
+  });
+
+  it('passes the booking cancellation_window_hours into the token claims (matches disposition.js)', async () => {
+    const { injected, calls } = baseInjected();
+    await handleSchedulingMutate(
+      { ...RL_EVENT, booking: { ...RL_EVENT.booking, cancellation_window_hours: 24 } },
+      injected
+    );
+    expect(calls.token[0][1]).toMatchObject({ booking_id: 'bk1', cancellation_window_hours: 24 });
+  });
+
+  it('RATE-LIMITED: a repeat send within the cooldown is refused WITHOUT minting or notifying', async () => {
+    const { injected, calls } = baseInjected({
+      bookingStore: {
+        updateBookingReschedule: async () => {},
+        updateBookingCancelReason: async () => {},
+        touchRescheduleLinkSentAt: async () => false, // within cooldown
+      },
+    });
+    const out = await handleSchedulingMutate(RL_EVENT, injected);
+    expect(out).toEqual({ outcome: 'rate_limited' });
+    expect(calls.token).toHaveLength(0); // never minted a fresh token
+    expect(calls.notify).toHaveLength(0); // never emailed
+  });
+
+  it('a cooldown-write failure folds to a clean failed (no token, no email, no FunctionError)', async () => {
+    const { injected, calls } = baseInjected({
+      bookingStore: {
+        updateBookingReschedule: async () => {},
+        updateBookingCancelReason: async () => {},
+        touchRescheduleLinkSentAt: async () => { throw new Error('ddb down'); },
+      },
+    });
+    const out = await handleSchedulingMutate(RL_EVENT, injected);
+    expect(out).toEqual({ outcome: 'failed', error: 'cooldown_write_failed' });
+    expect(calls.token).toHaveLength(0);
   });
 
   it('a token-mint failure returns token_mint_failed and never notifies', async () => {
@@ -220,7 +271,7 @@ describe('handleSchedulingMutate — unexpected throw → clean failed (no Funct
       executeCancel: async () => { throw new Error('google 500'); },
     });
     const out = await handleSchedulingMutate(
-      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', booking: { booking_id: 'bk1' } },
+      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', booking: { booking_id: 'bk1', tenant_id: 'T1' } },
       injected
     );
     expect(out.outcome).toBe('failed');

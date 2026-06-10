@@ -72,4 +72,43 @@ describe('updateBookingCancelReason (G6 cancel-with-reason)', () => {
     await expect(bookingStore.updateBookingCancelReason('', 'bk1', { reason: 'x' })).rejects.toThrow();
     await expect(bookingStore.updateBookingCancelReason('T1', '', { reason: 'x' })).rejects.toThrow();
   });
+
+  it('throws on a non-string / empty reason (never marshals "undefined"/"null" into DDB)', async () => {
+    await expect(bookingStore.updateBookingCancelReason('T1', 'bk1', {})).rejects.toThrow();
+    await expect(bookingStore.updateBookingCancelReason('T1', 'bk1', { reason: undefined })).rejects.toThrow();
+    await expect(bookingStore.updateBookingCancelReason('T1', 'bk1', { reason: '' })).rejects.toThrow();
+    await expect(bookingStore.updateBookingCancelReason('T1', 'bk1', { reason: 123 })).rejects.toThrow();
+  });
+});
+
+describe('touchRescheduleLinkSentAt (G6 reschedule-link rate limit)', () => {
+  it('claims the slot: conditional UpdateItem (exists AND no-prior-or-stale) and returns true', async () => {
+    ddbMock.on(UpdateItemCommand).resolves({});
+    const ok = await bookingStore.touchRescheduleLinkSentAt('T1', 'booking#abc', 60, Date.UTC(2026, 0, 1, 0, 0, 0));
+    expect(ok).toBe(true);
+    const input = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
+    expect(input.Key).toEqual({ tenantId: { S: 'T1' }, booking_id: { S: 'booking#abc' } });
+    expect(input.UpdateExpression).toBe('SET reschedule_link_sent_at = :now');
+    expect(input.ConditionExpression).toContain('attribute_exists(booking_id)');
+    expect(input.ConditionExpression).toContain('attribute_not_exists(reschedule_link_sent_at) OR reschedule_link_sent_at < :cutoff');
+    expect(input.ExpressionAttributeValues[':now']).toEqual({ S: '2026-01-01T00:00:00.000Z' });
+    expect(input.ExpressionAttributeValues[':cutoff']).toEqual({ S: '2025-12-31T23:59:00.000Z' }); // now - 60s
+  });
+
+  it('returns false (not throw) when the cooldown condition fails', async () => {
+    const err = new Error('conditional'); err.name = 'ConditionalCheckFailedException';
+    ddbMock.on(UpdateItemCommand).rejects(err);
+    const ok = await bookingStore.touchRescheduleLinkSentAt('T1', 'bk1', 60);
+    expect(ok).toBe(false);
+  });
+
+  it('rethrows a non-conditional DDB error', async () => {
+    ddbMock.on(UpdateItemCommand).rejects(new Error('ProvisionedThroughputExceeded'));
+    await expect(bookingStore.touchRescheduleLinkSentAt('T1', 'bk1', 60)).rejects.toThrow('ProvisionedThroughputExceeded');
+  });
+
+  it('throws on missing keys', async () => {
+    await expect(bookingStore.touchRescheduleLinkSentAt('', 'bk1', 60)).rejects.toThrow();
+    await expect(bookingStore.touchRescheduleLinkSentAt('T1', '', 60)).rejects.toThrow();
+  });
 });

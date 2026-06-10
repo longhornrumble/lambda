@@ -4066,7 +4066,19 @@ _SCHED_CONFIG_LIST_LIMIT = 500
 # (coordinator_email == their email); admin/super_admin may act on any in-tenant booking.
 BOOKING_COMMIT_FUNCTION = os.environ.get('BOOKING_COMMIT_FUNCTION_NAME', 'Booking_Commit_Handler')
 _CANCEL_REASON_MAX = 1000
-_CANCELED_STATUSES = ('canceled', 'cancelled')
+# A booking in ANY terminal state is not actionable — re-canceling a completed/no-show booking
+# would delete an already-closed calendar event + overwrite the disposition, corrupting the row.
+# (Both spellings of canceled are guarded for historical-data drift.)
+_TERMINAL_STATUSES = ('canceled', 'cancelled', 'completed', 'no_show', 'coordinator_no_show')
+
+# Dedicated, BOUNDED Lambda client for the booking-action invoke (mirrors _secrets_client). A
+# bare boto3 client has no socket timeout → a slow BCH would hang ADA to its own 60s timeout
+# (a 504) instead of letting ADA return a clean 502. read_timeout is well under ADA's timeout;
+# NO retries — a retried cancel/reschedule_link invoke could double-delete or double-email.
+_booking_action_lambda_client = boto3.client(
+    'lambda',
+    config=Config(connect_timeout=3, read_timeout=30, retries={'max_attempts': 1}),
+)
 
 
 def _load_booking_for_action(tenant_id: str, booking_id: str) -> Optional[Dict[str, Any]]:
@@ -4093,8 +4105,9 @@ def _authorize_booking_action(booking: Dict[str, Any], user_role: Optional[str],
 
 
 def _invoke_booking_mutate(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Invoke BCH's scheduling_mutate executor (RequestResponse). Returns (result, error_str)."""
-    resp = lambda_client.invoke(
+    """Invoke BCH's scheduling_mutate executor (RequestResponse, bounded client). Returns
+    (result, error_str)."""
+    resp = _booking_action_lambda_client.invoke(
         FunctionName=BOOKING_COMMIT_FUNCTION,
         InvocationType='RequestResponse',
         Payload=json.dumps(payload).encode('utf-8'),
@@ -4104,6 +4117,26 @@ def _invoke_booking_mutate(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Opt
     if resp.get('FunctionError'):
         return result, 'function_error'
     return result, None
+
+
+def _load_authorize_actionable(tenant_id: str, booking_id: str, user_role: Optional[str],
+                               user_email: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Shared §8 gate for the booking-action handlers: load → authorize → terminal-status check.
+    Returns (booking, None) when the booking is actionable, or (None, error_response) to return
+    directly. A non-admin non-owner gets 404 (NOT 403) with the same body as a genuine miss, so a
+    caller cannot distinguish 'exists but not yours' from 'does not exist' (no enumeration oracle)."""
+    try:
+        booking = _load_booking_for_action(tenant_id, booking_id)
+    except ClientError as e:
+        logger.error(f"[scheduling/booking-action] GetItem failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return None, cors_response(502, {'error': 'failed to load booking'})
+    if not booking or not _authorize_booking_action(booking, user_role, user_email):
+        return None, cors_response(404, {'error': 'booking not found'})
+    status = (booking.get('status') or '').lower()
+    if status in _TERMINAL_STATUSES:
+        return None, cors_response(409, {'error': f'booking is not actionable (status: {status or "unknown"})',
+                                         'booking_id': booking_id, 'status': status})
+    return booking, None
 
 
 def handle_scheduling_booking_cancel(tenant_id: str, booking_id: str, body: Dict[str, Any],
@@ -4121,17 +4154,9 @@ def handle_scheduling_booking_cancel(tenant_id: str, booking_id: str, body: Dict
         return cors_response(400, {'error': 'reason is required'})
     if len(reason) > _CANCEL_REASON_MAX:
         return cors_response(400, {'error': f'reason exceeds {_CANCEL_REASON_MAX} chars'})
-    try:
-        booking = _load_booking_for_action(tenant_id, booking_id)
-    except ClientError as e:
-        logger.error(f"[scheduling/booking-cancel] GetItem failed (tenant={redact_tenant_id(tenant_id)}): {e}")
-        return cors_response(502, {'error': 'failed to load booking'})
-    if not booking:
-        return cors_response(404, {'error': 'booking not found'})
-    if not _authorize_booking_action(booking, user_role, user_email):
-        return cors_response(403, {'error': 'not permitted to cancel this booking'})
-    if (booking.get('status') or '').lower() in _CANCELED_STATUSES:
-        return cors_response(409, {'error': 'booking already canceled', 'booking_id': booking_id, 'status': 'canceled'})
+    booking, err_resp = _load_authorize_actionable(tenant_id, booking_id, user_role, user_email)
+    if err_resp:
+        return err_resp
 
     payload = {
         'action': 'scheduling_mutate',
@@ -4149,7 +4174,7 @@ def handle_scheduling_booking_cancel(tenant_id: str, booking_id: str, body: Dict
         logger.error(f"[scheduling/booking-cancel] invoke failed (tenant={redact_tenant_id(tenant_id)}): {e}")
         return cors_response(502, {'error': 'failed to cancel booking'})
     outcome = result.get('outcome')
-    if err or outcome not in ('deleted', 'canceled', 'pending_calendar_sync'):
+    if err or outcome not in ('deleted', 'pending_calendar_sync'):
         logger.error(f"[scheduling/booking-cancel] executor failure (tenant={redact_tenant_id(tenant_id)}, "
                      f"outcome={outcome}, err={err})")
         return cors_response(502, {'error': 'cancel failed'})
@@ -4170,17 +4195,9 @@ def handle_scheduling_booking_reschedule_link(tenant_id: str, booking_id: str,
     access_error = validate_feature_access(tenant_id, 'dashboard_scheduling', user_role)
     if access_error:
         return access_error
-    try:
-        booking = _load_booking_for_action(tenant_id, booking_id)
-    except ClientError as e:
-        logger.error(f"[scheduling/reschedule-link] GetItem failed (tenant={redact_tenant_id(tenant_id)}): {e}")
-        return cors_response(502, {'error': 'failed to load booking'})
-    if not booking:
-        return cors_response(404, {'error': 'booking not found'})
-    if not _authorize_booking_action(booking, user_role, user_email):
-        return cors_response(403, {'error': 'not permitted to reschedule this booking'})
-    if (booking.get('status') or '').lower() in _CANCELED_STATUSES:
-        return cors_response(409, {'error': 'cannot send a reschedule link for a canceled booking'})
+    booking, err_resp = _load_authorize_actionable(tenant_id, booking_id, user_role, user_email)
+    if err_resp:
+        return err_resp
 
     payload = {
         'action': 'scheduling_mutate',
@@ -4195,9 +4212,15 @@ def handle_scheduling_booking_reschedule_link(tenant_id: str, booking_id: str,
     except ClientError as e:
         logger.error(f"[scheduling/reschedule-link] invoke failed (tenant={redact_tenant_id(tenant_id)}): {e}")
         return cors_response(502, {'error': 'failed to send reschedule link'})
-    if err or result.get('outcome') != 'success':
+    outcome = result.get('outcome')
+    # BCH refuses a repeat send within the anti-bombing cooldown → 429 (a distinct, retriable-later
+    # signal the portal can surface, NOT a 502 error).
+    if not err and outcome == 'rate_limited':
+        return cors_response(429, {'error': 'a reschedule link was sent recently; please wait before resending',
+                                   'booking_id': booking_id})
+    if err or outcome != 'success':
         logger.error(f"[scheduling/reschedule-link] executor failure (tenant={redact_tenant_id(tenant_id)}, "
-                     f"outcome={result.get('outcome')}, err={err})")
+                     f"outcome={outcome}, err={err})")
         return cors_response(502, {'error': 'reschedule link failed'})
     logger.info(f"[scheduling/reschedule-link] tenant={redact_tenant_id(tenant_id)} "
                 f"by={redact_email(user_email or '')} sent={bool(result.get('sent'))}")

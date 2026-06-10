@@ -73,6 +73,8 @@ describe('cancelOnCoordinatorDelete — calendar_deleted booked→canceled (idem
     expect(call.ExpressionAttributeValues[':r']).toEqual({ S: 'coordinator_deleted' });
     expect(call.ExpressionAttributeValues[':at']).toEqual({ S: base.now });
     expect(call.UpdateExpression).not.toContain('rescheduleOfBookingId');
+    // G6: if_not_exists preserves an admin cancel-with-reason written just before this fires.
+    expect(call.UpdateExpression).toContain('cancel_reason = if_not_exists(cancel_reason, :r)');
   });
 
   it('returns false on ConditionalCheckFailed (already canceled / terminal / absent)', async () => {
