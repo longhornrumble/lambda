@@ -50,6 +50,10 @@ const {
   DynamoDBClient,
   PutItemCommand,
 } = require('@aws-sdk/client-dynamodb');
+// E.164 normalization lives in phone.js (single source of truth) so the reminder-dispatcher
+// reader can share it without importing this AWS-touching writer (Track 1 S3). Re-exported
+// below so existing importers of `toE164` from consent.js are unaffected.
+const { toE164 } = require('./phone');
 
 // Created once at module load; reused across warm invocations.
 const ddb = new DynamoDBClient({});
@@ -60,31 +64,8 @@ const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent'
 // a grace beyond the 4-yr retention floor; epoch SECONDS for the DynamoDB TTL attribute.
 const CONSENT_TTL_SECONDS = (4 * 365 + 30) * 24 * 60 * 60;
 
-// ─── phone normalization (E.164-before-write) ──────────────────────────────────────────
-
-// Returns the E.164 string, or null if it cannot be normalized to a valid E.164 number.
-// Mirrors form_handler.js writeConsentRecord: a bare 10-digit US number gets a +1; an
-// already-+-prefixed number keeps its country code. Anything outside +<10..15 digits> is
-// rejected (null) — never written.
-function toE164(raw) {
-  if (typeof raw !== 'string' || raw.trim() === '') return null;
-  const trimmed = raw.trim();
-  let phone;
-  if (trimmed.startsWith('+')) {
-    phone = trimmed;
-  } else {
-    const digits = trimmed.replace(/\D/g, '');
-    // A bare 11-digit number already carrying the US country code (leading 1) keeps it
-    // (just prepend +); a bare 10-digit local number gets +1. Without this, an 11-digit
-    // "15125551234" would become "+115125551234" — a double country code that mis-keys
-    // the consent record and silently suppresses the legit SMS (fail-closed, but wrong).
-    phone =
-      digits.length === 11 && digits.startsWith('1')
-        ? `+${digits}`
-        : `+1${digits}`;
-  }
-  return /^\+\d{10,15}$/.test(phone) ? phone : null;
-}
+// phone normalization (E.164-before-write): toE164 now lives in ./phone (single source of
+// truth — see the require above) and is re-exported below for backward compatibility.
 
 // ─── default DI implementation (the only AWS-touching code) ─────────────────────────────
 

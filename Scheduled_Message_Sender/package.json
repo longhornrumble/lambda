@@ -7,7 +7,7 @@
   "scripts": {
     "test": "node --test *.test.mjs",
     "build": "node esbuild.config.mjs",
-    "package": "npm run build && cp package.json dist/package.json && cd dist && zip -X ../deployment.zip index.mjs package.json"
+    "package": "npm run build && zip -j deployment.zip dist/index.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.700.0",

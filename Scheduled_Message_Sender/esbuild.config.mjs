@@ -19,7 +19,12 @@ await esbuild.build({
   platform: 'node',
   target: 'node20',
   outfile: 'dist/index.mjs',
-  format: 'esm', // preserves the named `export async function handler` for the runtime
+  // ESM output (dist/index.mjs) — the honest fit: the source is .mjs and package.json is
+  // "type":"module", so a .js/cjs bundle would be mis-interpreted as ESM under that package.json
+  // (load returns an empty module). The .mjs extension forces ESM regardless of any package.json,
+  // so the bundle loads correctly + the deploy needs no package.json in the zip. Lambda handler
+  // stays `index.handler` (the runtime resolves index.mjs as ESM and reads the named export).
+  format: 'esm',
   external: LAMBDA_EXTERNALS,
   treeShaking: true,
   keepNames: true,

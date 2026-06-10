@@ -26,31 +26,12 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
-// §E3 TCPA gate (WS-E-TCPA, FROZEN). PURE (no top-level I/O). This Lambda is now
-// esbuild-bundled (the raw-zip deploy can't see ../shared) so this resolves into the
-// deployable — see esbuild.config.mjs. We do NOT import consent.js for toE164: that module
-// require()s @aws-sdk at load (it owns the consent WRITER), and dragging the whole DDB
-// writer into this lean reader-only Lambda + its node:test job isn't worth one formatter.
-// toE164 is inlined below as a byte-parity mirror (see consent.js toE164).
+// §E3 TCPA gate (WS-E-TCPA, FROZEN) + the shared E.164 normalizer (single source of truth —
+// keys the consent lookup identically to the writer). Both are PURE (no top-level @aws-sdk),
+// so this reader-only Lambda imports them without dragging the consent WRITER's AWS deps in.
+// This Lambda is esbuild-bundled (the raw-zip deploy can't see ../shared) — see esbuild.config.mjs.
 import { selectChannels } from '../shared/scheduling/channels.js';
-
-// E.164 normalizer — PARITY MIRROR of shared/scheduling/consent.js `toE164` (itself a mirror
-// of form_handler.js writeConsentRecord). MUST stay byte-identical so the consent lookup key
-// here matches the writer's; a divergence fail-closes (missed consent → SMS suppressed, email
-// floor stands), never a wrongful send. Bare 10-digit → +1; 11-digit leading-1 → +; else as-is;
-// reject anything outside +<10..15 digits>.
-function toE164(raw) {
-  if (typeof raw !== 'string' || raw.trim() === '') return null;
-  const trimmed = raw.trim();
-  let phone;
-  if (trimmed.startsWith('+')) {
-    phone = trimmed;
-  } else {
-    const digits = trimmed.replace(/\D/g, '');
-    phone = digits.length === 11 && digits.startsWith('1') ? `+${digits}` : `+1${digits}`;
-  }
-  return /^\+\d{10,15}$/.test(phone) ? phone : null;
-}
+import { toE164 } from '../shared/scheduling/phone.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const ddbClient = new DynamoDBClient({ region });
@@ -66,7 +47,10 @@ const SEND_EMAIL_FUNCTION = process.env.SEND_EMAIL_FUNCTION || 'send_email';
  * Bare fail-closed consent check (legacy single-channel rows only — the §E3
  * selectChannels gate supersedes this for reminder rows that carry tenant_prefs).
  */
-async function checkConsent(ddb, tenantId, phoneE164) {
+async function checkConsent(ddb, tenantId, phoneRaw) {
+  // Normalize to E.164 so the key matches the writer's (a bare 10-digit row-phone would
+  // otherwise miss the +1-prefixed consent record and silently suppress a legit SMS).
+  const phoneE164 = toE164(phoneRaw);
   if (!phoneE164) return false;
   try {
     const result = await ddb.send(new GetCommand({
@@ -102,7 +86,10 @@ async function readConsentRecord(ddb, tenantId, phoneRaw, logger) {
     if (!result.Item) return null;
     return {
       consent_given: result.Item.consent_given === true,
-      opted_out_at: result.Item.opted_out_at || undefined,
+      // ?? (not ||): pass a real opt-out timestamp through; coerce only DDB NULL→null to
+      // undefined. || would also swallow a wrong-typed falsy (e.g. "" / false) as "not opted
+      // out" — ?? preserves it so consentValid (!opted_out_at) still fail-closes correctly.
+      opted_out_at: result.Item.opted_out_at ?? undefined,
     };
   } catch (error) {
     (logger || console).error(`consent record read failed: ${error.message}`);
@@ -121,6 +108,9 @@ async function resolveChannels(message, deps) {
   // §E3 fire-time gate path — only when the row carries the gate context AND a gate is wired.
   if (deps.selectChannels && message.tenant_prefs) {
     try {
+      // Capture the fire instant BEFORE the consent I/O — quiet-hours is TCPA-sensitive, so a
+      // slow GetItem must not drift fireTime past the 8pm/8am boundary into a wrong decision.
+      const fireTime = deps.now();
       // org-level toggle from the row snapshot (captured at schedule-creation).
       const orgSmsEnabled = message.tenant_prefs?.notificationPrefs?.sms === true;
       // Only the consent read is I/O — skip it when SMS can't win anyway (org off / no phone):
@@ -136,7 +126,7 @@ async function resolveChannels(message, deps) {
         booking: { timezone: message.timezone },
         orgSmsEnabled,
         consentRecord,
-        fireTime: deps.now(),
+        fireTime,
       });
       // Email is the floor — always true per §E3, but never email a row with no recipient.
       return {

@@ -714,7 +714,8 @@ jobs:
       needs.detect-changes.outputs.attendance_disposition_handler == 'true' ||
       needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
       needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true' ||
-      needs.detect-changes.outputs.calendar_oauth_connect == 'true'
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true' ||
+      needs.detect-changes.outputs.scheduled_message_sender == 'true'
 
     strategy:
       fail-fast: false
@@ -752,6 +753,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.scheduling_synthetic_monitor }}
           - lambda: Calendar_OAuth_Connect
             changed: ${{ needs.detect-changes.outputs.calendar_oauth_connect }}
+          - lambda: Scheduled_Message_Sender
+            changed: ${{ needs.detect-changes.outputs.scheduled_message_sender }}
 
     steps:
       - name: Skip unchanged Lambda
@@ -798,17 +801,19 @@ jobs:
         working-directory: ${{ matrix.lambda }}
         run: node esbuild.config.mjs
 
-      - name: Verify dist/index.js exists
+      - name: Verify dist bundle exists
         if: |
           matrix.changed == 'true' ||
           needs.detect-changes.outputs.shared == 'true'
         working-directory: ${{ matrix.lambda }}
         run: |
-          if [ ! -f dist/index.js ]; then
-            echo "ERROR: dist/index.js not produced by esbuild for ${{ matrix.lambda }}"
+          # Most Lambdas emit dist/index.js (cjs); Scheduled_Message_Sender emits dist/index.mjs
+          # (ESM source + package.json "type":"module"). Accept either.
+          if [ ! -f dist/index.js ] && [ ! -f dist/index.mjs ]; then
+            echo "ERROR: no dist/index.{js,mjs} produced by esbuild for ${{ matrix.lambda }}"
             exit 1
           fi
-          echo "OK: dist/index.js exists"
+          echo "OK: dist bundle exists"
 
       - name: Check bundle size
         if: |
@@ -816,12 +821,13 @@ jobs:
           needs.detect-changes.outputs.shared == 'true'
         working-directory: ${{ matrix.lambda }}
         run: |
+          BUNDLE_FILE=$([ -f dist/index.js ] && echo dist/index.js || echo dist/index.mjs)
           # macOS stat: -f%z | Linux stat: -c%s
-          BUNDLE_BYTES=$(stat -c%z dist/index.js 2>/dev/null || stat -f%z dist/index.js)
+          BUNDLE_BYTES=$(stat -c%z "$BUNDLE_FILE" 2>/dev/null || stat -f%z "$BUNDLE_FILE")
           BUNDLE_KB=$((BUNDLE_BYTES / 1024))
           BUNDLE_MB=$(echo "scale=2; $BUNDLE_BYTES / 1048576" | bc)
 
-          echo "Bundle size: ${BUNDLE_KB}KB (${BUNDLE_MB}MB) — ${{ matrix.lambda }}/dist/index.js"
+          echo "Bundle size: ${BUNDLE_KB}KB (${BUNDLE_MB}MB) — ${{ matrix.lambda }}/${BUNDLE_FILE}"
 
           # Warn threshold: 5MB (Lambda cold start degrades noticeably above this)
           WARN_BYTES=5242880
