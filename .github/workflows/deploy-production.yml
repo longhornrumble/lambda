@@ -47,11 +47,17 @@ on:
 
 concurrency:
   group: deploy-prod-${{ github.event.inputs.lambda }}
+  # Queued runs wait, never cancel a mid-flight deploy. Caveat (audit N4): a
+  # queued second dispatch WILL run on top of a failed first run's $LATEST —
+  # if a run fails, cancel anything queued behind it before investigating.
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-east-1
-  NODE_VERSION: '20.x'   # Match the Lambda nodejs20.x runtime (mirrors deploy-staging.yml)
+  # Keep MANUALLY in sync with the BSH function's runtime (nodejs20.x today).
+  # There is no mechanical coupling (audit C3): bumping the Lambda runtime
+  # does not update this, and vice versa — change both together.
+  NODE_VERSION: '20.x'
 
 jobs:
   deploy:
@@ -139,6 +145,12 @@ jobs:
             # convention from the §P5.1 promote).
             alias: ''
             # Through CloudFront so the SigV4 signer + cf-origin header apply.
+            # Smoke depth (audit C1): a 200 here is NOT just CF-layer health —
+            # the request invokes the Lambda through the Function URL, so a
+            # bundle that fails at module load returns 502 and fails the
+            # smoke. What it does NOT prove: Bedrock connectivity or a real
+            # streaming conversation (that's the operator's post-deploy
+            # widget check / the BSH ops alarms).
             smoke_url: 'https://chat.myrecruiter.ai/stream'
             smoke_path: ''
             smoke_expect_status: '200'
@@ -202,6 +214,8 @@ jobs:
           # backfill utilities live in the repo but never ship). New
           # non-deployed file classes extend that exclusion regex.
           # unzip -Z1 = one filename per line (space-safe, unlike awk on -l).
+          # Fire-tested 2026-06-09 (audit C4): a zip built without
+          # pii_subject.py failed the guard as designed.
           SRC='${{ matrix.lambda.source_dir }}'
           MISSING=0
           while IFS= read -r f; do
@@ -233,16 +247,25 @@ jobs:
           aws lambda wait function-updated \
             --function-name ${{ matrix.lambda.prod_function }}
 
+      # Re-running a failed run re-uploads the same zip and publishes a NEW
+      # version number with identical code (audit C2) — benign duplicate in
+      # the version history; re-run is the intended recovery action.
       - name: Publish version (audit trail / rollback snapshot)
         if: matrix.lambda.prod_function == github.event.inputs.lambda
         id: publish
+        # Free-text input reaches the shell via env, NEVER inline ${{ }}
+        # interpolation: a note containing `$LATEST` killed run 27248430578
+        # ("LATEST: unbound variable" under set -u), and inline interpolation
+        # of free text into a script is shell injection by construction.
+        env:
+          RELEASE_NOTE: ${{ github.event.inputs.release_note }}
         run: |
           set -euo pipefail
           COMMIT_SHA=$(git rev-parse HEAD)
           COMMIT_MSG=$(git log -1 --pretty=%s)
           NOTE="PROD: ${COMMIT_MSG} (${COMMIT_SHA:0:7})"
-          if [ -n "${{ github.event.inputs.release_note }}" ]; then
-            NOTE="${NOTE} | ${{ github.event.inputs.release_note }}"
+          if [ -n "$RELEASE_NOTE" ]; then
+            NOTE="${NOTE} | ${RELEASE_NOTE}"
           fi
           NOTE=${NOTE:0:256}
           NEW_VERSION=$(aws lambda publish-version \
