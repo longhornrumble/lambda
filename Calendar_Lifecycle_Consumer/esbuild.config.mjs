@@ -10,6 +10,9 @@ const LAMBDA_EXTERNALS = [
   // gap C (Y) wire: notify.js → client-lambda; tokens.js (§13.4) → client-secrets-manager.
   '@aws-sdk/client-lambda',
   '@aws-sdk/client-secrets-manager',
+  // Track 1: Reminder_Scheduler.deleteReminders → EventBridge Scheduler + DDB document client.
+  '@aws-sdk/client-scheduler',
+  '@aws-sdk/lib-dynamodb',
 ];
 
 await esbuild.build({
