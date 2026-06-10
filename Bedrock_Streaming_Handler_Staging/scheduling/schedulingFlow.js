@@ -219,12 +219,16 @@ function _resolveFacade({ tenantId, binding, booking, deps }) {
 // pure executor. On executor error / outcome 'failed' we DON'T claim success: the caller
 // surfaces the "we'll confirm by email" fallback rather than a silent no-op.
 // Audit NTH1 (PII): project the booking to ONLY the fields the executor + reschedule.js +
-// cancel.js read (verified exhaustively) — drops attendee_phone + booking metadata from the
-// cross-Lambda payload. NOT the 6-field strip the reviewer first suggested: reschedule
-// rebuilds the new invite, so attendee_email/name + appointment_type_name + timezone ARE
-// required (omitting them would create an event with no attendee). Both casings kept so the
-// executor's pick() still resolves. (transport is encrypted + same-account + not logged;
-// this minimizes blast radius, it is not the security boundary.)
+// cancel.js read (verified exhaustively). NOT the 6-field strip the reviewer first suggested:
+// reschedule rebuilds the new invite, so attendee_email/name + appointment_type_name + timezone
+// ARE required (omitting them would create an event with no attendee). Both casings kept so the
+// executor's pick() still resolves. (transport is encrypted + same-account + not logged; this
+// minimizes blast radius, it is not the security boundary.)
+// Track 1 S1.1: attendee_phone + organization_name are carried so the executor's reminder
+// rebind (scheduling-mutate → rebindReminders) snapshots the real phone (the TCPA-gated SMS
+// supplement is impossible without it) + org name (else every rescheduled-booking reminder
+// reads "your appointment with us"). organization_name is persisted on the Booking row at
+// commit (booking-store), so deps.loadBooking surfaces it for the projection.
 const _EXEC_BOOKING_FIELDS = [
   'booking_id', 'bookingId', 'tenant_id', 'tenantId',
   'coordinator_email', 'coordinatorEmail', 'resource_id', 'resourceId',
@@ -232,6 +236,7 @@ const _EXEC_BOOKING_FIELDS = [
   'conference_provider', 'conferenceProvider', 'appointment_type_name', 'appointmentTypeName',
   'attendee_email', 'attendeeEmail', 'attendee_first_name', 'attendeeFirstName',
   'attendee_last_name', 'attendeeLastName', 'attendee_name', 'attendeeName',
+  'attendee_phone', 'attendeePhone', 'organization_name', 'organizationName',
   'timezone', 'timeZone', 'deep_link', 'deepLink',
 ];
 function _projectBookingForExecutor(booking) {

@@ -104,6 +104,11 @@ function buildBookingItem(b) {
   // Optional / PII fields — only set when present (schema discipline; forward-compat).
   if (b.attendeeName) item.attendee_name = s(b.attendeeName);
   if (b.attendeePhone) item.attendee_phone = s(b.attendeePhone);
+  // Track 1 S1.1: persist the display name + appointment-type name so a later in-chat
+  // reschedule (which loads this row to re-bind reminders) renders real reminder copy
+  // instead of the generic "your appointment with us" / "appointment" fallbacks.
+  if (b.organizationName) item.organization_name = s(b.organizationName);
+  if (b.appointmentTypeName) item.appointment_type_name = s(b.appointmentTypeName);
   if (b.conferenceId) item.conference_id = s(b.conferenceId);
   if (b.joinUrl) item.channel_details = s(b.joinUrl);
   if (b.rescheduleOfBookingId) item.reschedule_of_booking_id = s(b.rescheduleOfBookingId);

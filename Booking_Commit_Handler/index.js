@@ -159,6 +159,16 @@ function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail }
 // org SMS pref is read from the tenant config here, post-commit — NOT on the latency-sensitive
 // pre-commit path; the in-chat reschedule path re-binds via the event-passed org flag instead.
 async function scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail }) {
+  // Inert-and-QUIET until S6 wires the EventBridge Scheduler IaC: with no scheduler target
+  // configured, every CreateSchedule would throw + alert on EVERY booking (alert-channel
+  // noise). Skip silently when the scheduler env is absent — activates the instant S6 sets
+  // SCHEDULER_TARGET_ARN. A test injects ctx.schedulerConfigured to exercise the live path.
+  const schedulerConfigured =
+    ctx.schedulerConfigured != null ? ctx.schedulerConfigured : !!process.env.SCHEDULER_TARGET_ARN;
+  if (!schedulerConfigured) {
+    log('reminder_scheduling_skipped_not_configured', { booking_id: bookingId });
+    return;
+  }
   const scheduleReminders = ctx.scheduleReminders || reminderScheduler.scheduleReminders;
   const loadTenantConfig = ctx.loadTenantConfig || featureGate.loadTenantConfig;
   try {
@@ -329,6 +339,10 @@ async function commitAgainstResource({
         // here would 404 a later mutation of this booking.
         coordinatorEmail: calendarId, resourceId,
         appointmentTypeId: ctx.appointmentTypeId,
+        // Track 1 S1.1: persist the display + appointment-type names so a later in-chat
+        // reschedule re-binds reminders with real copy (the loaded row feeds the executor).
+        appointmentTypeName: ctx.appointmentTypeName,
+        organizationName: ctx.orgName,
         attendeeEmail: ctx.attendee.email,
         attendeeName: [ctx.attendee.first_name, ctx.attendee.last_name].filter(Boolean).join(' '),
         attendeePhone: ctx.attendee.phone,
@@ -396,7 +410,14 @@ async function commitAgainstResource({
 
     // Track 1 (§E1): schedule the reminder + attendance messages. Best-effort, post-commit,
     // post-email — a reminder-scheduling failure NEVER undoes a committed booking.
-    await scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail: calendarId });
+    // Double-guard: scheduleBookingReminders self-contains all throws, but this call sits
+    // inside the commit's compensating try/catch, so wrap it too — a future edit that adds a
+    // throw path can NEVER turn a committed booking into a rollback (structural isolation).
+    try {
+      await scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail: calendarId });
+    } catch (remErr) {
+      warn('reminder_schedule_unexpected', { booking_id: bookingId, error: remErr.message });
+    }
 
     return {
       // No coordinatorEmail in the response (§5.7 PII boundary): the caller has
@@ -615,6 +636,7 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
     scheduleReminders: injected.scheduleReminders,
     loadTenantConfig: injected.loadTenantConfig,
     isSynthetic: event.is_synthetic === true,
+    schedulerConfigured: injected.schedulerConfigured, // test seam for the not-configured skip
   };
 
   // step 1: live freeBusy re-check → surviving candidates (tie-broken order).
