@@ -22,6 +22,10 @@ const mockSign = jest.fn();
 jest.mock('../shared/scheduling/notify', () => ({ dispatchVolunteerNotice: (...a) => mockDispatchVolunteerNotice(...a) }));
 jest.mock('../shared/scheduling/tokens', () => ({ sign: (...a) => mockSign(...a) }));
 
+// Track 1: the reminder scheduler (mocked — no real EventBridge Scheduler / DDB).
+const mockDeleteReminders = jest.fn();
+jest.mock('../Reminder_Scheduler/scheduler', () => ({ deleteReminders: (...a) => mockDeleteReminders(...a) }));
+
 const reconcile = require('./booking-reconcile');
 
 const FULL_CTX = { attendeeEmail: 'vol@example.org', attendeeName: 'Vol', appointmentTypeId: 'apt-1', startAt: '2026-06-10T15:00:00Z' };
@@ -34,10 +38,15 @@ beforeEach(() => {
   mockGetNoticeContext.mockReset().mockResolvedValue(FULL_CTX);
   mockDispatchVolunteerNotice.mockReset().mockResolvedValue({ suppressed: false, dispatched: { email: 'queued' } });
   mockSign.mockReset().mockResolvedValue('tok-resched');
+  mockDeleteReminders.mockReset().mockResolvedValue({ deleted: true });
+  delete process.env.SCHEDULER_TARGET_ARN; // default: scheduler not wired → reminder teardown skipped
   logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'warn').mockImplementation(() => {});
 });
-afterEach(() => jest.restoreAllMocks());
+afterEach(() => {
+  delete process.env.SCHEDULER_TARGET_ARN;
+  jest.restoreAllMocks();
+});
 
 function loggedEvents() {
   return logSpy.mock.calls.map((c) => { try { return JSON.parse(c[0]).event; } catch (_) { return ''; } });
@@ -182,5 +191,50 @@ describe('requireStrings helper', () => {
   });
   it('passes when all fields are non-empty strings', () => {
     expect(() => reconcile.requireStrings({ a: 'x', b: 'y' }, ['a', 'b'])).not.toThrow();
+  });
+});
+
+describe('Track 1 — reminder teardown on cancel/move', () => {
+  const DEL_ENV = { tenant_id: 'AUS123957', booking_id: 'booking#1' };
+  const MOVE_ENV = { tenant_id: 'AUS123957', booking_id: 'booking#1', new_start_at: '2026-07-01T15:00:00Z', new_end_at: '2026-07-01T15:30:00Z' };
+
+  it('reconcileDeleted tears down reminders (by {tenantId, bookingId}) when the scheduler is wired', async () => {
+    process.env.SCHEDULER_TARGET_ARN = 'arn:aws:scheduler:us-east-1:525409062831:schedule/picasso-scheduling/x';
+    await reconcile.reconcileDeleted(DEL_ENV);
+    expect(mockDeleteReminders).toHaveBeenCalledWith({ tenantId: 'AUS123957', bookingId: 'booking#1' });
+    expect(loggedEvents()).toContain('reminders_teardown_requested');
+  });
+
+  it('reconcileMoved tears down reminders (a move cancels the booking)', async () => {
+    process.env.SCHEDULER_TARGET_ARN = 'arn:aws:scheduler:us-east-1:525409062831:schedule/picasso-scheduling/x';
+    await reconcile.reconcileMoved(MOVE_ENV);
+    expect(mockDeleteReminders).toHaveBeenCalledWith({ tenantId: 'AUS123957', bookingId: 'booking#1' });
+  });
+
+  it('skips teardown SILENTLY when the scheduler is not wired (no SCHEDULER_TARGET_ARN)', async () => {
+    // env unset by beforeEach
+    await reconcile.reconcileDeleted(DEL_ENV);
+    expect(mockDeleteReminders).not.toHaveBeenCalled();
+  });
+
+  it('does NOT tear down reminders on a delete no-op (booking was not canceled)', async () => {
+    process.env.SCHEDULER_TARGET_ARN = 'arn:...';
+    mockCancelDelete.mockResolvedValue(false); // already canceled / not found
+    await reconcile.reconcileDeleted(DEL_ENV);
+    expect(mockDeleteReminders).not.toHaveBeenCalled();
+  });
+
+  it('does NOT tear down reminders on a move no-op (booking was not canceled)', async () => {
+    process.env.SCHEDULER_TARGET_ARN = 'arn:...';
+    mockCancelMove.mockResolvedValue(false);
+    await reconcile.reconcileMoved(MOVE_ENV);
+    expect(mockDeleteReminders).not.toHaveBeenCalled();
+  });
+
+  it('a teardown failure is non-fatal (cancel already durable; record must not redrive)', async () => {
+    process.env.SCHEDULER_TARGET_ARN = 'arn:...';
+    mockDeleteReminders.mockRejectedValue(new Error('scheduler down'));
+    await expect(reconcile.reconcileDeleted(DEL_ENV)).resolves.toBeUndefined();
+    expect(loggedEvents()).toContain('calendar_deleted_canceled'); // the cancel still succeeded
   });
 });

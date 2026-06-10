@@ -19,6 +19,7 @@
 const bookingStore = require('./booking-store');
 const { dispatchVolunteerNotice } = require('../shared/scheduling/notify'); // (Y) §B8
 const { sign } = require('../shared/scheduling/tokens'); // §13.4 signed reschedule link
+const reminderScheduler = require('../Reminder_Scheduler/scheduler'); // Track 1: delete reminders on cancel/move
 
 const SCHEDULE_BASE_URL = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
 
@@ -27,6 +28,25 @@ function log(event, fields) {
 }
 function warn(event, fields) {
   console.warn(JSON.stringify({ event, level: 'WARN', ...fields }));
+}
+
+// Track 1 (§E1): tear down a booking's reminder + attendance schedules when it's canceled
+// (a coordinator delete OR move — both cancel the booking; a rebook is a NEW booking that
+// re-schedules at commit, satisfying the "reminders still materialize" intent). Best-effort:
+// the cancel is the durable outcome, so a teardown failure must NEVER fail/redrive the record.
+// deleteReminders is idempotent (404/missing → success) and self-loads the booking's exact
+// schedule state. Inert-and-QUIET until S6 wires the scheduler (no SCHEDULER_TARGET_ARN → no
+// schedules exist → skip), matching the BCH commit-path guard.
+async function deleteBookingReminders(tenantId, bookingId) {
+  if (!process.env.SCHEDULER_TARGET_ARN) return;
+  try {
+    await reminderScheduler.deleteReminders({ tenantId, bookingId });
+    // Distinct from scheduler.js's own 'reminders_deleted' (the authoritative teardown log) —
+    // this marks the consumer requested it, so a metric filter on either won't double-count.
+    log('reminders_teardown_requested', { tenant_id: tenantId, booking_id: bookingId });
+  } catch (err) {
+    warn('reminder_delete_failed', { tenant_id: tenantId, booking_id: bookingId, error: err.message });
+  }
 }
 
 // Require non-empty string fields. Applied ONLY to the fields an action actually needs
@@ -55,6 +75,8 @@ async function reconcileDeleted(env) {
     // Google's cancellation email lacks the reschedule link. Best-effort — the cancel
     // (the durable outcome) already succeeded, so a notice failure must NOT redrive.
     await sendCancelNotice(tenantId, bookingId);
+    // Track 1: tear down the canceled booking's reminders (best-effort, idempotent).
+    await deleteBookingReminders(tenantId, bookingId);
   } else {
     log('calendar_deleted_noop', { tenant_id: tenantId, booking_id: bookingId });
   }
@@ -125,6 +147,9 @@ async function reconcileMoved(env) {
     } catch (err) {
       warn('moved_notice_failed', { tenant_id: tenantId, booking_id: bookingId, error: err.message });
     }
+    // Track 1: a move cancels the booking → tear down its reminders. The rebook is a NEW
+    // booking that re-schedules fresh at commit (best-effort, idempotent).
+    await deleteBookingReminders(tenantId, bookingId);
   } else {
     log('calendar_moved_noop', { tenant_id: tenantId, booking_id: bookingId });
   }
