@@ -339,6 +339,10 @@ async function defaultLoadTemplateOverride({ tenantId, kind, log = console } = {
     const it = res.Item;
     if (!it) return null;
     const s = (a) => (a && typeof a.S === 'string' ? a.S : undefined);
+    // G7 items 4-5 (SMS SEND, HELD): the ADA editor (G7a) stores the SMS override under the
+    // attribute name `sms_text` on this same row. When the SMS send path lands, project it here
+    // (`sms: s(it.sms_text)`) and append the TCPA STOP/HELP footer AFTER render — and add the
+    // ADA↔notify.js SMS-defaults PARITY TEST as a merge gate (mirrors the email-defaults parity).
     return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html) };
   } catch (err) {
     (log || console).warn(
