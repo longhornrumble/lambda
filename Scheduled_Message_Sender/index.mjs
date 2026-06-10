@@ -26,6 +26,31 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
+// §E3 TCPA gate (WS-E-TCPA, FROZEN). PURE (no top-level I/O). This Lambda is now
+// esbuild-bundled (the raw-zip deploy can't see ../shared) so this resolves into the
+// deployable — see esbuild.config.mjs. We do NOT import consent.js for toE164: that module
+// require()s @aws-sdk at load (it owns the consent WRITER), and dragging the whole DDB
+// writer into this lean reader-only Lambda + its node:test job isn't worth one formatter.
+// toE164 is inlined below as a byte-parity mirror (see consent.js toE164).
+import { selectChannels } from '../shared/scheduling/channels.js';
+
+// E.164 normalizer — PARITY MIRROR of shared/scheduling/consent.js `toE164` (itself a mirror
+// of form_handler.js writeConsentRecord). MUST stay byte-identical so the consent lookup key
+// here matches the writer's; a divergence fail-closes (missed consent → SMS suppressed, email
+// floor stands), never a wrongful send. Bare 10-digit → +1; 11-digit leading-1 → +; else as-is;
+// reject anything outside +<10..15 digits>.
+function toE164(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  const trimmed = raw.trim();
+  let phone;
+  if (trimmed.startsWith('+')) {
+    phone = trimmed;
+  } else {
+    const digits = trimmed.replace(/\D/g, '');
+    phone = digits.length === 11 && digits.startsWith('1') ? `+${digits}` : `+1${digits}`;
+  }
+  return /^\+\d{10,15}$/.test(phone) ? phone : null;
+}
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const ddbClient = new DynamoDBClient({ region });
@@ -58,24 +83,30 @@ async function checkConsent(ddb, tenantId, phoneE164) {
 }
 
 /**
- * "now" in the booking's local timezone, as a Date whose UTC fields carry the local
- * wall clock (so a consumer reads the local hour via getUTCHours()). Computed AT FIRE
- * TIME from the row's snapshotted timezone (§E3: quiet-hours is fire-time, never
- * schedule-creation). Shape is an integration seam confirmed with WS-E-TCPA at weave.
+ * Read the recipient's SMS consent RECORD for the §E3 gate (selectChannels is PURE — it
+ * needs the record passed in). Keyed on the SAME picasso-sms-consent key the consent.js
+ * writer + SMS_Sender use (pk=TENANT#{tenantId}, sk=CONSENT#transactional#{E.164}), via the
+ * shared toE164 so the lookup matches the writer exactly. Document client → plain values.
+ * FAIL-SAFE: a bad phone / missing record / DDB error returns null → consentValid() reads
+ * "no consent" → SMS suppressed, the email floor still sends.
+ * @returns {Promise<{consent_given: boolean, opted_out_at?: string} | null>}
  */
-function localNow(nowMs, timezone) {
+async function readConsentRecord(ddb, tenantId, phoneRaw, logger) {
+  const phoneE164 = toE164(phoneRaw);
+  if (!tenantId || !phoneE164) return null;
   try {
-    const fmt = new Intl.DateTimeFormat('en-CA', {
-      timeZone: timezone || 'UTC',
-      hour12: false,
-      year: 'numeric', month: '2-digit', day: '2-digit',
-      hour: '2-digit', minute: '2-digit', second: '2-digit',
-    });
-    const p = Object.fromEntries(fmt.formatToParts(new Date(nowMs)).map((x) => [x.type, x.value]));
-    const hh = p.hour === '24' ? '00' : p.hour;
-    return new Date(`${p.year}-${p.month}-${p.day}T${hh}:${p.minute}:${p.second}Z`);
-  } catch {
-    return new Date(nowMs);
+    const result = await ddb.send(new GetCommand({
+      TableName: SMS_CONSENT_TABLE,
+      Key: { pk: `TENANT#${tenantId}`, sk: `CONSENT#transactional#${phoneE164}` },
+    }));
+    if (!result.Item) return null;
+    return {
+      consent_given: result.Item.consent_given === true,
+      opted_out_at: result.Item.opted_out_at || undefined,
+    };
+  } catch (error) {
+    (logger || console).error(`consent record read failed: ${error.message}`);
+    return null; // fail-safe
   }
 }
 
@@ -90,13 +121,22 @@ async function resolveChannels(message, deps) {
   // §E3 fire-time gate path — only when the row carries the gate context AND a gate is wired.
   if (deps.selectChannels && message.tenant_prefs) {
     try {
-      const nowLocal = localNow(deps.now(), message.timezone);
+      // org-level toggle from the row snapshot (captured at schedule-creation).
+      const orgSmsEnabled = message.tenant_prefs?.notificationPrefs?.sms === true;
+      // Only the consent read is I/O — skip it when SMS can't win anyway (org off / no phone):
+      // fail-closed + avoids a needless GetItem on every email-only reminder.
+      const consentRecord =
+        orgSmsEnabled && message.recipient_phone
+          ? await readConsentRecord(deps.ddb, tenantId, message.recipient_phone, deps.logger)
+          : null;
+      // selectChannels is PURE: pass the REAL fire instant + booking.timezone; it does the
+      // volunteer-local quiet-hours conversion itself (§E3 SEAM-1, fixed 8pm–8am).
       const result = await deps.selectChannels({
         tenantId,
-        attendee: { phone: message.recipient_phone, email: message.recipient_email },
-        moment: message.moment || 'reminder',
-        nowLocal,
-        tenantPrefs: message.tenant_prefs,
+        booking: { timezone: message.timezone },
+        orgSmsEnabled,
+        consentRecord,
+        fireTime: deps.now(),
       });
       // Email is the floor — always true per §E3, but never email a row with no recipient.
       return {
@@ -259,10 +299,9 @@ function defaultDeps() {
     lambda: lambdaClient,
     now: () => Date.now(),
     logger: console,
-    // selectChannels (§E3, WS-E-TCPA) is wired here by the integrator once it merges.
-    // Until then it is undefined → reminder rows fall back to email-floor only (SMS
-    // fail-closed). Example wiring: selectChannels: (await import('...')).selectChannels
-    selectChannels: undefined,
+    // §E3 TCPA gate wired in (S3). Reminder rows that carry tenant_prefs now go through the
+    // real channel selection: email floor + org-flag/consent/quiet-hours-gated SMS supplement.
+    selectChannels,
   };
 }
 

@@ -141,8 +141,10 @@ jobs:
               - 'Scheduling_Redemption_Handler/**'
               - 'shared/**'
             scheduled_message_sender:
-              # WS-E-REMIND dispatcher. node:test runner; no shared imports.
+              # WS-E-REMIND dispatcher. node:test runner. Track 1 S3: now imports the FROZEN
+              # §E3 gate shared/scheduling/channels.js, so a shared/** change must retest it.
               - 'Scheduled_Message_Sender/**'
+              - 'shared/**'
             scheduling_synthetic_monitor:
               # WS-E-CI6 synthetic monitor. Self-contained; no shared/** trigger.
               - 'Scheduling_Synthetic_Monitor/**'

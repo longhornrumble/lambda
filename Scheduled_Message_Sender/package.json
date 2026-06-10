@@ -6,12 +6,16 @@
   "main": "index.mjs",
   "scripts": {
     "test": "node --test *.test.mjs",
-    "package": "zip -r deployment.zip index.mjs package.json node_modules/ -x '*.DS_Store' -x 'node_modules/.package-lock.json'"
+    "build": "node esbuild.config.mjs",
+    "package": "npm run build && cp package.json dist/package.json && cd dist && zip -X ../deployment.zip index.mjs package.json"
   },
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.700.0",
     "@aws-sdk/client-lambda": "^3.700.0",
     "@aws-sdk/client-scheduler": "^3.700.0",
     "@aws-sdk/lib-dynamodb": "^3.700.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.27.7"
   }
 }
