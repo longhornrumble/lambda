@@ -43,6 +43,10 @@ const { dispatchVolunteerNotice } = require('../shared/scheduling/notify');
 // consent read it needs. Both fail-closed → email always sends, SMS only when truly permitted.
 const { selectChannels } = require('../shared/scheduling/channels');
 const { readSmsConsent } = require('./sms-consent');
+// Track 1 (§E1): an in-chat reschedule mutates start_at in place (same booking_id) → re-bind
+// the reminder schedules to the NEW time. The ONLY re-bind trigger (a calendar move is a
+// cancel, handled by the cal-lifecycle consumer).
+const reminderScheduler = require('../Reminder_Scheduler/scheduler');
 
 // tolerate camel OR snake on the inbound booking (schema discipline)
 function pick(b, camel, snake) {
@@ -62,6 +66,7 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   const _dispatchVolunteerNotice = injected.dispatchVolunteerNotice || dispatchVolunteerNotice;
   const _selectChannels = injected.selectChannels || selectChannels;
   const _readSmsConsent = injected.readSmsConsent || readSmsConsent;
+  const _rebindReminders = injected.rebindReminders || reminderScheduler.rebindReminders;
   const logger = injected.logger || console;
 
   const { mutation, tenantId, coordinatorId, booking } = event;
@@ -184,6 +189,33 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
         });
       } catch (err) {
         (logger.warn || logger.error || (() => {}))('booking_persist_failed', { error_name: (err && err.name) || 'unknown' });
+      }
+      // Track 1 (§E1): re-bind reminders to the NEW start_at. Best-effort — the calendar +
+      // §14.2 listener remain the source of truth; a rebind failure must not undo the move.
+      // Build the view from the NEW slot explicitly (do not trust result.booking to carry it).
+      // tenantPrefs.org SMS = the event-passed org flag (ADA-resolved, mirrors reschedule_link).
+      try {
+        await _rebindReminders({
+          booking: {
+            tenant_id: tenantId,
+            booking_id: pick(b, 'bookingId', 'booking_id'),
+            start_at: newSlot.start,
+            end_at: newSlot.end,
+            timezone: pick(b, 'timeZone', 'timezone'),
+            attendee_email: pick(b, 'attendeeEmail', 'attendee_email'),
+            attendee_phone: pick(b, 'attendeePhone', 'attendee_phone'),
+            attendee_name: pick(b, 'attendeeName', 'attendee_name'),
+            coordinator_email: pick(b, 'coordinatorEmail', 'coordinator_email'),
+            appointment_type_name: pick(b, 'appointmentTypeName', 'appointment_type_name'),
+            organization_name: pick(b, 'organizationName', 'organization_name'),
+          },
+          tenantPrefs: {
+            notificationPrefs: { sms: event.org_sms_enabled === true },
+            sms_quiet_hours: event.sms_quiet_hours || null,
+          },
+        });
+      } catch (err) {
+        (logger.warn || logger.error || (() => {}))('reminder_rebind_failed', { error_name: (err && err.name) || 'unknown' });
       }
     }
     return { outcome: result.outcome, booking: result.booking };
