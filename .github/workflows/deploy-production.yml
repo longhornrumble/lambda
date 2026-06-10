@@ -316,10 +316,23 @@ jobs:
           # Cache-Control: request a CloudFront cache bypass so the smoke
           # exercises the origin (the just-deployed code), not a cached 200
           # from the previous version.
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'Cache-Control: no-cache' "$URL")
-          echo "Smoke: GET $URL → $STATUS"
-          if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
-            echo "::error::Expected ${{ matrix.lambda.smoke_expect_status }}, got $STATUS"
+          # Retry: the URL auth plane lags update-function-code by more than
+          # 30s on AuthType=AWS_IAM RESPONSE_STREAM URLs (staging run
+          # 27258497374, 2026-06-10 — same Lambda shape as prod BSH). A
+          # single unretried curl here would false-fail the deploy and, for
+          # alias-fronted functions, trigger a SPURIOUS auto-rollback of a
+          # healthy deploy. Budget: 15×12s = 3 minutes; failure after that
+          # is genuine and the rollback step is correct to act on it.
+          EXPECT="${{ matrix.lambda.smoke_expect_status }}"
+          STATUS=""
+          for attempt in $(seq 1 15); do
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'Cache-Control: no-cache' "$URL")
+            echo "Smoke attempt $attempt: GET $URL → $STATUS (expect $EXPECT)"
+            [ "$STATUS" = "$EXPECT" ] && break
+            sleep 12
+          done
+          if [ "$STATUS" != "$EXPECT" ]; then
+            echo "::error::Expected $EXPECT, got $STATUS after 15 attempts (3m)"
             exit 1
           fi
 

@@ -772,21 +772,26 @@ jobs:
               --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
           fi
           # Retry: immediately after update-function-code the Function URL
-          # transiently 403s (or 5xx) for a few seconds while the new code +
-          # resource policy propagate — a single curl raced that window and
-          # false-failed the deploy. Retry up to 5×6s; succeed on the first
-          # expected status.
+          # transiently 403s (or 5xx) while the new code + URL auth plane
+          # propagate. `aws lambda wait function-updated` covers the CODE
+          # plane only — for AuthType=AWS_IAM RESPONSE_STREAM URLs the AUTH
+          # plane lags MORE THAN 30s (run 27258497374, 2026-06-10: BSH smoke
+          # 403'd for all 5×6s attempts starting 7s after the update, twice;
+          # the same URL served 200 to independent clients throughout and
+          # settled well within 5 minutes). Budget: 15×12s = 3 minutes.
+          # Pre-2.5 this never fired because the CF-routed smoke hit the OLD
+          # origin, which the run had not just updated.
           FULL_URL="${URL%/}${{ matrix.lambda.smoke_path }}"
           EXPECT="${{ matrix.lambda.smoke_expect_status }}"
           STATUS=""
-          for attempt in 1 2 3 4 5; do
+          for attempt in $(seq 1 15); do
             STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$FULL_URL")
             echo "Smoke attempt $attempt: GET $FULL_URL → $STATUS (expect $EXPECT)"
             [ "$STATUS" = "$EXPECT" ] && break
-            sleep 6
+            sleep 12
           done
           if [ "$STATUS" != "$EXPECT" ]; then
-            echo "::error::Expected $EXPECT, got $STATUS after 5 attempts"
+            echo "::error::Expected $EXPECT, got $STATUS after 15 attempts (3m)"
             exit 1
           fi
 
