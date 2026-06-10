@@ -202,7 +202,7 @@ describe('Track 1 — reminder teardown on cancel/move', () => {
     process.env.SCHEDULER_TARGET_ARN = 'arn:aws:scheduler:us-east-1:525409062831:schedule/picasso-scheduling/x';
     await reconcile.reconcileDeleted(DEL_ENV);
     expect(mockDeleteReminders).toHaveBeenCalledWith({ tenantId: 'AUS123957', bookingId: 'booking#1' });
-    expect(loggedEvents()).toContain('reminders_deleted');
+    expect(loggedEvents()).toContain('reminders_teardown_requested');
   });
 
   it('reconcileMoved tears down reminders (a move cancels the booking)', async () => {
@@ -217,10 +217,17 @@ describe('Track 1 — reminder teardown on cancel/move', () => {
     expect(mockDeleteReminders).not.toHaveBeenCalled();
   });
 
-  it('does NOT tear down reminders on a no-op (booking was not canceled)', async () => {
+  it('does NOT tear down reminders on a delete no-op (booking was not canceled)', async () => {
     process.env.SCHEDULER_TARGET_ARN = 'arn:...';
     mockCancelDelete.mockResolvedValue(false); // already canceled / not found
     await reconcile.reconcileDeleted(DEL_ENV);
+    expect(mockDeleteReminders).not.toHaveBeenCalled();
+  });
+
+  it('does NOT tear down reminders on a move no-op (booking was not canceled)', async () => {
+    process.env.SCHEDULER_TARGET_ARN = 'arn:...';
+    mockCancelMove.mockResolvedValue(false);
+    await reconcile.reconcileMoved(MOVE_ENV);
     expect(mockDeleteReminders).not.toHaveBeenCalled();
   });
 

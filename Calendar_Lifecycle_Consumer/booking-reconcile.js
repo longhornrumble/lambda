@@ -41,7 +41,9 @@ async function deleteBookingReminders(tenantId, bookingId) {
   if (!process.env.SCHEDULER_TARGET_ARN) return;
   try {
     await reminderScheduler.deleteReminders({ tenantId, bookingId });
-    log('reminders_deleted', { tenant_id: tenantId, booking_id: bookingId });
+    // Distinct from scheduler.js's own 'reminders_deleted' (the authoritative teardown log) —
+    // this marks the consumer requested it, so a metric filter on either won't double-count.
+    log('reminders_teardown_requested', { tenant_id: tenantId, booking_id: bookingId });
   } catch (err) {
     warn('reminder_delete_failed', { tenant_id: tenantId, booking_id: bookingId, error: err.message });
   }
