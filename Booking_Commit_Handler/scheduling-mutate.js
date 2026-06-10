@@ -38,6 +38,11 @@ const { executeCancel } = require('../shared/scheduling/cancel');
 // Reuses the SoT signer (tokens.sign) + notice dispatcher — never re-implemented.
 const { sign: signRescheduleToken } = require('../shared/scheduling/tokens');
 const { dispatchVolunteerNotice } = require('../shared/scheduling/notify');
+// G7b: SMS is the opt-in supplement on the reschedule-link notice. selectChannels (§E3 TCPA
+// gate, PURE) decides email-floor + consent/quiet-hours-gated SMS; readSmsConsent is the
+// consent read it needs. Both fail-closed → email always sends, SMS only when truly permitted.
+const { selectChannels } = require('../shared/scheduling/channels');
+const { readSmsConsent } = require('./sms-consent');
 
 // tolerate camel OR snake on the inbound booking (schema discipline)
 function pick(b, camel, snake) {
@@ -55,6 +60,8 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   const _resolveProvider = injected.resolveProvider || resolveProvider;
   const _signRescheduleToken = injected.signRescheduleToken || signRescheduleToken;
   const _dispatchVolunteerNotice = injected.dispatchVolunteerNotice || dispatchVolunteerNotice;
+  const _selectChannels = injected.selectChannels || selectChannels;
+  const _readSmsConsent = injected.readSmsConsent || readSmsConsent;
   const logger = injected.logger || console;
 
   const { mutation, tenantId, coordinatorId, booking } = event;
@@ -92,9 +99,14 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
       return await handleRescheduleLink({
         booking,
         tenantId,
+        // G7b: ADA resolves the tenant's org-level SMS toggle (notificationPrefs.sms) and
+        // passes it; absent/false → SMS suppressed (email-only), the safe default.
+        orgSmsEnabled: event.org_sms_enabled === true,
         bookingStore,
         signRescheduleToken: _signRescheduleToken,
         dispatchVolunteerNotice: _dispatchVolunteerNotice,
+        selectChannels: _selectChannels,
+        readSmsConsent: _readSmsConsent,
         logger,
       });
     }
@@ -185,10 +197,34 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
 // portal click within the window is refused WITHOUT minting a fresh token → no email-bombing).
 const RESCHEDULE_LINK_COOLDOWN_SECONDS = 60;
 
+// G7b: resolve the notice channels for the reschedule link. Email is the unconditional floor;
+// SMS is the opt-in supplement — attempted ONLY when the tenant enabled org SMS AND the guest
+// has live consent AND it is not quiet-hours (selectChannels, §E3). FAIL-CLOSED at every step:
+// no org-flag / no phone / consent-read error / selectChannels throw → { email:true, sms:false }.
+async function resolveNoticeChannels({ tenantId, booking, orgSmsEnabled, readSmsConsent, selectChannels, logger }) {
+  if (orgSmsEnabled !== true) return { email: true, sms: false };
+  const phone = pick(booking, 'attendeePhone', 'attendee_phone');
+  if (!phone) return { email: true, sms: false };
+  let consentRecord = null;
+  try {
+    consentRecord = await readSmsConsent(tenantId, phone);
+  } catch (err) {
+    (logger.warn || logger.error || (() => {}))('reschedule_link_consent_read_failed', { error_name: (err && err.name) || 'unknown' });
+    return { email: true, sms: false };
+  }
+  try {
+    // fireTime = now: the link is sent immediately; quiet-hours is evaluated in the guest's tz.
+    return selectChannels({ tenantId, booking, orgSmsEnabled, consentRecord, fireTime: new Date() });
+  } catch (err) {
+    (logger.warn || logger.error || (() => {}))('reschedule_link_select_channels_failed', { error_name: (err && err.name) || 'unknown' });
+    return { email: true, sms: false };
+  }
+}
+
 // G6 reschedule_link — notify-only (NO calendar mutation). Rate-limited; mints a fresh §B4
 // reschedule token (MINT is stateless: NO jti write — the jti is written only at REDEEM) and
 // emails the guest a self-serve reschedule link. Mirrors Attendance_Disposition_Handler's flow.
-async function handleRescheduleLink({ booking, tenantId, bookingStore, signRescheduleToken, dispatchVolunteerNotice, logger }) {
+async function handleRescheduleLink({ booking, tenantId, orgSmsEnabled, bookingStore, signRescheduleToken, dispatchVolunteerNotice, selectChannels, readSmsConsent, logger }) {
   const bookingId = pick(booking, 'bookingId', 'booking_id');
   const startAt = pick(booking, 'startAt', 'start_at');
   // §B4 reschedule expiry = start_at − cancellation_window_hours (MIN-floored to 15min in tokens.js).
@@ -224,14 +260,22 @@ async function handleRescheduleLink({ booking, tenantId, bookingStore, signResch
     return { outcome: 'failed', error: 'token_mint_failed' };
   }
 
-  // Email the guest the self-serve link (best-effort — notify appends the STOP footer and never
+  // G7b: decide channels (email floor + TCPA-gated SMS supplement) before dispatch.
+  const channels = await resolveNoticeChannels({
+    tenantId, booking, orgSmsEnabled, readSmsConsent, selectChannels, logger,
+  });
+
+  // Notify the guest the self-serve link (best-effort — notify appends the STOP footer and never
   // throws on a send failure). buildEmailPayload requires booking.rescheduleUrl, supplied here.
+  // The guest phone (for the SMS supplement) is read off the booking inside notify.
   try {
     const result = await dispatchVolunteerNotice(
-      { kind: 'reschedule_link', tenantId, booking: { ...booking, rescheduleUrl } },
+      { kind: 'reschedule_link', tenantId, booking: { ...booking, rescheduleUrl }, channels },
       {}
     );
-    const sent = !!(result && result.dispatched && result.dispatched.email === 'sent');
+    // "sent" = the guest was reached on at least one channel (email floor or the SMS supplement).
+    const d = (result && result.dispatched) || {};
+    const sent = d.email === 'sent' || d.sms === 'sent';
     return { outcome: 'success', sent };
   } catch (err) {
     // Defensive: dispatch is best-effort and shouldn't throw, but a throw here must not become

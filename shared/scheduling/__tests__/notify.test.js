@@ -4,7 +4,8 @@
  * Unit tests for notify.js (WS-SCHED-FOUNDATIONS, contract Y).
  *
  * Covers: per-kind email payload build; the agent-of-CoR guard (reassigned/moved
- * suppressed); the SMS TODO(SMS-E) stub; channel defaults + overrides; best-effort
+ * suppressed); the G7b SMS send path (buildSmsPayload + real SMS_Sender invoke,
+ * sendType:'contact', STOP/HELP footer, override flow); channel defaults + overrides; best-effort
  * (send failure non-fatal + PII-redacted logging); forward-compatible snake/camel
  * booking reads; and the default Lambda-invoke implementation via aws-sdk-client-mock.
  */
@@ -19,10 +20,12 @@ const lambdaMock = mockClient(LambdaClient);
 const {
   dispatchVolunteerNotice,
   buildEmailPayload,
+  buildSmsPayload,
   defaultInvokeEmail,
   defaultInvokeSms,
   render,
   escapeHtml,
+  SMS_STOP_FOOTER,
 } = require('../notify');
 
 const TENANT = 'AUS123957';
@@ -329,34 +332,158 @@ describe('dispatchVolunteerNotice — email dispatch', () => {
   });
 });
 
-// ─── dispatchVolunteerNotice — SMS stub ───────────────────────────────────────────────
+// ─── buildSmsPayload (G7b) ────────────────────────────────────────────────────────────
 
-describe('dispatchVolunteerNotice — SMS path (TODO SMS-E stub)', () => {
-  test('move_optin_sms returns the stub marker, never sends', async () => {
-    const invokeSms = jest.fn().mockResolvedValue({ stub: true });
-    const res = await dispatchVolunteerNotice(
-      { kind: 'move_optin_sms', tenantId: TENANT, booking: baseBooking },
-      { invokeSms, log: quietLog() }
-    );
-    expect(res).toEqual({
-      kind: 'move_optin_sms',
-      suppressed: false,
-      dispatched: { sms: 'stubbed_todo_sms_e' },
-    });
-    expect(invokeSms).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: 'move_optin_sms', tenantId: TENANT })
-    );
+const smsBooking = { ...baseBooking, attendeePhone: '+15125551234' };
+
+describe('buildSmsPayload', () => {
+  test('reschedule_link renders the default body with the action link + STOP/HELP footer', () => {
+    const p = buildSmsPayload({ kind: 'reschedule_link', booking: smsBooking });
+    expect(p.to).toBe('+15125551234');
+    expect(p.body).toContain('https://x/r?token=abc');
+    expect(p.body).toContain('intake call');
+    expect(p.body.endsWith(SMS_STOP_FOOTER)).toBe(true);
+    expect(p.body).toMatch(/reply\s+STOP/i); // compliance marker
   });
 
-  test('move_optin_sms is SMS-only — never invokes the email path', async () => {
-    const invokeEmail = jest.fn();
-    const invokeSms = jest.fn().mockResolvedValue({ stub: true });
+  test('reoffer falls back to rescheduleUrl when reofferUrl absent', () => {
+    const p = buildSmsPayload({
+      kind: 'reoffer',
+      booking: { ...smsBooking, reofferUrl: undefined },
+    });
+    expect(p.body).toContain('https://x/r?token=abc');
+  });
+
+  test('cancel_notice includes the optional rebook link, and omits it when absent', () => {
+    const withRebook = buildSmsPayload({ kind: 'cancel_notice', booking: smsBooking });
+    expect(withRebook.body).toContain('Want to rebook? https://x/r?token=abc');
+    const noRebook = buildSmsPayload({
+      kind: 'cancel_notice',
+      booking: { ...smsBooking, rescheduleUrl: undefined },
+    });
+    expect(noRebook.body).not.toContain('Want to rebook?');
+  });
+
+  test('a tenant sms_text override replaces the body (footer still appended)', () => {
+    const p = buildSmsPayload({
+      kind: 'reschedule_link',
+      booking: smsBooking,
+      smsOverride: 'Yo {{firstName}} — reschedule: {{actionUrl}}',
+    });
+    expect(p.body).toContain('Yo Sam — reschedule: https://x/r?token=abc');
+    expect(p.body.endsWith(SMS_STOP_FOOTER)).toBe(true);
+  });
+
+  test('an override already containing "reply STOP" is NOT double-footed', () => {
+    const p = buildSmsPayload({
+      kind: 'reschedule_link',
+      booking: smsBooking,
+      smsOverride: 'Pick a time {{actionUrl}}. Reply STOP to opt out.',
+    });
+    expect((p.body.match(/reply\s+STOP/gi) || []).length).toBe(1);
+  });
+
+  test('a kind with no SMS template and no override yields an empty body (no footer-only SMS)', () => {
+    const p = buildSmsPayload({ kind: 'move_optin_sms', booking: smsBooking });
+    expect(p.body).toBe('');
+  });
+
+  test('forward-compatible snake_case phone read', () => {
+    const p = buildSmsPayload({
+      kind: 'reschedule_link',
+      booking: { attendee_phone: '+15129990000', reschedule_url: 'https://x/r?t=z' },
+    });
+    expect(p.to).toBe('+15129990000');
+    expect(p.body).toContain('https://x/r?t=z');
+  });
+});
+
+// ─── dispatchVolunteerNotice — SMS path (G7b real send) ───────────────────────────────
+
+describe('dispatchVolunteerNotice — SMS path (G7b)', () => {
+  test('email kind + channels.sms:true → email AND a real SMS invoke (sendType:contact)', async () => {
+    const invokeEmail = jest.fn().mockResolvedValue(undefined);
+    const invokeSms = jest.fn().mockResolvedValue(undefined);
     const res = await dispatchVolunteerNotice(
-      { kind: 'move_optin_sms', tenantId: TENANT, booking: baseBooking },
+      {
+        kind: 'reschedule_link',
+        tenantId: TENANT,
+        booking: smsBooking,
+        channels: { email: true, sms: true },
+      },
       { invokeEmail, invokeSms, log: quietLog() }
     );
-    expect(res.dispatched).toEqual({ sms: 'stubbed_todo_sms_e' });
-    expect(invokeEmail).not.toHaveBeenCalled();
+    expect(res.dispatched).toEqual({ email: 'sent', sms: 'sent' });
+    expect(invokeSms).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: TENANT,
+        to: '+15125551234',
+        kind: 'reschedule_link',
+      })
+    );
+    const smsBody = invokeSms.mock.calls[0][0].body;
+    expect(smsBody).toMatch(/reply\s+STOP/i);       // footer present
+    expect(smsBody).toContain('https://x/r?token=abc'); // the actual reschedule link, not just the footer
+  });
+
+  test('reoffer + cancel_notice also dispatch SMS via channels.sms:true', async () => {
+    for (const kind of ['reoffer', 'cancel_notice']) {
+      const invokeSms = jest.fn().mockResolvedValue(undefined);
+      const res = await dispatchVolunteerNotice(
+        { kind, tenantId: TENANT, booking: smsBooking, channels: { email: false, sms: true } },
+        { invokeSms, log: quietLog() }
+      );
+      expect(res.dispatched.sms).toBe('sent');
+      expect(invokeSms.mock.calls[0][0].body).toMatch(/reply\s+STOP/i);
+    }
+  });
+
+  test('an email kind WITHOUT channels.sms does not attempt SMS (email is the floor)', async () => {
+    const invokeEmail = jest.fn().mockResolvedValue(undefined);
+    const invokeSms = jest.fn();
+    const res = await dispatchVolunteerNotice(
+      { kind: 'reschedule_link', tenantId: TENANT, booking: smsBooking },
+      { invokeEmail, invokeSms, log: quietLog() }
+    );
+    expect(invokeSms).not.toHaveBeenCalled();
+    expect(res.dispatched).toEqual({ email: 'sent' });
+  });
+
+  test('no recipient phone → skipped_no_recipient, never invokes the sender', async () => {
+    const invokeSms = jest.fn();
+    const res = await dispatchVolunteerNotice(
+      {
+        kind: 'reschedule_link',
+        tenantId: TENANT,
+        booking: baseBooking, // no attendeePhone
+        channels: { email: false, sms: true },
+      },
+      { invokeSms, log: quietLog() }
+    );
+    expect(invokeSms).not.toHaveBeenCalled();
+    expect(res.dispatched.sms).toBe('skipped_no_recipient');
+  });
+
+  test('an SMS-native kind dispatched WITHOUT explicit channels throws (TCPA gate is caller-owned)', async () => {
+    const invokeSms = jest.fn();
+    await expect(
+      dispatchVolunteerNotice(
+        { kind: 'move_optin_sms', tenantId: TENANT, booking: smsBooking },
+        { invokeSms, log: quietLog() }
+      )
+    ).rejects.toThrow(/requires an explicit channels/);
+    expect(invokeSms).not.toHaveBeenCalled();
+  });
+
+  test('SMS-native kind with no template → skipped_no_template (no footer-only spam)', async () => {
+    const invokeSms = jest.fn();
+    const res = await dispatchVolunteerNotice(
+      // explicit channels (the caller-owned TCPA gate decided sms:true); no template for the kind.
+      { kind: 'move_optin_sms', tenantId: TENANT, booking: smsBooking, channels: { sms: true } },
+      { invokeSms, log: quietLog() }
+    );
+    expect(invokeSms).not.toHaveBeenCalled();
+    expect(res.dispatched.sms).toBe('skipped_no_template');
   });
 
   test('channels.sms:false suppresses an SMS-native kind (mirrors the email guard)', async () => {
@@ -365,7 +492,7 @@ describe('dispatchVolunteerNotice — SMS path (TODO SMS-E stub)', () => {
       {
         kind: 'move_optin_sms',
         tenantId: TENANT,
-        booking: baseBooking,
+        booking: smsBooking,
         channels: { sms: false },
       },
       { invokeSms, log: quietLog() }
@@ -374,42 +501,65 @@ describe('dispatchVolunteerNotice — SMS path (TODO SMS-E stub)', () => {
     expect(res.dispatched).toEqual({});
   });
 
-  test('an email kind with channels.sms:true also fires the SMS stub', async () => {
+  test('the §E14 sms_text override flows into the SMS body', async () => {
+    const invokeSms = jest.fn().mockResolvedValue(undefined);
+    const loadTemplateOverride = jest
+      .fn()
+      .mockResolvedValue({ sms: 'Custom {{firstName}}: {{actionUrl}}' });
+    await dispatchVolunteerNotice(
+      {
+        kind: 'reschedule_link',
+        tenantId: TENANT,
+        booking: smsBooking,
+        channels: { email: false, sms: true },
+      },
+      { invokeSms, loadTemplateOverride, log: quietLog() }
+    );
+    expect(invokeSms.mock.calls[0][0].body).toContain('Custom Sam: https://x/r?token=abc');
+  });
+
+  test('a throwing SMS impl is caught (best-effort); email still sent', async () => {
     const invokeEmail = jest.fn().mockResolvedValue(undefined);
-    const invokeSms = jest.fn().mockResolvedValue({ stub: true });
+    const invokeSms = jest.fn().mockRejectedValue(new Error('telnyx 500'));
+    const log = quietLog();
     const res = await dispatchVolunteerNotice(
       {
         kind: 'reschedule_link',
         tenantId: TENANT,
-        booking: baseBooking,
+        booking: smsBooking,
         channels: { email: true, sms: true },
       },
-      { invokeEmail, invokeSms, log: quietLog() }
+      { invokeEmail, invokeSms, log }
     );
-    expect(res.dispatched).toEqual({ email: 'sent', sms: 'stubbed_todo_sms_e' });
+    expect(res.dispatched).toEqual({ email: 'sent', sms: 'failed' });
+    // PII-redacted: the phone is never logged.
+    const logged = log.error.mock.calls.map((c) => c.join(' ')).join('\n');
+    expect(logged).not.toContain('+15125551234');
   });
 
-  test('a throwing SMS impl is caught (best-effort)', async () => {
-    const invokeSms = jest.fn().mockRejectedValue(new Error('boom'));
-    const res = await dispatchVolunteerNotice(
-      { kind: 'move_optin_sms', tenantId: TENANT, booking: baseBooking },
-      { invokeSms, log: quietLog() }
-    );
-    expect(res.dispatched.sms).toBe('failed');
-  });
-
-  test('the real stub logs the TODO and returns { stub: true } without throwing', async () => {
-    const log = quietLog();
-    const out = await defaultInvokeSms({ tenantId: TENANT, kind: 'move_optin_sms', log });
-    expect(out).toEqual({ stub: true });
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('TODO SMS-E'));
-  });
-
-  test('the stub tolerates an absent log (defaults to console)', async () => {
-    const spy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    await defaultInvokeSms({ tenantId: TENANT, kind: 'move_optin_sms' });
-    expect(spy).toHaveBeenCalled();
-    spy.mockRestore();
+  test('defaultInvokeSms invokes SMS_Sender async (Event) with sendType:contact', async () => {
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+    await defaultInvokeSms({
+      tenantId: TENANT,
+      to: '+15125551234',
+      body: 'hello',
+      kind: 'reschedule_link',
+      sessionId: 'sess-1',
+    });
+    const calls = lambdaMock.commandCalls(InvokeCommand);
+    expect(calls).toHaveLength(1);
+    const input = calls[0].args[0].input;
+    expect(input.FunctionName).toBe('SMS_Sender');
+    expect(input.InvocationType).toBe('Event');
+    const sent = JSON.parse(Buffer.from(input.Payload).toString());
+    expect(sent).toMatchObject({
+      to: '+15125551234',
+      body: 'hello',
+      tenantId: TENANT,
+      type: 'reschedule_link',
+      sendType: 'contact',
+      sessionId: 'sess-1',
+    });
   });
 });
 

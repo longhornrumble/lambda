@@ -20,6 +20,15 @@
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
+import { createHash } from 'node:crypto';
+
+// PII: the recipient phone is a tier-1 PII field — it must NEVER appear in CloudWatch logs.
+// Log a short sha256 prefix instead (enough to correlate across log lines for one number, not
+// enough to recover it). The Telnyx-side message id remains the durable per-message handle.
+function hashPhone(phone) {
+  if (!phone) return 'none';
+  return 'phone_' + createHash('sha256').update(String(phone)).digest('hex').slice(0, 12);
+}
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const secretsClient = new SecretsManagerClient({ region });
@@ -163,12 +172,12 @@ async function checkConsent(tenantId, phoneE164) {
     }));
 
     if (!result.Item) {
-      console.log(`🚫 No consent record for ${phoneE164} (tenant: ${tenantId}) — suppressing send`);
+      console.log(`🚫 No consent record for ${hashPhone(phoneE164)} (tenant: ${tenantId}) — suppressing send`);
       return false;
     }
 
     if (result.Item.consent_given === false || result.Item.opted_out_at) {
-      console.log(`🚫 Contact ${phoneE164} has opted out (tenant: ${tenantId}) — suppressing send`);
+      console.log(`🚫 Contact ${hashPhone(phoneE164)} has opted out (tenant: ${tenantId}) — suppressing send`);
       return false;
     }
 
@@ -195,8 +204,9 @@ export async function handler(event) {
 
   // Validate E.164 format
   if (!/^\+\d{10,15}$/.test(to)) {
-    const error = `Invalid phone number format: ${to}. Must be E.164 (e.g. +15125551234)`;
-    console.error(`❌ ${error}`);
+    const error = 'Invalid phone number format. Must be E.164 (e.g. +15125551234)';
+    // PII: do NOT log the raw (malformed) number — hash it for correlation only.
+    console.error(`❌ ${error} (${hashPhone(to)})`);
     await writeAuditRecord(tenantId, null, event, 'failed', error);
     return { success: false, error };
   }
@@ -249,7 +259,7 @@ export async function handler(event) {
 
     const messageId = message.id;
     const segments = calculateSegmentCount(body);
-    console.log(`✅ SMS sent to ${to} (ID: ${messageId}, type: ${type || 'internal'}, segments: ${segments})`);
+    console.log(`✅ SMS sent to ${hashPhone(to)} (ID: ${messageId}, type: ${type || 'internal'}, segments: ${segments})`);
 
     // Write success audit record
     await writeAuditRecord(tenantId, messageId, event, 'sent', '', segments);
@@ -257,7 +267,7 @@ export async function handler(event) {
     return { success: true, messageId, segments };
 
   } catch (error) {
-    console.error(`❌ SMS send failed for ${to}:`, error.message);
+    console.error(`❌ SMS send failed for ${hashPhone(to)}:`, error.message);
 
     // Write failure audit record
     const segments = calculateSegmentCount(body);

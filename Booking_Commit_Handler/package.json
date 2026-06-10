@@ -40,6 +40,7 @@
       "confirmation-email.js",
       "booking-store.js",
       "scheduling-mutate.js",
+      "sms-consent.js",
       "oauth-client.js"
     ],
     "coverageThreshold": {
