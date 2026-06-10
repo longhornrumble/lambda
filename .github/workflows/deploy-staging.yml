@@ -21,8 +21,8 @@ on:
           - Analytics_Dashboard_API
           - Analytics_Event_Processor
           - picasso-session-archiver
-          - Master_Function_Staging
-          - Bedrock_Streaming_Handler_Staging
+          - Master_Function
+          - Bedrock_Streaming_Handler
           - SMS_Sender
           - SMS_Webhook_Handler
           - Meta_Webhook_Handler
@@ -219,13 +219,14 @@ jobs:
             # pattern above.
             smoke_invoke_event: '{"Records":[]}'
           - source_dir: Master_Function_Staging
-            # In staging account, Lambda keeps its `_Staging` suffix because
-            # the matching prod-account Lambda is `Master_Function` (no
-            # suffix). Different account boundary IS the env separation,
-            # but the function NAMES remain distinct because the prod-side
-            # name was claimed first historically. Cf. ADA, where staging
-            # and prod both renamed to the suffix-less form on Phase 4.5.
-            staging_function: Master_Function_Staging
+            # CI-modernization task 2.5 (picasso TASK_2_5_DESUFFIX_SCOPE.md):
+            # staging function de-suffixed to the bare name — account boundary
+            # IS the env separation, matching ADA/SMS_Sender/Calendar_*. The
+            # SOURCE DIR keeps its historical name (operator decision #1:
+            # repo paths are not env resources; this mapping line is the
+            # seam). The old `Master_Function_Staging` function is frozen
+            # (no longer a CI target) and decommissions in 2.5 Wave 4.
+            staging_function: Master_Function
             handler: lambda_function.lambda_handler
             runtime: python
             # Explicit runtime-file enumeration. Previously `'*'` shipped
@@ -271,7 +272,10 @@ jobs:
             #     (EC-P4-4). Was previously out-of-band with a hardcoded
             #     prod-account URL fallback. Phase 4 audit row #4 flagged the
             #     out-of-band gap; this brings it under CI source-of-truth.
-            env_vars: 'BEDROCK_MODEL_ID=global.anthropic.claude-haiku-4-5-20251001-v1:0,STREAMING_ENDPOINT=https://chm3ioesaxyrgsaeo3v763dmw40qaswu.lambda-url.us-east-1.on.aws/'
+            # STREAMING_ENDPOINT = the bare BSH instance's Function URL (the
+            # new pair streams together; Terraform sets the same value via
+            # module output — keep them identical or applies/deploys flap).
+            env_vars: 'BEDROCK_MODEL_ID=global.anthropic.claude-haiku-4-5-20251001-v1:0,STREAMING_ENDPOINT=https://av5b2veoxmmrmx3hmggjell4bu0igeru.lambda-url.us-east-1.on.aws/'
             # action=health_check returns 200 unauthenticated; default route
             # (no action) also dispatches to health_check. Use the explicit
             # form for clarity in CI logs.
@@ -280,6 +284,10 @@ jobs:
             # without x-picasso-cf-origin now 403. Route the smoke through CF
             # so the header is injected. CF /Master_Function* routes to MFS;
             # action=health_check works without tenant.
+            # 2.5 TRANSITIONAL: until the Wave-2 CF origin flip, CF still
+            # routes to the OLD suffixed function — this smoke validates the
+            # public path, not the freshly-deployed bare function. Wave 2
+            # makes it exact again.
             smoke_base_url: 'https://staging.chat.myrecruiter.ai'
             smoke_path: '/Master_Function?action=health_check'
             smoke_expect_status: '200'
@@ -288,7 +296,9 @@ jobs:
             # Node.js Lambda — esbuild bundles dependencies into a single
             # dist/index.js; npm run package zips it. Different deploy flow
             # from Python entries (see Package function (Node.js) step below).
-            staging_function: Bedrock_Streaming_Handler_Staging
+            # Task 2.5: de-suffixed (see the Master_Function entry's note —
+            # same source-dir-stays / function-renames seam).
+            staging_function: Bedrock_Streaming_Handler
             handler: index.handler
             runtime: nodejs
             # Not used for Node.js entries — esbuild controls what's bundled
@@ -304,6 +314,8 @@ jobs:
             # x-picasso-cf-origin now 403. Route smoke through CF (which
             # injects the header on origin `picasso-streaming-lambda`).
             # Mirrors the MFS pattern above. Closes Phase C YIELD-2 noise.
+            # 2.5 TRANSITIONAL: validates the public path (old function)
+            # until the Wave-2 CF origin flip — see the MFS note above.
             smoke_base_url: 'https://staging.chat.myrecruiter.ai'
             smoke_path: '/stream'
             smoke_expect_status: '200'
