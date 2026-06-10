@@ -2,6 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { dispatch } from './index.mjs';
+// The REAL §E3 gate — used in the integration tests below to prove the seam is wired
+// correctly end-to-end (not just that a fake's return value is forwarded).
+import { selectChannels } from '../shared/scheduling/channels.js';
 
 // ─── recording deps ─────────────────────────────────────────────────────────────────
 
@@ -102,19 +105,34 @@ test('selectChannels sms:false (quiet hours / opted out) → email only', async 
   assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
 });
 
-test('selectChannels receives a fire-time nowLocal + the snapshotted tenantPrefs/moment', async () => {
+test('selectChannels receives the FROZEN §E3 contract: { tenantId, booking.timezone, orgSmsEnabled, consentRecord, fireTime }', async () => {
   const message = reminderRow();
+  makeDeps._consent = { consent_given: true };
   let seen;
   const selectChannels = async (args) => { seen = args; return { email: true, sms: false }; };
-  const { deps } = makeDeps({ message, selectChannels });
+  const { deps } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
   await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
   assert.equal(seen.tenantId, 'AUS123957');
-  assert.equal(seen.moment, 'reminder');
-  assert.deepEqual(seen.attendee, { phone: '+15125551234', email: 'vol@example.com' });
-  assert.deepEqual(seen.tenantPrefs, message.tenant_prefs);
-  // nowLocal is a Date whose UTC hour carries the booking-timezone wall clock:
-  // 2026-06-12T11:00Z is 06:00 in America/Chicago (CDT, UTC-5).
-  assert.equal(seen.nowLocal.getUTCHours(), 6);
+  assert.deepEqual(seen.booking, { timezone: 'America/Chicago' }); // selectChannels does its own tz→local
+  assert.equal(seen.orgSmsEnabled, true); // from tenant_prefs.notificationPrefs.sms
+  assert.deepEqual(seen.consentRecord, { consent_given: true, opted_out_at: undefined }); // RECORD, read at fire time
+  assert.ok('opted_out_at' in seen.consentRecord); // key present (not merely absent) — pins the shape
+  assert.equal(seen.fireTime, Date.parse('2026-06-12T18:00:00Z')); // the REAL instant, not a wall-clock shim
+  // the broken args are GONE:
+  assert.equal('nowLocal' in seen, false);
+  assert.equal('attendee' in seen, false);
+});
+
+test('reads the consent RECORD only when org SMS is enabled + a phone exists', async () => {
+  // org SMS OFF → no consent GetItem, consentRecord null (fail-closed without I/O).
+  const offMsg = reminderRow({ tenant_prefs: { notificationPrefs: { sms: false } } });
+  let seenOff;
+  const { deps: depsOff, ddbCalls: callsOff } = makeDeps({ message: offMsg, selectChannels: async (a) => { seenOff = a; return { email: true, sms: false }; } });
+  await dispatch(EVENT(offMsg), depsOff);
+  assert.equal(seenOff.orgSmsEnabled, false);
+  assert.equal(seenOff.consentRecord, null);
+  assert.equal(callsOff.some((c) => c.input?.Key?.sk?.startsWith('CONSENT#')), false); // no consent read
 });
 
 test('selectChannels throws → email floor still sends, SMS fails closed', async () => {
@@ -124,6 +142,154 @@ test('selectChannels throws → email floor still sends, SMS fails closed', asyn
   const res = await dispatch(EVENT(message), deps);
   assert.deepEqual(res.dispatched, { email: true, sms: false });
   assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
+});
+
+// ─── §E3 seam FIX proof: the REAL channels.js selectChannels, not a fake ──────────────────
+// Pre-S3 the dispatcher passed args channels.js ignores → orgSmsEnabled was always undefined
+// → SMS could NEVER send. These exercise the real gate to prove the wiring is correct.
+
+test('REAL gate: org on + consent + daytime (non-quiet) → SMS sent (seam fixed)', async () => {
+  const message = reminderRow(); // Chicago, tenant_prefs.notificationPrefs.sms:true
+  makeDeps._consent = { consent_given: true };
+  // 2026-06-12T18:00Z = 13:00 America/Chicago (CDT) → outside the 8pm–8am quiet window.
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.deepEqual(res.dispatched, { email: true, sms: true });
+  assert.deepEqual(fnNames(lambdaCalls).sort(), ['SMS_Sender', 'send_email']);
+});
+
+test('REAL gate: org on + consent but QUIET HOURS (volunteer-local) → email only', async () => {
+  const message = reminderRow();
+  makeDeps._consent = { consent_given: true };
+  // 2026-06-12T11:00Z = 06:00 America/Chicago → inside the 8pm–8am quiet window.
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T11:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.deepEqual(res.dispatched, { email: true, sms: false });
+  assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
+});
+
+test('REAL gate: org on + NO consent record → email only (fail-closed)', async () => {
+  const message = reminderRow();
+  makeDeps._consent = undefined; // no consent row
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  assert.deepEqual(res.dispatched, { email: true, sms: false });
+  assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
+});
+
+test('REAL gate: org on + consent but OPTED OUT → email only', async () => {
+  const message = reminderRow();
+  makeDeps._consent = { consent_given: true, opted_out_at: '2026-01-01T00:00:00Z' };
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.deepEqual(res.dispatched, { email: true, sms: false });
+  assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
+});
+
+test('REAL gate: org OFF (tenant_prefs.sms:false) → email only, no consent read', async () => {
+  const message = reminderRow({ tenant_prefs: { notificationPrefs: { sms: false } } });
+  const { deps, ddbCalls, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  assert.deepEqual(res.dispatched, { email: true, sms: false });
+  assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
+  assert.equal(ddbCalls.some((c) => c.input?.Key?.sk?.startsWith('CONSENT#')), false); // org off → no consent read
+});
+
+test('REAL gate: org on + consent + daytime → SMS payload uses sendType:contact (server re-check)', async () => {
+  const message = reminderRow();
+  makeDeps._consent = { consent_given: true };
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  const sms = lambdaCalls.find((c) => c.FunctionName === 'SMS_Sender');
+  assert.equal(JSON.parse(sms.Payload).sendType, 'contact'); // defense-in-depth preserved on the REAL path
+});
+
+test('REAL gate: bare 10-digit recipient_phone is normalized (toE164) to hit the +1 consent key', async () => {
+  const message = reminderRow({ recipient_phone: '5125551234' }); // bare, not +-prefixed
+  makeDeps._consent = { consent_given: true };
+  const { deps, ddbCalls, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  // the consent GetItem must key on the normalized E.164 (matches the writer) → consent found → SMS sends.
+  const consentGet = ddbCalls.find((c) => c.input?.Key?.sk?.startsWith('CONSENT#'));
+  assert.equal(consentGet.input.Key.sk, 'CONSENT#transactional#+15125551234');
+  assert.deepEqual(res.dispatched, { email: true, sms: true });
+});
+
+test('REAL gate: consent record with explicit consent_given:false → email only', async () => {
+  const message = reminderRow();
+  makeDeps._consent = { consent_given: false };
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.deepEqual(res.dispatched, { email: true, sms: false });
+  assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
+});
+
+test('REAL gate: consent record MISSING the consent_given field (old shape) → email only', async () => {
+  const message = reminderRow();
+  makeDeps._consent = { some_other_field: 'x' }; // record exists, no consent_given
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.deepEqual(res.dispatched, { email: true, sms: false }); // === true gate → forward-compatible fail-closed
+});
+
+test('readConsentRecord DDB THROW → fail-safe (status stays sent, email floor sends, SMS suppressed)', async () => {
+  const message = reminderRow();
+  const { deps } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const realSend = deps.ddb.send;
+  deps.ddb.send = async (command) => {
+    if (command.constructor.name === 'GetCommand' && command.input.Key.sk?.startsWith('CONSENT#')) {
+      throw new Error('ProvisionedThroughputExceededException');
+    }
+    return realSend(command);
+  };
+  const res = await dispatch(EVENT(message), deps);
+  assert.equal(res.success, true); // NOT failed — the consent throw is caught in readConsentRecord
+  assert.deepEqual(res.dispatched, { email: true, sms: false });
+});
+
+test('REAL gate: org on but NO phone → no consent read + SMS suppressed', async () => {
+  const message = reminderRow({ recipient_phone: '' });
+  const { deps, ddbCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  assert.equal(res.dispatched.sms, false);
+  assert.equal(ddbCalls.some((c) => c.input?.Key?.sk?.startsWith('CONSENT#')), false); // no phone → skip read
+});
+
+test('REAL gate: quiet-hours boundary — exactly 08:00 volunteer-local → SMS allowed', async () => {
+  const message = reminderRow();
+  makeDeps._consent = { consent_given: true };
+  // 2026-06-12T13:00Z = 08:00 America/Chicago (CDT) → first allowed minute (window is 20:00–08:00).
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T13:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.equal(res.dispatched.sms, true);
+  assert.ok(fnNames(lambdaCalls).includes('SMS_Sender'));
+});
+
+test('REAL gate: quiet-hours boundary — 07:59 volunteer-local → SMS suppressed', async () => {
+  const message = reminderRow();
+  makeDeps._consent = { consent_given: true };
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T12:59:00Z') }); // 07:59 Chicago
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.equal(res.dispatched.sms, false);
+  assert.deepEqual(fnNames(lambdaCalls), ['send_email']);
+});
+
+test('REAL gate: unresolvable timezone → fail-closed (SMS suppressed, email floor stands)', async () => {
+  const message = reminderRow({ timezone: 'Not/AZone' });
+  makeDeps._consent = { consent_given: true };
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels, now: Date.parse('2026-06-12T18:00:00Z') });
+  const res = await dispatch(EVENT(message), deps);
+  makeDeps._consent = undefined;
+  assert.deepEqual(res.dispatched, { email: true, sms: false });
 });
 
 // ─── legacy single-channel rows (no tenant_prefs) ───────────────────────────────────────
