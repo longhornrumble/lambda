@@ -26,15 +26,17 @@
  *   .ics; these post-booking notices deliberately reuse the shared transactional
  *   sender per the work-order. Flagged for the integrator: the two scheduling email
  *   paths could later converge.)
- *   SMS routes to the existing `SMS_Sender` Lambda — but that twin lands in
- *   sub-phase-E/SMS, so the SMS path here is a **TODO(SMS-E) STUB**: it logs and
- *   returns a stub marker, never sends, never throws. `move_optin_sms` is therefore
- *   entirely stubbed today.
+ *   SMS routes to the existing `SMS_Sender` Lambda (G7b — async Event, sendType:'contact'
+ *   so SMS_Sender re-checks live consent server-side). It is the opt-in SUPPLEMENT, never
+ *   the sole channel: it is attempted ONLY when the CALL-SITE passes `channels.sms:true`
+ *   (decided by the §E3 selectChannels TCPA gate — org-flag && live consent && !quiet-hours).
+ *   Email is the unconditional floor.
  *
  * ── Compliance injection (§12.2/§12.3) ──
  *   Email bodies embed the reschedule/manage link (the §12.3 "easy reschedule path")
- *   and a STOP/unsubscribe line. SMS (when SMS-E lands) must carry STOP/HELP — the
- *   stub records that requirement.
+ *   and a STOP/unsubscribe line. SMS carries the STOP/HELP footer (SMS_STOP_FOOTER),
+ *   appended AFTER render in buildSmsPayload — structurally outside the editable §E14
+ *   sms_text override, so an override can neither remove nor (appendStopOnce) duplicate it.
  *
  * ── Best-effort ──
  *   A send failure is NON-FATAL: caught, logged PII-redacted (booking_id + kind only —
@@ -128,6 +130,12 @@ function appendStopOnce(rendered, stopLine) {
   return _STOP_MARKER_RE.test(rendered) ? rendered : rendered + stopLine;
 }
 
+// SMS compliance footer (G7b, §E3 TCPA). Appended AFTER render (outside the editable
+// sms_text override body) so a tenant override can never remove it; appendStopOnce reuses
+// the same "reply STOP" marker so an override that already carries STOP is not double-footed.
+// Plain-text, no HTML (SMS). HELP is included per CTIA/TCPA guidance.
+const SMS_STOP_FOOTER = '\nReply STOP to opt out, HELP for help.';
+
 // NB: STOP is NOT baked into these template bodies. It is appended (STOP_LINE_*) AFTER
 // render in buildEmailPayload, so a tenant E14 override (§E14) of subject/text/html can
 // never remove the unsubscribe line — the compliance footer is structurally outside the
@@ -169,6 +177,23 @@ const TEMPLATES = {
 // §E14 overridable moments (the 3 with a full subject+body here). reengagement (AI body)
 // + SMS kinds are NOT overridable in v1. Keep in sync with the ADA write API allowlist.
 const OVERRIDABLE_MOMENTS = new Set(['reschedule_link', 'reoffer', 'cancel_notice']);
+
+// ─── SMS templates (G7b, §E14 items 4-5) ──────────────────────────────────────────────
+// Plain-text single-body templates for the 3 dispatched moments. STOP/HELP is NOT baked
+// in here — it is appended (SMS_STOP_FOOTER) AFTER render, so a tenant sms_text override
+// can never remove it. These MUST stay byte-identical to the ADA editor's authoritative
+// `_SCHED_NOTIF_SMS_DEFAULTS` (Analytics_Dashboard_API/lambda_function.py) — the editor
+// shows the default, the sender renders it; a drift would make the preview lie. The
+// notify-sms parity test (notify-sms.test.js) is the merge gate that enforces this.
+// Follow-up (§E14 lock): extract to a shared JSON to make the parity structural.
+const SMS_TEMPLATES = {
+  reschedule_link:
+    'Hi {{firstName}}, need a different time for your {{apptType}}? Pick a new one: {{actionUrl}}',
+  reoffer:
+    'Hi {{firstName}}, your {{apptType}} time is no longer available. Pick a new one: {{actionUrl}}',
+  cancel_notice:
+    'Hi {{firstName}}, your {{apptType}}{{whenSuffix}} was canceled.{{rebookText}}',
+};
 
 // Merge a tenant override (§E14) over a default template. Per field: use the override's
 // value only when it is a non-empty string; otherwise keep the default. The override body
@@ -289,6 +314,57 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
   };
 }
 
+// Returns { to, body } for an SMS kind — plain-text, single body, STOP/HELP footer appended
+// AFTER render (outside any tenant override). `to` is the attendee phone (caller validates
+// E.164 / SMS_Sender re-validates). Best-effort: never throws. NOTE: a missing required action
+// link renders to an empty {{actionUrl}} here — for the value-add EMAIL kinds the email path
+// throws on a truly-missing link BEFORE SMS is attempted, but ONLY when email is also attempted;
+// a caller that sets channels.email:false MUST ensure the required link is present itself.
+// `smsOverride` is the tenant's §E14 sms_text string (or undefined → default). Mirrors
+// buildEmailPayload's plain-text var computation (NO html).
+function buildSmsPayload({ kind, booking, smsOverride }) {
+  const attendeePhone = pick(booking, 'attendeePhone', 'attendee_phone');
+  const firstName =
+    pick(booking, 'attendeeFirstName', 'attendee_first_name') ||
+    firstNameOf(pick(booking, 'attendeeName', 'attendee_name'));
+  const org =
+    pick(booking, 'organizationName', 'organization_name') ||
+    pick(booking, 'orgName', 'org_name') ||
+    'us';
+  const apptType =
+    pick(booking, 'appointmentTypeName', 'appointment_type_name') || 'appointment';
+  const whenLabel = pick(booking, 'whenLabel', 'when_label');
+  const whenSuffix = whenLabel ? ` on ${whenLabel}` : '';
+  const rescheduleUrl = safeUrl(pick(booking, 'rescheduleUrl', 'reschedule_url'));
+  const reofferUrl = safeUrl(pick(booking, 'reofferUrl', 'reoffer_url'));
+
+  let actionUrl = '';
+  if (kind === 'reschedule_link') actionUrl = rescheduleUrl;
+  else if (kind === 'reoffer') actionUrl = reofferUrl || rescheduleUrl;
+
+  // cancel_notice rebook link is optional (mirrors the email path).
+  const rebookText = rescheduleUrl ? ` Want to rebook? ${rescheduleUrl}` : '';
+
+  // Override is a single non-empty string or fall back to the default; the override never
+  // contains the footer (appended below), so this can't strip it.
+  const template =
+    typeof smsOverride === 'string' && smsOverride.trim()
+      ? smsOverride
+      : SMS_TEMPLATES[kind];
+
+  // No SMS template for this kind AND no override (e.g. a non-dispatched moment) → no body.
+  // Return an empty body so the dispatcher skips rather than sending a footer-only SMS.
+  if (!template) return { to: attendeePhone, body: '' };
+
+  // `org` is rendered because the §E14 SMS editor advertises {{org}} as an available variable
+  // (ADA _SCHED_NOTIF_SMS_VARS) — a tenant override using it must not silently render empty.
+  const body = appendStopOnce(
+    render(template, { firstName, org, apptType, whenSuffix, actionUrl, rebookText }),
+    SMS_STOP_FOOTER
+  );
+  return { to: attendeePhone, body };
+}
+
 // ─── default DI implementations (the only AWS-touching code) ──────────────────────────
 
 // Invoke the send_email Lambda async (Event) — best-effort, fire-and-forget. send_email
@@ -310,15 +386,30 @@ async function defaultInvokeEmail({ tenantId, to, subject, html_body, text_body 
   );
 }
 
-// TODO(SMS-E): wire to the SMS_Sender Lambda (event { to, body, tenantId, type:'reminder',
-// sessionId, ... }, async Event; SMS_Sender enforces consent + STOP/opt-out + quiet
-// hours). Until the sub-phase-E/SMS twin lands this is a no-send STUB. Never throws.
-// eslint-disable-next-line no-unused-vars -- args are the contract the real impl will use
-async function defaultInvokeSms({ tenantId, booking, kind, log }) {
-  (log || console).warn(
-    `[notify] SMS path not yet implemented (TODO SMS-E) — kind=${kind} would route to ${SMS_SENDER_FUNCTION}`
+// G7b: invoke the SMS_Sender Lambda async (Event) — best-effort, fire-and-forget. The
+// dispatch layer has already (a) decided SMS is permitted (selectChannels TCPA gate at the
+// call-site) and (b) built the footer-bearing body. `sendType:'contact'` makes SMS_Sender
+// RE-CHECK live consent server-side (defense in depth) and suppress on opt-out. We never
+// wait on delivery; a Telnyx failure is captured by SMS_Sender's DLQ + audit table.
+async function defaultInvokeSms({ tenantId, to, body, kind, sessionId }) {
+  await lambda.send(
+    new InvokeCommand({
+      FunctionName: SMS_SENDER_FUNCTION,
+      InvocationType: 'Event',
+      Payload: Buffer.from(
+        JSON.stringify({
+          to,
+          body,
+          tenantId,
+          sessionId: sessionId || '',
+          type: kind,
+          // contact-facing → SMS_Sender enforces the consent gate (the email floor is the
+          // unconditional channel; SMS is the consented supplement).
+          sendType: 'contact',
+        })
+      ),
+    })
   );
-  return { stub: true };
 }
 
 // §E14: default override loader — GetItem on the scheduling-notif-template table for an
@@ -339,11 +430,16 @@ async function defaultLoadTemplateOverride({ tenantId, kind, log = console } = {
     const it = res.Item;
     if (!it) return null;
     const s = (a) => (a && typeof a.S === 'string' ? a.S : undefined);
-    // G7 items 4-5 (SMS SEND, HELD): the ADA editor (G7a) stores the SMS override under the
-    // attribute name `sms_text` on this same row. When the SMS send path lands, project it here
-    // (`sms: s(it.sms_text)`) and append the TCPA STOP/HELP footer AFTER render — and add the
-    // ADA↔notify.js SMS-defaults PARITY TEST as a merge gate (mirrors the email-defaults parity).
-    return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html) };
+    // G7b: the ADA editor (G7a) stores the SMS override under `sms_text` on this same row.
+    // Projected here so the SMS path renders the tenant override; the TCPA STOP/HELP footer
+    // is appended AFTER render in buildSmsPayload (outside the editable body). The ADA↔notify
+    // SMS-defaults parity test (notify-sms.test.js) is the merge gate guarding the defaults.
+    return {
+      subject: s(it.subject),
+      text: s(it.body_text),
+      html: s(it.body_html),
+      sms: s(it.sms_text),
+    };
   } catch (err) {
     (log || console).warn(
       `[notify] template override load failed kind=${kind}: ${err.message} (using default)`
@@ -393,6 +489,16 @@ async function dispatchVolunteerNotice(
     throw new Error(`unknown notice kind: ${kind}`);
   }
 
+  // TCPA invariant (G7b): an SMS-NATIVE kind has no email floor to fall back on, so the only
+  // thing standing between it and a text is the caller's selectChannels gate. Refuse to dispatch
+  // one without an explicit `channels` decision — the org-flag + consent + quiet-hours gate is
+  // CALLER-OWNED (this module never reads consent). A caller bug (omitting channels) must not
+  // default an SMS-native kind to "send". Email kinds are unaffected (email is the floor; SMS is
+  // opt-in via channels.sms:true). Caught by the caller like the unknown-kind throw above.
+  if (isSmsKind && !channels) {
+    throw new Error(`SMS-native kind '${kind}' requires an explicit channels object (TCPA gate is caller-owned)`);
+  }
+
   const bookingId = pick(booking, 'bookingId', 'booking_id') || 'unknown';
   // Default channels per kind; an explicit `channels` overrides which to attempt.
   // An SMS-native kind sends UNLESS `channels.sms:false` (mirrors the email guard,
@@ -406,15 +512,20 @@ async function dispatchVolunteerNotice(
 
   const dispatched = {};
 
-  if (attemptEmail) {
-    // §E14: best-effort tenant override (null → defaults). Defense-in-depth: even if the
-    // loader itself throws, fall back to defaults — a template-store problem never blocks a send.
-    let templateOverride = null;
+  // §E14: load the tenant template override ONCE (shared by the email body AND the SMS
+  // body, so both honor the same override row). Best-effort / defense-in-depth: a loader
+  // throw or miss → null → defaults; a template-store problem must NEVER block a send. A
+  // non-overridable kind short-circuits to null inside the loader.
+  let templateOverride = null;
+  if (attemptEmail || attemptSms) {
     try {
       templateOverride = await loadTemplateOverride({ tenantId, kind, log });
     } catch (err) {
       log.warn(`[notify] template override load threw kind=${kind}: ${err.message} (using default)`);
     }
+  }
+
+  if (attemptEmail) {
     const payload = buildEmailPayload({ kind, booking, templateOverride }); // throws on missing required link
     if (!payload.to) {
       log.warn(`[notify] no recipient email — kind=${kind} booking=${bookingId}`);
@@ -434,15 +545,37 @@ async function dispatchVolunteerNotice(
   }
 
   if (attemptSms) {
-    try {
-      await invokeSms({ tenantId, booking, kind, log });
-      dispatched.sms = 'stubbed_todo_sms_e';
-    } catch (err) {
-      // Defensive: the stub never throws, but a future real impl must stay best-effort.
-      log.error(
-        `[notify] sms dispatch failed — kind=${kind} booking=${bookingId}: ${err.message}`
-      );
-      dispatched.sms = 'failed';
+    // G7b: build the footer-bearing SMS body (override-or-default), then invoke SMS_Sender.
+    // The TCPA gate (consent + quiet-hours) was applied by the CALL-SITE via selectChannels
+    // to decide channels.sms — by here SMS is permitted; SMS_Sender re-checks consent.
+    const smsPayload = buildSmsPayload({
+      kind,
+      booking,
+      smsOverride: templateOverride && templateOverride.sms,
+    });
+    if (!smsPayload.to) {
+      log.warn(`[notify] no recipient phone — kind=${kind} booking=${bookingId}`);
+      dispatched.sms = 'skipped_no_recipient';
+    } else if (!smsPayload.body) {
+      log.warn(`[notify] no SMS template — kind=${kind} booking=${bookingId}`);
+      dispatched.sms = 'skipped_no_template';
+    } else {
+      try {
+        await invokeSms({
+          tenantId,
+          to: smsPayload.to,
+          body: smsPayload.body,
+          kind,
+          sessionId: pick(booking, 'sessionId', 'session_id'),
+        });
+        dispatched.sms = 'sent';
+      } catch (err) {
+        // Best-effort: a failed courtesy SMS must not roll back the calendar mutation.
+        log.error(
+          `[notify] sms dispatch failed — kind=${kind} booking=${bookingId}: ${err.message}`
+        );
+        dispatched.sms = 'failed';
+      }
     }
   }
 
@@ -453,6 +586,7 @@ module.exports = {
   dispatchVolunteerNotice,
   // exported for unit coverage + reuse:
   buildEmailPayload,
+  buildSmsPayload,
   defaultInvokeEmail,
   defaultInvokeSms,
   defaultLoadTemplateOverride,
@@ -463,6 +597,8 @@ module.exports = {
   SMS_KINDS,
   COR_NATIVE_KINDS,
   OVERRIDABLE_MOMENTS,
+  SMS_TEMPLATES,
+  SMS_STOP_FOOTER,
   _SEND_EMAIL_FUNCTION: SEND_EMAIL_FUNCTION,
   _SMS_SENDER_FUNCTION: SMS_SENDER_FUNCTION,
 };

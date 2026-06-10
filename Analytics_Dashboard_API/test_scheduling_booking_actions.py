@@ -35,6 +35,9 @@ def _ddb_booking(status='booked', coord='coord@x.com', include_coord=True):
         'external_event_id': {'S': 'evt1'},
         'start_at': {'S': '2026-07-01T15:00:00Z'},
         'attendee_email': {'S': 'guest@x.com'},
+        # G7b: the guest phone must survive the ADA→BCH forward (BCH's selectChannels gate reads
+        # it; a field-whitelist that dropped it would silently kill the SMS supplement).
+        'attendee_phone': {'S': '+15125551234'},
     }
     if include_coord:
         item['coordinator_email'] = {'S': coord}
@@ -359,3 +362,56 @@ def test_route_booking_id_urldecode_reschedule_link():
     path = '/scheduling/bookings/booking%23deadbeef/reschedule-link'
     bid = urllib.parse.unquote(path.split('/scheduling/bookings/')[1].rsplit('/reschedule-link', 1)[0])
     assert bid == 'booking#deadbeef'
+
+
+# --------------------------------------------------------------------------- #
+# G7b: _scheduling_org_sms_enabled + reschedule_link payload threading
+# --------------------------------------------------------------------------- #
+
+def test_org_sms_enabled_true_when_config_flag_strictly_true():
+    with patch.object(lambda_function, 'get_tenant_config',
+                      return_value={'notificationPrefs': {'sms': True}}):
+        assert lambda_function._scheduling_org_sms_enabled('TEN1') is True
+
+
+def test_org_sms_enabled_false_for_non_true_values():
+    # Strictly True only — a truthy non-bool ('yes', 1) does NOT enable (fail-closed).
+    for cfg in ({'notificationPrefs': {'sms': 'yes'}},
+                {'notificationPrefs': {'sms': 1}},
+                {'notificationPrefs': {'sms': False}},
+                {'notificationPrefs': {}},
+                {},
+                None):
+        with patch.object(lambda_function, 'get_tenant_config', return_value=cfg):
+            assert lambda_function._scheduling_org_sms_enabled('TEN1') is False, cfg
+
+
+def test_org_sms_enabled_fails_closed_on_config_error():
+    with patch.object(lambda_function, 'get_tenant_config', side_effect=Exception('s3 down')):
+        assert lambda_function._scheduling_org_sms_enabled('TEN1') is False
+
+
+@patch('lambda_function._booking_action_lambda_client')
+@patch('lambda_function.dynamodb')
+def test_rl_payload_carries_org_sms_enabled_true(mock_ddb, mock_lambda):
+    mock_ddb.get_item.return_value = {'Item': _ddb_booking()}
+    mock_lambda.invoke.return_value = _invoke_resp({'outcome': 'success', 'sent': True})
+    with patch.object(lambda_function, 'get_tenant_config',
+                      return_value={'notificationPrefs': {'sms': True}}):
+        resp = handle_scheduling_booking_reschedule_link('TEN1', 'booking#abc', 'admin', 'a@x.com')
+    assert resp['statusCode'] == 200
+    payload = json.loads(mock_lambda.invoke.call_args.kwargs['Payload'].decode())
+    assert payload['org_sms_enabled'] is True
+    # the guest phone must survive into the forwarded booking (BCH's SMS gate reads it).
+    assert payload['booking']['attendee_phone'] == '+15125551234'
+
+
+@patch('lambda_function._booking_action_lambda_client')
+@patch('lambda_function.dynamodb')
+def test_rl_payload_org_sms_enabled_false_when_unset(mock_ddb, mock_lambda):
+    mock_ddb.get_item.return_value = {'Item': _ddb_booking()}
+    mock_lambda.invoke.return_value = _invoke_resp({'outcome': 'success', 'sent': True})
+    with patch.object(lambda_function, 'get_tenant_config', return_value={}):
+        resp = handle_scheduling_booking_reschedule_link('TEN1', 'booking#abc', 'admin', 'a@x.com')
+    payload = json.loads(mock_lambda.invoke.call_args.kwargs['Payload'].decode())
+    assert payload['org_sms_enabled'] is False

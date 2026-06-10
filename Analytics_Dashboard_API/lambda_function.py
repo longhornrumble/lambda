@@ -4185,6 +4185,23 @@ def handle_scheduling_booking_cancel(tenant_id: str, booking_id: str, body: Dict
     return cors_response(200, {'booking_id': booking_id, 'status': 'canceled'})
 
 
+def _scheduling_org_sms_enabled(tenant_id: str) -> bool:
+    """
+    G7b: the tenant's org-level scheduling SMS toggle, read from tenant config
+    `notificationPrefs.sms` (the same slice Reminder_Scheduler snapshots as tenantPrefs;
+    §E3). This is the org gate ONLY — the per-guest consent + quiet-hours gate runs in BCH
+    (selectChannels) and SMS_Sender re-checks consent server-side. FAIL-CLOSED: a missing
+    config / missing field / any error → False (email-only), never a spurious enable.
+    """
+    try:
+        config = get_tenant_config(tenant_id) or {}
+        prefs = config.get('notificationPrefs') or {}
+        return prefs.get('sms') is True
+    except Exception as e:  # noqa: BLE001 — fail-closed on any config-load error
+        logger.warning(f"[scheduling/org-sms] config read failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return False
+
+
 def handle_scheduling_booking_reschedule_link(tenant_id: str, booking_id: str,
                                               user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
     """
@@ -4206,6 +4223,10 @@ def handle_scheduling_booking_reschedule_link(tenant_id: str, booking_id: str,
         'coordinatorId': booking.get('coordinator_email'),
         'bookingId': booking_id,
         'booking': booking,
+        # G7b: tenant org-level SMS toggle. BCH's selectChannels gate uses this (with the
+        # guest's live consent + quiet-hours) to decide whether to ALSO send the reschedule
+        # link by SMS. Fail-closed: anything but an explicit True → email-only.
+        'org_sms_enabled': _scheduling_org_sms_enabled(tenant_id),
     }
     try:
         result, err = _invoke_booking_mutate(payload)

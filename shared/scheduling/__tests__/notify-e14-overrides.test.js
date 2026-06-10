@@ -207,15 +207,22 @@ test('mergeNoticeTemplate: an override with only unknown keys keeps base', () =>
   expect(mergeNoticeTemplate(base, { bogus: 'x' })).toEqual(base);
 });
 
-test('override loader is NOT called for an SMS kind (only the email path loads overrides)', async () => {
+test('override loader is loaded ONCE and shared by the email + SMS bodies (G7b)', async () => {
   let loaderCalls = 0;
   await dispatchVolunteerNotice(
-    { kind: 'move_optin_sms', tenantId: 'TEN1', booking: baseBooking(), channels: { sms: true } },
     {
-      invokeSms: async () => ({ ok: true }),
+      kind: 'reschedule_link',
+      tenantId: 'TEN1',
+      booking: { ...baseBooking(), attendeePhone: '+15125551234' },
+      channels: { email: true, sms: true },
+    },
+    {
+      invokeEmail: async () => undefined,
+      invokeSms: async () => undefined,
       loadTemplateOverride: async () => { loaderCalls++; return null; },
       log: { info() {}, warn() {}, error() {} },
     }
   );
-  expect(loaderCalls).toBe(0);
+  // One shared load feeds both channels — not one per channel.
+  expect(loaderCalls).toBe(1);
 });

@@ -27,7 +27,11 @@ function baseInjected(overrides = {}) {
       executeCancel: async ({ booking }) => { calls.cancel.push({ booking }); return { outcome: 'deleted', booking }; },
       // G6 reschedule_link seams.
       signRescheduleToken: async (purpose, claims) => { calls.token.push([purpose, claims]); return 'mock.jwt.token'; },
-      dispatchVolunteerNotice: async ({ kind, tenantId, booking }) => { calls.notify.push({ kind, tenantId, booking }); return { kind, dispatched: { email: 'sent' } }; },
+      dispatchVolunteerNotice: async ({ kind, tenantId, booking, channels }) => { calls.notify.push({ kind, tenantId, booking, channels }); return { kind, dispatched: { email: 'sent' } }; },
+      // G7b SMS-gate seams (deterministic fakes; real channels.js is covered by channels.test.js).
+      // Default: no SMS unless a test opts in (consent present + a fake that honors it).
+      selectChannels: ({ orgSmsEnabled, consentRecord }) => ({ email: true, sms: orgSmsEnabled === true && !!consentRecord }),
+      readSmsConsent: async () => null,
       logger: { warn: () => {}, error: () => {} },
       ...overrides,
     },
@@ -142,10 +146,12 @@ describe('handleSchedulingMutate — reschedule_link (G6, notify-only)', () => {
     expect(calls.notify[0].booking.rescheduleUrl).toMatch(/\/reschedule\?t=mock\.jwt\.token$/);
     // NEVER builds the calendar facade for a notify-only action
     expect(calls.facade).toHaveLength(0);
-    // claimed the anti-bombing cooldown slot BEFORE minting
+    // claimed the anti-bombing cooldown slot BEFORE minting (60s window — a change to 0/3600
+    // would silently weaken/strengthen the email-bombing guard, so pin it).
     expect(calls.cooldown).toHaveLength(1);
     expect(calls.cooldown[0][0]).toBe('T1');
     expect(calls.cooldown[0][1]).toBe('bk1');
+    expect(calls.cooldown[0][2]).toBe(60);
   });
 
   it('passes the booking cancellation_window_hours into the token claims (matches disposition.js)', async () => {
@@ -207,6 +213,90 @@ describe('handleSchedulingMutate — reschedule_link (G6, notify-only)', () => {
     });
     const out = await handleSchedulingMutate(RL_EVENT, injected);
     expect(out).toEqual({ outcome: 'success', sent: false });
+  });
+
+  // ── G7b: SMS supplement channel gating (email is always the floor) ──────────────────
+  const RL_SMS_EVENT = {
+    ...RL_EVENT,
+    org_sms_enabled: true,
+    booking: { ...RL_EVENT.booking, attendee_phone: '+15125551234', timezone: 'America/Chicago' },
+  };
+
+  it('org SMS on + live consent → channels.sms:true is passed to notify', async () => {
+    let consentReads = 0;
+    const { injected, calls } = baseInjected({
+      readSmsConsent: async (t, p) => { consentReads++; return { consent_given: true }; },
+    });
+    const out = await handleSchedulingMutate(RL_SMS_EVENT, injected);
+    expect(out.outcome).toBe('success');
+    expect(consentReads).toBe(1);
+    expect(calls.notify[0].channels).toEqual({ email: true, sms: true });
+  });
+
+  it('org SMS on but NO consent record → channels.sms:false (email floor stands)', async () => {
+    const { injected, calls } = baseInjected({ readSmsConsent: async () => null });
+    await handleSchedulingMutate(RL_SMS_EVENT, injected);
+    expect(calls.notify[0].channels).toEqual({ email: true, sms: false });
+  });
+
+  it('org SMS OFF → never reads consent, channels.sms:false', async () => {
+    let consentReads = 0;
+    const { injected, calls } = baseInjected({
+      readSmsConsent: async () => { consentReads++; return { consent_given: true }; },
+    });
+    await handleSchedulingMutate({ ...RL_SMS_EVENT, org_sms_enabled: false }, injected);
+    expect(consentReads).toBe(0);
+    expect(calls.notify[0].channels).toEqual({ email: true, sms: false });
+  });
+
+  it('org_sms_enabled truthy-non-bool ("yes"/1) does NOT enable SMS (strict === true gate)', async () => {
+    for (const truthy of ['yes', 'true', 1]) {
+      const { injected, calls } = baseInjected({
+        readSmsConsent: async () => ({ consent_given: true }),
+      });
+      await handleSchedulingMutate({ ...RL_SMS_EVENT, org_sms_enabled: truthy }, injected);
+      expect(calls.notify[0].channels).toEqual({ email: true, sms: false });
+    }
+  });
+
+  it('org SMS on but no phone on the booking → no consent read, channels.sms:false', async () => {
+    let consentReads = 0;
+    const { injected, calls } = baseInjected({
+      readSmsConsent: async () => { consentReads++; return { consent_given: true }; },
+    });
+    await handleSchedulingMutate(
+      { ...RL_SMS_EVENT, booking: { ...RL_EVENT.booking } }, // no attendee_phone
+      injected
+    );
+    expect(consentReads).toBe(0);
+    expect(calls.notify[0].channels).toEqual({ email: true, sms: false });
+  });
+
+  it('a consent-read throw FAILS CLOSED (sms:false) and still emails the link', async () => {
+    const { injected, calls } = baseInjected({
+      readSmsConsent: async () => { throw new Error('ddb down'); },
+    });
+    const out = await handleSchedulingMutate(RL_SMS_EVENT, injected);
+    expect(out).toEqual({ outcome: 'success', sent: true });
+    expect(calls.notify[0].channels).toEqual({ email: true, sms: false });
+  });
+
+  it('a selectChannels throw FAILS CLOSED (sms:false)', async () => {
+    const { injected, calls } = baseInjected({
+      readSmsConsent: async () => ({ consent_given: true }),
+      selectChannels: () => { throw new Error('boom'); },
+    });
+    await handleSchedulingMutate(RL_SMS_EVENT, injected);
+    expect(calls.notify[0].channels).toEqual({ email: true, sms: false });
+  });
+
+  it('sent:true when ONLY the SMS supplement delivered (email skipped)', async () => {
+    const { injected } = baseInjected({
+      readSmsConsent: async () => ({ consent_given: true }),
+      dispatchVolunteerNotice: async ({ kind }) => ({ kind, dispatched: { sms: 'sent' } }),
+    });
+    const out = await handleSchedulingMutate(RL_SMS_EVENT, injected);
+    expect(out).toEqual({ outcome: 'success', sent: true });
   });
 });
 
