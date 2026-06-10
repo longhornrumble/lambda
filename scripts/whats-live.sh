@@ -31,17 +31,21 @@ show_fn() {
     echo "  $fn: (not found / no access)"; return; }
   mod=$(cut -f1 <<<"$cfg"); sha=$(cut -f2 <<<"$cfg")
   # Latest published version's description carries the deploy note.
-  local note
-  note=$(aws lambda list-versions-by-function --function-name "$fn" \
+  # (CLI v2 auto-paginates list calls before --query, so Versions[-1] is the
+  # true newest even past 50 versions.) List query → text preserves order.
+  local v d
+  read -r v d < <(aws lambda list-versions-by-function --function-name "$fn" \
          --profile "$profile" \
-         --query 'Versions[-1].{V:Version,D:Description}' --output text 2>/dev/null | tr '\t' ' ')
+         --query 'Versions[-1].[Version,Description]' --output text 2>/dev/null)
   echo "  $fn"
   echo "    \$LATEST: sha=${sha:0:12}… modified=$mod"
-  echo "    newest version: $note"
+  echo "    newest version: v$v — ${d:-"(no description)"}"
   if [ -n "$alias_name" ]; then
     local av asha
+    # No stderr suppression here: a real failure (expired SSO, IAM deny)
+    # should be visible, not masquerade as "alias not found".
     av=$(aws lambda get-alias --function-name "$fn" --name "$alias_name" \
-         --profile "$profile" --query FunctionVersion --output text 2>/dev/null) || av="(none)"
+         --profile "$profile" --query FunctionVersion --output text) || av="(none)"
     if [ "$av" != "(none)" ]; then
       asha=$(aws lambda get-function-configuration --function-name "$fn:$av" \
              --profile "$profile" --query CodeSha256 --output text 2>/dev/null)
