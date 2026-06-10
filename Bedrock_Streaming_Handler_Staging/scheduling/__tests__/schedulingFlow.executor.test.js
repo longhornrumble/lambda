@@ -24,12 +24,18 @@ describe('executor payload + outcome mapping (via _doReschedule/_doCancel)', () 
     expect('bookingId' in seen[0]).toBe(false); // CR nit: dead top-level field removed
   });
 
-  it('NTH1: payload.booking is PII-projected — keeps attendee_email, drops attendee_phone', async () => {
+  it('NTH1/S1.1: payload.booking is PII-projected — keeps attendee_email + attendee_phone + organization_name (reminders), drops un-listed fields', async () => {
     const seen = [];
-    await _doReschedule({ tenantId: 'T1', binding: BINDING, booking: BOOKING, newSlot: SLOT, deps: { invokeSchedulingExecutor: async (p) => { seen.push(p); return { outcome: 'success', booking: BOOKING }; } }, logger: console });
-    expect(seen[0].booking.attendee_email).toBe('vol@x.com');     // needed to rebuild the invite
+    const booking = { ...BOOKING, organization_name: 'Austin Angels', reminder_schedule_state: { tiers: ['t24h'] } };
+    await _doReschedule({ tenantId: 'T1', binding: BINDING, booking, newSlot: SLOT, deps: { invokeSchedulingExecutor: async (p) => { seen.push(p); return { outcome: 'success', booking }; } }, logger: console });
+    expect(seen[0].booking.attendee_email).toBe('vol@x.com');       // needed to rebuild the invite
     expect(seen[0].booking.external_event_id).toBe('evt-old');
-    expect('attendee_phone' in seen[0].booking).toBe(false);       // stripped
+    // S1.1: phone + org are now CARRIED — the executor's reminder rebind needs them (phone →
+    // TCPA-gated SMS supplement; org → real reminder copy instead of "your appointment with us").
+    expect(seen[0].booking.attendee_phone).toBe('+15551234567');
+    expect(seen[0].booking.organization_name).toBe('Austin Angels');
+    // projection discipline still holds: a field NOT in _EXEC_BOOKING_FIELDS is stripped.
+    expect('reminder_schedule_state' in seen[0].booking).toBe(false);
   });
 
   it('cancel payload omits newSlot', async () => {

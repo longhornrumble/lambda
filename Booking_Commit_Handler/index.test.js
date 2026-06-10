@@ -15,6 +15,10 @@
 // Set BEFORE requiring ./index — OPS_ALERTS_TOPIC_ARN is read at module load, and
 // these tests exercise the SNS admin-alert paths.
 process.env.OPS_ALERTS_TOPIC_ARN = 'arn:aws:sns:us-east-1:525409062831:picasso-ops-alerts-staging';
+// Track 1 S1.1: scheduleBookingReminders skips silently unless the scheduler is configured.
+// Set the env so the commit-path reminder tests exercise the LIVE scheduling path; the
+// not-configured skip is tested explicitly via the ctx.schedulerConfigured:false seam.
+process.env.SCHEDULER_TARGET_ARN = 'arn:aws:scheduler:us-east-1:525409062831:schedule/picasso-scheduling/test';
 
 // Feature gate: these tests exercise the commit LOGIC, so scheduling is enabled.
 // The disabled/refuse paths live in index.gate.test.js.
@@ -662,7 +666,7 @@ describe('Track 1 — reminder scheduling at commit', () => {
 
   it('schedules reminders after a successful commit, with the plain-object booking view', async () => {
     const inj = reminderInjection();
-    const res = await handler(baseEvent(), {}, inj);
+    const res = await handler(baseEvent({ attendee: { first_name: 'Sam', last_name: 'Patel', email: 'sam@example.com', phone: '+15125550101' } }), {}, inj);
     expect(res.status).toBe('BOOKED');
     expect(inj.scheduleReminders).toHaveBeenCalledTimes(1);
     const arg = inj.scheduleReminders.mock.calls[0][0];
@@ -673,11 +677,37 @@ describe('Track 1 — reminder scheduling at commit', () => {
       timezone: 'America/Chicago',
       attendee_email: 'sam@example.com',
       attendee_name: 'Sam Patel',
+      attendee_phone: '+15125550101', // present → forwarded for the fire-time SMS supplement
       appointment_type_name: 'Volunteer intake',
       organization_name: 'Austin Angels',
       is_synthetic: false,
     });
     expect(typeof arg.booking.booking_id).toBe('string'); // plain string, not a {S:...} AttributeValue
+  });
+
+  it('threads the REAL calendar email (coordinator_email), not the secret-path label, into the view', async () => {
+    const REAL_CAL = 'coordinator-maya@org.example';
+    oauth.getCoordinatorCalendarId.mockResolvedValue(REAL_CAL);
+    const inj = reminderInjection();
+    await handler(baseEvent(), {}, inj);
+    expect(inj.scheduleReminders.mock.calls[0][0].booking.coordinator_email).toBe(REAL_CAL);
+    expect(inj.scheduleReminders.mock.calls[0][0].booking.coordinator_email).not.toBe('maya@org.org');
+  });
+
+  it('leaves attendee_phone undefined when the attendee has no phone (no SMS supplement possible)', async () => {
+    const inj = reminderInjection(); // baseEvent attendee has no phone
+    await handler(baseEvent(), {}, inj);
+    expect(inj.scheduleReminders.mock.calls[0][0].booking.attendee_phone).toBeUndefined();
+  });
+
+  it('skips reminder scheduling SILENTLY (no alert) when the scheduler is not configured', async () => {
+    const inj = reminderInjection({ schedulerConfigured: false });
+    const res = await handler(baseEvent(), {}, inj);
+    expect(res.status).toBe('BOOKED');
+    expect(inj.scheduleReminders).not.toHaveBeenCalled();
+    expect(
+      snsMock.commandCalls(PublishCommand).some((c) => /reminder/i.test(c.args[0].input.Subject))
+    ).toBe(false); // no admin alert noise pre-S6
   });
 
   it('snapshots org SMS = true into tenantPrefs when the tenant config enables it', async () => {
@@ -698,6 +728,30 @@ describe('Track 1 — reminder scheduling at commit', () => {
     const inj = reminderInjection();
     await handler(baseEvent({ is_synthetic: true }), {}, inj);
     expect(inj.scheduleReminders.mock.calls[0][0].booking.is_synthetic).toBe(true);
+  });
+
+  it('threads sms_quiet_hours from the tenant config into tenantPrefs', async () => {
+    const inj = reminderInjection({
+      loadTenantConfig: jest.fn().mockResolvedValue({ notificationPrefs: { sms: true }, sms_quiet_hours: { start: 22, end: 7 } }),
+    });
+    await handler(baseEvent(), {}, inj);
+    expect(inj.scheduleReminders.mock.calls[0][0].tenantPrefs.sms_quiet_hours).toEqual({ start: 22, end: 7 });
+  });
+
+  it('does NOT schedule reminders on an idempotent ALREADY_CONFIRMED (no commit happened)', async () => {
+    bookingStore.getBookingById.mockResolvedValue({ status: { S: 'booked' } });
+    const inj = reminderInjection();
+    const res = await handler(baseEvent(), {}, inj);
+    expect(res.status).toBe('ALREADY_CONFIRMED');
+    expect(inj.scheduleReminders).not.toHaveBeenCalled();
+  });
+
+  it('does NOT schedule reminders on a SLOT_UNAVAILABLE reoffer (no commit happened)', async () => {
+    availability.getBusyIntervals.mockResolvedValue({ busy: [{ start: '2026-06-03T18:00:00.000Z', end: '2026-06-03T18:30:00.000Z' }] });
+    const inj = reminderInjection();
+    const res = await handler(baseEvent(), {}, inj);
+    expect(res.status).toBe('SLOT_UNAVAILABLE');
+    expect(inj.scheduleReminders).not.toHaveBeenCalled();
   });
 
   it('a reminder-scheduling failure never undoes a committed booking (BOOKED + admin alert)', async () => {

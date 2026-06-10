@@ -44,7 +44,12 @@ function baseInjected(overrides = {}) {
 const RESCH_EVENT = {
   action: 'scheduling_mutate', mutation: 'reschedule',
   tenantId: 'T1', coordinatorId: 'coord@x.com', bookingId: 'bk1',
-  booking: { booking_id: 'bk1', tenant_id: 'T1', coordinator_email: 'coord@x.com', external_event_id: 'evt-old' },
+  // S1.1: the executor projection now carries attendee_phone + organization_name (+ the
+  // already-projected attendee_name / appointment_type_name / timezone) so a rebind snapshots
+  // real reminder data (phone → SMS supplement; org/appt → real copy).
+  booking: { booking_id: 'bk1', tenant_id: 'T1', coordinator_email: 'coord@x.com', external_event_id: 'evt-old',
+    attendee_phone: '+15125550199', attendee_name: 'Sam Patel', organization_name: 'Austin Angels',
+    appointment_type_name: 'Volunteer intake', timezone: 'America/Chicago' },
   newSlot: { start: '2026-07-01T15:00:00Z', end: '2026-07-01T15:30:00Z' },
 };
 
@@ -362,7 +367,21 @@ describe('handleSchedulingMutate — reschedule reminder rebind (Track 1, §E1)'
     expect(booking.booking_id).toBe('bk1');
     expect(booking.start_at).toBe(RESCH_EVENT.newSlot.start); // the NEW time, not the old
     expect(booking.end_at).toBe(RESCH_EVENT.newSlot.end);
+    // S1.1: real reminder data carried (phone for the SMS supplement; org/appt/name for copy)
+    expect(booking.attendee_phone).toBe('+15125550199');
+    expect(booking.organization_name).toBe('Austin Angels');
+    expect(booking.appointment_type_name).toBe('Volunteer intake');
+    expect(booking.attendee_name).toBe('Sam Patel');
+    expect(booking.timezone).toBe('America/Chicago');
     expect(tenantPrefs).toEqual({ notificationPrefs: { sms: false }, sms_quiet_hours: null });
+  });
+
+  it('truthy-non-bool org_sms_enabled ("yes"/1/"true") does NOT enable SMS on rebind (strict === true)', async () => {
+    for (const truthy of ['yes', 'true', 1]) {
+      const { injected, calls } = baseInjected();
+      await handleSchedulingMutate({ ...RESCH_EVENT, org_sms_enabled: truthy }, injected);
+      expect(calls.rebind[0].tenantPrefs.notificationPrefs.sms).toBe(false);
+    }
   });
 
   it('passes org SMS = true + sms_quiet_hours into tenantPrefs from the event', async () => {

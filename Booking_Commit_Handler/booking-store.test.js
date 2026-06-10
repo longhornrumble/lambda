@@ -79,6 +79,15 @@ describe('buildBookingItem — GSI keys + status discipline', () => {
     expect(withPhone.attendee_name.S).toBe('Sam Patel');
   });
 
+  it('S1.1: persists organization_name + appointment_type_name only when present (for reschedule reminder copy)', () => {
+    const item = store.buildBookingItem(fields);
+    expect(item.organization_name).toBeUndefined();
+    expect(item.appointment_type_name).toBeUndefined();
+    const withNames = store.buildBookingItem({ ...fields, organizationName: 'Austin Angels', appointmentTypeName: 'Volunteer intake' });
+    expect(withNames.organization_name.S).toBe('Austin Angels');
+    expect(withNames.appointment_type_name.S).toBe('Volunteer intake');
+  });
+
   it('sets all optional fields when present (conference id, join url, reschedule link)', () => {
     const item = store.buildBookingItem({
       ...fields, conferenceId: 'z-1', joinUrl: 'https://zoom.us/j/z-1', rescheduleOfBookingId: 'booking#old',
