@@ -4614,6 +4614,24 @@ _SCHED_NOTIF_MOMENT_VARS = {
                       '{{rebookText}}', '{{rebookHtml}}'],
 }
 
+# G7a (E14 SMS EDITOR surface — items 1-3 only): the SMS override field + its editor-display
+# defaults + the SMS-valid variable subset (plain-text — NO html vars like {{rebookHtml}}).
+# ⚠ EDITOR SURFACE ONLY: the actual SMS SEND (notify.js SMS path + the TCPA STOP/HELP footer) is
+# HELD (G7 items 4-5, gated on the SMS_Sender twin + WS-E-TCPA). These ADA defaults are
+# authoritative for the editor; when the sender lands, notify.js MUST mirror them — a parity test
+# ships with items 4-5 (notify.js SMS is a no-send stub today, so there is nothing to mirror yet).
+_SCHED_SMS_FIELD_MAX = 480  # ~3 SMS segments; the editor surfaces the per-segment (160-char) count.
+_SCHED_NOTIF_SMS_DEFAULTS = {
+    'reschedule_link': 'Hi {{firstName}}, need a different time for your {{apptType}}? Pick a new one: {{actionUrl}}',
+    'reoffer': 'Hi {{firstName}}, your {{apptType}} time is no longer available. Pick a new one: {{actionUrl}}',
+    'cancel_notice': 'Hi {{firstName}}, your {{apptType}}{{whenSuffix}} was canceled.{{rebookText}}',
+}
+_SCHED_NOTIF_SMS_VARS = {
+    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{rebookText}}'],
+}
+
 
 def handle_scheduling_notification_templates_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
     """
@@ -4660,16 +4678,25 @@ def handle_scheduling_notification_templates_get(tenant_id: str, user_role: Opti
                 is_override = True
             else:
                 effective[f] = default[f]
+        # G7a SMS editor surface (inert until the sender lands): effective sms_text = override or default.
+        sms_default = _SCHED_NOTIF_SMS_DEFAULTS[moment]
+        sms_ov = ov.get('sms_text')
+        sms_is_override = isinstance(sms_ov, str) and bool(sms_ov.strip())
         moments_out[moment] = {
             **effective,
             'is_override': is_override,
             'default': dict(default),
             'modified_at': ov.get('modified_at'),
             'available_variables': _SCHED_NOTIF_MOMENT_VARS[moment],
+            'sms_text': sms_ov if sms_is_override else sms_default,
+            'sms_is_override': sms_is_override,
+            'sms_default': sms_default,
+            'sms_available_variables': _SCHED_NOTIF_SMS_VARS[moment],
         }
     return cors_response(200, {
         'moments': moments_out,
         'stop_footer_note': 'An unsubscribe (STOP) line is appended automatically and cannot be removed.',
+        'sms_footer_note': 'A STOP/HELP line is appended automatically to every SMS and cannot be removed (TCPA). SMS sending is not yet enabled.',
     })
 
 
@@ -4701,8 +4728,18 @@ def handle_scheduling_notification_template_write(tenant_id: str, moment: str, b
             if len(v) > _SCHED_TPL_FIELD_MAX:
                 return cors_response(400, {'error': f'{f} exceeds {_SCHED_TPL_FIELD_MAX} chars'})
             fields[f] = v
+    # G7a: the SMS override field (its own, smaller max). Empty-string clears the override (reads
+    # fall back to the SMS default), same merge semantics as the email fields. The actual SMS SEND
+    # is still HELD — this only stores the copy the editor manages.
+    if 'sms_text' in body:
+        v = body['sms_text']
+        if not isinstance(v, str):
+            return cors_response(400, {'error': 'sms_text must be a string'})
+        if len(v) > _SCHED_SMS_FIELD_MAX:
+            return cors_response(400, {'error': f'sms_text exceeds {_SCHED_SMS_FIELD_MAX} chars'})
+        fields['sms_text'] = v
     if not fields:
-        return cors_response(400, {'error': 'provide at least one of subject, body_text, body_html'})
+        return cors_response(400, {'error': 'provide at least one of subject, body_text, body_html, sms_text'})
 
     fields['modified_at'] = _modified_at(user_email)
     # No ConditionExpression (no optimistic lock per §E13c) → no '#pk' alias: DynamoDB rejects
@@ -7516,6 +7553,45 @@ def handle_notification_template_test_send(
 # Team Management Handlers (Phase 3)
 # =============================================================================
 
+# G8 (WS-E-PORTAL E13 D3 warnings): the prefix of the per-coordinator OAuth secrets (the §E11
+# connect flow + §B7 read the same path). connection state lives ONLY in these secrets — the
+# OAuth connect flow writes nothing to the employee registry — so calendar_connected is derived
+# by reading the secret, not projecting a registry field. (v2 perf: have the connect/revoke flow
+# stamp connected_at on the registry → a true one-line projection + no per-member secret read.)
+_OAUTH_SECRET_PATH_PREFIX = os.environ.get('OAUTH_SECRET_PATH_PREFIX', 'picasso/scheduling/oauth')
+
+
+def _coordinator_calendar_connected(tenant_id: str, coordinator_id: str) -> bool:
+    """G8: does this coordinator have an ACTIVE E11 OAuth calendar connection? Reads the SAME
+    per-coordinator OAuth secret §B7 consults: connected = the secret EXISTS AND its `status` is
+    not 'revoked' (a missing/null status on an existing secret reads as connected, mirroring §B7
+    keeping such a candidate). Secret path = {prefix}/{tenantId}/{coordinator_id} where
+    coordinator_id = the lower-cased login email (the §E0 self-mint identity). A missing secret →
+    not connected; an unreadable/transient error → not connected (conservative: surface the
+    'connect calendar' nudge rather than hide a real disconnection)."""
+    if not coordinator_id:
+        return False
+    try:
+        resp = _secrets_client.get_secret_value(
+            SecretId=f'{_OAUTH_SECRET_PATH_PREFIX}/{tenant_id}/{coordinator_id}')
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', '')
+        if code != 'ResourceNotFoundException':
+            logger.warning(f"[team] calendar_connected read failed (tenant={redact_tenant_id(tenant_id)}): {code}")
+        return False
+    except Exception as e:  # noqa: BLE001 — best-effort display field; ANY read failure → not connected
+        logger.warning(f"[team] calendar_connected read error (tenant={redact_tenant_id(tenant_id)}): {type(e).__name__}")
+        return False
+    raw = resp.get('SecretString') or ''
+    if not raw:
+        return False
+    try:
+        status = json.loads(raw).get('status')
+    except (json.JSONDecodeError, ValueError, AttributeError):
+        return True  # secret exists but shapeless → connected (mirrors §B7 keeping it)
+    return status != 'revoked'
+
+
 def handle_team_members_list(auth_result: Dict[str, Any], tenant_id: str) -> Dict[str, Any]:
     """GET /team/members — List organization members (registry-first)."""
     org_id, err = _resolve_team_org_id(auth_result, tenant_id)
@@ -7597,6 +7673,13 @@ def handle_team_members_list(auth_result: Dict[str, Any], tenant_id: str) -> Dic
                 else None
             ),
             'bookable_override': record.get('bookable_override'),
+            # G8 (ui_plan Surface 3 D3 warnings): is this staff member's calendar actively connected?
+            # Derived from the per-coordinator OAuth secret (the §B7 signal). The portal derives the
+            # "connect calendar" warning (!connected), the "not on any team" warning (connected but no
+            # tags), and the bookable/connection filter from this + scheduling_tags + bookable_override.
+            # Additive; pre-G8 reads as false (no secret → not connected).
+            'calendar_connected': _coordinator_calendar_connected(
+                tenant_id, (record.get('email', '') or '').lower()),
         })
 
     return cors_response(200, {

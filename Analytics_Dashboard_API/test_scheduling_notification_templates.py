@@ -223,3 +223,82 @@ def test_patch_200_body_shape_gap7(mock_ddb):
 def test_patch_non_dict_body_400_gap8():
     assert handle_scheduling_notification_template_write(
         TENANT, 'reschedule_link', "not-a-dict", ADMIN, EMAIL)['statusCode'] == 400
+
+
+# --------------------------------------------------------------------------- #
+# G7a — SMS editor surface (items 1-3; the SEND path is held)
+# --------------------------------------------------------------------------- #
+
+def test_sms_defaults_cover_the_three_moments_no_stop_no_html_vars():
+    assert set(lf._SCHED_NOTIF_SMS_DEFAULTS.keys()) == set(lf._SCHED_NOTIF_MOMENTS)
+    for moment, txt in lf._SCHED_NOTIF_SMS_DEFAULTS.items():
+        assert 'STOP' not in txt, f'{moment} SMS default must not bake in STOP (appended at dispatch)'
+    # SMS vars are plain-text only — never the html-only {{rebookHtml}}
+    for moment, vars_ in lf._SCHED_NOTIF_SMS_VARS.items():
+        assert '{{rebookHtml}}' not in vars_
+
+
+@patch('lambda_function.dynamodb')
+def test_get_exposes_sms_surface_defaults(mock_ddb):
+    mock_ddb.query.return_value = {'Items': []}
+    body = json.loads(handle_scheduling_notification_templates_get(TENANT, ADMIN)['body'])
+    assert 'sms_footer_note' in body and 'cannot be removed' in body['sms_footer_note']
+    rl = body['moments']['reschedule_link']
+    assert rl['sms_is_override'] is False
+    assert rl['sms_text'] == lf._SCHED_NOTIF_SMS_DEFAULTS['reschedule_link']
+    assert rl['sms_default'] == lf._SCHED_NOTIF_SMS_DEFAULTS['reschedule_link']
+    assert '{{actionUrl}}' in rl['sms_available_variables']
+    assert '{{rebookHtml}}' not in rl['sms_available_variables']
+
+
+@patch('lambda_function.dynamodb')
+def test_get_with_sms_override_shows_effective_and_flag(mock_ddb):
+    mock_ddb.query.return_value = {'Items': [{
+        'tenantId': {'S': TENANT}, 'moment': {'S': 'reschedule_link'},
+        'sms_text': {'S': 'Custom SMS {{actionUrl}}'},
+    }]}
+    rl = json.loads(handle_scheduling_notification_templates_get(TENANT, ADMIN)['body'])['moments']['reschedule_link']
+    assert rl['sms_is_override'] is True
+    assert rl['sms_text'] == 'Custom SMS {{actionUrl}}'
+    # email side untouched → still default + not an override
+    assert rl['is_override'] is False
+    assert rl['subject'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['subject']
+
+
+@patch('lambda_function.dynamodb')
+def test_get_blank_sms_override_falls_back_to_sms_default(mock_ddb):
+    mock_ddb.query.return_value = {'Items': [{
+        'tenantId': {'S': TENANT}, 'moment': {'S': 'reoffer'}, 'sms_text': {'S': '   '},
+    }]}
+    rf = json.loads(handle_scheduling_notification_templates_get(TENANT, ADMIN)['body'])['moments']['reoffer']
+    assert rf['sms_is_override'] is False
+    assert rf['sms_text'] == lf._SCHED_NOTIF_SMS_DEFAULTS['reoffer']
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_accepts_sms_text_only_200(mock_ddb):
+    mock_ddb.update_item.return_value = _attrs(sms_text='Hi {{firstName}} {{actionUrl}}')
+    r = handle_scheduling_notification_template_write(
+        TENANT, 'reschedule_link', {'sms_text': 'Hi {{firstName}} {{actionUrl}}'}, ADMIN, EMAIL)
+    assert r['statusCode'] == 200
+    kw = mock_ddb.update_item.call_args.kwargs
+    assert any(n == 'sms_text' for n in kw['ExpressionAttributeNames'].values())
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_sms_text_non_string_400(mock_ddb):
+    assert handle_scheduling_notification_template_write(
+        TENANT, 'reschedule_link', {'sms_text': 123}, ADMIN, EMAIL)['statusCode'] == 400
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_sms_text_too_long_400(mock_ddb):
+    assert handle_scheduling_notification_template_write(
+        TENANT, 'reschedule_link', {'sms_text': 'x' * (lf._SCHED_SMS_FIELD_MAX + 1)}, ADMIN, EMAIL)['statusCode'] == 400
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_empty_sms_text_clears_override_200(mock_ddb):
+    mock_ddb.update_item.return_value = _attrs(sms_text='')
+    assert handle_scheduling_notification_template_write(
+        TENANT, 'reschedule_link', {'sms_text': ''}, ADMIN, EMAIL)['statusCode'] == 200
