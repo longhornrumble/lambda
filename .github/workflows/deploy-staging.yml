@@ -620,6 +620,31 @@ jobs:
           echo "size=$(stat -c%s /tmp/deploy.zip)" >> "$GITHUB_OUTPUT"
           echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
 
+      - name: Zip-manifest guard (Python)
+        if: matrix.lambda.runtime == 'python'
+        run: |
+          set -euo pipefail
+          # The include_globs allowlist silently DROPS any runtime file that
+          # isn't listed (cost §P5.1 twice —
+          # reference_lambda_deploy_include_globs_allowlist). Fail loudly
+          # instead: every tracked .py/.json in the source dir must be inside
+          # the zip, except non-deployed classes: tests (test_*, run_*,
+          # conftest) and one-off ops scripts (backfill_*, create_*,
+          # migrate_*). New non-deployed file classes extend that exclusion
+          # regex. unzip -Z1 = one filename per line (space-safe).
+          # Mirrors the identical guard in deploy-production.yml.
+          SRC='${{ matrix.lambda.source_dir }}'
+          MISSING=0
+          while IFS= read -r f; do
+            rel="${f#"$SRC"/}"
+            if ! unzip -Z1 /tmp/deploy.zip | grep -qx "$rel"; then
+              echo "::error file=$f::Tracked runtime file missing from deploy zip — add it to include_globs (in BOTH deploy-staging.yml and deploy-production.yml)"
+              MISSING=1
+            fi
+          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)(test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)$')
+          if [ "$MISSING" -eq 0 ]; then echo "Zip-manifest guard: all tracked runtime files present."; fi
+          exit $MISSING
+
       # C8 (Booking_Commit_Handler) bundles ../shared/scheduling/* at esbuild
       # time. esbuild resolves those modules' own deps (@googleapis/calendar,
       # google-auth-library, @aws-sdk/*) from shared/scheduling/node_modules, so
