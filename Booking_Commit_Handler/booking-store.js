@@ -185,6 +185,50 @@ async function updateBookingReschedule(tenantId, bookingId, { startAt, externalE
   }));
 }
 
+// G6 cancel-with-reason — persist the audit-only cancel reason + actor. The Booking.status
+// flip is the §14.2 listener's job (the calendar delete drives it); this writes ONLY the
+// reason/actor attributes. ConditionExpression guards a vanished row (a concurrent delete).
+async function updateBookingCancelReason(tenantId, bookingId, { reason, canceledBy } = {}) {
+  if (!tenantId || !bookingId) throw new Error('updateBookingCancelReason requires tenantId and bookingId');
+  // Guard a non-string/empty reason → never marshal `String(undefined)`='undefined' into DDB.
+  if (typeof reason !== 'string' || !reason) throw new Error('updateBookingCancelReason requires a non-empty reason string');
+  const sets = ['cancel_reason = :r'];
+  const vals = { ':r': s(reason) };
+  if (canceledBy) { sets.push('canceled_by = :by'); vals[':by'] = s(canceledBy); }
+  await ddb.send(new UpdateItemCommand({
+    TableName: BOOKING_TABLE,
+    Key: BOOKING_KEY(tenantId, bookingId),
+    UpdateExpression: 'SET ' + sets.join(', '),
+    ExpressionAttributeValues: vals,
+    ConditionExpression: 'attribute_exists(booking_id)',
+  }));
+}
+
+// G6 reschedule-link rate limit (anti email-bombing): atomically claim a send-slot by writing
+// reschedule_link_sent_at ONLY if it is unset or older than cooldownSeconds. Returns true if the
+// slot was claimed (caller may proceed to mint+notify); false (ConditionalCheckFailed) if a send
+// happened within the cooldown — the caller then refuses without minting a fresh token. The
+// conditional write is atomic, so two simultaneous POSTs cannot both claim the slot (no TOCTOU).
+async function touchRescheduleLinkSentAt(tenantId, bookingId, cooldownSeconds, nowMs = Date.now()) {
+  if (!tenantId || !bookingId) throw new Error('touchRescheduleLinkSentAt requires tenantId and bookingId');
+  const now = new Date(nowMs).toISOString();
+  const cutoff = new Date(nowMs - cooldownSeconds * 1000).toISOString();
+  try {
+    await ddb.send(new UpdateItemCommand({
+      TableName: BOOKING_TABLE,
+      Key: BOOKING_KEY(tenantId, bookingId),
+      UpdateExpression: 'SET reschedule_link_sent_at = :now',
+      // booking must exist AND (no prior send OR the prior send is older than the cooldown).
+      ConditionExpression: 'attribute_exists(booking_id) AND (attribute_not_exists(reschedule_link_sent_at) OR reschedule_link_sent_at < :cutoff)',
+      ExpressionAttributeValues: { ':now': s(now), ':cutoff': s(cutoff) },
+    }));
+    return true;
+  } catch (err) {
+    if (isConditionalCheckFailed(err)) return false; // within cooldown (or vanished row) → refuse
+    throw err;
+  }
+}
+
 // Stamp a TTL on the lock item right after acquisition (the lock is created by C6
 // pool.lockSlot, which this module must not modify — so C8 adds the TTL attribute
 // via UpdateItem). DynamoDB TTL then garbage-collects any lock orphaned by a crash
@@ -252,6 +296,8 @@ module.exports = {
   getBookingById,
   writeBooking,
   updateBookingReschedule,
+  updateBookingCancelReason,
+  touchRescheduleLinkSentAt,
   readLock,
   recordConferenceOnLock,
   setLockTtl,

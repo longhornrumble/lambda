@@ -52,9 +52,10 @@ import hmac
 import base64
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from decimal import Decimal
 from botocore.exceptions import ClientError
 from botocore.config import Config
@@ -437,6 +438,16 @@ def lambda_handler(event, context):
         # Scheduling endpoints (§E7 bookings read API — Clerk-authed, scope-gated)
         elif path.endswith('/scheduling/bookings'):
             return handle_scheduling_bookings(tenant_id, params, user_role, user_email)
+        # §G6/E12 booking ACTIONS (cancel-with-reason + reschedule-link). ADA authorizes (§8)
+        # then proxies the side-effect to Booking_Commit_Handler (the live mutation executor).
+        # The booking_id path segment is %-encoded (it contains '#') → urldecode it.
+        elif '/scheduling/bookings/' in path and path.endswith('/cancel') and method == 'POST':
+            g6_booking_id = urllib.parse.unquote(path.split('/scheduling/bookings/')[1].rsplit('/cancel', 1)[0])
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_booking_cancel(tenant_id, g6_booking_id, body, user_role, user_email)
+        elif '/scheduling/bookings/' in path and path.endswith('/reschedule-link') and method == 'POST':
+            g6_booking_id = urllib.parse.unquote(path.split('/scheduling/bookings/')[1].rsplit('/reschedule-link', 1)[0])
+            return handle_scheduling_booking_reschedule_link(tenant_id, g6_booking_id, user_role, user_email)
         # §G5/E15 scheduling metrics (Phase 1: per-type + status breakdown; admin, tenant-wide).
         elif path.endswith('/scheduling/metrics') and method == 'GET':
             return handle_scheduling_metrics(tenant_id, params, user_role)
@@ -4045,6 +4056,175 @@ def _update_scheduling_row(table: str, key: Dict[str, Any], fields: Dict[str, An
 # Hard cap: these tables are expected tiny (a handful of rows); the Limit is a
 # safety guard against an unbounded read (no GSI, no pagination cursor in v1).
 _SCHED_CONFIG_LIST_LIMIT = 500
+
+
+# --- G6 / E12: booking ACTIONS (cancel-with-reason + reschedule-link) ----------------- #
+# ADA is the Clerk-authed ENTRY: it loads the booking (for the §8 permission check), then
+# proxies the side-effect to Booking_Commit_Handler's `scheduling_mutate` executor — the SAME
+# Lambda-to-Lambda path BSH uses. ADA performs NO calendar op / token mint itself (those are
+# Node, single-sourced in BCH). The §8 rule: staff may act on their OWN booking
+# (coordinator_email == their email); admin/super_admin may act on any in-tenant booking.
+BOOKING_COMMIT_FUNCTION = os.environ.get('BOOKING_COMMIT_FUNCTION_NAME', 'Booking_Commit_Handler')
+_CANCEL_REASON_MAX = 1000
+# A booking in ANY terminal state is not actionable — re-canceling a completed/no-show booking
+# would delete an already-closed calendar event + overwrite the disposition, corrupting the row.
+# (Both spellings of canceled are guarded for historical-data drift.)
+_TERMINAL_STATUSES = ('canceled', 'cancelled', 'completed', 'no_show', 'coordinator_no_show')
+
+# Dedicated, BOUNDED Lambda client for the booking-action invoke (mirrors _secrets_client). A
+# bare boto3 client has no socket timeout → a slow BCH would hang ADA to its own 60s timeout
+# (a 504) instead of letting ADA return a clean 502. read_timeout is well under ADA's timeout;
+# NO retries — a retried cancel/reschedule_link invoke could double-delete or double-email.
+_booking_action_lambda_client = boto3.client(
+    'lambda',
+    config=Config(connect_timeout=3, read_timeout=30, retries={'max_attempts': 1}),
+)
+
+
+def _load_booking_for_action(tenant_id: str, booking_id: str) -> Optional[Dict[str, Any]]:
+    """GetItem one booking on the base table key (tenantId, booking_id). The authenticated
+    tenant is IN the key, so a booking_id from another tenant is simply not found — cross-tenant
+    access is structurally impossible. Returns the unmarshalled row or None. Raises ClientError."""
+    resp = dynamodb.get_item(
+        TableName=BOOKING_TABLE,
+        Key={'tenantId': {'S': tenant_id}, 'booking_id': {'S': booking_id}},
+    )
+    item = resp.get('Item')
+    return _unmarshal(item) if item else None
+
+
+def _authorize_booking_action(booking: Dict[str, Any], user_role: Optional[str],
+                              user_email: Optional[str]) -> bool:
+    """§8 permission: admin/super_admin act on any in-tenant booking; a staff member acts ONLY
+    on their own (coordinator_email == their authenticated email, mirroring §E7 staff_self)."""
+    if user_role in ('admin', 'super_admin'):
+        return True
+    email = (user_email or '').strip().lower()
+    coord = (booking.get('coordinator_email') or '').strip().lower()
+    return bool(email) and email == coord
+
+
+def _invoke_booking_mutate(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Invoke BCH's scheduling_mutate executor (RequestResponse, bounded client). Returns
+    (result, error_str)."""
+    resp = _booking_action_lambda_client.invoke(
+        FunctionName=BOOKING_COMMIT_FUNCTION,
+        InvocationType='RequestResponse',
+        Payload=json.dumps(payload).encode('utf-8'),
+    )
+    raw = resp['Payload'].read()
+    result = json.loads(raw) if raw else {}
+    if resp.get('FunctionError'):
+        return result, 'function_error'
+    return result, None
+
+
+def _load_authorize_actionable(tenant_id: str, booking_id: str, user_role: Optional[str],
+                               user_email: Optional[str]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Shared §8 gate for the booking-action handlers: load → authorize → terminal-status check.
+    Returns (booking, None) when the booking is actionable, or (None, error_response) to return
+    directly. A non-admin non-owner gets 404 (NOT 403) with the same body as a genuine miss, so a
+    caller cannot distinguish 'exists but not yours' from 'does not exist' (no enumeration oracle)."""
+    try:
+        booking = _load_booking_for_action(tenant_id, booking_id)
+    except ClientError as e:
+        logger.error(f"[scheduling/booking-action] GetItem failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return None, cors_response(502, {'error': 'failed to load booking'})
+    if not booking or not _authorize_booking_action(booking, user_role, user_email):
+        return None, cors_response(404, {'error': 'booking not found'})
+    status = (booking.get('status') or '').lower()
+    if status in _TERMINAL_STATUSES:
+        return None, cors_response(409, {'error': f'booking is not actionable (status: {status or "unknown"})',
+                                         'booking_id': booking_id, 'status': status})
+    return booking, None
+
+
+def handle_scheduling_booking_cancel(tenant_id: str, booking_id: str, body: Dict[str, Any],
+                                     user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
+    """
+    POST /scheduling/bookings/{booking_id}/cancel  body={ reason }  (Clerk-authed; G6/E12 v1-MUST).
+    §8: own-by-coordinator_email or admin. Proxies to BCH cancel (events.delete → the §14.2
+    listener flips status); BCH also persists the audit-only cancel_reason / canceled_by.
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_scheduling', user_role)
+    if access_error:
+        return access_error
+    reason = (body or {}).get('reason')
+    if not isinstance(reason, str) or not reason.strip():
+        return cors_response(400, {'error': 'reason is required'})
+    if len(reason) > _CANCEL_REASON_MAX:
+        return cors_response(400, {'error': f'reason exceeds {_CANCEL_REASON_MAX} chars'})
+    booking, err_resp = _load_authorize_actionable(tenant_id, booking_id, user_role, user_email)
+    if err_resp:
+        return err_resp
+
+    payload = {
+        'action': 'scheduling_mutate',
+        'mutation': 'cancel',
+        'tenantId': tenant_id,
+        'coordinatorId': booking.get('coordinator_email'),
+        'bookingId': booking_id,
+        'booking': booking,
+        'reason': reason.strip(),
+        'canceled_by': user_email,
+    }
+    try:
+        result, err = _invoke_booking_mutate(payload)
+    except ClientError as e:
+        logger.error(f"[scheduling/booking-cancel] invoke failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return cors_response(502, {'error': 'failed to cancel booking'})
+    outcome = result.get('outcome')
+    if err or outcome not in ('deleted', 'pending_calendar_sync'):
+        logger.error(f"[scheduling/booking-cancel] executor failure (tenant={redact_tenant_id(tenant_id)}, "
+                     f"outcome={outcome}, err={err})")
+        return cors_response(502, {'error': 'cancel failed'})
+    logger.info(f"[scheduling/booking-cancel] tenant={redact_tenant_id(tenant_id)} "
+                f"by={redact_email(user_email or '')} outcome={outcome}")
+    if outcome == 'pending_calendar_sync':
+        return cors_response(202, {'booking_id': booking_id, 'status': 'pending_calendar_sync'})
+    return cors_response(200, {'booking_id': booking_id, 'status': 'canceled'})
+
+
+def handle_scheduling_booking_reschedule_link(tenant_id: str, booking_id: str,
+                                              user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
+    """
+    POST /scheduling/bookings/{booking_id}/reschedule-link  (Clerk-authed; G6/E12 should).
+    §8: own-by-coordinator_email or admin. Proxies to BCH reschedule_link, which mints a fresh
+    §B4 reschedule token + emails the GUEST a self-serve link (the guest picks the new time).
+    """
+    access_error = validate_feature_access(tenant_id, 'dashboard_scheduling', user_role)
+    if access_error:
+        return access_error
+    booking, err_resp = _load_authorize_actionable(tenant_id, booking_id, user_role, user_email)
+    if err_resp:
+        return err_resp
+
+    payload = {
+        'action': 'scheduling_mutate',
+        'mutation': 'reschedule_link',
+        'tenantId': tenant_id,
+        'coordinatorId': booking.get('coordinator_email'),
+        'bookingId': booking_id,
+        'booking': booking,
+    }
+    try:
+        result, err = _invoke_booking_mutate(payload)
+    except ClientError as e:
+        logger.error(f"[scheduling/reschedule-link] invoke failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return cors_response(502, {'error': 'failed to send reschedule link'})
+    outcome = result.get('outcome')
+    # BCH refuses a repeat send within the anti-bombing cooldown → 429 (a distinct, retriable-later
+    # signal the portal can surface, NOT a 502 error).
+    if not err and outcome == 'rate_limited':
+        return cors_response(429, {'error': 'a reschedule link was sent recently; please wait before resending',
+                                   'booking_id': booking_id})
+    if err or outcome != 'success':
+        logger.error(f"[scheduling/reschedule-link] executor failure (tenant={redact_tenant_id(tenant_id)}, "
+                     f"outcome={outcome}, err={err})")
+        return cors_response(502, {'error': 'reschedule link failed'})
+    logger.info(f"[scheduling/reschedule-link] tenant={redact_tenant_id(tenant_id)} "
+                f"by={redact_email(user_email or '')} sent={bool(result.get('sent'))}")
+    return cors_response(200, {'booking_id': booking_id, 'sent': bool(result.get('sent'))})
 
 
 def handle_scheduling_appointment_types_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:

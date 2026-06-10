@@ -96,7 +96,12 @@ async function cancelOnCoordinatorDelete({ tenantId, bookingId, now = nowIso() }
     await ddb.send(new UpdateItemCommand({
       TableName: BOOKING_TABLE,
       Key: BOOKING_KEY(tenantId, bookingId),
-      UpdateExpression: 'SET #st = :canceled, canceled_at = :at, cancel_reason = :r',
+      // if_not_exists preserves an EXISTING cancel_reason — e.g. a G6 admin cancel-with-reason
+      // writes the reason (status still booked) just before this listener fires; without the
+      // guard this overwrites it with the system 'coordinator_*' reason and the admin's reason
+      // is silently lost (the G6 v1-MUST). A direct coordinator delete has no prior reason → the
+      // system reason is written as before.
+      UpdateExpression: 'SET #st = :canceled, canceled_at = :at, cancel_reason = if_not_exists(cancel_reason, :r)',
       ConditionExpression: 'attribute_exists(booking_id) AND #st = :booked',
       ExpressionAttributeNames: { '#st': 'status' },
       ExpressionAttributeValues: {
@@ -129,7 +134,12 @@ async function cancelOnCoordinatorMove({ tenantId, bookingId, now = nowIso() }) 
     await ddb.send(new UpdateItemCommand({
       TableName: BOOKING_TABLE,
       Key: BOOKING_KEY(tenantId, bookingId),
-      UpdateExpression: 'SET #st = :canceled, canceled_at = :at, cancel_reason = :r',
+      // if_not_exists preserves an EXISTING cancel_reason — e.g. a G6 admin cancel-with-reason
+      // writes the reason (status still booked) just before this listener fires; without the
+      // guard this overwrites it with the system 'coordinator_*' reason and the admin's reason
+      // is silently lost (the G6 v1-MUST). A direct coordinator delete has no prior reason → the
+      // system reason is written as before.
+      UpdateExpression: 'SET #st = :canceled, canceled_at = :at, cancel_reason = if_not_exists(cancel_reason, :r)',
       ConditionExpression: 'attribute_exists(booking_id) AND #st = :booked',
       ExpressionAttributeNames: { '#st': 'status' },
       ExpressionAttributeValues: {
