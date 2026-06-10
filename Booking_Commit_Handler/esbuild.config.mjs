@@ -10,9 +10,11 @@ const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
   '@aws-sdk/client-lambda', // G6 reschedule_link: scheduling-mutate.js → notify.js dispatches via Lambda invoke
   '@aws-sdk/client-s3',
+  '@aws-sdk/client-scheduler', // Track 1: Reminder_Scheduler creates per-booking EventBridge schedules
   '@aws-sdk/client-secrets-manager',
   '@aws-sdk/client-ses',
   '@aws-sdk/client-sns',
+  '@aws-sdk/lib-dynamodb', // Track 1: Reminder_Scheduler uses the DynamoDB Document client
 ];
 
 await esbuild.build({

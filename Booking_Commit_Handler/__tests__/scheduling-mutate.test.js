@@ -4,7 +4,7 @@ const { handleSchedulingMutate } = require('../scheduling-mutate');
 
 // Minimal fakes for the injected seam (no real Google/Zoom/DDB).
 function baseInjected(overrides = {}) {
-  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [] };
+  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [], rebind: [] };
   const calendarEvents = {
     buildEventBody: (x) => ({ built: x }),
     insertEvent: (calId, body) => { calls.facade.push(['insert', calId]); return { id: 'evt-new' }; },
@@ -32,6 +32,9 @@ function baseInjected(overrides = {}) {
       // Default: no SMS unless a test opts in (consent present + a fake that honors it).
       selectChannels: ({ orgSmsEnabled, consentRecord }) => ({ email: true, sms: orgSmsEnabled === true && !!consentRecord }),
       readSmsConsent: async () => null,
+      // Track 1: rebind reminders on a successful reschedule (deterministic fake; the real
+      // scheduler is covered by Reminder_Scheduler's own suite).
+      rebindReminders: async (args) => { calls.rebind.push(args); return { reminders: [], attendance: null, tiers: [] }; },
       logger: { warn: () => {}, error: () => {} },
       ...overrides,
     },
@@ -342,6 +345,57 @@ describe('handleSchedulingMutate — reschedule', () => {
   it('persist failure is non-fatal (calendar already moved; listener backstops)', async () => {
     const { injected } = baseInjected({
       bookingStore: { updateBookingReschedule: async () => { throw new Error('ddb down'); } },
+    });
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out.outcome).toBe('success'); // swallowed
+  });
+});
+
+describe('handleSchedulingMutate — reschedule reminder rebind (Track 1, §E1)', () => {
+  it('rebinds reminders to the NEW slot on a successful reschedule', async () => {
+    const { injected, calls } = baseInjected();
+    const out = await handleSchedulingMutate({ ...RESCH_EVENT, org_sms_enabled: false }, injected);
+    expect(out.outcome).toBe('success');
+    expect(calls.rebind).toHaveLength(1);
+    const { booking, tenantPrefs } = calls.rebind[0];
+    expect(booking.tenant_id).toBe('T1');
+    expect(booking.booking_id).toBe('bk1');
+    expect(booking.start_at).toBe(RESCH_EVENT.newSlot.start); // the NEW time, not the old
+    expect(booking.end_at).toBe(RESCH_EVENT.newSlot.end);
+    expect(tenantPrefs).toEqual({ notificationPrefs: { sms: false }, sms_quiet_hours: null });
+  });
+
+  it('passes org SMS = true + sms_quiet_hours into tenantPrefs from the event', async () => {
+    const { injected, calls } = baseInjected();
+    await handleSchedulingMutate(
+      { ...RESCH_EVENT, org_sms_enabled: true, sms_quiet_hours: { start: 21, end: 8 } },
+      injected
+    );
+    expect(calls.rebind[0].tenantPrefs).toEqual({
+      notificationPrefs: { sms: true },
+      sms_quiet_hours: { start: 21, end: 8 },
+    });
+  });
+
+  it('rebinds on pending_calendar_sync too (the booking time is the new slot)', async () => {
+    const { injected, calls } = baseInjected({
+      executeReschedule: async ({ booking, newSlot }) => ({ outcome: 'pending_calendar_sync', booking: { ...booking, start_at: newSlot.start } }),
+    });
+    await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(calls.rebind).toHaveLength(1);
+  });
+
+  it('does NOT rebind on a failed reschedule', async () => {
+    const { injected, calls } = baseInjected({
+      executeReschedule: async () => ({ outcome: 'failed', booking: RESCH_EVENT.booking }),
+    });
+    await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(calls.rebind).toHaveLength(0);
+  });
+
+  it('a rebind failure is non-fatal (the move already happened; listener backstops)', async () => {
+    const { injected } = baseInjected({
+      rebindReminders: async () => { throw new Error('scheduler down'); },
     });
     const out = await handleSchedulingMutate(RESCH_EVENT, injected);
     expect(out.outcome).toBe('success'); // swallowed

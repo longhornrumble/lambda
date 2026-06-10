@@ -43,6 +43,7 @@ const calendarEvents = require('./calendar-events');
 const { resolveProvider } = require('./conference-providers');
 const bookingStore = require('./booking-store');
 const { sendConfirmationEmail } = require('./confirmation-email');
+const reminderScheduler = require('../Reminder_Scheduler/scheduler'); // Track 1 (§E1): per-booking reminder + attendance schedules at commit
 
 const CONFIRMATION_SLA_MS = 60 * 1000; // AC #7
 const OPS_ALERTS_TOPIC_ARN = process.env.OPS_ALERTS_TOPIC_ARN || '';
@@ -115,6 +116,67 @@ async function alertAdmin(subject, detail) {
     }));
   } catch (err) {
     warn('admin_alert_failed', { subject, error: err.message });
+  }
+}
+
+// ─── Track 1 (§E1): reminder + attendance scheduling at commit ────────────────────────
+
+// The minimal tenant SMS-prefs the fire-time §E3 selectChannels gate snapshots into each
+// reminder row. Email is the unconditional floor; SMS the opt-in supplement, so org SMS
+// OFF / unknown → sms:false (fail-closed). Live consent is still read at fire time.
+function reminderTenantPrefs(config) {
+  const np = (config && config.notificationPrefs) || {};
+  return {
+    notificationPrefs: { sms: np.sms === true },
+    sms_quiet_hours: (config && config.sms_quiet_hours) || np.sms_quiet_hours || null,
+  };
+}
+
+// The plain-object booking view scheduleReminders.readBooking consumes (snake_case). NOT
+// the marshalled DDB bookingItem — readBooking expects plain string values, so a {S:...}
+// AttributeValue map would silently mis-parse (start_at → NaN fire times).
+function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail }) {
+  const a = ctx.attendee || {};
+  return {
+    tenant_id: tenantId,
+    booking_id: bookingId,
+    start_at: ctx.start,
+    end_at: ctx.end,
+    timezone: ctx.timezone,
+    attendee_email: a.email,
+    attendee_phone: a.phone,
+    attendee_name: [a.first_name, a.last_name].filter(Boolean).join(' '),
+    coordinator_email: coordinatorEmail,
+    appointment_type_name: ctx.appointmentTypeName,
+    organization_name: ctx.orgName,
+    is_synthetic: ctx.isSynthetic === true,
+  };
+}
+
+// Best-effort: schedule the reminder + attendance messages for a freshly-committed booking.
+// Runs AFTER the slot-lock release + confirmation email (off the AC#7 SLA path); NEVER rolls
+// back a committed booking (mirrors the email step's "fail forward, alert" discipline). The
+// org SMS pref is read from the tenant config here, post-commit — NOT on the latency-sensitive
+// pre-commit path; the in-chat reschedule path re-binds via the event-passed org flag instead.
+async function scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail }) {
+  const scheduleReminders = ctx.scheduleReminders || reminderScheduler.scheduleReminders;
+  const loadTenantConfig = ctx.loadTenantConfig || featureGate.loadTenantConfig;
+  try {
+    let tenantConfig = null;
+    try {
+      tenantConfig = await loadTenantConfig(tenantId);
+    } catch (cfgErr) {
+      warn('reminder_config_load_failed', { booking_id: bookingId, error: cfgErr.message });
+    }
+    await scheduleReminders({
+      booking: buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail }),
+      tenantPrefs: reminderTenantPrefs(tenantConfig),
+    });
+  } catch (err) {
+    warn('reminder_schedule_failed', { booking_id: bookingId, error: err.message });
+    await alertAdmin('Scheduling: reminder scheduling failed (booking valid)', {
+      bookingId, error: err.message,
+    });
   }
 }
 
@@ -331,6 +393,11 @@ async function commitAgainstResource({
     }
 
     // (lock already released above, right after the Booking write.)
+
+    // Track 1 (§E1): schedule the reminder + attendance messages. Best-effort, post-commit,
+    // post-email — a reminder-scheduling failure NEVER undoes a committed booking.
+    await scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail: calendarId });
+
     return {
       // No coordinatorEmail in the response (§5.7 PII boundary): the caller has
       // resourceId; the coordinator identity is revealed in-conversation (C12), and
@@ -543,6 +610,11 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
     // DI seams for tests (NullConferenceProvider / Zoom client double / token key).
     providerOverrides: injected.providerOverrides || {},
     signOpts: injected.signOpts,
+    // Track 1 reminder DI seams (carried on ctx, like the seams above) + synthetic flag
+    // (STAGING_TEST_MODE time-compression is double-gated downstream by is_synthetic).
+    scheduleReminders: injected.scheduleReminders,
+    loadTenantConfig: injected.loadTenantConfig,
+    isSynthetic: event.is_synthetic === true,
   };
 
   // step 1: live freeBusy re-check → surviving candidates (tie-broken order).

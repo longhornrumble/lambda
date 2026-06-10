@@ -21,6 +21,14 @@ process.env.OPS_ALERTS_TOPIC_ARN = 'arn:aws:sns:us-east-1:525409062831:picasso-o
 jest.mock('../shared/scheduling/featureGate', () => ({
   isSchedulingEnabledForTenant: jest.fn().mockResolvedValue(true),
   isSchedulingEnabled: () => true,
+  // Track 1: the commit reminder block loads the tenant config to snapshot the org SMS pref.
+  loadTenantConfig: jest.fn().mockResolvedValue({ feature_flags: { scheduling_enabled: true }, notificationPrefs: { sms: false } }),
+}));
+// Track 1: the per-booking reminder scheduler — mocked so commit tests never touch real
+// EventBridge Scheduler / DynamoDB (the real module's AWS clients are lazy inside deps).
+jest.mock('../Reminder_Scheduler/scheduler', () => ({
+  scheduleReminders: jest.fn().mockResolvedValue({ reminders: [], attendance: null, tiers: [] }),
+  rebindReminders: jest.fn().mockResolvedValue({ reminders: [], attendance: null, tiers: [] }),
 }));
 jest.mock('../shared/scheduling/pool', () => ({
   lockSlot: jest.fn(),
@@ -79,6 +87,8 @@ const oauth = require('./oauth-client');
 const calendarEvents = require('./calendar-events');
 const bookingStore = require('./booking-store');
 const confirmationEmail = require('./confirmation-email');
+const featureGate = require('../shared/scheduling/featureGate');
+const reminderScheduler = require('../Reminder_Scheduler/scheduler');
 const { NullConferenceProvider } = require('./conference-providers');
 
 const { handler } = require('./index');
@@ -633,5 +643,77 @@ describe('freeBusy re-check excludes a coordinator whose query fails', () => {
     expect(pool.recordFreeBusyFailure).toHaveBeenCalledWith('AUS123957', 'res-a');
     // only res-b reached the lock
     expect(pool.lockSlot.mock.calls[0][0].candidateResourceIds).toEqual(['res-b']);
+  });
+});
+
+// ─── Track 1 (§E1): reminder scheduling at commit ──────────────────────────────────────
+describe('Track 1 — reminder scheduling at commit', () => {
+  function reminderInjection(extra = {}) {
+    return {
+      ...nullInjection(),
+      scheduleReminders: jest.fn().mockResolvedValue({}),
+      loadTenantConfig: jest.fn().mockResolvedValue({ notificationPrefs: { sms: false } }),
+      ...extra,
+    };
+  }
+  beforeEach(() => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1', format: 'one_to_one' });
+  });
+
+  it('schedules reminders after a successful commit, with the plain-object booking view', async () => {
+    const inj = reminderInjection();
+    const res = await handler(baseEvent(), {}, inj);
+    expect(res.status).toBe('BOOKED');
+    expect(inj.scheduleReminders).toHaveBeenCalledTimes(1);
+    const arg = inj.scheduleReminders.mock.calls[0][0];
+    expect(arg.booking).toMatchObject({
+      tenant_id: 'AUS123957',
+      start_at: '2026-06-03T18:00:00.000Z',
+      end_at: '2026-06-03T18:30:00.000Z',
+      timezone: 'America/Chicago',
+      attendee_email: 'sam@example.com',
+      attendee_name: 'Sam Patel',
+      appointment_type_name: 'Volunteer intake',
+      organization_name: 'Austin Angels',
+      is_synthetic: false,
+    });
+    expect(typeof arg.booking.booking_id).toBe('string'); // plain string, not a {S:...} AttributeValue
+  });
+
+  it('snapshots org SMS = true into tenantPrefs when the tenant config enables it', async () => {
+    const inj = reminderInjection({ loadTenantConfig: jest.fn().mockResolvedValue({ notificationPrefs: { sms: true } }) });
+    await handler(baseEvent(), {}, inj);
+    expect(inj.scheduleReminders.mock.calls[0][0].tenantPrefs).toEqual({ notificationPrefs: { sms: true }, sms_quiet_hours: null });
+  });
+
+  it('fails closed to org SMS = false when the config load throws (still schedules; booking valid)', async () => {
+    const inj = reminderInjection({ loadTenantConfig: jest.fn().mockRejectedValue(new Error('s3 down')) });
+    const res = await handler(baseEvent(), {}, inj);
+    expect(res.status).toBe('BOOKED');
+    expect(inj.scheduleReminders).toHaveBeenCalledTimes(1);
+    expect(inj.scheduleReminders.mock.calls[0][0].tenantPrefs.notificationPrefs.sms).toBe(false);
+  });
+
+  it('threads is_synthetic from the event into the booking view', async () => {
+    const inj = reminderInjection();
+    await handler(baseEvent({ is_synthetic: true }), {}, inj);
+    expect(inj.scheduleReminders.mock.calls[0][0].booking.is_synthetic).toBe(true);
+  });
+
+  it('a reminder-scheduling failure never undoes a committed booking (BOOKED + admin alert)', async () => {
+    const inj = reminderInjection({ scheduleReminders: jest.fn().mockRejectedValue(new Error('scheduler boom')) });
+    const res = await handler(baseEvent(), {}, inj);
+    expect(res.status).toBe('BOOKED');
+    expect(bookingStore.writeBooking).toHaveBeenCalledTimes(1);
+    expect(
+      snsMock.commandCalls(PublishCommand).some((c) => /reminder scheduling failed/i.test(c.args[0].input.Subject))
+    ).toBe(true);
+  });
+
+  it('falls back to the module-default scheduler + config loader when none is injected', async () => {
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res.status).toBe('BOOKED');
+    expect(reminderScheduler.scheduleReminders).toHaveBeenCalledTimes(1);
+    expect(featureGate.loadTenantConfig).toHaveBeenCalledWith('AUS123957');
   });
 });
