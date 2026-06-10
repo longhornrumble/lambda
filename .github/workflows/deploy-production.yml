@@ -3,9 +3,23 @@ name: Deploy Lambda — Production
 # Manual promotion to production. Run this AFTER verifying the same
 # code on staging.
 #
-# Prod model: code lives on $LATEST; publish-version on every deploy creates
-# an immutable audit-trail snapshot (no aliases reference it). Rollback =
-# redeploy a previous commit via this workflow with `git_ref` override.
+# Prod models (per function — see matrix `alias` field):
+#   - $LATEST model (ADA, BSH): code lives on $LATEST; publish-version on every
+#     deploy creates an immutable audit-trail snapshot (no aliases reference
+#     it). Rollback = redeploy a previous commit via this workflow with
+#     `git_ref` override.
+#   - alias model (MFS): prod traffic enters via API Gateway → the `live`
+#     alias. Deploy = update code → publish version → flip `live` to the new
+#     version. Rollback = flip `live` back to the previous version (one
+#     command, printed in the run summary). Discovered the hard way
+#     (CI-modernization Phase 1, 2026-06-09): a deploy that only updates
+#     $LATEST does NOT reach MFS prod traffic — the §P5.1 2026-06-07 manual
+#     deploy left the alias on v21 while $LATEST carried the new code.
+#
+# Env vars are NOT managed here (unlike deploy-staging.yml): prod BSH function
+# config is Terraform-owned (infra/modules/bsh-function-prod — one writer per
+# resource); prod MFS env is hand-managed until the MFS-prod module exists.
+# Code flows through this workflow; resource shape does not.
 #
 # See feedback_uniform_env_rules.md.
 
@@ -13,11 +27,13 @@ on:
   workflow_dispatch:
     inputs:
       lambda:
-        description: Lambda to promote
+        description: Lambda to promote (prod function name)
         type: choice
         required: true
         options:
           - Analytics_Dashboard_API
+          - Master_Function
+          - Bedrock_Streaming_Handler
       git_ref:
         description: Git ref to deploy (default = main HEAD)
         type: string
@@ -35,6 +51,7 @@ concurrency:
 
 env:
   AWS_REGION: us-east-1
+  NODE_VERSION: '20.x'   # Match the Lambda nodejs20.x runtime (mirrors deploy-staging.yml)
 
 jobs:
   deploy:
@@ -49,35 +66,142 @@ jobs:
         lambda:
           - source_dir: Analytics_Dashboard_API
             prod_function: Analytics_Dashboard_API
+            runtime: python
             include_globs: 'lambda_function.py tenant_registry_ops.py'
+            alias: ''
+            # ADA smokes against its own Function URL (looked up at deploy
+            # time); MFS/BSH smoke through CloudFront instead (smoke_url).
+            smoke_url: ''
             smoke_path: /forms/summary
             smoke_expect_status: '401'
+          - source_dir: Master_Function_Staging
+            # Code dir keeps the historical `_Staging` suffix; the prod-account
+            # function is bare-named (see deploy-staging.yml entry for the
+            # naming history). Same code, different account.
+            prod_function: Master_Function
+            runtime: python
+            # KEEP IN SYNC with the deploy-staging.yml MFS entry. The
+            # zip-manifest guard below fails the run if a tracked runtime .py
+            # is missing from this list (the include_globs landmine that cost
+            # §P5.1 twice — reference_lambda_deploy_include_globs_allowlist).
+            include_globs: >-
+              analytics_writer.py
+              audit_logger.py
+              aws_client_manager.py
+              bedrock_handler_optimized.py
+              contact_extractor.py
+              conversation_handler.py
+              form_cta_enhancer.py
+              form_handler.py
+              intent_router.py
+              lambda_function.py
+              pii_subject.py
+              redact_pii.py
+              response_formatter.py
+              session_utils.py
+              template_renderer.py
+              tenant_config_loader.py
+              tenant_inference.py
+              tenant_registry.py
+              token_blacklist.py
+              jwt
+              PyJWT-2.10.1.dist-info
+              notification_templates.json
+              analytics_writer_contract.json
+            # Prod traffic = API GW kgvc8xnewf → Master_Function:live. The
+            # alias flip below is what actually ships the deploy.
+            alias: live
+            # action=health_check returns 200 unauthenticated; routed through
+            # CloudFront (which injects x-picasso-cf-origin). Mirrors staging.
+            smoke_url: 'https://chat.myrecruiter.ai/Master_Function?action=health_check'
+            smoke_path: ''
+            smoke_expect_status: '200'
+          - source_dir: Bedrock_Streaming_Handler_Staging
+            prod_function: Bedrock_Streaming_Handler
+            # Node.js — esbuild bundles to a single dist/index.js; `npm run
+            # package` zips it. Needs devDependencies (esbuild), so plain
+            # `npm ci`, NOT --production (which fails — esbuild is a devDep).
+            runtime: nodejs
+            include_globs: ''
+            # No alias: the Function URL (AuthType=AWS_IAM behind the
+            # CloudFront /stream Lambda@Edge signer, Remedy A #435) serves
+            # $LATEST. update-function-code switches traffic immediately;
+            # the published version is the rollback snapshot (v25/v26
+            # convention from the §P5.1 promote).
+            alias: ''
+            # Through CloudFront so the SigV4 signer + cf-origin header apply.
+            smoke_url: 'https://chat.myrecruiter.ai/stream'
+            smoke_path: ''
+            smoke_expect_status: '200'
     steps:
       - name: Guard — only handle the selected Lambda
-        if: matrix.lambda.source_dir != github.event.inputs.lambda
+        if: matrix.lambda.prod_function != github.event.inputs.lambda
         run: |
-          echo "Skipping ${{ matrix.lambda.source_dir }} (selected: ${{ github.event.inputs.lambda }})"
+          echo "Skipping ${{ matrix.lambda.prod_function }} (selected: ${{ github.event.inputs.lambda }})"
           exit 0
 
       - uses: actions/checkout@v4
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
+        if: matrix.lambda.prod_function == github.event.inputs.lambda
         with:
           ref: ${{ github.event.inputs.git_ref }}
 
+      - name: Setup Node.js
+        if: matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.runtime == 'nodejs'
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.lambda.source_dir }}/package-lock.json
+
       - name: Configure AWS credentials
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
+        if: matrix.lambda.prod_function == github.event.inputs.lambda
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Package function
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
+      - name: Package function (Python)
+        if: matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.runtime == 'python'
         working-directory: ${{ matrix.lambda.source_dir }}
         run: |
           set -euo pipefail
           zip -q -r9 /tmp/deploy.zip ${{ matrix.lambda.include_globs }}
           echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
+
+      - name: Package function (Node.js)
+        if: matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.runtime == 'nodejs'
+        working-directory: ${{ matrix.lambda.source_dir }}
+        run: |
+          set -euo pipefail
+          # Per-Lambda `package.json` controls what `npm run package` does.
+          # BSH: esbuild bundle → zip deployment.zip (single dist/index.js).
+          # Mirrors deploy-staging.yml's Node path exactly.
+          npm ci
+          npm run package
+          cp deployment.zip /tmp/deploy.zip
+          echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
+
+      - name: Zip-manifest guard (Python)
+        if: matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.runtime == 'python'
+        run: |
+          set -euo pipefail
+          # The include_globs allowlist silently DROPS any runtime .py that
+          # isn't listed (cost §P5.1 twice). Fail loudly instead: every
+          # tracked .py in the source dir must be inside the zip, except
+          # non-deployed classes: tests (test_*, run_*, conftest) and one-off
+          # ops scripts (backfill_*, create_*, migrate_* — table-creation and
+          # backfill utilities live in the repo but never ship).
+          SRC='${{ matrix.lambda.source_dir }}'
+          MISSING=0
+          while IFS= read -r f; do
+            rel="${f#"$SRC"/}"
+            if ! unzip -l /tmp/deploy.zip | awk '{print $4}' | grep -qx "$rel"; then
+              echo "::error file=$f::Tracked runtime file missing from deploy zip — add it to include_globs (in BOTH deploy-staging.yml and deploy-production.yml)"
+              MISSING=1
+            fi
+          done < <(git ls-files -- "$SRC/*.py" | grep -vE '(^|/)(test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.py$')
+          [ "$MISSING" -eq 0 ] && echo "Zip-manifest guard: all tracked runtime .py present."
+          exit $MISSING
 
       # Note: the previous "compare local SHA to staging $LATEST" safety check
       # was removed when staging Lambda moved out of this AWS account into the
@@ -87,7 +211,7 @@ jobs:
       # before this step.
 
       - name: Update function code
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
+        if: matrix.lambda.prod_function == github.event.inputs.lambda
         run: |
           set -euo pipefail
           aws lambda update-function-code \
@@ -98,8 +222,8 @@ jobs:
           aws lambda wait function-updated \
             --function-name ${{ matrix.lambda.prod_function }}
 
-      - name: Publish version (audit trail)
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
+      - name: Publish version (audit trail / rollback snapshot)
+        if: matrix.lambda.prod_function == github.event.inputs.lambda
         id: publish
         run: |
           set -euo pipefail
@@ -118,30 +242,62 @@ jobs:
           echo "note=$NOTE" >> "$GITHUB_OUTPUT"
           echo "Published v$NEW_VERSION: $NOTE"
 
-      - name: Smoke test
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
+      - name: Flip traffic alias
+        if: matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.alias != ''
+        id: alias
         run: |
           set -euo pipefail
-          # Deterministic: filter for the unaliased ($LATEST) URL config.
-          # Aliased entries have a Qualifier field; the $LATEST entry does not.
-          # Tolerates transitional state where alias URLs still exist.
-          URL=$(aws lambda list-function-url-configs \
+          PREV=$(aws lambda get-alias \
             --function-name ${{ matrix.lambda.prod_function }} \
-            --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "${URL%/}${{ matrix.lambda.smoke_path }}")
-          echo "Smoke: GET ${URL%/}${{ matrix.lambda.smoke_path }} → $STATUS"
+            --name ${{ matrix.lambda.alias }} \
+            --query FunctionVersion --output text)
+          aws lambda update-alias \
+            --function-name ${{ matrix.lambda.prod_function }} \
+            --name ${{ matrix.lambda.alias }} \
+            --function-version ${{ steps.publish.outputs.new_version }} \
+            --query '{Alias:Name,NowServing:FunctionVersion}'
+          echo "prev_version=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Alias ${{ matrix.lambda.alias }}: v$PREV → v${{ steps.publish.outputs.new_version }}"
+
+      - name: Smoke test
+        if: matrix.lambda.prod_function == github.event.inputs.lambda
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.lambda.smoke_url }}" ]; then
+            URL="${{ matrix.lambda.smoke_url }}"
+          else
+            # Deterministic: filter for the unaliased ($LATEST) URL config.
+            # Aliased entries have a Qualifier field; the $LATEST entry does not.
+            BASE=$(aws lambda list-function-url-configs \
+              --function-name ${{ matrix.lambda.prod_function }} \
+              --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
+            URL="${BASE%/}${{ matrix.lambda.smoke_path }}"
+          fi
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$URL")
+          echo "Smoke: GET $URL → $STATUS"
           if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
             echo "::error::Expected ${{ matrix.lambda.smoke_expect_status }}, got $STATUS"
             exit 1
           fi
 
       - name: Summary
-        if: matrix.lambda.source_dir == github.event.inputs.lambda
+        if: matrix.lambda.prod_function == github.event.inputs.lambda
         run: |
           echo "### Promoted ${{ matrix.lambda.prod_function }} to production" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Code:** \$LATEST (snapshot v${{ steps.publish.outputs.new_version }} for audit)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Note:** ${{ steps.publish.outputs.note }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Smoke:** passed" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Rollback: re-run this workflow with \`git_ref\` set to a previous commit (e.g. \`gh workflow run deploy-production.yml -f lambda=${{ matrix.lambda.prod_function }} -f git_ref=<prev-sha>\`)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${{ matrix.lambda.alias }}" ]; then
+            echo "- **Traffic:** alias \`${{ matrix.lambda.alias }}\` → v${{ steps.publish.outputs.new_version }} (was v${{ steps.alias.outputs.prev_version }})" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Note:** ${{ steps.publish.outputs.note }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Smoke:** passed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Rollback (one command):" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
+            echo "aws lambda update-alias --function-name ${{ matrix.lambda.prod_function }} --name ${{ matrix.lambda.alias }} --function-version ${{ steps.alias.outputs.prev_version }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Code:** \$LATEST (snapshot v${{ steps.publish.outputs.new_version }} for audit)" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Note:** ${{ steps.publish.outputs.note }}" >> "$GITHUB_STEP_SUMMARY"
+            echo "- **Smoke:** passed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Rollback: re-run this workflow with \`git_ref\` set to a previous commit (e.g. \`gh workflow run deploy-production.yml -f lambda=${{ matrix.lambda.prod_function }} -f git_ref=<prev-sha>\`)" >> "$GITHUB_STEP_SUMMARY"
+          fi
