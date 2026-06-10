@@ -7677,9 +7677,17 @@ def handle_team_members_list(auth_result: Dict[str, Any], tenant_id: str) -> Dic
             # Derived from the per-coordinator OAuth secret (the §B7 signal). The portal derives the
             # "connect calendar" warning (!connected), the "not on any team" warning (connected but no
             # tags), and the bookable/connection filter from this + scheduling_tags + bookable_override.
-            # Additive; pre-G8 reads as false (no secret → not connected).
-            'calendar_connected': _coordinator_calendar_connected(
-                tenant_id, (record.get('email', '') or '').lower()),
+            # Additive; pre-G8 reads as false (no secret → not connected). READ-GATED admin-or-self
+            # (same as calendar_email_override): a member's connection status is personal, so a
+            # non-admin sees only their OWN — which ALSO bounds the per-request secret reads to 1 for
+            # a member (only admins fan out across the team). Secret is keyed by the LOGIN email (the
+            # §E0 self-mint coordinator_id) — calendar_email_override is the target calendar, NOT the
+            # OAuth identity, so it is correctly NOT the lookup key.
+            'calendar_connected': (
+                _coordinator_calendar_connected(tenant_id, (record.get('email', '') or '').lower())
+                if (caller_is_admin or (caller_email_l and caller_email_l == (record.get('email', '') or '').lower()))
+                else None
+            ),
         })
 
     return cors_response(200, {

@@ -283,6 +283,9 @@ def test_patch_accepts_sms_text_only_200(mock_ddb):
     assert r['statusCode'] == 200
     kw = mock_ddb.update_item.call_args.kwargs
     assert any(n == 'sms_text' for n in kw['ExpressionAttributeNames'].values())
+    # B1 regression class: every alias must be USED in the UpdateExpression (a stale alias 502s).
+    for alias in kw['ExpressionAttributeNames']:
+        assert alias in kw['UpdateExpression'], f'stale alias {alias} not referenced'
 
 
 @patch('lambda_function.dynamodb')
