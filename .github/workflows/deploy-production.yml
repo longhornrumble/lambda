@@ -253,13 +253,19 @@ jobs:
       - name: Publish version (audit trail / rollback snapshot)
         if: matrix.lambda.prod_function == github.event.inputs.lambda
         id: publish
+        # Free-text input reaches the shell via env, NEVER inline ${{ }}
+        # interpolation: a note containing `$LATEST` killed run 27248430578
+        # ("LATEST: unbound variable" under set -u), and inline interpolation
+        # of free text into a script is shell injection by construction.
+        env:
+          RELEASE_NOTE: ${{ github.event.inputs.release_note }}
         run: |
           set -euo pipefail
           COMMIT_SHA=$(git rev-parse HEAD)
           COMMIT_MSG=$(git log -1 --pretty=%s)
           NOTE="PROD: ${COMMIT_MSG} (${COMMIT_SHA:0:7})"
-          if [ -n "${{ github.event.inputs.release_note }}" ]; then
-            NOTE="${NOTE} | ${{ github.event.inputs.release_note }}"
+          if [ -n "$RELEASE_NOTE" ]; then
+            NOTE="${NOTE} | ${RELEASE_NOTE}"
           fi
           NOTE=${NOTE:0:256}
           NEW_VERSION=$(aws lambda publish-version \
