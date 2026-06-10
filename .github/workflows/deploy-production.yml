@@ -110,6 +110,15 @@ jobs:
               analytics_writer_contract.json
             # Prod traffic = API GW kgvc8xnewf → Master_Function:live. The
             # alias flip below is what actually ships the deploy.
+            #
+            # publish-version FREEZES $LATEST's env vars into the version the
+            # alias will serve. Before dispatching after any out-of-band env
+            # change, sanity-check prod $LATEST env (e.g. scripts/whats-live.sh
+            # + get-function-configuration). First-dispatch pre-flight done
+            # 2026-06-09: §P5.1 keys (PII_SUBJECT_INDEX_TABLE,
+            # FORM_SUBMISSIONS_TABLE) + fail-loud keys (BEDROCK_MODEL_ID,
+            # STREAMING_ENDPOINT) all present; KB_RETRIEVER_ROLE_ARN absent by
+            # design (environ.get with same-account fallback).
             alias: live
             # action=health_check returns 200 unauthenticated; routed through
             # CloudFront (which injects x-picasso-cf-origin). Mirrors staging.
@@ -185,22 +194,24 @@ jobs:
         if: matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.runtime == 'python'
         run: |
           set -euo pipefail
-          # The include_globs allowlist silently DROPS any runtime .py that
+          # The include_globs allowlist silently DROPS any runtime file that
           # isn't listed (cost §P5.1 twice). Fail loudly instead: every
-          # tracked .py in the source dir must be inside the zip, except
+          # tracked .py/.json in the source dir must be inside the zip, except
           # non-deployed classes: tests (test_*, run_*, conftest) and one-off
           # ops scripts (backfill_*, create_*, migrate_* — table-creation and
-          # backfill utilities live in the repo but never ship).
+          # backfill utilities live in the repo but never ship). New
+          # non-deployed file classes extend that exclusion regex.
+          # unzip -Z1 = one filename per line (space-safe, unlike awk on -l).
           SRC='${{ matrix.lambda.source_dir }}'
           MISSING=0
           while IFS= read -r f; do
             rel="${f#"$SRC"/}"
-            if ! unzip -l /tmp/deploy.zip | awk '{print $4}' | grep -qx "$rel"; then
+            if ! unzip -Z1 /tmp/deploy.zip | grep -qx "$rel"; then
               echo "::error file=$f::Tracked runtime file missing from deploy zip — add it to include_globs (in BOTH deploy-staging.yml and deploy-production.yml)"
               MISSING=1
             fi
-          done < <(git ls-files -- "$SRC/*.py" | grep -vE '(^|/)(test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.py$')
-          [ "$MISSING" -eq 0 ] && echo "Zip-manifest guard: all tracked runtime .py present."
+          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)(test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)$')
+          if [ "$MISSING" -eq 0 ]; then echo "Zip-manifest guard: all tracked runtime files present."; fi
           exit $MISSING
 
       # Note: the previous "compare local SHA to staging $LATEST" safety check
@@ -251,12 +262,18 @@ jobs:
             --function-name ${{ matrix.lambda.prod_function }} \
             --name ${{ matrix.lambda.alias }} \
             --query FunctionVersion --output text)
+          echo "prev_version=$PREV" >> "$GITHUB_OUTPUT"
+          # Defensive: ensure the just-published version is fully active
+          # before pointing traffic at it (publish is usually synchronous;
+          # large functions can lag).
+          aws lambda wait published-version-active \
+            --function-name ${{ matrix.lambda.prod_function }} \
+            --qualifier ${{ steps.publish.outputs.new_version }}
           aws lambda update-alias \
             --function-name ${{ matrix.lambda.prod_function }} \
             --name ${{ matrix.lambda.alias }} \
             --function-version ${{ steps.publish.outputs.new_version }} \
             --query '{Alias:Name,NowServing:FunctionVersion}'
-          echo "prev_version=$PREV" >> "$GITHUB_OUTPUT"
           echo "Alias ${{ matrix.lambda.alias }}: v$PREV → v${{ steps.publish.outputs.new_version }}"
 
       - name: Smoke test
@@ -273,12 +290,31 @@ jobs:
               --query 'FunctionUrlConfigs[?!Qualifier].FunctionUrl | [0]' --output text)
             URL="${BASE%/}${{ matrix.lambda.smoke_path }}"
           fi
-          STATUS=$(curl -s -o /dev/null -w '%{http_code}' "$URL")
+          # Cache-Control: request a CloudFront cache bypass so the smoke
+          # exercises the origin (the just-deployed code), not a cached 200
+          # from the previous version.
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' -H 'Cache-Control: no-cache' "$URL")
           echo "Smoke: GET $URL → $STATUS"
           if [ "$STATUS" != "${{ matrix.lambda.smoke_expect_status }}" ]; then
             echo "::error::Expected ${{ matrix.lambda.smoke_expect_status }}, got $STATUS"
             exit 1
           fi
+
+      - name: Roll alias back on failure
+        # The alias model's whole point is instant rollback — make it
+        # automatic. If anything failed AFTER the alias flipped (smoke,
+        # typically), point traffic back at the previous version so a bad
+        # deploy never sits live waiting for a human. ($LATEST-model
+        # functions have no equivalent: rollback = redeploy a prior git_ref.)
+        if: failure() && matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.alias != '' && steps.alias.outcome == 'success'
+        run: |
+          set -euo pipefail
+          aws lambda update-alias \
+            --function-name ${{ matrix.lambda.prod_function }} \
+            --name ${{ matrix.lambda.alias }} \
+            --function-version ${{ steps.alias.outputs.prev_version }} \
+            --query '{Alias:Name,RolledBackTo:FunctionVersion}'
+          echo "::error::Deploy failed after alias flip — alias ${{ matrix.lambda.alias }} AUTO-ROLLED-BACK to v${{ steps.alias.outputs.prev_version }}. \$LATEST and v${{ steps.publish.outputs.new_version }} still carry the new code; investigate, then redeploy."
 
       - name: Summary
         if: matrix.lambda.prod_function == github.event.inputs.lambda

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # whats-live.sh — one command answering "what code is live where" for the
 # CI-managed Lambdas (CI-modernization Phase 1.5, minimal read-side form —
 # no manifest infra: the publish-version description already encodes
@@ -23,11 +23,13 @@ unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 show_fn() {
   local profile="$1" fn="$2" alias_name="$3"
   local cfg sha mod
+  # NOTE: --output text emits dict keys in ALPHABETICAL order (Mod, Sha),
+  # not query order. Keys are named so alphabetical == declaration order.
   cfg=$(aws lambda get-function-configuration --function-name "$fn" \
         --profile "$profile" \
-        --query '{Sha:CodeSha256,Mod:LastModified}' --output text 2>/dev/null) || {
+        --query '{Mod:LastModified,Sha:CodeSha256}' --output text 2>/dev/null) || {
     echo "  $fn: (not found / no access)"; return; }
-  sha=$(cut -f2 <<<"$cfg"); mod=$(cut -f1 <<<"$cfg")
+  mod=$(cut -f1 <<<"$cfg"); sha=$(cut -f2 <<<"$cfg")
   # Latest published version's description carries the deploy note.
   local note
   note=$(aws lambda list-versions-by-function --function-name "$fn" \
