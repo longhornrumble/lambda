@@ -68,6 +68,6 @@ fi
 if [ "$SCOPE" = "all" ] || [ "$SCOPE" = "staging" ]; then
   echo "STAGING (525, profile=$STAGING_PROFILE)"
   show_fn "$STAGING_PROFILE" Analytics_Dashboard_API ""
-  show_fn "$STAGING_PROFILE" Master_Function_Staging ""
-  show_fn "$STAGING_PROFILE" Bedrock_Streaming_Handler_Staging ""
+  show_fn "$STAGING_PROFILE" Master_Function ""
+  show_fn "$STAGING_PROFILE" Bedrock_Streaming_Handler ""
 fi
