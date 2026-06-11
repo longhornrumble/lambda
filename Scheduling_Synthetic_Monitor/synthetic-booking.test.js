@@ -42,7 +42,8 @@ describe('synthetic-booking.createSyntheticBooking', () => {
     expect(res).toMatchObject({ tenantId: 'TEN-SYNTH', bookingId: 'booking#xyz', coordinatorId: 'coord@example.org' });
 
     expect(deps.invokeBch).toHaveBeenNthCalledWith(1, expect.objectContaining({ action: 'scheduling_propose', appointmentTypeId: 'apt-1' }));
-    // commit passes the chip's FULL candidateResourceIds pool (not just [0]) + pool_size.
+    // commit passes the chip's FULL candidateResourceIds pool (not just [0]) + pool_size,
+    // and is_synthetic:true so BCH compresses the reminder cadence (reminder cycle proof).
     expect(deps.invokeBch).toHaveBeenNthCalledWith(2, expect.objectContaining({
       tenant_id: 'TEN-SYNTH',
       slot: {
@@ -50,6 +51,7 @@ describe('synthetic-booking.createSyntheticBooking', () => {
         end: '2026-07-01T15:30:00Z',
         candidateResourceIds: ['coord@example.org', 'coord2@example.org'],
       },
+      is_synthetic: true,
       pool_size: 2,
       tie_breaker: 'round_robin',
     }));
