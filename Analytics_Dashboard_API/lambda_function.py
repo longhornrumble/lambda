@@ -4592,12 +4592,18 @@ def handle_scheduling_tag_vocabulary_get(tenant_id: str, user_role: Optional[str
 # --- G2 / E14: scheduling notification-template overrides (ui_plan Surface E14) -------- #
 # Per-tenant overrides of the scheduling lifecycle-notice email copy, stored in DDB (NOT
 # tenant config S3 — that store is form-scoped AND read-only on staging; scheduling config
-# lives in DDB per §E13b). notify.js reads these at dispatch (override → else local default);
-# STOP is appended by notify.js OUTSIDE the editable body, so an override can never drop it.
-# v1 = the 3 moments that actually dispatch with a full subject+body. Reminders/confirmation
-# (WS-E-REMIND) + the AI-bodied reengagement are out of scope.
+# lives in DDB per §E13b). The dispatchers read these at dispatch (override → else local
+# default); STOP / action-links are appended OUTSIDE the editable body, so an override can
+# never drop them.
+# Moments by dispatch path:
+#   • reschedule_link / reoffer / cancel_notice → notify.js (volunteer-notice path, §E14 G2).
+#   • reminder_24h / reminder_1h → Scheduled_Message_Sender at FIRE TIME (S4/D3). LIVE.
+#   • confirmation → Booking_Commit_Handler at commit (S4c). EDITOR SURFACE only until the BCH
+#     read lands; the cancel/reschedule/join links + .ics are appended outside the editable body.
+# The reengagement (AI body) + the t15m / attendance moments remain non-overridable in v1.
 SCHED_NOTIF_TEMPLATE_TABLE = os.environ.get('SCHED_NOTIF_TEMPLATE_TABLE', 'picasso-scheduling-notif-template')
-_SCHED_NOTIF_MOMENTS = ('reschedule_link', 'reoffer', 'cancel_notice')
+_SCHED_NOTIF_MOMENTS = ('reschedule_link', 'reoffer', 'cancel_notice',
+                        'reminder_24h', 'reminder_1h', 'confirmation')
 _SCHED_TPL_FIELD_MAX = 5000
 _SCHED_TPL_FIELDS = ('subject', 'body_text', 'body_html')
 # Editor-display defaults — MIRROR shared/scheduling/notify.js TEMPLATES (STOP excluded, it
@@ -4624,6 +4630,27 @@ _SCHED_NOTIF_DEFAULTS = {
         'body_text': 'Hi {{firstName}},\n\nYour {{apptType}}{{whenSuffix}} has been canceled.{{rebookText}}',
         'body_html': '<p>Hi {{firstName}},</p><p>Your {{apptType}}{{whenSuffix}} has been canceled.</p>{{rebookHtml}}',
     },
+    # Reminders dispatch via Scheduled_Message_Sender at FIRE TIME (S4/D3). The tier implies the
+    # lead, so the default copy bakes "tomorrow" / "in about an hour" — there is no {{when}} var.
+    'reminder_24h': {
+        'subject': 'Reminder: your {{apptType}} is tomorrow — {{org}}',
+        'body_text': 'Hi {{firstName}},\n\nThis is a reminder that your {{apptType}} with {{org}} is tomorrow.',
+        'body_html': '<p>Hi {{firstName}},</p><p>This is a reminder that your {{apptType}} with {{org}} is tomorrow.</p>',
+    },
+    'reminder_1h': {
+        'subject': 'Reminder: your {{apptType}} is in about an hour — {{org}}',
+        'body_text': 'Hi {{firstName}},\n\nThis is a reminder that your {{apptType}} with {{org}} is in about an hour.',
+        'body_html': '<p>Hi {{firstName}},</p><p>This is a reminder that your {{apptType}} with {{org}} is in about an hour.</p>',
+    },
+    # Confirmation dispatches via Booking_Commit_Handler at commit (S4c). The cancel/reschedule/
+    # join links + the .ics attachment are appended OUTSIDE this editable body (compliance/
+    # functionality — like STOP), so an override can never drop them. {{whenLabel}} = the
+    # formatted appointment time.
+    'confirmation': {
+        'subject': "You're confirmed — {{org}}",
+        'body_text': "Hi {{firstName}},\n\nYou're confirmed for your {{apptType}} {{whenLabel}}.",
+        'body_html': "<p>Hi {{firstName}},</p><p>You're confirmed for your {{apptType}} {{whenLabel}}.</p>",
+    },
 }
 # Variables are PER-MOMENT (notify.js renders different vars per kind): a var used in the
 # wrong moment renders as an empty string. {{rebookText}} is text-only, {{rebookHtml}}
@@ -4633,6 +4660,9 @@ _SCHED_NOTIF_MOMENT_VARS = {
     'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
     'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}',
                       '{{rebookText}}', '{{rebookHtml}}'],
+    'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
+    'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
+    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}'],
 }
 
 # G7a (E14 SMS EDITOR surface — items 1-3 only): the SMS override field + its editor-display
@@ -4646,11 +4676,17 @@ _SCHED_NOTIF_SMS_DEFAULTS = {
     'reschedule_link': 'Hi {{firstName}}, need a different time for your {{apptType}}? Pick a new one: {{actionUrl}}',
     'reoffer': 'Hi {{firstName}}, your {{apptType}} time is no longer available. Pick a new one: {{actionUrl}}',
     'cancel_notice': 'Hi {{firstName}}, your {{apptType}}{{whenSuffix}} was canceled.{{rebookText}}',
+    'reminder_24h': 'Reminder: your {{apptType}} with {{org}} is tomorrow.',
+    'reminder_1h': 'Reminder: your {{apptType}} with {{org}} is in about an hour.',
+    'confirmation': "Hi {{firstName}}, you're confirmed for your {{apptType}} with {{org}}.",
 }
 _SCHED_NOTIF_SMS_VARS = {
     'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
     'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
     'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{rebookText}}'],
+    'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
+    'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
+    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}'],
 }
 
 

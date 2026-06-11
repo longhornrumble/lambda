@@ -27,9 +27,44 @@ EMAIL = 'admin@example.com'
 # defaults parity / compliance
 # --------------------------------------------------------------------------- #
 
-def test_defaults_cover_exactly_the_three_dispatched_moments():
+def test_defaults_cover_exactly_the_moments():
     assert tuple(lf._SCHED_NOTIF_DEFAULTS.keys()) == lf._SCHED_NOTIF_MOMENTS
-    assert set(lf._SCHED_NOTIF_MOMENTS) == {'reschedule_link', 'reoffer', 'cancel_notice'}
+    assert set(lf._SCHED_NOTIF_MOMENTS) == {
+        'reschedule_link', 'reoffer', 'cancel_notice',
+        'reminder_24h', 'reminder_1h', 'confirmation',
+    }
+    # every moment must also have SMS defaults + email/SMS var lists (the GET indexes them).
+    assert set(lf._SCHED_NOTIF_SMS_DEFAULTS.keys()) == set(lf._SCHED_NOTIF_MOMENTS)
+    assert set(lf._SCHED_NOTIF_MOMENT_VARS.keys()) == set(lf._SCHED_NOTIF_MOMENTS)
+    assert set(lf._SCHED_NOTIF_SMS_VARS.keys()) == set(lf._SCHED_NOTIF_MOMENTS)
+
+
+@patch('lambda_function.dynamodb')
+def test_get_includes_reminder_and_confirmation_moments(mock_ddb):
+    # S4: the reminder + confirmation moments surface in the editor (data-driven GET).
+    mock_ddb.query.return_value = {'Items': []}
+    body = json.loads(handle_scheduling_notification_templates_get(TENANT, ADMIN)['body'])
+    for m in ('reminder_24h', 'reminder_1h', 'confirmation'):
+        assert m in body['moments'], f'{m} missing from editor moments'
+        assert body['moments'][m]['is_override'] is False
+        assert body['moments'][m]['subject'] == lf._SCHED_NOTIF_DEFAULTS[m]['subject']
+        assert body['moments'][m]['sms_text'] == lf._SCHED_NOTIF_SMS_DEFAULTS[m]
+    # reminder vars are the plain trio (no actionUrl / rebook); confirmation adds whenLabel.
+    assert body['moments']['reminder_24h']['available_variables'] == ['{{firstName}}', '{{org}}', '{{apptType}}']
+    assert '{{whenLabel}}' in body['moments']['confirmation']['available_variables']
+    assert '{{actionUrl}}' not in body['moments']['reminder_1h']['available_variables']
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_accepts_reminder_and_confirmation_moments_200(mock_ddb):
+    for m, field, val in (
+        ('reminder_24h', 'subject', 'See you tomorrow — {{org}}'),
+        ('reminder_1h', 'body_text', 'Hi {{firstName}}, almost time for your {{apptType}}.'),
+        ('confirmation', 'body_html', '<p>Hi {{firstName}}</p>'),
+    ):
+        mock_ddb.update_item.return_value = _attrs(moment=m, **{field: val})
+        r = handle_scheduling_notification_template_write(TENANT, m, {field: val}, ADMIN, EMAIL)
+        assert r['statusCode'] == 200, f'{m} PATCH should be accepted'
 
 
 def test_defaults_carry_no_stop_line():
@@ -157,7 +192,7 @@ def test_patch_empty_string_clears_field_200(mock_ddb):
 
 def test_patch_unknown_moment_404():
     r = handle_scheduling_notification_template_write(
-        TENANT, 'reminder_24h', {'subject': 'x'}, ADMIN, EMAIL)
+        TENANT, 'not_a_real_moment', {'subject': 'x'}, ADMIN, EMAIL)
     assert r['statusCode'] == 404
 
 
