@@ -40,11 +40,23 @@ function warn(event, fields) {
 }
 const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// A cadence reminder (NOT the attendance check): moment='reminder' with a tier. The
-// attendance row also carries moment='reminder' but attendance_check=true / no tier.
+// A cadence reminder (NOT the attendance check). Each condition is load-bearing and relies
+// on the §E1 row contract (Reminder_Scheduler/scheduler.js buildReminderRow/buildAttendanceRow):
+//   • moment === 'reminder'  — both reminder + attendance rows set this; gates out any future
+//     non-reminder moment that might share the table.
+//   • !attendance_check      — attendance rows set attendance_check=true; cadence rows omit it
+//     (read as false). The PRIMARY discriminator.
+//   • !!tier                 — cadence rows carry a tier (t24h|t1h|t15m); attendance rows have
+//     none. Defence-in-depth behind attendance_check; also rejects a malformed tier-less row.
+// If the row contract ever adds a tier to attendance rows or a new tiered moment, revisit.
 function isCadenceReminder(row) {
   return row && row.moment === 'reminder' && !row.attendance_check && !!row.tier;
 }
+
+// Terminal statuses the Sender writes AFTER it ran (vs 'pending' = never fired). 'failed' =
+// the send threw; 'suppressed' = no channel resolved. Neither is the proof ('sent' only),
+// but both mean EventBridge fired + Sender ran — a distinct finding from EventBridge lag.
+const TERMINAL_NOT_SENT = new Set(['failed', 'suppressed']);
 
 async function runReminderCycle(deps = {}) {
   const create = deps.createSyntheticBooking || syntheticBooking.createSyntheticBooking;
@@ -83,21 +95,27 @@ async function runReminderCycle(deps = {}) {
       tiers: reminderRows.map((r) => r.tier),
     });
 
-    // Poll until a cadence-reminder row flips to 'sent' (the EventBridge→Sender proof).
+    // Poll until a cadence-reminder row flips to 'sent' (the EventBridge→Sender proof). Keep
+    // polling past a 'failed'/'suppressed' tier — a LATER tier may still fire 'sent' (success
+    // = ANY tier sent). Record a terminal-not-sent row so the failure message can distinguish
+    // "Sender ran but didn't send" from "EventBridge never fired" (all rows still pending).
     let sentRow = null;
     let lastStatuses = [];
+    let terminalRow = null;
     for (let i = 0; i < pollAttempts; i += 1) {
-      const rows = (await queryByAppointment(tenantId, bookingId)).filter(isCadenceReminder);
+      const rows = ((await queryByAppointment(tenantId, bookingId)) || []).filter(isCadenceReminder);
       lastStatuses = rows.map((r) => ({ tier: r.tier, status: r.status }));
       sentRow = rows.find((r) => r.status === 'sent') || null;
       if (sentRow) break;
+      terminalRow = rows.find((r) => TERMINAL_NOT_SENT.has(r.status)) || terminalRow;
       if (i < pollAttempts - 1) await sleep(pollIntervalMs);
     }
     if (!sentRow) {
+      const detail = `last statuses=${JSON.stringify(lastStatuses)}`;
       throw new Error(
-        `no reminder dispatched within ${pollAttempts} polls (last statuses=${JSON.stringify(
-          lastStatuses
-        )}) — EventBridge/Sender lag or breakage`
+        terminalRow
+          ? `reminder reached terminal status '${terminalRow.status}' (tier=${terminalRow.tier}; ${detail}) — Sender ran but did not send`
+          : `no reminder dispatched within ${pollAttempts} polls (${detail}) — EventBridge/Sender lag or breakage`
       );
     }
 

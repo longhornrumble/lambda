@@ -37,10 +37,13 @@ hard-stops a prod run with test-mode on).
 > ⚠️ **Do NOT copy an adjacent role's policy wholesale** (e.g. BCH's role): this role MUST
 > NOT have `secretsmanager:GetSecretValue` or any Google/SES grant — it has no use for them
 > and they would broaden the blast radius. Build the role from the table above only.
-> **Recommended hardening:** scope the DynamoDB grant with a `Condition` on
-> `aws:ResourceAccount = <staging account id>` so an accidental prod deploy can't reach a
-> future prod booking table (the prod-guard covers the test-mode case; this covers the
-> test-mode-OFF-in-prod case at the IAM layer).
+>
+> 🔒 **REQUIRED (not optional):** scope the DynamoDB **and** `lambda:InvokeFunction` grants
+> with a `Condition` on `aws:ResourceAccount = <staging account id>`. This is the only non-code
+> backstop for the **test-mode-OFF** case: the `prod-guard` refuses init only when
+> `STAGING_TEST_MODE` is ON — a role provisioned in the prod account with the flag OFF would
+> let the monitor reach a prod booking table / BCH. **Do not apply this role without this
+> condition.**
 
 > **`BOOKING_TABLE` is a required env var, not a safe default.** The code falls back to
 > `picasso-booking-${ENV}` only as a staging convenience; under the table-naming-alignment

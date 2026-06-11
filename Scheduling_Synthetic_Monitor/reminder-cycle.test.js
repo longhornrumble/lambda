@@ -50,15 +50,25 @@ describe('reminder-cycle', () => {
     expect(deps.createSyntheticBooking).toHaveBeenCalledWith({ cyclePrefix: 'reminder' }, deps);
     expect(deps.emitCycleResult).toHaveBeenCalledWith('reminder', true);
     expect(deps.alert).not.toHaveBeenCalled();
-    // best-effort cleanup cancels the synthetic booking via the Tier-2 executor.
+    // best-effort cleanup cancels the synthetic booking via the Tier-2 executor — the full
+    // arg set (tenantId + booking) is asserted: BCH's cancel route needs the booking object.
     expect(deps.invokeBch).toHaveBeenCalledWith(
       expect.objectContaining({
         action: 'scheduling_mutate',
         mutation: 'cancel',
+        tenantId: 'TEN-SYNTH',
         coordinatorId: 'coord@example.org',
         bookingId: 'booking#abc',
+        booking: expect.objectContaining({ coordinator_email: 'coord@example.org' }),
       })
     );
+  });
+
+  test('a reminder row already sent on the first read → immediate success (fast path)', async () => {
+    const deps = makeDeps({ queryByAppointment: jest.fn().mockResolvedValue([reminderRow('sent')]) });
+    const res = await runReminderCycle(deps);
+    expect(res).toMatchObject({ success: true, firedTier: 't24h' });
+    expect(deps.sleep).not.toHaveBeenCalled(); // found on poll 0, never sleeps
   });
 
   test('polls until a reminder row flips to sent, sleeping between attempts', async () => {
@@ -83,9 +93,40 @@ describe('reminder-cycle', () => {
 
     expect(res).toMatchObject({ cycle: 'reminder', success: false });
     expect(res.error).toMatch(/no reminder dispatched/);
+    expect(res.error).toMatch(/EventBridge\/Sender lag/); // distinguished from a terminal flip
     expect(deps.emitCycleResult).toHaveBeenCalledWith('reminder', false);
     expect(deps.alert).toHaveBeenCalled();
     expect(deps.invokeBch).toHaveBeenCalled(); // cleanup still attempted (booking exists)
+    // last poll (i=2) does not sleep — 3 attempts → 2 sleeps.
+    expect(deps.sleep).toHaveBeenCalledTimes(2);
+  });
+
+  test('a reminder that reaches terminal failed → fail, distinguished from EventBridge lag', async () => {
+    const deps = makeDeps({ queryByAppointment: jest.fn().mockResolvedValue([reminderRow('failed')]), pollAttempts: 2 });
+    const res = await runReminderCycle(deps);
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/terminal status 'failed'/);
+    expect(res.error).toMatch(/Sender ran but did not send/);
+    expect(deps.alert).toHaveBeenCalled();
+  });
+
+  test('a reminder that reaches terminal suppressed → fail, distinguished from EventBridge lag', async () => {
+    const deps = makeDeps({ queryByAppointment: jest.fn().mockResolvedValue([reminderRow('suppressed')]), pollAttempts: 2 });
+    const res = await runReminderCycle(deps);
+    expect(res.success).toBe(false);
+    expect(res.error).toMatch(/terminal status 'suppressed'/);
+  });
+
+  test('a later tier still flips to sent after an earlier tier failed → success', async () => {
+    // poll sees t24h failed, then on the next poll t1h is sent → success (ANY tier sent).
+    const queryByAppointment = jest
+      .fn()
+      .mockResolvedValueOnce([reminderRow('failed', 't24h'), reminderRow('pending', 't1h')]) // initial
+      .mockResolvedValueOnce([reminderRow('failed', 't24h'), reminderRow('pending', 't1h')]) // poll 0
+      .mockResolvedValueOnce([reminderRow('failed', 't24h'), reminderRow('sent', 't1h')]); // poll 1
+    const deps = makeDeps({ queryByAppointment, pollAttempts: 5 });
+    const res = await runReminderCycle(deps);
+    expect(res).toMatchObject({ success: true, firedTier: 't1h' });
   });
 
   test('fails when the scheduler created no cadence-reminder rows (compression off / broken)', async () => {
@@ -156,6 +197,17 @@ describe('reminder-cycle', () => {
     const res = await runReminderCycle(deps);
     expect(res.success).toBe(true);
     expect(res.firedTier).toBe('t24h');
+  });
+
+  test('uses the real defaultSleep when none is injected (covers the sleep helper)', async () => {
+    const queryByAppointment = jest
+      .fn()
+      .mockResolvedValueOnce([reminderRow('pending')]) // initial
+      .mockResolvedValueOnce([reminderRow('pending')]) // poll 0 → sleeps via real defaultSleep(0)
+      .mockResolvedValueOnce([reminderRow('sent')]); // poll 1 → success
+    const deps = makeDeps({ queryByAppointment, pollIntervalMs: 0, sleep: undefined });
+    const res = await runReminderCycle(deps);
+    expect(res.success).toBe(true);
   });
 
   test('pollAttempts:1 → single poll, no sleep, clean failure if not yet sent', async () => {

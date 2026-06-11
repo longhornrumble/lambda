@@ -84,4 +84,9 @@ describe('scheduled-messages-table.queryByAppointment', () => {
     ddbMock.on(QueryCommand).resolves({ Items: [] });
     expect(await scheduledMessages.queryByAppointment('TEN-SYNTH', 'booking#none')).toEqual([]);
   });
+
+  test('tolerates a response with no Items key (defensive `Items || []`)', async () => {
+    ddbMock.on(QueryCommand).resolves({}); // SDK contract guarantees Items, but the guard holds
+    expect(await scheduledMessages.queryByAppointment('TEN-SYNTH', 'booking#x')).toEqual([]);
+  });
 });
