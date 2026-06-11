@@ -20,17 +20,25 @@
 
 const crypto = require('crypto');
 const { SESClient, SendRawEmailCommand } = require('@aws-sdk/client-ses');
+const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 
 const { sign } = require('../shared/scheduling/tokens');
+const { CONFIRMATION_DEFAULTS } = require('../shared/scheduling/notif-defaults');
 const { sdkConfig } = require('./aws-client-config');
 
 const SES_REGION = process.env.AWS_REGION || 'us-east-1';
 const ses = new SESClient(sdkConfig({ region: SES_REGION }));
+// §E14 S4c override read — same bounded sdkConfig as every commit-path client (the
+// confirmation rides the 60s SLA; requestTimeout caps the GetItem, fail-safe → defaults).
+const ddb = new DynamoDBClient(sdkConfig({ region: SES_REGION }));
 
 const FROM_EMAIL = process.env.SES_FROM_EMAIL || 'notify@myrecruiter.ai';
 const CONFIG_SET = process.env.SES_CONFIGURATION_SET || 'picasso-emails';
 // §13.8 — token action endpoints live on the greenfield schedule.* host.
 const SCHEDULE_BASE_URL = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
+// §E14 S4c: per-tenant confirmation template overrides. Already wired on BCH (G6 grant
+// DDBReadSchedulingNotifTemplate + env). Unset/empty → override system off, defaults send.
+const SCHED_NOTIF_TEMPLATE_TABLE = process.env.SCHED_NOTIF_TEMPLATE_TABLE || '';
 
 // ─── sanitization helpers ──────────────────────────────────────────────────────────
 
@@ -160,38 +168,91 @@ function buildRawMime({ from, to, subject, textBody, htmlBody, icsContent, icsFi
   ].join('\r\n');
 }
 
-// ─── content templates ───────────────────────────────────────────────────────────────
+// ─── content templates (§E14 S4c: override → else shared defaults) ────────────────────
 
-function buildBodies({ firstName, orgName, whenLabel, coordinatorName, joinUrl, rescheduleUrl, cancelUrl }) {
-  const safeFirst = escapeHtml(firstName) || 'there';
-  const safeOrg = escapeHtml(orgName) || 'the team';
-  const safeWhen = escapeHtml(whenLabel);
-  const safeCoord = escapeHtml(coordinatorName);
+// {{var}} substitution; unknown vars render '' (the §E14 editor contract — a var used in
+// the wrong moment renders empty, never a literal {{...}} in a volunteer's inbox).
+function renderVars(template, vars) {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key) =>
+    vars[key] != null ? String(vars[key]) : ''
+  );
+}
+
+/**
+ * §E14 S4c loader — GetItem of the tenant's `confirmation` override. FAIL-SAFE: unset
+ * table / miss / error → null (defaults send); the bounded sdkConfig client caps the
+ * read so a template-store hang can never threaten the 60s commit SLA. Mirrors
+ * notify.js defaultLoadTemplateOverride (raw client; that loader gates on ITS moments,
+ * so confirmation needs this local one).
+ */
+async function loadTemplateOverride({ tenantId, log = console } = {}) {
+  if (!SCHED_NOTIF_TEMPLATE_TABLE || !tenantId) return null;
+  try {
+    const res = await ddb.send(new GetItemCommand({
+      TableName: SCHED_NOTIF_TEMPLATE_TABLE,
+      Key: { tenantId: { S: String(tenantId) }, moment: { S: 'confirmation' } },
+    }));
+    const it = res.Item;
+    if (!it) return null;
+    const s = (a) => (a && typeof a.S === 'string' ? a.S : undefined);
+    return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html) };
+  } catch (err) {
+    // err.name (not .message): SDK messages can embed the role/table ARN.
+    (log || console).warn(`[confirmation] template override load failed: ${err.name || 'error'} (using default copy)`);
+    return null;
+  }
+}
+
+/**
+ * The EDITABLE region is only the greeting/confirmation copy (override field → else the
+ * shared CONFIRMATION_DEFAULTS, byte-in-sync with the ADA editor). The join link, the
+ * signed reschedule/cancel links, and the org sign-off are appended OUTSIDE it —
+ * compliance/functionality invariant (like STOP): no override can drop them. The .ics
+ * attachment is likewise untouched by overrides (assembled in sendConfirmationEmail).
+ */
+function buildBodies({ firstName, orgName, apptTypeName, whenLabel, joinUrl, rescheduleUrl, cancelUrl, templateOverride }) {
+  const vars = {
+    firstName: firstName || 'there',
+    org: orgName || 'the team',
+    apptType: apptTypeName || 'appointment',
+    whenLabel: whenLabel || '',
+  };
+  const htmlVars = {
+    firstName: escapeHtml(vars.firstName),
+    org: escapeHtml(vars.org),
+    apptType: escapeHtml(vars.apptType),
+    whenLabel: escapeHtml(vars.whenLabel),
+  };
+  const pickField = (k) =>
+    templateOverride && typeof templateOverride[k] === 'string' && templateOverride[k].trim()
+      ? templateOverride[k]
+      : CONFIRMATION_DEFAULTS[k];
+
+  const subject = stripCrlf(renderVars(pickField('subject'), vars));
+  const editableText = renderVars(pickField('text'), vars);
+  const editableHtml = renderVars(pickField('html'), htmlVars);
 
   const textBody = [
-    `Hi ${firstName || 'there'},`,
+    editableText,
     '',
-    `You're confirmed${whenLabel ? ` for ${whenLabel}` : ''}${coordinatorName ? ` with ${coordinatorName}` : ''}.`,
-    joinUrl ? `Join: ${joinUrl}` : '',
-    '',
+    ...(joinUrl ? [`Join: ${joinUrl}`] : []),
     `Reschedule: ${rescheduleUrl}`,
     `Cancel: ${cancelUrl}`,
     '',
     `— ${orgName || 'MyRecruiter'}`,
-  ].filter(Boolean).join('\n');
+  ].join('\n');
 
   const htmlBody = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333;line-height:1.6;">
-<p>Hi ${safeFirst},</p>
-<p>You're confirmed${safeWhen ? ` for <strong>${safeWhen}</strong>` : ''}${safeCoord ? ` with ${safeCoord}` : ''}.</p>
+${editableHtml}
 ${joinUrl ? `<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>` : ''}
 <p>
   <a href="${escapeHtml(rescheduleUrl)}">Reschedule</a> &nbsp;|&nbsp;
   <a href="${escapeHtml(cancelUrl)}">Cancel</a>
 </p>
-<p style="color:#999;font-size:12px;">&mdash; ${safeOrg}</p>
+<p style="color:#999;font-size:12px;">&mdash; ${escapeHtml(orgName) || 'the team'}</p>
 </body></html>`;
 
-  return { textBody, htmlBody };
+  return { subject, textBody, htmlBody };
 }
 
 // ─── public: send the confirmation email ─────────────────────────────────────────────
@@ -235,20 +296,30 @@ async function sendConfirmationEmail(args, opts = {}) {
     // dtstamp defaults to now() inside buildIcs (RFC 5545 — not the event start).
   });
 
-  const { textBody, htmlBody } = buildBodies({
+  // §E14 S4c: per-tenant override (fail-safe → shared defaults). DI via
+  // opts.loadTemplateOverride for tests; a throwing injected loader also degrades.
+  let templateOverride = null;
+  try {
+    templateOverride = await (opts.loadTemplateOverride || loadTemplateOverride)({ tenantId, log: opts.log });
+  } catch (err) {
+    (opts.log || console).warn(`[confirmation] template override load threw: ${err.name || 'error'} (using default copy)`);
+  }
+
+  const { subject, textBody, htmlBody } = buildBodies({
     firstName: attendeeFirstName,
     orgName,
+    apptTypeName: appointmentTypeName,
     whenLabel,
-    coordinatorName,
     joinUrl,
     rescheduleUrl,
     cancelUrl,
+    templateOverride,
   });
 
   const raw = buildRawMime({
     from: FROM_EMAIL,
     to: attendeeEmail,
-    subject: `You're confirmed${whenLabel ? ` — ${whenLabel}` : ''}`,
+    subject,
     textBody,
     htmlBody,
     icsContent: ics,
@@ -275,6 +346,8 @@ module.exports = {
   buildActionLinks,
   buildRawMime,
   buildBodies,
+  loadTemplateOverride,
+  renderVars,
   escapeHtml,
   escapeIcsText,
   stripCrlf,

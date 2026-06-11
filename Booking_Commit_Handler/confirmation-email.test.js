@@ -174,3 +174,175 @@ describe('helper edge cases (branch coverage)', () => {
     expect(sign).toHaveBeenCalledWith('cancel', expect.objectContaining({ start_at: ARGS.start }), undefined);
   });
 });
+
+// ─── §E14 S4c: per-tenant confirmation template overrides ─────────────────────────────
+
+const { mockClient: mockDdbClient } = require('aws-sdk-client-mock');
+const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
+
+describe('buildBodies — §E14 override/default resolution', () => {
+  const BASE = {
+    firstName: 'Sam', orgName: 'Austin Angels', apptTypeName: 'Volunteer intake',
+    whenLabel: 'Wed, Jun 3 - 1:00 PM CT', joinUrl: 'https://zoom.us/j/12345',
+    rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+    cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
+  };
+
+  it('no override → the shared §E14 defaults (byte-in-sync with the ADA editor) + action block', () => {
+    const { subject, textBody, htmlBody } = email.buildBodies({ ...BASE, templateOverride: null });
+    expect(subject).toBe("You're confirmed — Austin Angels");
+    expect(textBody).toContain("Hi Sam,\n\nYou're confirmed for your Volunteer intake Wed, Jun 3 - 1:00 PM CT.");
+    expect(textBody).toContain('Join: https://zoom.us/j/12345');
+    expect(textBody).toContain('Reschedule: https://schedule.myrecruiter.ai/reschedule?t=r');
+    expect(textBody).toContain('Cancel: https://schedule.myrecruiter.ai/cancel?t=c');
+    // NB: the apostrophe is template-literal text (only VARS are escaped), matching ADA:
+    expect(htmlBody).toContain("<p>Hi Sam,</p><p>You're confirmed for your Volunteer intake Wed, Jun 3 - 1:00 PM CT.</p>");
+    expect(htmlBody).toContain('>Reschedule</a>');
+    expect(htmlBody).toContain('>Cancel</a>');
+  });
+
+  it('override is rendered with {firstName,org,apptType,whenLabel}; action links survive REGARDLESS (compliance invariant)', () => {
+    // Adversarial override: tries to BE the whole email with no links at all.
+    const templateOverride = {
+      subject: 'See you {{whenLabel}}, {{firstName}}!',
+      text: '{{firstName}} — {{apptType}} at {{org}}. No links needed!',
+      html: '<p>{{firstName}} — {{apptType}} at {{org}}. No links needed!</p>',
+    };
+    const { subject, textBody, htmlBody } = email.buildBodies({ ...BASE, templateOverride });
+    expect(subject).toBe('See you Wed, Jun 3 - 1:00 PM CT, Sam!');
+    expect(textBody).toContain('Sam — Volunteer intake at Austin Angels. No links needed!');
+    // The signed action links are OUTSIDE the editable region — the override cannot drop them:
+    expect(textBody).toContain('Reschedule: https://schedule.myrecruiter.ai/reschedule?t=r');
+    expect(textBody).toContain('Cancel: https://schedule.myrecruiter.ai/cancel?t=c');
+    expect(textBody).toContain('Join: https://zoom.us/j/12345');
+    expect(htmlBody).toContain('>Reschedule</a>');
+    expect(htmlBody).toContain('>Cancel</a>');
+    expect(htmlBody).toContain('Join the meeting');
+  });
+
+  it('partial override (subject only) → body fields fall back to the defaults', () => {
+    const { subject, textBody } = email.buildBodies({ ...BASE, templateOverride: { subject: 'Custom — {{org}}' } });
+    expect(subject).toBe('Custom — Austin Angels');
+    expect(textBody).toContain("You're confirmed for your Volunteer intake");
+  });
+
+  it('whitespace-only override field falls back; unknown {{vars}} render empty', () => {
+    const { subject, textBody } = email.buildBodies({
+      ...BASE,
+      templateOverride: { subject: '   ', text: 'Hi {{firstName}}, ref {{actionUrl}}done.' },
+    });
+    expect(subject).toBe("You're confirmed — Austin Angels");
+    expect(textBody).toContain('Hi Sam, ref done.');
+  });
+
+  it('html vars are HTML-escaped; text vars verbatim (injection guard)', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      ...BASE,
+      firstName: '<img src=x onerror=alert(1)>',
+      templateOverride: { text: 'Hi {{firstName}}!', html: '<p>Hi {{firstName}}!</p>' },
+    });
+    expect(htmlBody).toContain('&lt;img src=x onerror=alert(1)&gt;');
+    expect(htmlBody).not.toContain('<img');
+    expect(textBody).toContain('Hi <img src=x onerror=alert(1)>!');
+  });
+
+  it('override subject CRLF is stripped (header-injection guard)', () => {
+    const { subject } = email.buildBodies({
+      ...BASE,
+      templateOverride: { subject: 'Hello {{firstName}}\r\nBcc: evil@x.com' },
+    });
+    expect(subject).toBe('Hello Sam Bcc: evil@x.com');
+  });
+});
+
+describe('sendConfirmationEmail — §E14 override wiring (fail-safe on the 60s commit path)', () => {
+  it('injected loader supplies the override; the .ics attachment is still present', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-1' });
+    const loaderCalls = [];
+    const res = await email.sendConfirmationEmail(ARGS, {
+      loadTemplateOverride: async (a) => { loaderCalls.push(a); return { text: 'Custom for {{firstName}}.' }; },
+    });
+    expect(res.messageId).toBe('msg-1');
+    expect(loaderCalls).toEqual([{ tenantId: 'AUS123957', log: undefined }]);
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    expect(raw).toContain('Custom for Sam.');
+    expect(raw).toContain('Content-Type: text/calendar'); // .ics survives any override
+    expect(raw).toContain('filename="invite.ics"');
+    expect(raw).toContain('Reschedule: '); // action links survive any override
+  });
+
+  it('throwing injected loader degrades to the default copy — the send still goes out', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-2' });
+    const warns = [];
+    const res = await email.sendConfirmationEmail(ARGS, {
+      loadTemplateOverride: async () => { throw new Error('boom'); },
+      log: { warn: (m) => warns.push(m) },
+    });
+    expect(res.messageId).toBe('msg-2');
+    expect(warns.length).toBe(1);
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    expect(raw).toContain("You're confirmed for your Volunteer intake");
+  });
+});
+
+describe('loadTemplateOverride — fail-safe loader', () => {
+  it('returns null with zero I/O while SCHED_NOTIF_TEMPLATE_TABLE is unset (this suite)', async () => {
+    const ddbMock = mockDdbClient(DynamoDBClient);
+    ddbMock.on(GetItemCommand).resolves({ Item: { subject: { S: 'x' } } });
+    expect(await email.loadTemplateOverride({ tenantId: 'T1' })).toBeNull();
+    expect(ddbMock.commandCalls(GetItemCommand).length).toBe(0);
+    ddbMock.restore();
+  });
+
+  it('with the table env set: queries {tenantId, moment:confirmation}, maps fields, fail-safes on error', async () => {
+    // The isolated registry re-instantiates @aws-sdk/client-dynamodb — mock THAT class,
+    // not the outer one, or the isolated module's client escapes the mock.
+    let isolated, ddbMock, GetItemCommand;
+    jest.isolateModules(() => {
+      process.env.SCHED_NOTIF_TEMPLATE_TABLE = 'picasso-scheduling-notif-template-test';
+      const dynamo = require('@aws-sdk/client-dynamodb');
+      ddbMock = mockDdbClient(dynamo.DynamoDBClient);
+      GetItemCommand = dynamo.GetItemCommand;
+      isolated = require('./confirmation-email');
+      delete process.env.SCHED_NOTIF_TEMPLATE_TABLE;
+    });
+
+    ddbMock.on(GetItemCommand).resolves({
+      Item: { subject: { S: 'S' }, body_text: { S: 'T' }, body_html: { S: '<p>H</p>' } },
+    });
+    const hit = await isolated.loadTemplateOverride({ tenantId: 'AUS123957' });
+    expect(hit).toEqual({ subject: 'S', text: 'T', html: '<p>H</p>' });
+    const call = ddbMock.commandCalls(GetItemCommand)[0].args[0].input;
+    expect(call.TableName).toBe('picasso-scheduling-notif-template-test');
+    expect(call.Key).toEqual({ tenantId: { S: 'AUS123957' }, moment: { S: 'confirmation' } });
+
+    ddbMock.reset();
+    ddbMock.on(GetItemCommand).resolves({}); // miss
+    expect(await isolated.loadTemplateOverride({ tenantId: 'T1' })).toBeNull();
+
+    ddbMock.reset();
+    ddbMock.on(GetItemCommand).rejects(Object.assign(new Error('denied'), { name: 'AccessDeniedException' }));
+    const warns = [];
+    expect(await isolated.loadTemplateOverride({ tenantId: 'T1', log: { warn: (m) => warns.push(m) } })).toBeNull();
+    expect(warns[0]).toContain('AccessDeniedException');
+    expect(warns[0]).not.toContain('denied'); // the raw message (ARN-bearing in real life) stays out
+    ddbMock.restore();
+  });
+
+  it('non-string stored fields are dropped, not coerced (schema discipline)', async () => {
+    let isolated, ddbMock, GetItemCommand;
+    jest.isolateModules(() => {
+      process.env.SCHED_NOTIF_TEMPLATE_TABLE = 't';
+      const dynamo = require('@aws-sdk/client-dynamodb');
+      ddbMock = mockDdbClient(dynamo.DynamoDBClient);
+      GetItemCommand = dynamo.GetItemCommand;
+      isolated = require('./confirmation-email');
+      delete process.env.SCHED_NOTIF_TEMPLATE_TABLE;
+    });
+    ddbMock.on(GetItemCommand).resolves({ Item: { subject: { N: '42' }, body_text: { S: 'T' } } });
+    expect(await isolated.loadTemplateOverride({ tenantId: 'T1' })).toEqual({
+      subject: undefined, text: 'T', html: undefined,
+    });
+    ddbMock.restore();
+  });
+});
