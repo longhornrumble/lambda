@@ -542,50 +542,15 @@ test('loadTemplateOverride is a no-op (null, zero I/O) while SCHED_NOTIF_TEMPLAT
   assert.equal(calls.length, 0);
 });
 
-// ─── parity guards (mirror shared/scheduling/__tests__/notify-sms-parity.test.js) ─────
+// ─── parity guards ─────────────────────────────────────────────────────────────────────
+// The footer/template parity tests that lived here are GONE by construction: the Sender now
+// IMPORTS the strings from shared/scheduling/notif-defaults.js (same object notify.js uses).
+// ADA parity for ALL moments lives in shared/scheduling/__tests__/notif-defaults-parity.test.js.
 
-test('SMS_STOP_FOOTER is byte-identical to notify.js (single compliance footer)', () => {
-  // Source-read (not import): notify.js's CJS requires resolve against shared/'s tree,
-  // which has no node_modules here — same technique as the ADA parity test below.
-  const src = fs.readFileSync(path.resolve(__dir, '../shared/scheduling/notify.js'), 'utf8');
-  const m = src.match(/const SMS_STOP_FOOTER = '((?:[^'\\]|\\.)*)';/);
-  assert.ok(m, 'SMS_STOP_FOOTER not found in notify.js source');
-  assert.equal(SMS_STOP_FOOTER, m[1].replace(/\\(n|'|\\)/g, (_, c) => (c === 'n' ? '\n' : c)));
-});
 
 // REMINDER_TEMPLATES must stay byte-in-sync with the ADA editor's defaults — otherwise the
 // editor's reset/preview lies about what this Lambda actually sends. Reads the ADA Python
 // source (same technique as notify-sms-parity.test.js); unescapes \n / \' / \\ literals.
-test('REMINDER_TEMPLATES are byte-identical to the ADA §E14 editor defaults', () => {
-  const src = fs.readFileSync(path.resolve(__dir, '../Analytics_Dashboard_API/lambda_function.py'), 'utf8');
-  const unesc = (s) => s.replace(/\\(n|'|\\)/g, (_, c) => (c === 'n' ? '\n' : c));
-  const sliceBlock = (startMarker, endMarker) => {
-    const start = src.indexOf(startMarker);
-    assert.notEqual(start, -1, `${startMarker} not found in ADA source`);
-    const end = src.indexOf(endMarker, start);
-    return src.slice(start, end > start ? end : start + 6000);
-  };
-  const emailBlock = sliceBlock('_SCHED_NOTIF_DEFAULTS', '_SCHED_NOTIF_MOMENT_VARS');
-  const smsBlock = sliceBlock('_SCHED_NOTIF_SMS_DEFAULTS', '_SCHED_NOTIF_SMS_VARS');
-  for (const moment of ['reminder_24h', 'reminder_1h']) {
-    const momentBlock = emailBlock.slice(emailBlock.indexOf(`'${moment}'`));
-    for (const [adaField, field] of [['subject', 'subject'], ['body_text', 'text'], ['body_html', 'html']]) {
-      const m = momentBlock.match(new RegExp(`'${adaField}':\\s*'((?:[^'\\\\]|\\\\.)*)'`));
-      assert.ok(m, `ADA ${moment}.${adaField} not found`);
-      // Truncation guard: the regex captures a SINGLE single-quoted Python string. If ADA
-      // ever reformats a value into implicit string concatenation (as reschedule_link does),
-      // the capture would silently hold only the first fragment — pin a terminal token so
-      // that reads as a loud failure, not a fragment-vs-fragment false-pass.
-      const terminal = { subject: '{{org}}', body_text: '.', body_html: '</p>' }[adaField];
-      assert.ok(unesc(m[1]).endsWith(terminal), `ADA ${moment}.${adaField} extraction looks truncated (no terminal ${terminal})`);
-      assert.equal(REMINDER_TEMPLATES[moment][field], unesc(m[1]), `${moment}.${field} drifted from ADA`);
-    }
-    const sm = smsBlock.match(new RegExp(`'${moment}':\\s*'((?:[^'\\\\]|\\\\.)*)'`));
-    assert.ok(sm, `ADA SMS default for ${moment} not found`);
-    assert.ok(unesc(sm[1]).endsWith('.'), `ADA SMS default for ${moment} looks truncated`);
-    assert.equal(REMINDER_TEMPLATES[moment].sms, unesc(sm[1]), `${moment}.sms drifted from ADA`);
-  }
-});
 
 test('overridable row with NO template_vars (old-shape) renders empty vars, never crashes', async () => {
   const message = reminderRow({ tier: 't24h' });
@@ -728,19 +693,3 @@ test('attendance (coordinator) email gets NO unsubscribe line; attendee reminder
   }
 });
 
-test('STOP_LINE_TEXT / STOP_LINE_HTML / _STOP_MARKER_RE are byte-identical to notify.js (S6)', () => {
-  const src = fs.readFileSync(path.resolve(__dir, '../shared/scheduling/notify.js'), 'utf8');
-  const unesc = (s) => s.replace(/\\(n|'|\\)/g, (_, c) => (c === 'n' ? '\n' : c));
-  const text = src.match(/const STOP_LINE_TEXT = '((?:[^'\\]|\\.)*)';/);
-  assert.ok(text, 'STOP_LINE_TEXT not found in notify.js');
-  assert.equal(STOP_LINE_TEXT, unesc(text[1]));
-  const html = src.match(/const STOP_LINE_HTML =\s*\n?\s*'((?:[^'\\]|\\.)*)';/);
-  assert.ok(html, 'STOP_LINE_HTML not found in notify.js');
-  assert.equal(STOP_LINE_HTML, unesc(html[1]));
-  // The dedup marker must stay in lockstep too — a notify-only tightening would make the
-  // two dispatchers disagree on when an override "already carries" STOP.
-  const marker = src.match(/const _STOP_MARKER_RE = \/(.+)\/([a-z]*);/);
-  assert.ok(marker, '_STOP_MARKER_RE not found in notify.js');
-  assert.equal('reply\\s+STOP', marker[1]);
-  assert.equal('i', marker[2]);
-});

@@ -59,6 +59,16 @@
 
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
+// §E14 single-source defaults + compliance strings (extraction, S4b row 16):
+const {
+  TEMPLATES,
+  SMS_TEMPLATES,
+  STOP_LINE_TEXT,
+  STOP_LINE_HTML,
+  SMS_STOP_FOOTER,
+  STOP_MARKER_RE: _STOP_MARKER_RE,
+  appendStopOnce,
+} = require('./notif-defaults');
 
 // Created once at module load; reused across warm invocations.
 const lambda = new LambdaClient({});
@@ -119,60 +129,14 @@ function safeUrl(url) {
 
 // ─── templates ({{var}} — mirrors notification_templates.json; see header) ────────────
 
-const STOP_LINE_TEXT = '\n\nTo stop receiving these emails, reply STOP.';
-const STOP_LINE_HTML =
-  '<p style="margin-top:24px;font-size:12px;color:#64748B;">To stop receiving these emails, reply STOP.</p>';
-// Compliance: STOP must appear EXACTLY once. It is always appended (so an override can't
-// remove it), but if a tenant override body already contains an unsubscribe line we must
-// NOT double-inject. Detect the canonical "reply STOP" phrase (case-insensitive).
-const _STOP_MARKER_RE = /reply\s+STOP/i;
-function appendStopOnce(rendered, stopLine) {
-  return _STOP_MARKER_RE.test(rendered) ? rendered : rendered + stopLine;
-}
-
-// SMS compliance footer (G7b, §E3 TCPA). Appended AFTER render (outside the editable
-// sms_text override body) so a tenant override can never remove it; appendStopOnce reuses
-// the same "reply STOP" marker so an override that already carries STOP is not double-footed.
-// Plain-text, no HTML (SMS). HELP is included per CTIA/TCPA guidance.
-const SMS_STOP_FOOTER = '\nReply STOP to opt out, HELP for help.';
+// STOP/unsubscribe strings + appendStopOnce now come from ./notif-defaults (single
+// source shared with Scheduled_Message_Sender — the parity tests became imports).
 
 // NB: STOP is NOT baked into these template bodies. It is appended (STOP_LINE_*) AFTER
 // render in buildEmailPayload, so a tenant E14 override (§E14) of subject/text/html can
 // never remove the unsubscribe line — the compliance footer is structurally outside the
 // editable body.
-const TEMPLATES = {
-  reschedule_link: {
-    subject: 'Need a different time? — {{org}}',
-    text:
-      'Hi {{firstName}},\n\nNeed to change your {{apptType}}{{whenSuffix}}? ' +
-      'You can pick a new time here:\n{{actionUrl}}',
-    html:
-      '<p>Hi {{firstName}},</p>' +
-      '<p>Need to change your {{apptType}}{{whenSuffix}}? You can pick a new time here:</p>' +
-      '<p><a href="{{actionUrl}}">Reschedule</a></p>',
-  },
-  reoffer: {
-    subject: "Let's find you a new time — {{org}}",
-    text:
-      'Hi {{firstName}},\n\nThe time you picked for your {{apptType}} is no longer ' +
-      'available. Pick a new one here:\n{{actionUrl}}',
-    html:
-      '<p>Hi {{firstName}},</p>' +
-      '<p>The time you picked for your {{apptType}} is no longer available. ' +
-      'Pick a new one here:</p>' +
-      '<p><a href="{{actionUrl}}">Choose a new time</a></p>',
-  },
-  cancel_notice: {
-    subject: 'Your {{apptType}} was canceled — {{org}}',
-    text:
-      'Hi {{firstName}},\n\nYour {{apptType}}{{whenSuffix}} has been canceled.' +
-      '{{rebookText}}',
-    html:
-      '<p>Hi {{firstName}},</p>' +
-      '<p>Your {{apptType}}{{whenSuffix}} has been canceled.</p>' +
-      '{{rebookHtml}}',
-  },
-};
+// TEMPLATES: imported from ./notif-defaults (see header there for the parity contract).
 
 // §E14 overridable moments (the 3 with a full subject+body here). reengagement (AI body)
 // + SMS kinds are NOT overridable in v1. Keep in sync with the ADA write API allowlist.
@@ -186,14 +150,7 @@ const OVERRIDABLE_MOMENTS = new Set(['reschedule_link', 'reoffer', 'cancel_notic
 // shows the default, the sender renders it; a drift would make the preview lie. The
 // notify-sms parity test (notify-sms.test.js) is the merge gate that enforces this.
 // Follow-up (§E14 lock): extract to a shared JSON to make the parity structural.
-const SMS_TEMPLATES = {
-  reschedule_link:
-    'Hi {{firstName}}, need a different time for your {{apptType}}? Pick a new one: {{actionUrl}}',
-  reoffer:
-    'Hi {{firstName}}, your {{apptType}} time is no longer available. Pick a new one: {{actionUrl}}',
-  cancel_notice:
-    'Hi {{firstName}}, your {{apptType}}{{whenSuffix}} was canceled.{{rebookText}}',
-};
+// SMS_TEMPLATES: imported from ./notif-defaults.
 
 // Merge a tenant override (§E14) over a default template. Per field: use the override's
 // value only when it is a non-empty string; otherwise keep the default. The override body
@@ -442,7 +399,7 @@ async function defaultLoadTemplateOverride({ tenantId, kind, log = console } = {
     };
   } catch (err) {
     (log || console).warn(
-      `[notify] template override load failed kind=${kind}: ${err.message} (using default)`
+      `[notify] template override load failed kind=${kind}: ${err.name || 'error'} (using default)`
     );
     return null;
   }
@@ -521,7 +478,7 @@ async function dispatchVolunteerNotice(
     try {
       templateOverride = await loadTemplateOverride({ tenantId, kind, log });
     } catch (err) {
-      log.warn(`[notify] template override load threw kind=${kind}: ${err.message} (using default)`);
+      log.warn(`[notify] template override load threw kind=${kind}: ${err.name || 'error'} (using default)`);
     }
   }
 
@@ -537,7 +494,7 @@ async function dispatchVolunteerNotice(
       } catch (err) {
         // Best-effort: never propagate. PII-redacted (booking_id + kind only).
         log.error(
-          `[notify] email dispatch failed — kind=${kind} booking=${bookingId}: ${err.message}`
+          `[notify] email dispatch failed — kind=${kind} booking=${bookingId}: ${err.name || 'error'}`
         );
         dispatched.email = 'failed';
       }
@@ -572,7 +529,7 @@ async function dispatchVolunteerNotice(
       } catch (err) {
         // Best-effort: a failed courtesy SMS must not roll back the calendar mutation.
         log.error(
-          `[notify] sms dispatch failed — kind=${kind} booking=${bookingId}: ${err.message}`
+          `[notify] sms dispatch failed — kind=${kind} booking=${bookingId}: ${err.name || 'error'}`
         );
         dispatched.sms = 'failed';
       }
