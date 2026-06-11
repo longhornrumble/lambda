@@ -117,6 +117,9 @@ async function burnJti({ tenantId, jti, expSeconds }, deps = {}) {
 
 module.exports = {
   burnJti,
+  // JTI_BLACKLIST_TABLE is exported for test introspection only (e.g. confirming the env-set path).
+  // Tests that override the table name MUST reload the module via jest.resetModules() + loadJti()
+  // — direct reassignment of this export has no effect on the module-internal binding.
   JTI_BLACKLIST_TABLE,
   // Test-only: allow resetting the cold-start warn flag and the DDB client.
   _resetForTest: () => {

@@ -213,8 +213,26 @@ async function handleConnect(event) {
     return page(403, 'Scheduling unavailable', '<p>Online scheduling isn’t enabled for this organization.</p>');
   }
 
+  let app;
+  try {
+    app = await secrets.readPlatformApp();
+  } catch (err) {
+    warn('connect_platform_app_unavailable', { tenant_id: claims.tenant_id, name: err && err.name });
+    // readPlatformApp failed — do NOT burn the jti. A transient Secrets Manager failure must
+    // not consume the coordinator's single-use token; they must be able to retry from the dashboard.
+    return genericFailure(500);
+  }
+
   // ── Single-use enforcement (Beta-blocker §E0 / DEPLOY_NOTES §5) ──────────────────────────────
-  // Burn the jti BEFORE redirecting to Google so a leaked token cannot be replayed.
+  // Burn the jti AFTER readPlatformApp so a transient Secrets Manager failure does NOT consume
+  // the token (user can retry). Burn happens BEFORE the Google redirect so a leaked token cannot
+  // be replayed from this point forward.
+  //
+  // Residual window: if a failure occurs AFTER the burn (e.g. state signing fails, or Google
+  // rejects the redirect), the token IS consumed and the user must re-initiate from the dashboard.
+  // This is the accepted trade-off — the burn-before-redirect guarantee is more important than
+  // recovery from the narrow post-burn failure window.
+  //
   // Forward-compatible: tokens without a `jti` claim (minted before this deploy) are exempt —
   // they were valid under the old contract; burning them would break in-flight connects.
   // Fail-open on DDB error: connecting twice in an outage is lower-harm than blocking onboarding
@@ -227,23 +245,16 @@ async function handleConnect(event) {
     });
     if (!burnResult.burned) {
       // Already used — replay detected. Serve the generic failure page (no detail leak).
-      log('connect_jti_replayed', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
+      // WARN level: replay attempts are a security signal, not a routine user error.
+      warn('connect_jti_replayed', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
       return genericFailure(400);
     }
-    if (burnResult.warn) {
-      // unconfigured or unavailable — already logged inside burnJti; continue (fail-open).
-    }
+    // burnResult.warn ('unavailable' or 'unconfigured') — already logged inside burnJti; continue (fail-open).
   } else {
     // Token predates jti minting — treat as exempt, log a warn for visibility.
+    // Pre-jti tokens age out within the token TTL window; this warn naturally disappears after that.
+    // Its presence LATER (long after the deploy) would indicate someone minting tokens without jti.
     warn('connect_init_token_no_jti', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
-  }
-
-  let app;
-  try {
-    app = await secrets.readPlatformApp();
-  } catch (err) {
-    warn('connect_platform_app_unavailable', { tenant_id: claims.tenant_id, name: err && err.name });
-    return genericFailure(500);
   }
   const redirectUri = app.redirect_uri || OAUTH_REDIRECT_URI;
   if (!redirectUri || !redirectUri.startsWith('https://')) {

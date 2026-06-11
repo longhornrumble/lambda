@@ -169,6 +169,20 @@ describe('GET /connect — jti single-use enforcement', () => {
     expect(oauth.buildAuthUrl).not.toHaveBeenCalled();
   });
 
+  // SR-1: replay attempts are a security signal — must log at WARN, not INFO.
+  test('replay: connect_jti_replayed is logged at WARN level (console.warn, not console.log)', async () => {
+    burnJti.mockResolvedValue({ burned: false, reason: 'already_used' });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    await handler(ev('/connect', { init: 'ok' }));
+    const warnLines = warnSpy.mock.calls.map((a) => a.join(' ')).join('\n');
+    const logLines = logSpy.mock.calls.map((a) => a.join(' ')).join('\n');
+    expect(warnLines).toContain('connect_jti_replayed');
+    expect(logLines).not.toContain('connect_jti_replayed');
+    warnSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
   test('second use serves the generic invalid/expired page (no detail leak)', async () => {
     burnJti.mockResolvedValue({ burned: false, reason: 'already_used' });
     const res = await handler(ev('/connect', { init: 'ok' }));
@@ -211,6 +225,56 @@ describe('GET /connect — jti single-use enforcement', () => {
   test('/oauth/callback does NOT call burnJti (state token, not init token)', async () => {
     await handler(ev('/oauth/callback', { code: 'c', state: 's' }));
     expect(burnJti).not.toHaveBeenCalled();
+  });
+
+  // ── Fix 3a: burn ordering — token survives a Secrets Manager failure ───────────────────────
+  // If readPlatformApp throws (transient Secrets Manager outage), burnJti must NOT be called.
+  // The coordinator must be able to retry from the dashboard with the same token.
+  test('readPlatformApp failure: burnJti is NOT called — token survives for retry', async () => {
+    secrets.readPlatformApp.mockRejectedValue(new Error('sm transient'));
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(500);
+    expect(burnJti).not.toHaveBeenCalled();
+  });
+
+  // ── Fix 3b: post-burn failure consumes the token (accepted residual window) ─────────────────
+  // If a failure occurs AFTER the burn but BEFORE the redirect (e.g. state signing fails),
+  // the token IS consumed. The user must re-initiate from the dashboard. This is the accepted
+  // trade-off: burn-before-redirect is the stronger invariant; the post-burn window is narrow.
+  test('state signing failure AFTER burn: token is consumed (user must re-initiate)', async () => {
+    // burnJti succeeds (token burned), but state.sign fails afterward.
+    state.sign.mockRejectedValue(new Error('signing key unavailable'));
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(500);
+    // The burn DID happen — this is the accepted residual window.
+    expect(burnJti).toHaveBeenCalledTimes(1);
+    expect(oauth.buildAuthUrl).not.toHaveBeenCalled();
+  });
+
+  // ── Fix 4: call-order assertion — verifyInitToken before readPlatformApp before burnJti ─────
+  test('call order: state.verify → readPlatformApp → burnJti → buildAuthUrl', async () => {
+    const order = [];
+    state.verify.mockImplementation(async (...args) => {
+      order.push('verify');
+      return INIT_CLAIMS_WITH_JTI;
+    });
+    secrets.readPlatformApp.mockImplementation(async () => {
+      order.push('readPlatformApp');
+      return { client_id: 'cid', client_secret: 'cs', redirect_uri: 'https://staging.schedule.myrecruiter.ai/oauth/callback' };
+    });
+    burnJti.mockImplementation(async () => {
+      order.push('burnJti');
+      return { burned: true };
+    });
+    oauth.buildAuthUrl.mockImplementation((...args) => {
+      order.push('buildAuthUrl');
+      return 'https://accounts.google.com/o/oauth2/v2/auth?state=s';
+    });
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(302);
+    expect(order.indexOf('verify')).toBeLessThan(order.indexOf('readPlatformApp'));
+    expect(order.indexOf('readPlatformApp')).toBeLessThan(order.indexOf('burnJti'));
+    expect(order.indexOf('burnJti')).toBeLessThan(order.indexOf('buildAuthUrl'));
   });
 });
 
