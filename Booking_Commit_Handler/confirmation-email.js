@@ -144,13 +144,15 @@ function buildRawMime({ from, to, subject, textBody, htmlBody, icsContent, icsFi
     '',
     `--${boundaryAlt}`,
     'Content-Type: text/plain; charset=UTF-8',
-    'Content-Transfer-Encoding: 7bit',
+    // 8bit (not 7bit): §E14 overrides are tenant-authored UTF-8 (emoji, accents) — a
+    // 7bit declaration over multi-byte content gets mangled/rejected by strict gateways.
+    'Content-Transfer-Encoding: 8bit',
     '',
     textBody,
     '',
     `--${boundaryAlt}`,
     'Content-Type: text/html; charset=UTF-8',
-    'Content-Transfer-Encoding: 7bit',
+    'Content-Transfer-Encoding: 8bit',
     '',
     htmlBody,
     '',
@@ -204,6 +206,24 @@ async function loadTemplateOverride({ tenantId, log = console } = {}) {
 }
 
 /**
+ * Sanitize the override-supplied html region so it cannot interfere with the appended
+ * action-links block (the greeting region has no legitimate need for any of these):
+ *  - HTML comments (incl. an UNCLOSED `<!--` that would swallow the appended links),
+ *  - <style> blocks (could display:none the real links),
+ *  - <a> opening tags (an admin-authored fake cancel/reschedule link could phish the
+ *    volunteer's signed-token click; inner text is preserved, stray </a> is harmless).
+ * Deliberately stricter than the notify.js §E14 kinds: the confirmation carries signed
+ * action tokens, so the editable region is copy-only here.
+ */
+function sanitizeOverrideHtml(s) {
+  return String(s)
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!--[\s\S]*$/, '')
+    .replace(/<style[\s\S]*?(?:<\/style>|$)/gi, '')
+    .replace(/<a\s[^>]*>/gi, '');
+}
+
+/**
  * The EDITABLE region is only the greeting/confirmation copy (override field → else the
  * shared CONFIRMATION_DEFAULTS, byte-in-sync with the ADA editor). The join link, the
  * signed reschedule/cancel links, and the org sign-off are appended OUTSIDE it —
@@ -230,7 +250,8 @@ function buildBodies({ firstName, orgName, apptTypeName, whenLabel, joinUrl, res
 
   const subject = stripCrlf(renderVars(pickField('subject'), vars));
   const editableText = renderVars(pickField('text'), vars);
-  const editableHtml = renderVars(pickField('html'), htmlVars);
+  // sanitize is a no-op for the shared default (no comments/styles/links by construction).
+  const editableHtml = sanitizeOverrideHtml(renderVars(pickField('html'), htmlVars));
 
   const textBody = [
     editableText,
@@ -239,7 +260,7 @@ function buildBodies({ firstName, orgName, apptTypeName, whenLabel, joinUrl, res
     `Reschedule: ${rescheduleUrl}`,
     `Cancel: ${cancelUrl}`,
     '',
-    `— ${orgName || 'MyRecruiter'}`,
+    `— ${vars.org}`,
   ].join('\n');
 
   const htmlBody = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333;line-height:1.6;">
@@ -249,7 +270,7 @@ ${joinUrl ? `<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>` : ''}
   <a href="${escapeHtml(rescheduleUrl)}">Reschedule</a> &nbsp;|&nbsp;
   <a href="${escapeHtml(cancelUrl)}">Cancel</a>
 </p>
-<p style="color:#999;font-size:12px;">&mdash; ${escapeHtml(orgName) || 'the team'}</p>
+<p style="color:#999;font-size:12px;">&mdash; ${htmlVars.org}</p>
 </body></html>`;
 
   return { subject, textBody, htmlBody };
@@ -261,27 +282,45 @@ ${joinUrl ? `<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>` : ''}
  * sendConfirmationEmail(args, opts) — assemble + SES SendRawEmail.
  *   args = {
  *     tenantId, bookingId, attendeeEmail, attendeeFirstName,
- *     appointmentTypeName, orgName, coordinatorName, coordinatorEmail,
+ *     appointmentTypeName, orgName, coordinatorEmail,
  *     start, end, whenLabel, joinUrl, deepLink,
  *     startAt, cancellationWindowHours
  *   }
- *   opts = { signOpts } — passed through to tokens.sign (test key injection).
+ *   (callers may still pass coordinatorName — accepted but unused since §E14 S4c: the
+ *   editable body's ADA vocabulary has no {{coordinator}} var; coordinatorEmail is
+ *   still the .ics ORGANIZER.)
+ *   opts = {
+ *     signOpts,              // passed through to tokens.sign (test key injection)
+ *     loadTemplateOverride,  // DI seam for the §E14 override loader (tests)
+ *     log,                   // logger for the loader's fail-safe warn path
+ *   }
  * Returns { messageId, rescheduleUrl, cancelUrl }.
  */
 async function sendConfirmationEmail(args, opts = {}) {
   const {
     tenantId, bookingId, attendeeEmail, attendeeFirstName,
-    appointmentTypeName, orgName, coordinatorName, coordinatorEmail,
+    appointmentTypeName, orgName, coordinatorEmail,
     start, end, whenLabel, joinUrl, deepLink,
     startAt, cancellationWindowHours,
   } = args;
 
   if (!attendeeEmail) throw new Error('attendeeEmail is required for the confirmation email');
 
-  const { cancelUrl, rescheduleUrl } = await buildActionLinks(
-    { tenantId, bookingId, startAt: startAt || start, cancellationWindowHours },
-    opts.signOpts
-  );
+  // §E14 S4c: the override read runs IN PARALLEL with the token signing (independent —
+  // keeps the worst-case added latency on the 60s commit SLA at zero on the warm path).
+  // Fail-safe: any loader rejection (incl. a throwing injected loader) → defaults.
+  const [{ cancelUrl, rescheduleUrl }, templateOverride] = await Promise.all([
+    buildActionLinks(
+      { tenantId, bookingId, startAt: startAt || start, cancellationWindowHours },
+      opts.signOpts
+    ),
+    Promise.resolve()
+      .then(() => (opts.loadTemplateOverride || loadTemplateOverride)({ tenantId, log: opts.log }))
+      .catch((err) => {
+        (opts.log || console).warn(`[confirmation] template override load threw: ${err.name || 'error'} (using default copy)`);
+        return null;
+      }),
+  ]);
 
   const summary = `${appointmentTypeName || 'Appointment'}${attendeeFirstName ? ` — ${attendeeFirstName}` : ''}`;
   const ics = buildIcs({
@@ -295,15 +334,6 @@ async function sendConfirmationEmail(args, opts = {}) {
     attendeeEmail,
     // dtstamp defaults to now() inside buildIcs (RFC 5545 — not the event start).
   });
-
-  // §E14 S4c: per-tenant override (fail-safe → shared defaults). DI via
-  // opts.loadTemplateOverride for tests; a throwing injected loader also degrades.
-  let templateOverride = null;
-  try {
-    templateOverride = await (opts.loadTemplateOverride || loadTemplateOverride)({ tenantId, log: opts.log });
-  } catch (err) {
-    (opts.log || console).warn(`[confirmation] template override load threw: ${err.name || 'error'} (using default copy)`);
-  }
 
   const { subject, textBody, htmlBody } = buildBodies({
     firstName: attendeeFirstName,
@@ -347,6 +377,7 @@ module.exports = {
   buildRawMime,
   buildBodies,
   loadTemplateOverride,
+  sanitizeOverrideHtml,
   renderVars,
   escapeHtml,
   escapeIcsText,

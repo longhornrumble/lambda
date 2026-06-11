@@ -43,7 +43,9 @@ describe('ADA ↔ notif-defaults.js confirmation parity (§E14 S4c)', () => {
   });
 
   test('body_text is byte-identical to the ADA editor default', () => {
-    expect(CONFIRMATION_DEFAULTS.text).toBe(extractField(block, 'body_text', '.'));
+    // Terminal is the full tail (not just '.') — a bare-dot terminal could pass on a
+    // partial capture if the ADA string is ever split into implicit concatenation.
+    expect(CONFIRMATION_DEFAULTS.text).toBe(extractField(block, 'body_text', '{{whenLabel}}.'));
   });
 
   test('body_html is byte-identical to the ADA editor default', () => {

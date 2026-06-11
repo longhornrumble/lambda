@@ -131,8 +131,7 @@ describe('sendConfirmationEmail — AC #7', () => {
     // carries the literal name (plain text is not executed).
     const { htmlBody } = email.buildBodies({
       firstName: '<script>alert(1)</script>', orgName: 'Org',
-      whenLabel: 'soon', coordinatorName: 'Maya',
-      joinUrl: 'https://zoom.us/j/1', rescheduleUrl: 'r', cancelUrl: 'c',
+      whenLabel: 'soon', joinUrl: 'https://zoom.us/j/1', rescheduleUrl: 'r', cancelUrl: 'c',
     });
     expect(htmlBody).toContain('&lt;script&gt;');
     expect(htmlBody).not.toMatch(/<script>alert\(1\)<\/script>/);
@@ -160,12 +159,12 @@ describe('helper edge cases (branch coverage)', () => {
 
   it('buildBodies falls back gracefully with minimal inputs', () => {
     const { textBody, htmlBody } = email.buildBodies({
-      firstName: '', orgName: '', whenLabel: '', coordinatorName: '', joinUrl: '', rescheduleUrl: 'r', cancelUrl: 'c',
+      firstName: '', orgName: '', whenLabel: '', joinUrl: '', rescheduleUrl: 'r', cancelUrl: 'c',
     });
     expect(textBody).toContain('Hi there,');
     expect(htmlBody).toContain('Hi there,');
     expect(htmlBody).not.toContain('Join the meeting'); // no joinUrl → no join link
-    expect(textBody).toContain('MyRecruiter'); // org fallback
+    expect(textBody).toContain('the team'); // org fallback — S4c aligned to vars.org (was 'MyRecruiter')
   });
 
   it('sendConfirmationEmail uses start as startAt fallback when startAt omitted', async () => {
@@ -300,11 +299,14 @@ describe('loadTemplateOverride — fail-safe loader', () => {
     let isolated, ddbMock, GetItemCommand;
     jest.isolateModules(() => {
       process.env.SCHED_NOTIF_TEMPLATE_TABLE = 'picasso-scheduling-notif-template-test';
-      const dynamo = require('@aws-sdk/client-dynamodb');
-      ddbMock = mockDdbClient(dynamo.DynamoDBClient);
-      GetItemCommand = dynamo.GetItemCommand;
-      isolated = require('./confirmation-email');
-      delete process.env.SCHED_NOTIF_TEMPLATE_TABLE;
+      try {
+        const dynamo = require('@aws-sdk/client-dynamodb');
+        ddbMock = mockDdbClient(dynamo.DynamoDBClient);
+        GetItemCommand = dynamo.GetItemCommand;
+        isolated = require('./confirmation-email');
+      } finally {
+        delete process.env.SCHED_NOTIF_TEMPLATE_TABLE;
+      }
     });
 
     ddbMock.on(GetItemCommand).resolves({
@@ -333,16 +335,157 @@ describe('loadTemplateOverride — fail-safe loader', () => {
     let isolated, ddbMock, GetItemCommand;
     jest.isolateModules(() => {
       process.env.SCHED_NOTIF_TEMPLATE_TABLE = 't';
-      const dynamo = require('@aws-sdk/client-dynamodb');
-      ddbMock = mockDdbClient(dynamo.DynamoDBClient);
-      GetItemCommand = dynamo.GetItemCommand;
-      isolated = require('./confirmation-email');
-      delete process.env.SCHED_NOTIF_TEMPLATE_TABLE;
+      try {
+        const dynamo = require('@aws-sdk/client-dynamodb');
+        ddbMock = mockDdbClient(dynamo.DynamoDBClient);
+        GetItemCommand = dynamo.GetItemCommand;
+        isolated = require('./confirmation-email');
+      } finally {
+        delete process.env.SCHED_NOTIF_TEMPLATE_TABLE;
+      }
     });
     ddbMock.on(GetItemCommand).resolves({ Item: { subject: { N: '42' }, body_text: { S: 'T' } } });
     expect(await isolated.loadTemplateOverride({ tenantId: 'T1' })).toEqual({
       subject: undefined, text: 'T', html: undefined,
     });
     ddbMock.restore();
+  });
+});
+
+// ─── S4c audit-fix tests ───────────────────────────────────────────────────────────────
+
+describe('sanitizeOverrideHtml — the override cannot interfere with the action-links block', () => {
+  const BASE2 = {
+    firstName: 'Sam', orgName: 'Austin Angels', apptTypeName: 'Volunteer intake',
+    whenLabel: 'Wed', joinUrl: 'https://zoom.us/j/12345',
+    rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+    cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
+  };
+
+  it('an UNCLOSED <!-- comment cannot swallow the appended links (B1)', () => {
+    const { htmlBody } = email.buildBodies({
+      ...BASE2, templateOverride: { html: '<p>See you soon!</p><!--' },
+    });
+    expect(htmlBody).not.toContain('<!--');
+    expect(htmlBody).toContain('>Reschedule</a>');
+    expect(htmlBody).toContain('>Cancel</a>');
+  });
+
+  it('closed comments and <style> blocks are stripped (SR2)', () => {
+    const { htmlBody } = email.buildBodies({
+      ...BASE2,
+      templateOverride: { html: '<p>Hi<!-- hidden --></p><style>a{display:none}</style>' },
+    });
+    expect(htmlBody).not.toContain('hidden');
+    expect(htmlBody).not.toContain('<style');
+    expect(htmlBody).toContain('>Cancel</a>');
+  });
+
+  it('admin-authored <a> tags are stripped — a fake cancel link cannot phish (SR1)', () => {
+    const { htmlBody } = email.buildBodies({
+      ...BASE2,
+      templateOverride: { html: '<p>Cancel here: <a href="https://evil.com/steal">Cancel</a></p>' },
+    });
+    expect(htmlBody).not.toContain('evil.com');
+    expect(htmlBody).toContain('Cancel here: Cancel</a>'); // inner text kept, opener gone
+    expect(htmlBody).toContain('href="https://schedule.myrecruiter.ai/cancel?t=c"'); // the REAL link
+  });
+
+  it('unclosed <style is also neutralized', () => {
+    expect(email.sanitizeOverrideHtml('<p>x</p><style>a{display:none}')).toBe('<p>x</p>');
+  });
+});
+
+describe('S4c behavioral pins + coverage', () => {
+  const BASE3 = {
+    firstName: 'Sam', orgName: 'Austin Angels', apptTypeName: 'Volunteer intake',
+    whenLabel: 'Wed, Jun 3 - 1:00 PM CT', joinUrl: '',
+    rescheduleUrl: 'r', cancelUrl: 'c',
+  };
+
+  it('coordinatorName is deliberately ABSENT from the editable copy; apptType renders (SR-2 pin)', () => {
+    const { textBody, htmlBody } = email.buildBodies({ ...BASE3, coordinatorName: 'Maya', templateOverride: null });
+    expect(textBody).not.toContain('Maya');
+    expect(htmlBody).not.toContain('Maya');
+    expect(textBody).toContain('Volunteer intake');
+  });
+
+  it('org fallback is the SAME across subject, text sign-off, and html sign-off', () => {
+    const { subject, textBody, htmlBody } = email.buildBodies({
+      ...BASE3, orgName: '', templateOverride: null,
+    });
+    expect(subject).toBe("You're confirmed — the team");
+    expect(textBody).toContain('— the team');
+    expect(textBody).not.toContain('MyRecruiter');
+    expect(htmlBody).toContain('&mdash; the team');
+  });
+
+  it('joinUrl absent UNDER an override → no Join line, links still present', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      ...BASE3, templateOverride: { text: 'Custom.', html: '<p>Custom.</p>' },
+    });
+    expect(textBody).not.toContain('Join:');
+    expect(htmlBody).not.toContain('Join the meeting');
+    expect(textBody).toContain('Reschedule: r');
+  });
+
+  it('ALL html vars are escaped (org/apptType/whenLabel, not just firstName)', () => {
+    const { htmlBody } = email.buildBodies({
+      ...BASE3,
+      orgName: '<b>org</b>', apptTypeName: '<i>type</i>', whenLabel: '"when" & <u>now</u>',
+      templateOverride: { html: '<p>{{org}} {{apptType}} {{whenLabel}}</p>' },
+    });
+    expect(htmlBody).toContain('&lt;b&gt;org&lt;/b&gt;');
+    expect(htmlBody).toContain('&lt;i&gt;type&lt;/i&gt;');
+    expect(htmlBody).toContain('&quot;when&quot; &amp; &lt;u&gt;now&lt;/u&gt;');
+    expect(htmlBody).not.toContain('<b>org</b>');
+  });
+
+  it('text-only override → the html part keeps the DEFAULT html copy (S3)', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-3' });
+    await email.sendConfirmationEmail(ARGS, {
+      loadTemplateOverride: async () => ({ text: 'Custom for {{firstName}}.' }),
+    });
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    expect(raw).toContain('Custom for Sam.');
+    expect(raw).toContain("<p>Hi Sam,</p><p>You're confirmed for your Volunteer intake");
+  });
+
+  it('SES Tags / Destinations / 8bit CTE are pinned (S1 + SR3)', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-4' });
+    await email.sendConfirmationEmail(ARGS, { loadTemplateOverride: async () => null });
+    const input = sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input;
+    expect(input.Tags).toEqual([
+      { Name: 'tenant_id', Value: 'AUS123957' },
+      { Name: 'email_type', Value: 'booking_confirmation' },
+    ]);
+    expect(input.Destinations).toEqual(['sam@example.com']);
+    const raw = Buffer.from(input.RawMessage.Data).toString();
+    expect(raw).toContain('Content-Transfer-Encoding: 8bit');
+    expect(raw).not.toContain('Content-Transfer-Encoding: 7bit');
+  });
+
+  it('minimal args: no appointmentTypeName/attendeeFirstName/opts → fallbacks render, send succeeds', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-5' });
+    const { appointmentTypeName, attendeeFirstName, ...rest } = ARGS;
+    const res = await email.sendConfirmationEmail(rest);
+    expect(res.messageId).toBe('msg-5');
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    expect(raw).toContain('Hi there,');
+    expect(raw).toContain('for your appointment');
+  });
+
+  it('loadTemplateOverride() with no args → null (default-param branch)', async () => {
+    expect(await email.loadTemplateOverride()).toBeNull();
+  });
+
+  it('a nameless error in the loader logs the generic fallback', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-6' });
+    const warns = [];
+    await email.sendConfirmationEmail(ARGS, {
+      loadTemplateOverride: async () => { const e = new Error('x'); e.name = ''; throw e; },
+      log: { warn: (m) => warns.push(m) },
+    });
+    expect(warns[0]).toContain(': error (using default copy)');
   });
 });
