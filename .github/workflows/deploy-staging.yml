@@ -37,6 +37,8 @@ on:
           - Calendar_Event_Consumer
           - Calendar_Lifecycle_Consumer
           - Calendar_OAuth_Connect
+          - Reminder_Scheduler
+          - Scheduled_Message_Sender
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -69,6 +71,8 @@ jobs:
       calendar_watch_offboarder: ${{ steps.filter.outputs.calendar_watch_offboarder }}
       booking_commit_handler: ${{ steps.filter.outputs.booking_commit_handler }}
       calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
+      reminder_scheduler: ${{ steps.filter.outputs.reminder_scheduler }}
+      scheduled_message_sender: ${{ steps.filter.outputs.scheduled_message_sender }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -118,6 +122,16 @@ jobs:
               # WITHOUT a Calendar_OAuth_Connect/** change won't auto-rebundle; redeploy manually:
               #   gh workflow run "Deploy Lambda — Staging" -f lambda=Calendar_OAuth_Connect
               - 'Calendar_OAuth_Connect/**'
+            reminder_scheduler:
+              # Track 1 S6 — the nightly reconciler. Self-contained (scheduler.js + cadence.js,
+              # no shared/scheduling import), so dir-only is complete.
+              - 'Reminder_Scheduler/**'
+            scheduled_message_sender:
+              # Track 1 S6 — the EventBridge schedule target. Like C8/redemption it *bundles*
+              # shared/scheduling/channels.js, so a shared/scheduling-only change WITHOUT a
+              # Scheduled_Message_Sender/** change won't auto-rebundle; redeploy manually:
+              #   gh workflow run "Deploy Lambda — Staging" -f lambda=Scheduled_Message_Sender
+              - 'Scheduled_Message_Sender/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -150,7 +164,9 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
       needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
       needs.detect-changes.outputs.booking_commit_handler == 'true' ||
-      needs.detect-changes.outputs.calendar_oauth_connect == 'true'
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true' ||
+      needs.detect-changes.outputs.reminder_scheduler == 'true' ||
+      needs.detect-changes.outputs.scheduled_message_sender == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -582,6 +598,41 @@ jobs:
             # Public Function URL, but /connect + /connection/status are init-token-gated
             # and /oauth/callback needs a Google code — a synthetic probe 4xx/503s rather
             # than exercise a real flow. Live smoke is the integrator's curl post-deploy.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Reminder_Scheduler
+            # Track 1 S6 — the nightly reminder reconciler (EventBridge Scheduler cron).
+            # Node.js esbuild bundle (npm run package = node esbuild.config.mjs + zip
+            # dist/index.js); self-contained (scheduler.js + cadence.js, no shared/scheduling
+            # import), so NO shared/scheduling npm install. The function is created by picasso
+            # infra PR-A (placeholder); this entry lands the real code via update-function-code.
+            # Env vars Terraform-managed (infra/ lambda-reminder-scheduler-staging).
+            staging_function: Reminder_Scheduler
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # EventBridge-Scheduler-invoked (no HTTP frontend); a synthetic invoke would run a
+            # real multi-tenant DDB sweep. Live smoke is the integrator's post-deploy invoke.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Scheduled_Message_Sender
+            # Track 1 S6 — the EventBridge schedule target that sends reminder email/SMS.
+            # Node.js esbuild bundle (ESM dist/index.mjs); bundles ../shared/scheduling/channels.js
+            # with @aws-sdk/* externalized, so — like the calendar consumers — NO shared/scheduling
+            # npm install. shared-only change → manual trigger:
+            #   gh workflow run "Deploy Lambda — Staging" -f lambda=Scheduled_Message_Sender
+            # Created by picasso infra PR-A (placeholder). Env vars Terraform-managed
+            # (infra/ lambda-scheduled-message-sender-staging).
+            staging_function: Scheduled_Message_Sender
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # EventBridge-Scheduler-invoked with a {pk,sk,message_id} payload; a synthetic invoke
+            # would attempt a real DDB read + send_email/SMS_Sender fan-out. No synthetic smoke.
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
