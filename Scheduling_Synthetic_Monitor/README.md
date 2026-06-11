@@ -1,14 +1,15 @@
-# Scheduling_Synthetic_Monitor (CI-6 §5.1) — Phase 1
+# Scheduling_Synthetic_Monitor (CI-6 §5.1)
 
 Synthetic monitoring Lambda for the scheduling system's **Layer 2 staging burn-in**
 ([`scheduling/docs/scheduling_ci_strategy.md`](../../../scheduling/docs/scheduling_ci_strategy.md) §5.1).
 It continuously exercises the **live staging** scheduling surfaces so cross-repo drift and
 regressions surface within hours instead of at a customer (§5.2).
 
-> **Scope:** This is **Phase 1** — the three cycles whose producers are already shipped and
-> live. The three time-compressed cycles (attendance / reminder-cadence / missed-event
-> disposition) are **Phase 2**, deferred until **WS-E-REMIND** + **WS-E-ATTEND** land and
-> the `FROZEN_CONTRACTS.md` **§E1 / §E6** contracts are formally locked. See
+> **Scope:** the `cancel` / `revocation_observe` / `cleanup` cycles ship live. The **`reminder`
+> cadence cycle** (Phase-2 dispatch-proof slice) is now built — it proves the firing path
+> (EventBridge → `Scheduled_Message_Sender` → `pending→sent` row flip) now that the Track 1
+> reminder system (S1–S6) is LIVE. Still **deferred**: email/SMS RECEIPT verification, the
+> missed-event disposition cycle (WS-E-ATTEND), and the §4.3 DST/volume soak. See
 > [Deferred](#deferred-to-phase-2) below.
 
 ---
@@ -18,6 +19,7 @@ regressions surface within hours instead of at a customer (§5.2).
 | Cycle (`event.cycle`) | Trigger | Exercises | Producer (live) |
 |---|---|---|---|
 | `cancel` | EventBridge, hourly | book (propose→commit) → cancel → §14.2 listener flips `status=canceled` | Booking_Commit_Handler + cal-lifecycle consumer |
+| `reminder` | EventBridge, daily | book (compressed) → reminder row flips `pending→sent` (firing-path proof) | scheduler + Scheduled_Message_Sender |
 | `revocation_observe` | **operator-invoked** | one-time token: first redemption succeeds → replay returns **410 Gone** (§13.7) | Scheduling_Redemption_Handler |
 | `cleanup` | EventBridge, nightly | delete synthetic bookings older than 7 days (§5.1 test-data hygiene) | — (this Lambda owns it) |
 
@@ -34,6 +36,26 @@ finding (listener lag/breakage) — exactly what burn-in should catch.
 > the full public path. The BSH conversation flow, the §B14 action boundary, and the
 > widget/session threading are **bypassed** (covered by §5.2 manual exercise until a BSH-level
 > cycle lands). The `cancel` cycle does book/cancel **real** staging calendar events.
+
+### `reminder` cycle (Phase-2 dispatch-proof slice)
+Books a synthetic appointment with `is_synthetic:true` on the **commit payload** so BCH's
+post-commit reminder scheduling compresses the cadence (`STAGING_TEST_MODE && is_synthetic` —
+24h→+1m, 1h→+3m). The scheduler writes `picasso-scheduled-messages` rows (`status:pending`) +
+one-time EventBridge schedules at the compressed fire times; EventBridge fires
+`Scheduled_Message_Sender`, which dispatches and flips the row `status` to `sent`. The cycle
+**polls** the booking's reminder rows (via the `by-appointment` GSI) until a cadence-reminder
+row reaches `sent` — that flip is the **dispatch proof**. It then cancels the synthetic booking
+(best-effort cleanup; never masks the result).
+
+> **Requires** `STAGING_TEST_MODE=true` on **BCH** (the compression runs at commit, inside
+> BCH) + a function timeout ≥ ~500s (it polls ~7min for the fire). See
+> [`INFRA_NOTES.md`](INFRA_NOTES.md#reminder-cycle-phase-2-dispatch-proof-slice--activation-requirements).
+>
+> **Coverage boundary (honest scope):** this proves the firing path via the DynamoDB row
+> `pending→sent` flip — it does **not** verify the email/SMS was actually RECEIVED (SES inbound
+> / Gmail polling is deferred). A row stuck `pending` past the poll window is a real finding
+> (EventBridge/Sender lag or breakage). If the scheduler created no cadence-reminder rows
+> (e.g. `STAGING_TEST_MODE` off, or a <1h lead), the cycle fails cleanly.
 
 ### `revocation_observe` cycle (operator-triggered)
 **The monitor never mints or auto-revokes tokens** — it does not hold the JWT signing key and
@@ -94,13 +116,15 @@ returns no slots and the cycle reports a **clean failure** (no crash).
 | `SYNTHETIC_TIME_ZONE` | `America/Chicago` | user tz for propose/commit |
 | `SYNTHETIC_CONFERENCE_TYPE` | `null` | `null` \| `google_meet` \| `zoom` |
 | `BOOKING_TABLE` | `picasso-booking-${ENV}` | Booking table (FROZEN §A) |
+| `SCHEDULED_MESSAGES_TABLE` | `picasso-scheduled-messages` | reminder rows the `reminder` cycle reads (§E1) |
 | `BOOKING_COMMIT_FUNCTION_NAME` | `Booking_Commit_Handler` | BCH invoke target |
 | `BCH_INVOKE_TIMEOUT_MS` | `30000` | per-invoke request timeout for the BCH call (heavy I/O) |
 | `REDEMPTION_BASE_URL` | `https://schedule.myrecruiter.ai` | revocation endpoint base |
 | `OPS_ALERTS_TOPIC_ARN` | (unset → alerts skipped) | SNS ops-alerts topic |
 | `MONITOR_METRIC_NAMESPACE` | `Picasso/SchedulingSynthetic` | CloudWatch metric namespace |
 | `SYNTHETIC_RETENTION_DAYS` | `7` | cleanup window |
-| `CANCEL_POLL_ATTEMPTS` / `CANCEL_POLL_INTERVAL_MS` | `12` / `5000` | status-flip poll |
+| `CANCEL_POLL_ATTEMPTS` / `CANCEL_POLL_INTERVAL_MS` | `12` / `5000` | cancel status-flip poll |
+| `REMINDER_POLL_ATTEMPTS` / `REMINDER_POLL_INTERVAL_MS` | `42` / `10000` | reminder `pending→sent` poll (~7min) |
 
 See [`INFRA_NOTES.md`](INFRA_NOTES.md) for the IAM/EventBridge/IaC integrator brief.
 
@@ -108,13 +132,16 @@ See [`INFRA_NOTES.md`](INFRA_NOTES.md) for the IAM/EventBridge/IaC integrator br
 
 ## Deferred to Phase 2
 
-These require the **STAGING_TEST_MODE time-compression** in the (unbuilt) reminder
-dispatcher — that producer is **WS-E-REMIND**'s owned lane — plus **WS-E-ATTEND** for the
-disposition wiring, and the **§E1 / §E6** contract lock:
+The reminder system (S1–S6) is LIVE and the `reminder` cadence cycle above proves its firing
+path. Still deferred:
 
+- **Email/SMS RECEIPT verification** — the `reminder` cycle proves dispatch via the DynamoDB
+  `pending→sent` flip, not that the message was delivered. End-to-end receipt needs SES inbound
+  (MX + S3 receipt rule) or Gmail API polling — the heavy §5.1 part (~1-week effort).
 - **Happy-path attendance cycle** — book → reminder windows → mark completed
-- **Reminder cadence cycle** — 1h / 30min reminders fire → missed-event prompt at T+30min
 - **Missed-event disposition cycle** — Yes / No-show / didn't-connect / no-response escalation
+  (needs **WS-E-ATTEND**'s disposition surface)
+- **§4.3 DST / volume soak** — ≥3 reminder windows across a DST boundary, ≥50 booked, etc.
 
 ---
 
@@ -122,7 +149,7 @@ disposition wiring, and the **§E1 / §E6** contract lock:
 
 ```bash
 npm install
-npm test            # jest (132 tests)
+npm test            # jest (191 tests)
 npm run build       # esbuild → dist/index.js
 npm run package     # build + zip → deployment.zip
 ```
