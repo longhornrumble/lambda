@@ -356,3 +356,221 @@ test('send failure → status failed', async () => {
   assert.equal(res.error, 'SES throttled');
   assert.equal(lastStatus(ddbCalls), 'failed');
 });
+
+// ─── §E14 S4b: fire-time reminder template overrides ──────────────────────────────────
+
+import {
+  reminderMomentFromRow,
+  buildReminderContent,
+  loadTemplateOverride,
+  REMINDER_TEMPLATES,
+  SMS_STOP_FOOTER,
+} from './index.mjs';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dir = path.dirname(fileURLToPath(import.meta.url));
+
+// Both channels open — content tests assert WHAT is sent, not the §E3 gate (covered above).
+const bothChannels = async () => ({ email: true, sms: true });
+
+const s4bVars = {
+  organization_name: 'Austin Angels',
+  appointment_type: 'mentor interview',
+  first_name: 'Sam',
+};
+
+const parseEmail = (lambdaCalls) => {
+  const call = lambdaCalls.find((c) => c.FunctionName === 'send_email');
+  return JSON.parse(JSON.parse(Buffer.from(call.Payload).toString()).body);
+};
+const parseSms = (lambdaCalls) => {
+  const call = lambdaCalls.find((c) => c.FunctionName === 'SMS_Sender');
+  return JSON.parse(call.Payload);
+};
+
+test('reminderMomentFromRow maps t24h/t1h only', () => {
+  assert.equal(reminderMomentFromRow({ moment: 'reminder', tier: 't24h' }), 'reminder_24h');
+  assert.equal(reminderMomentFromRow({ moment: 'reminder', tier: 't1h' }), 'reminder_1h');
+  assert.equal(reminderMomentFromRow({ moment: 'reminder', tier: 't4h' }), null);
+  assert.equal(reminderMomentFromRow({ moment: 'reminder', tier: 't15m' }), null);
+  assert.equal(reminderMomentFromRow({ moment: 'reminder', tier: 't24h', attendance_check: true }), null);
+  assert.equal(reminderMomentFromRow({ moment: 'reminder' }), null); // legacy, no tier
+  assert.equal(reminderMomentFromRow({ moment: 'other', tier: 't24h' }), null);
+});
+
+test('t24h row, no override → §E14 default copy (NOT the baked row body) + SMS STOP footer', async () => {
+  const message = reminderRow({ tier: 't24h', template_vars: s4bVars });
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  deps.loadTemplateOverride = async () => null;
+  const res = await dispatch(EVENT(message), deps);
+  assert.equal(res.success, true);
+  const email = parseEmail(lambdaCalls);
+  assert.equal(email.subject, 'Reminder: your mentor interview is tomorrow — Austin Angels');
+  assert.equal(email.text_body, 'Hi Sam,\n\nThis is a reminder that your mentor interview with Austin Angels is tomorrow.');
+  assert.equal(email.html_body, '<p>Hi Sam,</p><p>This is a reminder that your mentor interview with Austin Angels is tomorrow.</p>');
+  const sms = parseSms(lambdaCalls);
+  assert.equal(sms.body, 'Reminder: your mentor interview with Austin Angels is tomorrow.' + SMS_STOP_FOOTER);
+});
+
+test('t24h row with full override → override rendered on every field; STOP outside the editable body', async () => {
+  const message = reminderRow({ tier: 't24h', template_vars: s4bVars });
+  const loaderCalls = [];
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  deps.loadTemplateOverride = async (args) => {
+    loaderCalls.push(args);
+    return {
+      subject: 'See you soon, {{firstName}}!',
+      text: '{{firstName}}, your {{apptType}} at {{org}} is tomorrow!',
+      html: '<p>{{firstName}}, your {{apptType}} at {{org}} is tomorrow!</p>',
+      sms: '{{firstName}}: {{apptType}} tomorrow at {{org}}.',
+    };
+  };
+  await dispatch(EVENT(message), deps);
+  assert.equal(loaderCalls.length, 1);
+  assert.equal(loaderCalls[0].tenantId, 'AUS123957');
+  assert.equal(loaderCalls[0].moment, 'reminder_24h');
+  const email = parseEmail(lambdaCalls);
+  assert.equal(email.subject, 'See you soon, Sam!');
+  assert.equal(email.text_body, 'Sam, your mentor interview at Austin Angels is tomorrow!');
+  assert.equal(email.html_body, '<p>Sam, your mentor interview at Austin Angels is tomorrow!</p>');
+  const sms = parseSms(lambdaCalls);
+  assert.equal(sms.body, 'Sam: mentor interview tomorrow at Austin Angels.' + SMS_STOP_FOOTER);
+});
+
+test('partial override → per-field merge (sms from override, email fields from defaults)', async () => {
+  const message = reminderRow({ tier: 't1h', template_vars: s4bVars });
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  deps.loadTemplateOverride = async () => ({ sms: 'Almost time, {{firstName}}!' });
+  await dispatch(EVENT(message), deps);
+  const email = parseEmail(lambdaCalls);
+  assert.equal(email.subject, 'Reminder: your mentor interview is in about an hour — Austin Angels');
+  const sms = parseSms(lambdaCalls);
+  assert.equal(sms.body, 'Almost time, Sam!' + SMS_STOP_FOOTER);
+});
+
+test('override carrying its own "reply STOP" line is not double-footed', async () => {
+  const message = reminderRow({ tier: 't1h', template_vars: s4bVars });
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  deps.loadTemplateOverride = async () => ({ sms: 'Almost time! Reply STOP to opt out.' });
+  await dispatch(EVENT(message), deps);
+  assert.equal(parseSms(lambdaCalls).body, 'Almost time! Reply STOP to opt out.');
+});
+
+test('html vars are escaped; text/sms vars are verbatim (HTML-injection guard)', () => {
+  const content = buildReminderContent('reminder_24h', {
+    first_name: '<b>Sam</b>',
+    organization_name: 'A&B "Angels"',
+    appointment_type: 'interview',
+  }, null);
+  assert.ok(content.html.includes('&lt;b&gt;Sam&lt;/b&gt;'));
+  assert.ok(content.html.includes('A&amp;B &quot;Angels&quot;'));
+  assert.ok(content.text.includes('<b>Sam</b>'));
+  assert.ok(content.text.includes('A&B "Angels"'));
+  assert.ok(content.sms.includes('A&B "Angels"'));
+});
+
+test('unknown {{vars}} in an override render as empty string (editor contract)', () => {
+  const content = buildReminderContent('reminder_24h', s4bVars, {
+    text: 'Hi {{firstName}}, see you {{whenLabel}}.',
+  });
+  assert.equal(content.text, 'Hi Sam, see you .');
+});
+
+test('whitespace-only override field falls back to the default', () => {
+  const content = buildReminderContent('reminder_24h', s4bVars, { subject: '   ' });
+  assert.equal(content.subject, 'Reminder: your mentor interview is tomorrow — Austin Angels');
+});
+
+test('non-overridable rows (t4h / attendance / legacy) never call the loader and keep the baked body', async () => {
+  for (const row of [
+    reminderRow({ tier: 't4h', template_vars: s4bVars }),
+    reminderRow({ attendance_check: true, template_vars: s4bVars }),
+    reminderRow({ template_vars: s4bVars }), // legacy: no tier
+  ]) {
+    const loaderCalls = [];
+    const { deps, lambdaCalls } = makeDeps({ message: row, selectChannels: bothChannels });
+    deps.loadTemplateOverride = async (args) => { loaderCalls.push(args); return null; };
+    await dispatch(EVENT(row), deps);
+    assert.equal(loaderCalls.length, 0);
+    const email = parseEmail(lambdaCalls);
+    assert.equal(email.subject, 'Appointment reminder'); // baked row subject, unchanged
+    assert.equal(email.text_body, 'Reminder: your appointment is coming up.'); // baked row body
+  }
+});
+
+test('baked (non-overridable) SMS also carries the STOP footer', async () => {
+  const message = reminderRow({ tier: 't4h', template_vars: s4bVars });
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  await dispatch(EVENT(message), deps);
+  assert.equal(parseSms(lambdaCalls).body, 'Reminder: your appointment is coming up.' + SMS_STOP_FOOTER);
+});
+
+test('throwing loader degrades to the default copy — never a failed send', async () => {
+  const message = reminderRow({ tier: 't24h', template_vars: s4bVars });
+  const { deps, lambdaCalls, ddbCalls } = makeDeps({ message, selectChannels: bothChannels });
+  deps.loadTemplateOverride = async () => { throw new Error('boom'); };
+  const res = await dispatch(EVENT(message), deps);
+  assert.equal(res.success, true);
+  assert.equal(parseEmail(lambdaCalls).subject, 'Reminder: your mentor interview is tomorrow — Austin Angels');
+  assert.equal(lastStatus(ddbCalls), 'sent');
+});
+
+test('loadTemplateOverride is a no-op (null, zero I/O) while SCHED_NOTIF_TEMPLATE_TABLE is unset', async () => {
+  // This file imports index.mjs WITHOUT the env var — the IaC-not-applied-yet state.
+  const calls = [];
+  const ddb = { send: async (c) => { calls.push(c); return { Item: { subject: 'x' } }; } };
+  const result = await loadTemplateOverride({ tenantId: 'T1', moment: 'reminder_24h', ddb, logger: console });
+  assert.equal(result, null);
+  assert.equal(calls.length, 0);
+});
+
+// ─── parity guards (mirror shared/scheduling/__tests__/notify-sms-parity.test.js) ─────
+
+test('SMS_STOP_FOOTER is byte-identical to notify.js (single compliance footer)', () => {
+  // Source-read (not import): notify.js's CJS requires resolve against shared/'s tree,
+  // which has no node_modules here — same technique as the ADA parity test below.
+  const src = fs.readFileSync(path.resolve(__dir, '../shared/scheduling/notify.js'), 'utf8');
+  const m = src.match(/const SMS_STOP_FOOTER = '((?:[^'\\]|\\.)*)';/);
+  assert.ok(m, 'SMS_STOP_FOOTER not found in notify.js source');
+  assert.equal(SMS_STOP_FOOTER, m[1].replace(/\\(n|'|\\)/g, (_, c) => (c === 'n' ? '\n' : c)));
+});
+
+// REMINDER_TEMPLATES must stay byte-in-sync with the ADA editor's defaults — otherwise the
+// editor's reset/preview lies about what this Lambda actually sends. Reads the ADA Python
+// source (same technique as notify-sms-parity.test.js); unescapes \n / \' / \\ literals.
+test('REMINDER_TEMPLATES are byte-identical to the ADA §E14 editor defaults', () => {
+  const src = fs.readFileSync(path.resolve(__dir, '../Analytics_Dashboard_API/lambda_function.py'), 'utf8');
+  const unesc = (s) => s.replace(/\\(n|'|\\)/g, (_, c) => (c === 'n' ? '\n' : c));
+  const sliceBlock = (startMarker, endMarker) => {
+    const start = src.indexOf(startMarker);
+    assert.notEqual(start, -1, `${startMarker} not found in ADA source`);
+    const end = src.indexOf(endMarker, start);
+    return src.slice(start, end > start ? end : start + 6000);
+  };
+  const emailBlock = sliceBlock('_SCHED_NOTIF_DEFAULTS', '_SCHED_NOTIF_MOMENT_VARS');
+  const smsBlock = sliceBlock('_SCHED_NOTIF_SMS_DEFAULTS', '_SCHED_NOTIF_SMS_VARS');
+  for (const moment of ['reminder_24h', 'reminder_1h']) {
+    const momentBlock = emailBlock.slice(emailBlock.indexOf(`'${moment}'`));
+    for (const [adaField, field] of [['subject', 'subject'], ['body_text', 'text'], ['body_html', 'html']]) {
+      const m = momentBlock.match(new RegExp(`'${adaField}':\\s*'((?:[^'\\\\]|\\\\.)*)'`));
+      assert.ok(m, `ADA ${moment}.${adaField} not found`);
+      assert.equal(REMINDER_TEMPLATES[moment][field], unesc(m[1]), `${moment}.${field} drifted from ADA`);
+    }
+    const sm = smsBlock.match(new RegExp(`'${moment}':\\s*'((?:[^'\\\\]|\\\\.)*)'`));
+    assert.ok(sm, `ADA SMS default for ${moment} not found`);
+    assert.equal(REMINDER_TEMPLATES[moment].sms, unesc(sm[1]), `${moment}.sms drifted from ADA`);
+  }
+});
+
+test('overridable row with NO template_vars (old-shape) renders empty vars, never crashes', async () => {
+  const message = reminderRow({ tier: 't24h' });
+  delete message.template_vars;
+  const { deps, lambdaCalls, ddbCalls } = makeDeps({ message, selectChannels: bothChannels });
+  deps.loadTemplateOverride = async () => null;
+  const res = await dispatch(EVENT(message), deps);
+  assert.equal(res.success, true);
+  assert.equal(lastStatus(ddbCalls), 'sent');
+  assert.equal(parseEmail(lambdaCalls).subject, 'Reminder: your  is tomorrow — ');
+});

@@ -42,6 +42,10 @@ const SCHEDULED_MESSAGES_TABLE = process.env.SCHEDULED_MESSAGES_TABLE || 'picass
 const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent';
 const SMS_SENDER_FUNCTION = process.env.SMS_SENDER_FUNCTION || 'SMS_Sender';
 const SEND_EMAIL_FUNCTION = process.env.SEND_EMAIL_FUNCTION || 'send_email';
+// §E14 S4b: per-tenant template-override table. Deliberately '' (not a default name) when
+// the env is absent — the override read is skipped entirely until the IaC grant+env land,
+// so the code degrades to the local default copy instead of erroring on a denied GetItem.
+const SCHED_NOTIF_TEMPLATE_TABLE = process.env.SCHED_NOTIF_TEMPLATE_TABLE || '';
 
 /**
  * Bare fail-closed consent check (legacy single-channel rows only — the §E3
@@ -156,6 +160,124 @@ function renderTemplate(template, variables) {
   return result;
 }
 
+// ─── §E14 S4b: fire-time reminder template overrides ──────────────────────────────────
+// The t24h/t1h reminder copy is per-tenant editable via the ADA §E14 editor
+// (picasso-scheduling-notif-template, key {tenantId, moment}). At fire time this Lambda
+// resolves: tenant override field → else the LOCAL default below. The defaults MUST stay
+// byte-in-sync with ADA `_SCHED_NOTIF_DEFAULTS` / `_SCHED_NOTIF_SMS_DEFAULTS` (the editor's
+// reset/preview) — index.test.mjs has a parity test that reads the ADA source, mirroring
+// shared/scheduling/__tests__/notify-sms-parity.test.js. t4h / t15m / attendance / legacy
+// rows are NOT overridable in v1 and keep the row's baked body.
+// The small helpers (escapeHtml / render / STOP footer) are duplicated from
+// shared/scheduling/notify.js rather than imported — notify.js carries top-level AWS
+// clients and this bundled Lambda only imports PURE shared modules (see header). The
+// parity test pins the footer to notify's export so they cannot drift.
+
+const REMINDER_TEMPLATES = {
+  reminder_24h: {
+    subject: 'Reminder: your {{apptType}} is tomorrow — {{org}}',
+    text: 'Hi {{firstName}},\n\nThis is a reminder that your {{apptType}} with {{org}} is tomorrow.',
+    html: '<p>Hi {{firstName}},</p><p>This is a reminder that your {{apptType}} with {{org}} is tomorrow.</p>',
+    sms: 'Reminder: your {{apptType}} with {{org}} is tomorrow.',
+  },
+  reminder_1h: {
+    subject: 'Reminder: your {{apptType}} is in about an hour — {{org}}',
+    text: 'Hi {{firstName}},\n\nThis is a reminder that your {{apptType}} with {{org}} is in about an hour.',
+    html: '<p>Hi {{firstName}},</p><p>This is a reminder that your {{apptType}} with {{org}} is in about an hour.</p>',
+    sms: 'Reminder: your {{apptType}} with {{org}} is in about an hour.',
+  },
+};
+
+// TCPA/CTIA compliance footer — appended AFTER render in sendSms, structurally OUTSIDE the
+// editable sms_text override body, so a tenant override can never remove it; the marker
+// check means an override that already carries STOP is not double-footed. Byte-pinned to
+// notify.js SMS_STOP_FOOTER by the parity test.
+const SMS_STOP_FOOTER = '\nReply STOP to opt out, HELP for help.';
+const _STOP_MARKER_RE = /reply\s+STOP/i;
+function appendStopOnce(rendered, stopLine) {
+  return _STOP_MARKER_RE.test(rendered) ? rendered : rendered + stopLine;
+}
+
+function escapeHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[c]));
+}
+
+// Override/default rendering: unknown {{vars}} become '' (the §E14 editor promises a var
+// used in the wrong moment renders empty — renderTemplate above leaves it literal, which
+// is right for the baked row body but wrong for editor-authored copy).
+function render(template, vars) {
+  return template.replace(/\{\{(\w+)\}\}/g, (_, key) =>
+    vars[key] != null ? String(vars[key]) : ''
+  );
+}
+
+/**
+ * Map a scheduled-message row to its §E14 overridable moment, or null when the row's copy
+ * is not editable (t4h/t15m tiers, attendance checks, legacy rows without a tier).
+ */
+function reminderMomentFromRow(message) {
+  if (message.moment !== 'reminder' || message.attendance_check) return null;
+  if (message.tier === 't24h') return 'reminder_24h';
+  if (message.tier === 't1h') return 'reminder_1h';
+  return null;
+}
+
+/**
+ * §E14 override loader — GetItem on the scheduling-notif-template table. FAIL-SAFE: unset
+ * table (IaC not applied yet) / miss / error → null, so a template-store problem can never
+ * block a reminder send (mirrors notify.js defaultLoadTemplateOverride; DocumentClient here).
+ */
+async function loadTemplateOverride({ tenantId, moment, ddb, logger }) {
+  if (!SCHED_NOTIF_TEMPLATE_TABLE || !tenantId || !moment) return null;
+  try {
+    const result = await ddb.send(new GetCommand({
+      TableName: SCHED_NOTIF_TEMPLATE_TABLE,
+      Key: { tenantId: String(tenantId), moment },
+    }));
+    const it = result.Item;
+    if (!it) return null;
+    const s = (v) => (typeof v === 'string' ? v : undefined);
+    return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html), sms: s(it.sms_text) };
+  } catch (error) {
+    (logger || console).warn(`template override load failed moment=${moment}: ${error.message} (using default copy)`);
+    return null;
+  }
+}
+
+/**
+ * Resolve the effective {subject,text,html,sms} for an overridable reminder moment:
+ * per-field override-wins merge (mirrors notify.js mergeNoticeTemplate), then {{var}}
+ * render — plain values into subject/text/sms, HTML-escaped values into html (firstName
+ * is attendee-supplied; unescaped it would be an HTML-injection vector in the email body).
+ */
+function buildReminderContent(moment, templateVars, override) {
+  const tpl = REMINDER_TEMPLATES[moment];
+  const pickField = (k) =>
+    override && typeof override[k] === 'string' && override[k].trim() ? override[k] : tpl[k];
+  const vars = {
+    firstName: templateVars.first_name || '',
+    org: templateVars.organization_name || '',
+    apptType: templateVars.appointment_type || '',
+  };
+  const htmlVars = {
+    firstName: escapeHtml(vars.firstName),
+    org: escapeHtml(vars.org),
+    apptType: escapeHtml(vars.apptType),
+  };
+  return {
+    subject: render(pickField('subject'), vars),
+    text: render(pickField('text'), vars),
+    html: render(pickField('html'), htmlVars),
+    sms: render(pickField('sms'), vars),
+  };
+}
+
 async function updateMessageStatus(ddb, pk, sk, status, error = '') {
   const now = new Date().toISOString();
   const base = status === 'cancelled'
@@ -174,12 +296,12 @@ async function updateMessageStatus(ddb, pk, sk, status, error = '') {
 
 // Invoke send_email (SES) — the §E1 email-as-floor branch. send_email reads `event.body`
 // as a JSON string (API-Gateway-shaped), so wrap accordingly (mirrors notify.js).
-async function sendEmail(deps, message, renderedBody) {
+async function sendEmail(deps, message, content) {
   const inner = {
     to: [message.recipient_email],
-    subject: message.subject || `Reminder from ${message.template_vars?.organization_name || message.tenant_id}`,
-    text_body: renderedBody,
-    html_body: `<p>${renderedBody}</p>`,
+    subject: content.subject,
+    text_body: content.text,
+    html_body: content.html,
     tags: {
       tenant_id: String(message.tenant_id || 'unknown').slice(0, 256),
       email_type: 'scheduled_reminder',
@@ -192,13 +314,15 @@ async function sendEmail(deps, message, renderedBody) {
   }));
 }
 
-async function sendSms(deps, message, renderedBody) {
+async function sendSms(deps, message, content) {
   await deps.lambda.send(new InvokeCommand({
     FunctionName: SMS_SENDER_FUNCTION,
     InvocationType: 'Event',
     Payload: JSON.stringify({
       to: message.recipient_phone,
-      body: renderedBody,
+      // The STOP/HELP footer rides OUTSIDE the (possibly tenant-overridden) body — §E3/§E14
+      // compliance invariant: an override can neither remove nor duplicate it.
+      body: appendStopOnce(content.sms, SMS_STOP_FOOTER),
       tenantId: message.tenant_id,
       formId: message.template || 'scheduled',
       submissionId: message.appointment_id || message.message_id,
@@ -249,6 +373,31 @@ export async function dispatch(event, deps) {
     ? renderTemplate(message.body, templateVars)
     : `Reminder from ${templateVars.organization_name || tenantId}`;
 
+  // §E14 S4b: overridable moments (t24h/t1h) render override-or-default at fire time —
+  // the ADA editor's effective copy. Everything else keeps the row's baked body. The
+  // loader is fail-safe (null on miss/error/unset table) and additionally guarded here
+  // so a throwing injected loader still degrades to the default copy, never a failed send.
+  let content = null;
+  const overrideMoment = reminderMomentFromRow(message);
+  if (overrideMoment) {
+    let override = null;
+    try {
+      override = deps.loadTemplateOverride
+        ? await deps.loadTemplateOverride({ tenantId, moment: overrideMoment, ddb: deps.ddb, logger: deps.logger })
+        : null;
+    } catch (error) {
+      deps.logger.warn(`template override load threw (${message_id}): ${error.message} (using default copy)`);
+    }
+    content = buildReminderContent(overrideMoment, templateVars, override);
+  } else {
+    content = {
+      subject: message.subject || `Reminder from ${templateVars.organization_name || tenantId}`,
+      text: renderedBody,
+      html: `<p>${renderedBody}</p>`,
+      sms: renderedBody,
+    };
+  }
+
   let channels;
   try {
     channels = await resolveChannels(message, deps);
@@ -267,11 +416,11 @@ export async function dispatch(event, deps) {
   const dispatched = { email: false, sms: false };
   try {
     if (channels.email) {
-      await sendEmail(deps, message, renderedBody);
+      await sendEmail(deps, message, content);
       dispatched.email = true;
     }
     if (channels.sms) {
-      await sendSms(deps, message, renderedBody);
+      await sendSms(deps, message, content);
       dispatched.sms = true;
     }
     await updateMessageStatus(deps.ddb, pk, sk, 'sent');
@@ -292,8 +441,19 @@ function defaultDeps() {
     // §E3 TCPA gate wired in (S3). Reminder rows that carry tenant_prefs now go through the
     // real channel selection: email floor + org-flag/consent/quiet-hours-gated SMS supplement.
     selectChannels,
+    // §E14 S4b: fire-time per-tenant template override read (fail-safe → default copy).
+    loadTemplateOverride,
   };
 }
+
+// exported for unit coverage:
+export {
+  reminderMomentFromRow,
+  loadTemplateOverride,
+  buildReminderContent,
+  REMINDER_TEMPLATES,
+  SMS_STOP_FOOTER,
+};
 
 /**
  * Lambda handler — invoked by EventBridge Scheduler with { pk, sk, message_id }.
