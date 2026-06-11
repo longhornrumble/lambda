@@ -21,6 +21,7 @@ Staging account: **525409062831**, region **us-east-1**.
 | `ONBOARDER_FUNCTION_NAME` | `Calendar_Watch_Onboarder-staging` | the B5 watch onboarder to fire |
 | `CONFIG_BUCKET` | the tenant-config bucket (same as the redemption handler / onboarder) | featureGate Flag-A read |
 | `STATE_TTL_SECONDS` | `600` | OAuth state lifetime |
+| `JTI_BLACKLIST_TABLE` | `picasso-token-jti-blacklist` | **BARE name** — NOT `-staging`-suffixed. The live table is bare-named; the IaC grant (picasso#527) targets the bare name. When unset/empty, single-use enforcement is OFF (fail-open — safe for deploy before the table is wired, but wire it before Beta). Requires `dynamodb:PutItem` on the table (see §2 IAM below). |
 | `AWS_REQUEST_TIMEOUT_MS` / `AWS_CONNECTION_TIMEOUT_MS` / `AWS_MAX_ATTEMPTS` | `5000` / `3000` / `2` | bounded SDK client |
 
 ---
@@ -67,9 +68,16 @@ Staging account: **525409062831**, region **us-east-1**.
       "Effect": "Allow",
       "Action": "s3:GetObject",
       "Resource": "arn:aws:s3:::<TENANT_CONFIG_BUCKET>/tenants/*"
+    },
+    {
+      "Sid": "BurnInitTokenJti",
+      "Effect": "Allow",
+      "Action": "dynamodb:PutItem",
+      "Resource": "arn:aws:dynamodb:us-east-1:525409062831:table/picasso-token-jti-blacklist"
     }
   ]
 }
+
 ```
 
 Plus the standard `logs:CreateLogGroup`/`CreateLogStream`/`PutLogEvents` (or `AWSLambdaBasicExecutionRole`).
@@ -164,6 +172,12 @@ diverging from the shipped BCH `classifyAuthError`. So a broken platform-app cre
 `/connection/status` log `status_platform_credential_error` + report `stale_connected` (NO secret
 stamp) instead of mass-revoking every polling coordinator. Wire `status_platform_credential_error`
 to an operator alarm before Beta.
+
+**Operational note (`jti_burn_unavailable` — alarm on this log):** when DDB is unavailable the
+jti burn fails open — the connect proceeds but single-use enforcement is offline for that request.
+A handful of isolated occurrences is noise (transient throttle / cold-start). Sustained occurrences
+(>N within a short window) mean replay protection is offline for ALL coordinators and require
+immediate investigation. Alarm on `jti_burn_unavailable` in CloudWatch Logs Insights before Beta.
 
 **⚠️ Beta-gated PII (track; NOT a staging blocker):** the signed `state`/`init` token's base64 payload
 carries `coordinator_email`/`coordinator_id`, and `state` rides in the `/oauth/callback?state=` query

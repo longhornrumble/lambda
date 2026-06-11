@@ -9,14 +9,17 @@
 
 const state = require('./state');
 
-// Must match Analytics_Dashboard_API/test_scheduling_connection_init.py KEY + NOW_MS.
+// Must match Analytics_Dashboard_API/test_scheduling_connection_init.py KEY + NOW_MS + FIXED_JTI.
+// Regenerated 2026-06-11 (Track 2 / Beta-blocker §E0): payload now includes `jti` claim.
+// FIXED_JTI = 'aaaabbbbccccdddd0000111122223333' (32 hex chars, pinned in the Python test).
 const KEY = 'test-signing-key-deadbeef';
 const deps = { getKey: () => KEY };
 const GOLDEN =
-  'eyJ0eXAiOiJpbml0IiwidGVuYW50X2lkIjoiVEVOMSIsImNvb3JkaW5hdG9yX2lkIjoic3RhZmZAZXhhbXBsZS5jb20i' +
-  'LCJjb29yZGluYXRvcl9lbWFpbCI6InN0YWZmQGV4YW1wbGUuY29tIiwiaWF0IjoxOTAwMDAwMDAwLCJleHAiOjE5MDAw' +
-  'MDAzMDAsIm5vbmNlIjoiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAifQ' +
-  '.c08AwE2zl1b2-I4PMa_uHj-nj4ozebRTf74q8P5Srv8';
+  'eyJ0eXAiOiJpbml0IiwidGVuYW50X2lkIjoiVEVOMSIsImNvb3JkaW5hdG9yX2lkIjoic3RhZmZAZXhh' +
+  'bXBsZS5jb20iLCJjb29yZGluYXRvcl9lbWFpbCI6InN0YWZmQGV4YW1wbGUuY29tIiwiaWF0IjoxOTAw' +
+  'MDAwMDAwLCJleHAiOjE5MDAwMDAzMDAsImp0aSI6ImFhYWFiYmJiY2NjY2RkZGQwMDAwMTExMTIyMjIz' +
+  'MzMzIiwibm9uY2UiOiIwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMCJ9' +
+  '.lRV7ovW26MAZbaweSag_t6hPLEUrGBsP6OeEHN6IdmA';
 
 beforeEach(() => state._resetKeyCache());
 
@@ -31,6 +34,8 @@ describe('state.verify accepts a Python-ADA-minted init token (G3/E0 cross-langu
     expect(claims.iat).toBe(1_900_000_000);
     expect(claims.exp).toBe(1_900_000_300);
     expect(claims.nonce).toHaveLength(32);
+    // jti claim (Track 2 / Beta-blocker §E0): Python mint now includes it for single-use enforcement.
+    expect(claims.jti).toBe('aaaabbbbccccdddd0000111122223333');
   });
 
   test('rejects the same golden under the wrong key (bad_signature)', async () => {

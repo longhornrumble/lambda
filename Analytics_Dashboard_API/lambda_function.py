@@ -4884,8 +4884,13 @@ def get_oauth_state_signing_key() -> str:
 
 
 def _sign_oauth_state(typ: str, claims: Dict[str, Any], ttl_seconds: int,
-                      now_ms: Optional[int] = None) -> str:
-    """Sign a compact HMAC token matching Calendar_OAuth_Connect/state.js sign()."""
+                      now_ms: Optional[int] = None, jti: Optional[str] = None) -> str:
+    """Sign a compact HMAC token matching Calendar_OAuth_Connect/state.js sign().
+
+    For typ='init' tokens, a `jti` claim (uuid4 hex) is included so Calendar_OAuth_Connect
+    can enforce single-use via a conditional PutItem to the jti-blacklist table.
+    The caller may pass a fixed jti (for deterministic tests); omitting it generates one.
+    """
     key = get_oauth_state_signing_key()
     if now_ms is None:
         now_ms = int(time.time() * 1000)
@@ -4894,6 +4899,12 @@ def _sign_oauth_state(typ: str, claims: Dict[str, Any], ttl_seconds: int,
     payload.update(claims)
     payload['iat'] = iat
     payload['exp'] = iat + ttl_seconds
+    # jti claim: uuid4 hex, unique per mint, used by /connect to enforce single-use.
+    # Only added to 'init' tokens (the ones burned at /connect). State tokens have a
+    # separate self-limiting mechanism (10-min TTL + code exchange). Caller may pass a
+    # fixed jti for deterministic golden tests; otherwise one is generated.
+    if typ == 'init':
+        payload['jti'] = jti if jti is not None else uuid.uuid4().hex
     payload['nonce'] = os.urandom(16).hex()
     payload_b64 = _b64url_no_pad(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
     sig = _b64url_no_pad(hmac.new(key.encode('utf-8'), payload_b64.encode('ascii'),

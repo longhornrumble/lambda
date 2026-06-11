@@ -2,6 +2,7 @@
 
 // Env must be set BEFORE requiring index (module reads these at load).
 process.env.DASHBOARD_RETURN_URL = 'https://app.example.com/scheduling';
+process.env.JTI_BLACKLIST_TABLE = 'picasso-token-jti-blacklist';
 delete process.env.OAUTH_REDIRECT_URI; // → '' ; redirect_uri supplied via the platform secret mock
 
 jest.mock('./state', () => ({ verify: jest.fn(), sign: jest.fn() }));
@@ -18,6 +19,7 @@ jest.mock('./secrets', () => ({
   markDisconnected: jest.fn(),
 }));
 jest.mock('../shared/scheduling/featureGate', () => ({ isSchedulingEnabledForTenant: jest.fn() }));
+jest.mock('./jti', () => ({ burnJti: jest.fn() }));
 
 const { mockClient } = require('aws-sdk-client-mock');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
@@ -26,6 +28,7 @@ const state = require('./state');
 const oauth = require('./oauth');
 const secrets = require('./secrets');
 const { isSchedulingEnabledForTenant } = require('../shared/scheduling/featureGate');
+const { burnJti } = require('./jti');
 const { handler, _internal } = require('./index');
 
 const lambdaMock = mockClient(LambdaClient);
@@ -33,12 +36,15 @@ const lambdaMock = mockClient(LambdaClient);
 const INIT_CLAIMS = { tenant_id: 'MYR384719', coordinator_id: 'maya@example.org', coordinator_email: 'maya@example.org' };
 const ev = (rawPath, queryStringParameters = {}) => ({ rawPath, queryStringParameters });
 
+// INIT_CLAIMS_WITH_JTI has a jti claim (new mints); INIT_CLAIMS is legacy (no jti).
+const INIT_CLAIMS_WITH_JTI = { ...INIT_CLAIMS, jti: 'deadbeef-1234-5678-abcd-000000000001', exp: Math.floor(Date.now() / 1000) + 300 };
+
 beforeEach(() => {
   jest.clearAllMocks();
   lambdaMock.reset();
   lambdaMock.on(InvokeCommand).resolves({});
   // sensible defaults; individual tests override
-  state.verify.mockResolvedValue(INIT_CLAIMS);
+  state.verify.mockResolvedValue(INIT_CLAIMS_WITH_JTI);  // new-style token by default
   state.sign.mockResolvedValue('signed-state');
   oauth.buildAuthUrl.mockReturnValue('https://accounts.google.com/o/oauth2/v2/auth?state=signed-state');
   oauth.exchangeCode.mockResolvedValue({ refresh_token: '1//refresh-secret', scope: 'https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.freebusy', token_type: 'Bearer' });
@@ -48,6 +54,8 @@ beforeEach(() => {
   secrets.readCoordinator.mockResolvedValue(null);
   secrets.markDisconnected.mockResolvedValue({ found: true });
   isSchedulingEnabledForTenant.mockResolvedValue(true);
+  // Default: burn succeeds (first use)
+  burnJti.mockResolvedValue({ burned: true });
 });
 
 describe('routing', () => {
@@ -138,6 +146,135 @@ describe('GET /connect', () => {
     oauth.buildAuthUrl.mockReturnValue('https://evil.example.com/o/oauth2/auth');
     const res = await handler(ev('/connect', { init: 'ok' }));
     expect(res.statusCode).toBe(500);
+  });
+});
+
+describe('GET /connect — jti single-use enforcement', () => {
+  test('first use: burnJti succeeds → 302 to Google (burn is called with tenantId + jti + exp)', async () => {
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(302);
+    expect(burnJti).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tenantId: INIT_CLAIMS_WITH_JTI.tenant_id,
+        jti: INIT_CLAIMS_WITH_JTI.jti,
+        expSeconds: INIT_CLAIMS_WITH_JTI.exp,
+      })
+    );
+  });
+
+  test('second use: burnJti returns already_used → 400, NO redirect to Google', async () => {
+    burnJti.mockResolvedValue({ burned: false, reason: 'already_used' });
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(400);
+    expect(oauth.buildAuthUrl).not.toHaveBeenCalled();
+  });
+
+  // SR-1: replay attempts are a security signal — must log at WARN, not INFO.
+  test('replay: connect_jti_replayed is logged at WARN level (console.warn, not console.log)', async () => {
+    burnJti.mockResolvedValue({ burned: false, reason: 'already_used' });
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    await handler(ev('/connect', { init: 'ok' }));
+    const warnLines = warnSpy.mock.calls.map((a) => a.join(' ')).join('\n');
+    const logLines = logSpy.mock.calls.map((a) => a.join(' ')).join('\n');
+    expect(warnLines).toContain('connect_jti_replayed');
+    expect(logLines).not.toContain('connect_jti_replayed');
+    warnSpy.mockRestore();
+    logSpy.mockRestore();
+  });
+
+  test('second use serves the generic invalid/expired page (no detail leak)', async () => {
+    burnJti.mockResolvedValue({ burned: false, reason: 'already_used' });
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.body).toContain('no longer valid');  // genericFailure copy
+    expect(res.body).not.toContain('already_used');
+    expect(res.body).not.toContain('jti');
+  });
+
+  test('missing-jti token (legacy mint): exempt from burn, warn emitted, connect proceeds', async () => {
+    // Tokens minted before this deploy have no jti claim — treat as exempt.
+    state.verify.mockResolvedValue(INIT_CLAIMS);  // no jti field
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(302);
+    expect(burnJti).not.toHaveBeenCalled();
+    const warns = warnSpy.mock.calls.map((a) => a.join(' '));
+    expect(warns.some((w) => w.includes('connect_init_token_no_jti'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  test('DDB error (fail-open): burnJti returns { burned: true, warn: unavailable } → connect proceeds', async () => {
+    burnJti.mockResolvedValue({ burned: true, warn: 'unavailable' });
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(302);
+    expect(oauth.buildAuthUrl).toHaveBeenCalled();
+  });
+
+  test('env unset (burn OFF): burnJti returns { burned: true, warn: unconfigured } → connect proceeds', async () => {
+    burnJti.mockResolvedValue({ burned: true, warn: 'unconfigured' });
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(302);
+  });
+
+  test('/connection/status does NOT call burnJti (read-only probe)', async () => {
+    secrets.readCoordinator.mockResolvedValue({ refresh_token: 'rt', client_id: 'c', client_secret: 's', status: 'connected', scopes: [] });
+    await handler(ev('/connection/status', { init: 'ok' }));
+    expect(burnJti).not.toHaveBeenCalled();
+  });
+
+  test('/oauth/callback does NOT call burnJti (state token, not init token)', async () => {
+    await handler(ev('/oauth/callback', { code: 'c', state: 's' }));
+    expect(burnJti).not.toHaveBeenCalled();
+  });
+
+  // ── Fix 3a: burn ordering — token survives a Secrets Manager failure ───────────────────────
+  // If readPlatformApp throws (transient Secrets Manager outage), burnJti must NOT be called.
+  // The coordinator must be able to retry from the dashboard with the same token.
+  test('readPlatformApp failure: burnJti is NOT called — token survives for retry', async () => {
+    secrets.readPlatformApp.mockRejectedValue(new Error('sm transient'));
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(500);
+    expect(burnJti).not.toHaveBeenCalled();
+  });
+
+  // ── Fix 3b: post-burn failure consumes the token (accepted residual window) ─────────────────
+  // If a failure occurs AFTER the burn but BEFORE the redirect (e.g. state signing fails),
+  // the token IS consumed. The user must re-initiate from the dashboard. This is the accepted
+  // trade-off: burn-before-redirect is the stronger invariant; the post-burn window is narrow.
+  test('state signing failure AFTER burn: token is consumed (user must re-initiate)', async () => {
+    // burnJti succeeds (token burned), but state.sign fails afterward.
+    state.sign.mockRejectedValue(new Error('signing key unavailable'));
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(500);
+    // The burn DID happen — this is the accepted residual window.
+    expect(burnJti).toHaveBeenCalledTimes(1);
+    expect(oauth.buildAuthUrl).not.toHaveBeenCalled();
+  });
+
+  // ── Fix 4: call-order assertion — verifyInitToken before readPlatformApp before burnJti ─────
+  test('call order: state.verify → readPlatformApp → burnJti → buildAuthUrl', async () => {
+    const order = [];
+    state.verify.mockImplementation(async (...args) => {
+      order.push('verify');
+      return INIT_CLAIMS_WITH_JTI;
+    });
+    secrets.readPlatformApp.mockImplementation(async () => {
+      order.push('readPlatformApp');
+      return { client_id: 'cid', client_secret: 'cs', redirect_uri: 'https://staging.schedule.myrecruiter.ai/oauth/callback' };
+    });
+    burnJti.mockImplementation(async () => {
+      order.push('burnJti');
+      return { burned: true };
+    });
+    oauth.buildAuthUrl.mockImplementation((...args) => {
+      order.push('buildAuthUrl');
+      return 'https://accounts.google.com/o/oauth2/v2/auth?state=s';
+    });
+    const res = await handler(ev('/connect', { init: 'ok' }));
+    expect(res.statusCode).toBe(302);
+    expect(order.indexOf('verify')).toBeLessThan(order.indexOf('readPlatformApp'));
+    expect(order.indexOf('readPlatformApp')).toBeLessThan(order.indexOf('burnJti'));
+    expect(order.indexOf('burnJti')).toBeLessThan(order.indexOf('buildAuthUrl'));
   });
 });
 
