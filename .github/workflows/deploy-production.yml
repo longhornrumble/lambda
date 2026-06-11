@@ -58,6 +58,10 @@ env:
   # There is no mechanical coupling (audit C3): bumping the Lambda runtime
   # does not update this, and vice versa — change both together.
   NODE_VERSION: '20.x'
+  # Match the Python Lambdas' runtime (mirrors deploy-staging.yml) — pip
+  # must resolve wheels (e.g. cryptography) for the runtime's version, not
+  # the runner default.
+  PYTHON_VERSION: '3.13'
 
 jobs:
   deploy:
@@ -174,6 +178,12 @@ jobs:
           cache: 'npm'
           cache-dependency-path: ${{ matrix.lambda.source_dir }}/package-lock.json
 
+      - name: Set up Python
+        if: matrix.lambda.prod_function == github.event.inputs.lambda && matrix.lambda.runtime == 'python'
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
       - name: Configure AWS credentials
         if: matrix.lambda.prod_function == github.event.inputs.lambda
         uses: aws-actions/configure-aws-credentials@v4
@@ -186,7 +196,21 @@ jobs:
         working-directory: ${{ matrix.lambda.source_dir }}
         run: |
           set -euo pipefail
-          zip -q -r9 /tmp/deploy.zip ${{ matrix.lambda.include_globs }}
+          # Mirrors deploy-staging.yml's Python packaging (Phase-2 audit D9):
+          # bundle requirements-layer.txt deps INTO the zip — no hand-attached
+          # Lambda Layer dependency. Previously prod zipped source only, so
+          # ADA prod silently relied on an undocumented PyJWT layer; a
+          # function recreate would have cold-start-crashed on import.
+          # MFS vendors its deps in-repo (include_globs lists jwt/ +
+          # dist-info) and has no requirements-layer.txt — no-op for it.
+          BUILD=/tmp/build
+          rm -rf "$BUILD" && mkdir "$BUILD"
+          cp -r ${{ matrix.lambda.include_globs }} "$BUILD/"
+          if [ -f requirements-layer.txt ]; then
+            pip install --quiet --target "$BUILD" -r requirements-layer.txt
+          fi
+          cd "$BUILD"
+          zip -q -r9 /tmp/deploy.zip .
           echo "Packaged $(unzip -l /tmp/deploy.zip | tail -1)"
 
       - name: Package function (Node.js)
