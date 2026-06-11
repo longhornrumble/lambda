@@ -60,6 +60,7 @@ const state = require('./state');
 const oauth = require('./oauth');
 const secrets = require('./secrets');
 const { classifyTokenError } = require('./revocation');
+const { burnJti } = require('./jti');
 // Backend scheduling feature gate (Flag A — fail-closed, like Forms). Flag B
 // (calendar_integration_enabled, tenant-admin) is integrator glue, enforced upstream.
 const { isSchedulingEnabledForTenant } = require('../shared/scheduling/featureGate');
@@ -210,6 +211,31 @@ async function handleConnect(event) {
   if (!enabled) {
     log('connect_scheduling_disabled', { tenant_id: claims.tenant_id });
     return page(403, 'Scheduling unavailable', '<p>Online scheduling isn’t enabled for this organization.</p>');
+  }
+
+  // ── Single-use enforcement (Beta-blocker §E0 / DEPLOY_NOTES §5) ──────────────────────────────
+  // Burn the jti BEFORE redirecting to Google so a leaked token cannot be replayed.
+  // Forward-compatible: tokens without a `jti` claim (minted before this deploy) are exempt —
+  // they were valid under the old contract; burning them would break in-flight connects.
+  // Fail-open on DDB error: connecting twice in an outage is lower-harm than blocking onboarding
+  // for all coordinators (see jti.js for the full rationale).
+  if (claims.jti) {
+    const burnResult = await burnJti({
+      tenantId: claims.tenant_id,
+      jti: claims.jti,
+      expSeconds: claims.exp,
+    });
+    if (!burnResult.burned) {
+      // Already used — replay detected. Serve the generic failure page (no detail leak).
+      log('connect_jti_replayed', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
+      return genericFailure(400);
+    }
+    if (burnResult.warn) {
+      // unconfigured or unavailable — already logged inside burnJti; continue (fail-open).
+    }
+  } else {
+    // Token predates jti minting — treat as exempt, log a warn for visibility.
+    warn('connect_init_token_no_jti', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
   }
 
   let app;
@@ -467,4 +493,5 @@ exports._internal = {
   handleStatus,
   STATE_TTL_SECONDS,
   ONBOARDER_FUNCTION_NAME,
+  burnJti,
 };

@@ -26,14 +26,17 @@ from lambda_function import handle_scheduling_connection_init
 KEY = 'test-signing-key-deadbeef'
 NOW_MS = 1_900_000_000_000          # iat 1_900_000_000, exp 1_900_000_300 (ttl 300)
 FIXED_NONCE = b'\x00' * 16          # -> "0" * 32 hex
+FIXED_JTI = 'aaaabbbbccccdddd0000111122223333'   # 32 hex chars (deterministic for golden tests)
 OAUTH_URL = 'https://abc123.lambda-url.us-east-1.on.aws'
 
 # The deterministic golden token (see test_golden_token_is_stable). Mirrored verbatim in the
 # Node compat test; if either side changes the wire format, BOTH break.
+# NOTE: the golden now includes a `jti` claim — init tokens include a jti for single-use
+# enforcement (Track 2 / Beta-blocker §E0). FIXED_JTI is passed as `jti=` to _sign_oauth_state.
 GOLDEN_PAYLOAD = (
     '{"typ":"init","tenant_id":"TEN1","coordinator_id":"staff@example.com",'
     '"coordinator_email":"staff@example.com","iat":1900000000,"exp":1900000300,'
-    '"nonce":"00000000000000000000000000000000"}'
+    '"jti":"' + FIXED_JTI + '","nonce":"00000000000000000000000000000000"}'
 )
 
 
@@ -97,6 +100,11 @@ def test_minted_token_verifies_under_js_rules():
     assert claims['iat'] == NOW_MS // 1000
     assert claims['exp'] == NOW_MS // 1000 + 300
     assert len(claims['nonce']) == 32  # 16 random bytes hex
+    # jti is present and is a 32-char hex string (uuid4.hex)
+    assert 'jti' in claims
+    assert len(claims['jti']) == 32
+    import re
+    assert re.fullmatch(r'[0-9a-f]{32}', claims['jti'])
 
 
 def test_token_is_two_b64url_parts():
@@ -133,7 +141,7 @@ def test_golden_token_is_stable():
         token = lf._sign_oauth_state('init', {
             'tenant_id': 'TEN1', 'coordinator_id': 'staff@example.com',
             'coordinator_email': 'staff@example.com',
-        }, 300, now_ms=NOW_MS)
+        }, 300, now_ms=NOW_MS, jti=FIXED_JTI)
     payload_b64, sig_b64 = token.split('.')
     # the payload decodes to the exact compact JSON the Node side will JSON.parse
     assert _b64url_decode(payload_b64).decode('utf-8') == GOLDEN_PAYLOAD
@@ -270,3 +278,56 @@ def test_token_is_url_safe_no_encoding_needed():
         resp = handle_scheduling_connection_init('TEN1', 'staff@example.com')
     token = json.loads(resp['body'])['connect_url'].split('init=')[1]
     assert re.fullmatch(r'[A-Za-z0-9_.-]+', token)  # base64url alphabet + the '.' separator
+
+
+# --------------------------------------------------------------------------- #
+# jti claim (Track 2 / Beta-blocker §E0 — single-use enforcement)
+# --------------------------------------------------------------------------- #
+
+def test_init_token_contains_jti_claim():
+    """Every init-token mint must include a non-empty jti claim (uuid4 hex)."""
+    import re
+    token = lf._sign_oauth_state('init', {
+        'tenant_id': 'TEN1', 'coordinator_id': 'c@ex.com', 'coordinator_email': 'c@ex.com',
+    }, 300, now_ms=NOW_MS)
+    claims_json = json.loads(base64.urlsafe_b64decode(
+        token.split('.')[0] + '==' ).decode('utf-8'))
+    assert 'jti' in claims_json, 'jti claim must be present in init tokens'
+    assert re.fullmatch(r'[0-9a-f]{32}', claims_json['jti']), 'jti must be a 32-char hex string'
+
+
+def test_jti_is_unique_across_mints():
+    """Each mint must produce a distinct jti (uuid4 is random; two mints must differ)."""
+    def mint():
+        return lf._sign_oauth_state('init', {
+            'tenant_id': 'TEN1', 'coordinator_id': 'c@ex.com', 'coordinator_email': 'c@ex.com',
+        }, 300, now_ms=NOW_MS)
+
+    def extract_jti(token):
+        payload = json.loads(base64.urlsafe_b64decode(token.split('.')[0] + '==').decode('utf-8'))
+        return payload['jti']
+
+    jtis = {extract_jti(mint()) for _ in range(5)}
+    assert len(jtis) == 5, 'Each mint must produce a unique jti'
+
+
+def test_state_token_does_not_contain_jti():
+    """State tokens (typ='state') must NOT include a jti — only init tokens are burned."""
+    token = lf._sign_oauth_state('state', {
+        'tenant_id': 'TEN1', 'coordinator_id': 'c@ex.com', 'coordinator_email': 'c@ex.com',
+    }, 600, now_ms=NOW_MS)
+    claims_json = json.loads(base64.urlsafe_b64decode(
+        token.split('.')[0] + '==').decode('utf-8'))
+    assert 'jti' not in claims_json, 'state tokens must not carry a jti'
+
+
+def test_handler_minted_token_has_jti():
+    """The full handler (handle_scheduling_connection_init) must return a token with a jti."""
+    import re
+    with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL):
+        resp = handle_scheduling_connection_init('TEN1', 'staff@example.com')
+    assert resp['statusCode'] == 200
+    token = json.loads(resp['body'])['connect_url'].split('init=')[1]
+    claims = js_verify(token, KEY, 'init', now_ms=int(__import__('time').time() * 1000))
+    assert 'jti' in claims, 'handler-minted token must have a jti claim'
+    assert re.fullmatch(r'[0-9a-f]{32}', claims['jti'])
