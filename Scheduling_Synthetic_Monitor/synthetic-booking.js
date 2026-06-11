@@ -9,6 +9,13 @@
  * Then stamps `is_synthetic=true` on the resulting row (§E6) and reads it back (commit
  * omits coordinator_email per §5.7; the cancel cycle needs it).
  *
+ * The commit payload also carries `is_synthetic: true` so BCH's post-commit reminder
+ * scheduling (scheduleBookingReminders → ctx.isSynthetic) double-gates the cadence
+ * time-compression (STAGING_TEST_MODE && is_synthetic). Without it the monitor's reminders
+ * schedule at real 24h/1h offsets and the reminder cadence cycle (reminder-cycle.js) could
+ * never observe a fire within its poll window. The post-commit row stamp (step 3) is a
+ * DISTINCT concern (it marks the Booking row for cancel/cleanup discrimination).
+ *
  * Operational precondition (not code): the synthetic tenant (SYNTHETIC_TENANT_ID) must be
  * provisioned with scheduling_enabled, a coordinator with a live OAuth grant, the named
  * appointment type, and a routing policy — i.e. the §5.2 staging burn-in tenant. Without
@@ -76,12 +83,15 @@ async function createSyntheticBooking({ cyclePrefix }, deps = {}) {
   }
 
   // 2. commit — the full transactional path (snake_case keys per the commit route).
+  //    is_synthetic:true → BCH ctx.isSynthetic → cadence time-compression double-gate
+  //    (STAGING_TEST_MODE && is_synthetic), so reminders fire within the cycle's poll window.
   const committed = await invoke({
     tenant_id: tenantId,
     session_id: sessionId,
     slot: { start: chip.start, end: chip.end, candidateResourceIds },
     attendee: { email: SYNTHETIC_ATTENDEE_EMAIL, first_name: 'Synthetic', last_name: 'Monitor' },
     conference_type: SYNTHETIC_CONFERENCE_TYPE,
+    is_synthetic: true,
     pool_size: proposed.poolSize || 1,
     appointment_type: {
       id: appointmentTypeId,

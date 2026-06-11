@@ -56,6 +56,13 @@ describe('index — handler cycle dispatch', () => {
     expect(res.cycle).toBe('cancel');
   });
 
+  test('routes reminder → runReminderCycle', async () => {
+    const runReminderCycle = jest.fn().mockResolvedValue({ cycle: 'reminder', success: true });
+    const res = await handler({ cycle: 'reminder' }, {}, { runReminderCycle });
+    expect(runReminderCycle).toHaveBeenCalled();
+    expect(res.cycle).toBe('reminder');
+  });
+
   test('routes cleanup → runCleanup', async () => {
     const runCleanup = jest.fn().mockResolvedValue({ cycle: 'cleanup', success: true });
     await handler({ cycle: 'cleanup' }, {}, { runCleanup });
