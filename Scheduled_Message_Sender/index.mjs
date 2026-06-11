@@ -65,7 +65,7 @@ async function checkConsent(ddb, tenantId, phoneRaw) {
     if (result.Item.consent_given === false || result.Item.opted_out_at) return false;
     return true;
   } catch (error) {
-    console.error('Consent check failed:', error);
+    console.error(`Consent check failed: ${error.name || 'error'}`);
     return false; // Fail closed
   }
 }
@@ -96,7 +96,7 @@ async function readConsentRecord(ddb, tenantId, phoneRaw, logger) {
       opted_out_at: result.Item.opted_out_at ?? undefined,
     };
   } catch (error) {
-    (logger || console).error(`consent record read failed: ${error.message}`);
+    (logger || console).error(`consent record read failed: ${error.name || 'error'}`);
     return null; // fail-safe
   }
 }
@@ -107,6 +107,9 @@ async function readConsentRecord(ddb, tenantId, phoneRaw, logger) {
  */
 async function resolveChannels(message, deps) {
   const tenantId = message.tenant_id;
+  // 'sms' default is the legacy pre-§E3 contract (single-channel rows whose intent WAS sms);
+  // every scheduler-written row sets channel:'email' explicitly, so this only governs rows
+  // that predate the field. Do not "fix" to 'email' — it would silently re-channel them.
   const channel = message.channel || 'sms';
 
   // §E3 fire-time gate path — only when the row carries the gate context AND a gate is wired.
@@ -188,14 +191,26 @@ const REMINDER_TEMPLATES = {
   },
 };
 
-// TCPA/CTIA compliance footer — appended AFTER render in sendSms, structurally OUTSIDE the
-// editable sms_text override body, so a tenant override can never remove it; the marker
-// check means an override that already carries STOP is not double-footed. Byte-pinned to
-// notify.js SMS_STOP_FOOTER by the parity test.
+// TCPA/CTIA compliance footers — appended AFTER render in sendSms/sendEmail, structurally
+// OUTSIDE the editable override body, so a tenant override can never remove them; the marker
+// check means an override that already carries STOP is not double-footed. All three strings
+// and the marker regex are byte-pinned to notify.js by the parity tests. The email lines are
+// appended only to ATTENDEE-facing reminder emails — the attendance check is a coordinator
+// operational prompt (staff can't opt out of disposition asks), and notify.js owns its own
+// kinds.
 const SMS_STOP_FOOTER = '\nReply STOP to opt out, HELP for help.';
+const STOP_LINE_TEXT = '\n\nTo stop receiving these emails, reply STOP.';
+const STOP_LINE_HTML =
+  '<p style="margin-top:24px;font-size:12px;color:#64748B;">To stop receiving these emails, reply STOP.</p>';
 const _STOP_MARKER_RE = /reply\s+STOP/i;
 function appendStopOnce(rendered, stopLine) {
   return _STOP_MARKER_RE.test(rendered) ? rendered : rendered + stopLine;
+}
+
+// Subjects feed an email header — strip CRLF so a hostile override/org-name can neither
+// inject headers nor crash send_email's MIME assembly (mirrors confirmation-email.js).
+function stripCrlf(s) {
+  return String(s ?? '').replace(/[\r\n]+/g, ' ').trim();
 }
 
 function escapeHtml(s) {
@@ -245,7 +260,10 @@ async function loadTemplateOverride({ tenantId, moment, ddb, logger }) {
     const s = (v) => (typeof v === 'string' ? v : undefined);
     return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html), sms: s(it.sms_text) };
   } catch (error) {
-    (logger || console).warn(`template override load failed moment=${moment}: ${error.message} (using default copy)`);
+    // error.name (not .message): SDK messages can embed the role ARN / account id / table
+    // ARN — keep CloudWatch reconnaissance-free; the code (e.g. AccessDeniedException) is
+    // the actionable part.
+    (logger || console).warn(`template override load failed moment=${moment}: ${error.name || 'error'} (using default copy)`);
     return null;
   }
 }
@@ -297,11 +315,14 @@ async function updateMessageStatus(ddb, pk, sk, status, error = '') {
 // Invoke send_email (SES) — the §E1 email-as-floor branch. send_email reads `event.body`
 // as a JSON string (API-Gateway-shaped), so wrap accordingly (mirrors notify.js).
 async function sendEmail(deps, message, content) {
+  // Attendee-facing reminder emails carry the unsubscribe line OUTSIDE the editable body
+  // (same invariant as SMS_STOP_FOOTER); coordinator attendance prompts do not.
+  const attendeeFacing = message.moment === 'reminder' && !message.attendance_check;
   const inner = {
     to: [message.recipient_email],
-    subject: content.subject,
-    text_body: content.text,
-    html_body: content.html,
+    subject: stripCrlf(content.subject),
+    text_body: attendeeFacing ? appendStopOnce(content.text, STOP_LINE_TEXT) : content.text,
+    html_body: attendeeFacing ? appendStopOnce(content.html, STOP_LINE_HTML) : content.html,
     tags: {
       tenant_id: String(message.tenant_id || 'unknown').slice(0, 256),
       email_type: 'scheduled_reminder',
@@ -318,8 +339,10 @@ async function sendSms(deps, message, content) {
   await deps.lambda.send(new InvokeCommand({
     FunctionName: SMS_SENDER_FUNCTION,
     InvocationType: 'Event',
-    Payload: JSON.stringify({
-      to: message.recipient_phone,
+    Payload: Buffer.from(JSON.stringify({
+      // E.164-normalize the send target so it matches the consent-lookup key — SMS_Sender
+      // rejects a bare 10-digit number, and the Event invoke would swallow that silently.
+      to: toE164(message.recipient_phone) || message.recipient_phone,
       // The STOP/HELP footer rides OUTSIDE the (possibly tenant-overridden) body — §E3/§E14
       // compliance invariant: an override can neither remove nor duplicate it.
       body: appendStopOnce(content.sms, SMS_STOP_FOOTER),
@@ -330,7 +353,7 @@ async function sendSms(deps, message, content) {
       type: 'reminder',
       sendType: 'contact', // activates the shipped SMS_Sender consent gate (§E3)
       fromNumber: message.from_number || '',
-    }),
+    })),
   }));
 }
 
@@ -393,7 +416,9 @@ export async function dispatch(event, deps) {
     content = {
       subject: message.subject || `Reminder from ${templateVars.organization_name || tenantId}`,
       text: renderedBody,
-      html: `<p>${renderedBody}</p>`,
+      // escapeHtml: template_vars values land here unescaped otherwise (first_name is
+      // attendee-supplied — HTML-injection guard, same as the override path's htmlVars).
+      html: `<p>${escapeHtml(renderedBody)}</p>`,
       sms: renderedBody,
     };
   }
@@ -453,6 +478,8 @@ export {
   buildReminderContent,
   REMINDER_TEMPLATES,
   SMS_STOP_FOOTER,
+  STOP_LINE_TEXT,
+  STOP_LINE_HTML,
 };
 
 /**
