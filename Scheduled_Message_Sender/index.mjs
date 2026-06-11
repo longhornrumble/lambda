@@ -32,6 +32,15 @@ import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 // This Lambda is esbuild-bundled (the raw-zip deploy can't see ../shared) — see esbuild.config.mjs.
 import { selectChannels } from '../shared/scheduling/channels.js';
 import { toE164 } from '../shared/scheduling/phone.js';
+// §E14 single-source defaults + compliance strings (extraction — was a local copy with
+// regex parity tests; now structural):
+import {
+  REMINDER_TEMPLATES,
+  STOP_LINE_TEXT,
+  STOP_LINE_HTML,
+  SMS_STOP_FOOTER,
+  appendStopOnce,
+} from '../shared/scheduling/notif-defaults.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const ddbClient = new DynamoDBClient({ region });
@@ -176,20 +185,7 @@ function renderTemplate(template, variables) {
 // clients and this bundled Lambda only imports PURE shared modules (see header). The
 // parity test pins the footer to notify's export so they cannot drift.
 
-const REMINDER_TEMPLATES = {
-  reminder_24h: {
-    subject: 'Reminder: your {{apptType}} is tomorrow — {{org}}',
-    text: 'Hi {{firstName}},\n\nThis is a reminder that your {{apptType}} with {{org}} is tomorrow.',
-    html: '<p>Hi {{firstName}},</p><p>This is a reminder that your {{apptType}} with {{org}} is tomorrow.</p>',
-    sms: 'Reminder: your {{apptType}} with {{org}} is tomorrow.',
-  },
-  reminder_1h: {
-    subject: 'Reminder: your {{apptType}} is in about an hour — {{org}}',
-    text: 'Hi {{firstName}},\n\nThis is a reminder that your {{apptType}} with {{org}} is in about an hour.',
-    html: '<p>Hi {{firstName}},</p><p>This is a reminder that your {{apptType}} with {{org}} is in about an hour.</p>',
-    sms: 'Reminder: your {{apptType}} with {{org}} is in about an hour.',
-  },
-};
+// REMINDER_TEMPLATES: imported from shared/scheduling/notif-defaults.js.
 
 // TCPA/CTIA compliance footers — appended AFTER render in sendSms/sendEmail, structurally
 // OUTSIDE the editable override body, so a tenant override can never remove them; the marker
@@ -198,14 +194,7 @@ const REMINDER_TEMPLATES = {
 // appended only to ATTENDEE-facing reminder emails — the attendance check is a coordinator
 // operational prompt (staff can't opt out of disposition asks), and notify.js owns its own
 // kinds.
-const SMS_STOP_FOOTER = '\nReply STOP to opt out, HELP for help.';
-const STOP_LINE_TEXT = '\n\nTo stop receiving these emails, reply STOP.';
-const STOP_LINE_HTML =
-  '<p style="margin-top:24px;font-size:12px;color:#64748B;">To stop receiving these emails, reply STOP.</p>';
-const _STOP_MARKER_RE = /reply\s+STOP/i;
-function appendStopOnce(rendered, stopLine) {
-  return _STOP_MARKER_RE.test(rendered) ? rendered : rendered + stopLine;
-}
+// Footers + appendStopOnce: imported from shared/scheduling/notif-defaults.js.
 
 // Subjects feed an email header — strip CRLF so a hostile override/org-name can neither
 // inject headers nor crash send_email's MIME assembly (mirrors confirmation-email.js).
