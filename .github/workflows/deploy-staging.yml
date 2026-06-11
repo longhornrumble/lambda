@@ -240,8 +240,8 @@ jobs:
             # IS the env separation, matching ADA/SMS_Sender/Calendar_*. The
             # SOURCE DIR keeps its historical name (operator decision #1:
             # repo paths are not env resources; this mapping line is the
-            # seam). The old `Master_Function_Staging` function is frozen
-            # (no longer a CI target) and decommissions in 2.5 Wave 4.
+            # seam). The old `Master_Function_Staging` function was
+            # decommissioned in 2.5 Wave 4 (picasso#516, 2026-06-11).
             staging_function: Master_Function
             handler: lambda_function.lambda_handler
             runtime: python
@@ -300,10 +300,9 @@ jobs:
             # without x-picasso-cf-origin now 403. Route the smoke through CF
             # so the header is injected. CF /Master_Function* routes to MFS;
             # action=health_check works without tenant.
-            # 2.5 TRANSITIONAL: until the Wave-2 CF origin flip, CF still
-            # routes to the OLD suffixed function — this smoke validates the
-            # public path, not the freshly-deployed bare function. Wave 2
-            # makes it exact again.
+            # Since the 2.5 Wave-2 CF origin flip (picasso#505), CF routes
+            # to the bare function — this smoke validates the freshly
+            # deployed function through the public path.
             smoke_base_url: 'https://staging.chat.myrecruiter.ai'
             smoke_path: '/Master_Function?action=health_check'
             smoke_expect_status: '200'
@@ -330,8 +329,8 @@ jobs:
             # x-picasso-cf-origin now 403. Route smoke through CF (which
             # injects the header on origin `picasso-streaming-lambda`).
             # Mirrors the MFS pattern above. Closes Phase C YIELD-2 noise.
-            # 2.5 TRANSITIONAL: validates the public path (old function)
-            # until the Wave-2 CF origin flip — see the MFS note above.
+            # Since the 2.5 Wave-2 CF origin flip (picasso#505) this
+            # validates the freshly deployed bare function — MFS note above.
             smoke_base_url: 'https://staging.chat.myrecruiter.ai'
             smoke_path: '/stream'
             smoke_expect_status: '200'
