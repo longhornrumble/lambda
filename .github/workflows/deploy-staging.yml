@@ -40,6 +40,7 @@ on:
           - Reminder_Scheduler
           - Scheduled_Message_Sender
           - Scheduling_Synthetic_Monitor
+          - Attendance_Disposition_Handler
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -589,6 +590,22 @@ jobs:
             # (cycles) — no Function URL, no smoke probe (first live run is the
             # integrator's manual cycle invoke post-deploy).
             staging_function: Scheduling_Synthetic_Monitor
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Attendance_Disposition_Handler
+            # WS-E-ATTEND (E5/E10/C13) — the missed-event attendance/escalation handler;
+            # T3 ACTIVATION (function provisioned by picasso infra/ module
+            # lambda-attendance-disposition-staging; this entry ships the real code over
+            # the placeholder). esbuild CJS bundle (npm run package); bundles
+            # ../shared/scheduling pure modules; @aws-sdk/* externalized. Role-invoked
+            # only (monitor disposition cycle today; REMIND attendance schedules later)
+            # — no Function URL, no smoke probe.
+            staging_function: Attendance_Disposition_Handler
             handler: index.handler
             runtime: nodejs
             include_globs: ''
