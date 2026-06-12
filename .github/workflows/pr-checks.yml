@@ -58,11 +58,14 @@ jobs:
       scheduling_synthetic_monitor: ${{ steps.filter.outputs.scheduling_synthetic_monitor }}
       # WS-E-OAUTH (E11) 3LO consent Lambda (jest; imports shared/scheduling/featureGate).
       calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
+      # Attribution mint service (jest; self-contained — Wave 1 WS-B).
+      attribution_mint_service: ${{ steps.filter.outputs.attribution_mint_service }}
       # Python Lambdas with tests
       meta_oauth:                ${{ steps.filter.outputs.meta_oauth }}
       master:                    ${{ steps.filter.outputs.master }}
       analytics_dashboard_api:   ${{ steps.filter.outputs.analytics_dashboard_api }}
       analytics_event_processor: ${{ steps.filter.outputs.analytics_event_processor }}
+      attribution_aggregator:   ${{ steps.filter.outputs.attribution_aggregator }}
       ses_event_handler:         ${{ steps.filter.outputs.ses_event_handler }}
       session_archiver:          ${{ steps.filter.outputs.session_archiver }}
       pii_dsar:                  ${{ steps.filter.outputs.pii_dsar }}
@@ -160,6 +163,8 @@ jobs:
               - 'Analytics_Dashboard_API/**'
             analytics_event_processor:
               - 'Analytics_Event_Processor/**'
+            attribution_aggregator:
+              - 'Attribution_Aggregator/**'
             ses_event_handler:
               - 'ses_event_handler/**'
             session_archiver:
@@ -176,6 +181,8 @@ jobs:
               - 'kb_proposal_applier/**'
             notification_hub:
               - 'notification_hub/**'
+            attribution_mint_service:
+              - 'Attribution_Mint_Service/**'
             shared:
               - 'shared/**'
 
@@ -214,7 +221,8 @@ jobs:
       needs.detect-changes.outputs.attendance_disposition_handler == 'true' ||
       needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
       needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true' ||
-      needs.detect-changes.outputs.calendar_oauth_connect == 'true'
+      needs.detect-changes.outputs.calendar_oauth_connect == 'true' ||
+      needs.detect-changes.outputs.attribution_mint_service == 'true'
 
     strategy:
       fail-fast: false   # Test all Lambdas even if one fails
@@ -252,6 +260,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.scheduling_synthetic_monitor }}
           - lambda: Calendar_OAuth_Connect
             changed: ${{ needs.detect-changes.outputs.calendar_oauth_connect }}
+          - lambda: Attribution_Mint_Service
+            changed: ${{ needs.detect-changes.outputs.attribution_mint_service }}
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -416,6 +426,7 @@ jobs:
       needs.detect-changes.outputs.master == 'true' ||
       needs.detect-changes.outputs.analytics_dashboard_api == 'true' ||
       needs.detect-changes.outputs.analytics_event_processor == 'true' ||
+      needs.detect-changes.outputs.attribution_aggregator == 'true' ||
       needs.detect-changes.outputs.ses_event_handler == 'true' ||
       needs.detect-changes.outputs.session_archiver == 'true' ||
       needs.detect-changes.outputs.pii_dsar == 'true' ||
@@ -442,6 +453,10 @@ jobs:
           - lambda: Analytics_Event_Processor
             changed: ${{ needs.detect-changes.outputs.analytics_event_processor }}
             # boto3 from Lambda runtime; no requirements.txt.
+            has_requirements: false
+          - lambda: Attribution_Aggregator
+            changed: ${{ needs.detect-changes.outputs.attribution_aggregator }}
+            # boto3/zoneinfo from Lambda runtime + stdlib; no requirements.txt (Wave 1 WS-C).
             has_requirements: false
           - lambda: ses_event_handler
             changed: ${{ needs.detect-changes.outputs.ses_event_handler }}
