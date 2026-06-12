@@ -41,6 +41,8 @@ on:
           - Scheduled_Message_Sender
           - Scheduling_Synthetic_Monitor
           - Attendance_Disposition_Handler
+          - Attribution_Mint_Service
+          - Attribution_Aggregator
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -75,6 +77,8 @@ jobs:
       calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
       reminder_scheduler: ${{ steps.filter.outputs.reminder_scheduler }}
       scheduled_message_sender: ${{ steps.filter.outputs.scheduled_message_sender }}
+      attribution_mint_service: ${{ steps.filter.outputs.attribution_mint_service }}
+      attribution_aggregator: ${{ steps.filter.outputs.attribution_aggregator }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -134,6 +138,10 @@ jobs:
               # Scheduled_Message_Sender/** change won't auto-rebundle; redeploy manually:
               #   gh workflow run "Deploy Lambda — Staging" -f lambda=Scheduled_Message_Sender
               - 'Scheduled_Message_Sender/**'
+            attribution_mint_service:
+              - 'Attribution_Mint_Service/**'
+            attribution_aggregator:
+              - 'Attribution_Aggregator/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -168,7 +176,9 @@ jobs:
       needs.detect-changes.outputs.booking_commit_handler == 'true' ||
       needs.detect-changes.outputs.calendar_oauth_connect == 'true' ||
       needs.detect-changes.outputs.reminder_scheduler == 'true' ||
-      needs.detect-changes.outputs.scheduled_message_sender == 'true'
+      needs.detect-changes.outputs.scheduled_message_sender == 'true' ||
+      needs.detect-changes.outputs.attribution_mint_service == 'true' ||
+      needs.detect-changes.outputs.attribution_aggregator == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -669,6 +679,48 @@ jobs:
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
+          - source_dir: Attribution_Mint_Service
+            # Mission Intelligence Wave 1 — Node.js esbuild bundle. Writes the
+            # picasso-entry-points-staging registry + calls Dub.co to mint short links.
+            # @aws-sdk/* deps are provided by the Lambda nodejs20.x runtime → externalized
+            # (not vendored), so NO node_modules needed in the zip. Same esbuild+externalize
+            # pattern as Calendar_Event_Consumer / Calendar_Lifecycle_Consumer.
+            # Function provisioned by Terraform in picasso#547; this entry deploys the real
+            # code over the placeholder. Env vars Terraform-managed (picasso infra/
+            # lambda-attribution-mint-service-staging module).
+            # NOTE: the staging function may not exist at the time this PR's CI runs if
+            # picasso#547 has not yet been applied — the update-function-code step will fail
+            # with ResourceNotFoundException. Do not merge this PR before picasso#547 applies.
+            staging_function: Attribution_Mint_Service
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # Direct-invoke from ADA (no public Function URL); a synthetic invoke would
+            # attempt real DDB PutItem + Dub.co API call. No automated smoke.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Attribution_Aggregator
+            # Mission Intelligence Wave 1 — Python 3.13 Lambda; hourly EventBridge schedule.
+            # Idempotently recomputes current-month C5 aggregates from session-events.
+            # boto3 is bundled in the Lambda runtime (no requirements-layer.txt needed).
+            # Function provisioned by Terraform in picasso#547; this entry deploys the real
+            # code over the placeholder. Env vars Terraform-managed (picasso infra/
+            # lambda-attribution-aggregator-staging module).
+            # NOTE: the staging function may not exist at the time this PR's CI runs if
+            # picasso#547 has not yet been applied — the update-function-code step will fail
+            # with ResourceNotFoundException. Do not merge this PR before picasso#547 applies.
+            staging_function: Attribution_Aggregator
+            handler: lambda_function.lambda_handler
+            runtime: python
+            include_globs: 'lambda_function.py'
+            env_vars: ''
+            smoke_path: ''
+            smoke_expect_status: ''
+            # Empty Records list exercises cold-start + handler entry with no side effects.
+            # Matches the Analytics_Event_Processor + picasso_session_archiver pattern.
+            smoke_invoke_event: '{"Records":[]}'
 
     steps:
       - uses: actions/checkout@v4
