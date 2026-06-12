@@ -834,6 +834,13 @@ describe('dubClient — Retry-After NaN guard (item 6)', () => {
 // ============================================================
 
 describe('mintEntryPoint — Dub POST body assertions (item 7)', () => {
+  it('extracts the key from a console-stored JSON wrapper secret', async () => {
+    setSmClient(makeSmMock('{"api-key":"dub_FROM_JSON"}'));
+    const result = await mintEntryPoint(makeValidBody());
+    expect(result.ok).toBe(true);
+    expect(globalThis.fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer dub_FROM_JSON');
+  });
+
   it('appends ?workspaceId= to the Dub URL when DUB_WORKSPACE_ID is set', async () => {
     process.env.DUB_WORKSPACE_ID = 'ws_TEST123';
     try {

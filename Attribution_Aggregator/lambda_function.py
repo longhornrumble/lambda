@@ -811,6 +811,30 @@ def _attribution_ttl() -> int:
 # ---------------------------------------------------------------------------
 # Dub analytics poll (C4)
 # ---------------------------------------------------------------------------
+def _extract_key(raw: str) -> str:
+    """
+    Console-stored secrets arrive as key/value JSON ({"api-key": "dub_..."})
+    rather than the raw string; verbatim use produced Dub 401s (2026-06-12).
+    Accept raw strings, or a JSON object with a recognizable key field
+    (or exactly one string value).
+    """
+    if not raw.startswith('{'):
+        return raw
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    if isinstance(obj, dict):
+        for k in ('api-key', 'apiKey', 'api_key', 'DUB_API_KEY', 'key', 'token'):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        strings = [v for v in obj.values() if isinstance(v, str) and v.strip()]
+        if len(strings) == 1:
+            return strings[0].strip()
+    return raw
+
+
 def _get_dub_secret() -> Optional[str]:
     """
     Fetch Dub API key from Secrets Manager (C4 / C8 Tier-4 key handling).
@@ -828,7 +852,7 @@ def _get_dub_secret() -> Optional[str]:
 
     try:
         resp = _secrets_client.get_secret_value(SecretId=DUB_SECRET_NAME)
-        secret = resp.get('SecretString', '')
+        secret = _extract_key(resp.get('SecretString', '').strip())
         _dub_secret_cache = secret
         return secret or None
     except _secrets_client.exceptions.ResourceNotFoundException:
