@@ -203,6 +203,26 @@ describe('executeGetAvailableTimes', () => {
     );
   });
 
+  test('alreadyRejected ACCUMULATES the persisted rejected_slot_ids with the model arg (§B16b rule)', async () => {
+    const args = tool1Args({
+      input: { exclude_slot_ids: ['s2', 's3'] },
+      session: { state: 'proposing', session_id: 'sess-1', rejected_slot_ids: ['s1', 's2'] },
+    });
+    await executeGetAvailableTimes(args);
+    expect(args.deps.invokeProposal.mock.calls[0][0].alreadyRejected.sort()).toEqual(['s1', 's2', 's3']);
+  });
+
+  test('no resolvable appointment type → the seam is STILL invoked (resolution lives behind §B16a), key omitted', async () => {
+    // Mirrors the §B17 eval fixtures (agentEvals A1–A3/A12): bare flags-on config, no
+    // scheduling block, no deps.qualifyingContext — the executor must not pre-empt the seam.
+    const args = tool1Args({ tenantConfig: { tenant_id: 'TEN', feature_flags: { scheduling_enabled: true } } });
+    delete args.deps.qualifyingContext;
+    const result = await executeGetAvailableTimes(args);
+    expect(args.deps.invokeProposal).toHaveBeenCalledTimes(1);
+    expect(args.deps.invokeProposal.mock.calls[0][0]).not.toHaveProperty('appointmentTypeId');
+    expect(result.slots).toHaveLength(2);
+  });
+
   test('exclude_slot_ids bounds: oversized ids dropped, list capped at 100 (payload hygiene)', async () => {
     const huge = Array.from({ length: 150 }, (_, i) => `s${i}`);
     const args = tool1Args({ input: { exclude_slot_ids: ['x'.repeat(201), ...huge] } });

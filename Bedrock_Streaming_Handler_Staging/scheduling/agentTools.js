@@ -161,15 +161,20 @@ async function executeGetAvailableTimes({
     qctx.appointmentTypeId != null ? qctx.appointmentTypeId : qctx.appointment_type_id;
   const userTimeZone = qctxUserTimeZone(qctx);
 
-  if (!appointmentTypeId || typeof deps.invokeProposal !== 'function') {
-    // Unresolvable appointment type / unwired seam — an honest transient failure to the
-    // model (§B17c error vocabulary is closed: no_availability | lookup_failed).
-    logger.warn('[WS-AG-CORE] get_available_times unavailable (no appointment type or propose seam unwired)');
+  if (typeof deps.invokeProposal !== 'function') {
+    // Unwired seam — an honest transient failure to the model (§B17c error vocabulary
+    // is closed: no_availability | lookup_failed).
+    logger.warn('[WS-AG-CORE] get_available_times unavailable (propose seam unwired)');
     return {
       error: 'lookup_failed',
       note: 'The live availability lookup is not available right now. Apologize honestly and offer the email fallback. Never invent times.',
     };
   }
+  // appointmentTypeId is server-context sourced (qualifyingContext / tenant config) and
+  // included WHEN RESOLVED — it is never a model arg and never a hard precondition here:
+  // the SHIPPED §B16a propose route owns resolution/validation behind the seam (a server-
+  // side resolution failure surfaces as outcome 'failed' → lookup_failed). Pinned by the
+  // §B17 eval suite (agentEvals A1–A3/A12 invoke the seam without a configured appt-type).
 
   // §B14-family state guard: persisting 'proposing' must be a legal move from the live
   // state. qualifying/proposing/confirming → proposing are all legal; a 'booked' (or
@@ -191,16 +196,24 @@ async function executeGetAvailableTimes({
     }
   }
 
-  const alreadyRejected = sanitizeExcludeSlotIds(input.exclude_slot_ids);
+  // §B17c: exclude_slot_ids → alreadyRejected. ACCUMULATE with the session row's
+  // persisted rejected_slot_ids (server state — mirrors the §B16b accumulation rule) so
+  // a model that forgets an earlier rejection cannot resurface already-rejected times.
+  const persistedRejected = (session && Array.isArray(session.rejected_slot_ids))
+    ? session.rejected_slot_ids.filter((v) => typeof v === 'string')
+    : [];
+  const alreadyRejected = Array.from(
+    new Set([...persistedRejected, ...sanitizeExcludeSlotIds(input.exclude_slot_ids)])
+  );
 
   const proposePayload = {
     action: 'scheduling_propose',
     tenantId,
     sessionId,
-    appointmentTypeId,
     userTimeZone,
     alreadyRejected,
   };
+  if (appointmentTypeId != null) proposePayload.appointmentTypeId = appointmentTypeId;
   // §B16a optional availability window — forward the tenant's configured window when
   // present (mirrors _propose; schema-discipline: tolerate camel OR snake; omit absent).
   const windowStart = qctx.windowStart ?? qctx.window_start;
