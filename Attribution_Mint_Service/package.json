@@ -1,0 +1,29 @@
+{
+  "name": "attribution-mint-service",
+  "version": "1.0.0",
+  "description": "Attribution entry-point mint service — creates Dub shortlinks and registry records",
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest --testEnvironment node",
+    "test:verbose": "node --experimental-vm-modules node_modules/.bin/jest --testEnvironment node --verbose",
+    "test:coverage": "node --experimental-vm-modules node_modules/.bin/jest --testEnvironment node --coverage --coverageReporters=text",
+    "package": "npm ci --omit=dev && zip -r deployment.zip . -x '*.zip' -x 'node_modules/.cache/*' -x '__tests__/*' -x 'README.md'"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@aws-sdk/lib-dynamodb": "^3.600.0"
+  },
+  "devDependencies": {
+    "@jest/globals": "^29.0.0",
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "transform": {},
+    "testMatch": ["**/__tests__/**/*.test.mjs", "**/__tests__/**/*.test.js"]
+  }
+}
