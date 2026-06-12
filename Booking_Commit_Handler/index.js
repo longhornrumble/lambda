@@ -347,6 +347,8 @@ async function commitAgainstResource({
         attendeeName: [ctx.attendee.first_name, ctx.attendee.last_name].filter(Boolean).join(' '),
         attendeePhone: ctx.attendee.phone,
         externalEventId: event.id,
+        // Native Google event link → dashboard "Open in Google Calendar" (E16 descope).
+        htmlLink: event.htmlLink,
         conferenceProvider: conference.provider,
         conferenceId,
         joinUrl,

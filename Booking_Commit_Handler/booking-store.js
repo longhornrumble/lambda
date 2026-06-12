@@ -111,6 +111,9 @@ function buildBookingItem(b) {
   if (b.appointmentTypeName) item.appointment_type_name = s(b.appointmentTypeName);
   if (b.conferenceId) item.conference_id = s(b.conferenceId);
   if (b.joinUrl) item.channel_details = s(b.joinUrl);
+  // E16-descope replacement: the dashboard deep-links "Open in Google Calendar" from
+  // this (ADA already projects it; BookingCard already renders it when present).
+  if (b.htmlLink) item.html_link = s(b.htmlLink);
   if (b.rescheduleOfBookingId) item.reschedule_of_booking_id = s(b.rescheduleOfBookingId);
   return item;
 }

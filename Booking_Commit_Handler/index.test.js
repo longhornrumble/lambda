@@ -102,7 +102,7 @@ const crypto = require('crypto');
 const h = (v) => crypto.createHash('sha256').update(String(v)).digest('hex').slice(0, 12);
 
 const FREE = { busy: [], cachedAt: 'x', source: 'google_freebusy' };
-const EVENT = { id: 'evt-1', conferenceData: {}, updated: '2026-06-01T00:00:00.000Z' };
+const EVENT = { id: 'evt-1', htmlLink: 'https://www.google.com/calendar/event?eid=evt-1', conferenceData: {}, updated: '2026-06-01T00:00:00.000Z' };
 
 function baseEvent(overrides = {}) {
   return {
@@ -200,6 +200,8 @@ describe('NullConferenceProvider DI — interface-seam verification', () => {
     const written = bookingStore.writeBooking.mock.calls[0][0];
     expect(written.status).toBe('booked');
     expect(written.externalEventId).toBe('evt-1');
+    // E16-descope deep link: the insert response's htmlLink rides into the Booking row.
+    expect(written.htmlLink).toBe('https://www.google.com/calendar/event?eid=evt-1');
   });
 });
 
