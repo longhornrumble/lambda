@@ -11,8 +11,9 @@
  *                                                  flip (firing-path proof; §5.1 cadence)
  *   - revocation_observe (operator-invoked)     — one-time-token success→410 (§13.7)
  *   - cleanup            (EventBridge, nightly) — delete synthetic bookings >7d (§5.1 hygiene)
- *   - disposition        (EventBridge, daily)   — attend check→pending_attendance→no_show
- *                                                  disposition→idempotency (WS-T3-DISP / CI-6)
+ *   - disposition        (EventBridge, daily)   — attend check→pending_attendance→
+ *                                                  coordinator_no_show disposition→idempotency
+ *                                                  (WS-T3-DISP / CI-6; didnt_connect — no outbound)
  *
  * The `reminder` cycle requires STAGING_TEST_MODE=true on BCH + a longer Lambda timeout
  * (it polls ~7min for the fire). The `disposition` cycle requires ATTEND_FUNCTION_NAME env
@@ -26,7 +27,8 @@
  * Invocation: { cycle: 'cancel' | 'reminder' | 'cleanup' | 'disposition' }, or for the
  * operator-triggered token cycle { cycle: 'revocation_observe', slug: '/cancel', token: '<one-time token>' }.
  * The `disposition` cycle (CI-6 5th cycle, WS-T3-DISP) is EventBridge-triggered (daily
- * recommended): book → attendance_check → no_show disposition → idempotency assert.
+ * recommended): book → attendance_check → didnt_connect disposition → coordinator_no_show
+ * + idempotency assert. Uses didnt_connect (no outbound, no signing-key dep, no send_email grant).
  * Requires STAGING_TEST_MODE=true + ATTEND_FUNCTION_NAME pointing at Attendance_Disposition_Handler.
  */
 

@@ -26,9 +26,9 @@ function pendingAttendanceRow(overrides = {}) {
   return baseBooking({ attendance_state: 'pending_attendance', ...overrides });
 }
 
-// Row state after applyDisposition(no_show).
-function noShowRow(overrides = {}) {
-  return baseBooking({ status: 'no_show', attendance_state: 'resolved', ...overrides });
+// Row state after applyDisposition(didnt_connect) → coordinator_no_show.
+function coordNoShowRow(overrides = {}) {
+  return baseBooking({ status: 'coordinator_no_show', attendance_state: 'resolved', ...overrides });
 }
 
 function makeDeps(overrides = {}) {
@@ -48,11 +48,11 @@ function makeDeps(overrides = {}) {
       // first call: assert pending_attendance on the row
       .mockResolvedValueOnce(pendingAttendanceRow())
       // subsequent calls: the poll after disposition resolves immediately
-      .mockResolvedValue(noShowRow()),
+      .mockResolvedValue(coordNoShowRow()),
     applyDisposition: jest
       .fn()
-      // first call: the real no_show transition
-      .mockResolvedValueOnce({ outcome: 'no_show', transitioned: true, status: 'no_show' })
+      // first call: the real didnt_connect transition → coordinator_no_show
+      .mockResolvedValueOnce({ outcome: 'coordinator_no_show', transitioned: true, status: 'coordinator_no_show' })
       // second call: the idempotency check
       .mockResolvedValueOnce({ outcome: 'already_resolved', transitioned: false }),
     emitCycleResult,
@@ -65,7 +65,7 @@ function makeDeps(overrides = {}) {
 }
 
 describe('disposition-cycle — happy path', () => {
-  test('full cycle: book → attend check → pending_attendance → no_show → idempotency ok → success metric', async () => {
+  test('full cycle: book → attend check → pending_attendance → coordinator_no_show → idempotency ok → success metric', async () => {
     const deps = makeDeps();
     const res = await runDispositionCycle(deps);
 
@@ -80,13 +80,13 @@ describe('disposition-cycle — happy path', () => {
       })
     );
 
-    // Step 4: first applyDisposition call is the real no_show transition
+    // Step 4: first applyDisposition call is the real didnt_connect transition
     expect(deps.applyDisposition).toHaveBeenNthCalledWith(
       1,
       expect.objectContaining({
         tenantId: TENANT,
         bookingId: BOOKING_ID,
-        purpose: 'no_show',
+        purpose: 'didnt_connect',
       })
     );
 
@@ -96,7 +96,7 @@ describe('disposition-cycle — happy path', () => {
       expect.objectContaining({
         tenantId: TENANT,
         bookingId: BOOKING_ID,
-        purpose: 'no_show',
+        purpose: 'didnt_connect',
       })
     );
     expect(deps.applyDisposition).toHaveBeenCalledTimes(2);
@@ -118,7 +118,7 @@ describe('disposition-cycle — happy path', () => {
   });
 
   test('polls the booking row until status + attendance_state match (eventual consistency)', async () => {
-    const notYetRow = noShowRow({ status: 'booked', attendance_state: 'pending_attendance' });
+    const notYetRow = coordNoShowRow({ status: 'booked', attendance_state: 'pending_attendance' });
     const getBooking = jest
       .fn()
       // Step 3: pending_attendance assertion (first read)
@@ -127,7 +127,7 @@ describe('disposition-cycle — happy path', () => {
       .mockResolvedValueOnce(notYetRow)
       .mockResolvedValueOnce(notYetRow)
       // Step 5 poll: third read is terminal
-      .mockResolvedValueOnce(noShowRow());
+      .mockResolvedValueOnce(coordNoShowRow());
 
     const deps = makeDeps({ getBooking, pollAttempts: 5 });
     const res = await runDispositionCycle(deps);
@@ -197,7 +197,7 @@ describe('disposition-cycle — failure modes', () => {
     const getBooking = jest
       .fn()
       .mockResolvedValueOnce(baseBooking({ attendance_state: null }))
-      .mockResolvedValue(noShowRow());
+      .mockResolvedValue(coordNoShowRow());
 
     const deps = makeDeps({ getBooking });
     const res = await runDispositionCycle(deps);
@@ -211,7 +211,7 @@ describe('disposition-cycle — failure modes', () => {
     const getBooking = jest
       .fn()
       .mockResolvedValueOnce(pendingAttendanceRow({ status: 'canceled' }))
-      .mockResolvedValue(noShowRow());
+      .mockResolvedValue(coordNoShowRow());
 
     const deps = makeDeps({ getBooking });
     const res = await runDispositionCycle(deps);
@@ -221,7 +221,7 @@ describe('disposition-cycle — failure modes', () => {
     expect(deps.applyDisposition).not.toHaveBeenCalled();
   });
 
-  test('fails when applyDisposition returns unexpected outcome (not no_show)', async () => {
+  test('fails when applyDisposition returns unexpected outcome (not coordinator_no_show)', async () => {
     const deps = makeDeps({
       applyDisposition: jest
         .fn()
@@ -231,7 +231,7 @@ describe('disposition-cycle — failure modes', () => {
 
     expect(res.success).toBe(false);
     expect(res.error).toMatch(/completed/);
-    expect(res.error).toMatch(/expected no_show/);
+    expect(res.error).toMatch(/expected coordinator_no_show/);
   });
 
   test('fails when applyDisposition throws', async () => {
@@ -248,7 +248,7 @@ describe('disposition-cycle — failure modes', () => {
     expect(deps.alert).toHaveBeenCalled();
   });
 
-  test('fails when row never reaches no_show+resolved within poll window', async () => {
+  test('fails when row never reaches coordinator_no_show+resolved within poll window', async () => {
     const getBooking = jest
       .fn()
       // Step 3: pending_attendance assertion passes
@@ -260,7 +260,7 @@ describe('disposition-cycle — failure modes', () => {
     const res = await runDispositionCycle(deps);
 
     expect(res.success).toBe(false);
-    expect(res.error).toMatch(/no_show.*resolved.*within 2 polls/);
+    expect(res.error).toMatch(/coordinator_no_show.*resolved.*within 2 polls/);
     // idempotency step must not run if the row never resolved
     expect(deps.applyDisposition).toHaveBeenCalledTimes(1);
   });
@@ -268,9 +268,9 @@ describe('disposition-cycle — failure modes', () => {
   test('fails when idempotency check returns an unexpected outcome', async () => {
     const applyDisposition = jest
       .fn()
-      .mockResolvedValueOnce({ outcome: 'no_show', transitioned: true })
+      .mockResolvedValueOnce({ outcome: 'coordinator_no_show', transitioned: true })
       // second call: returns something unexpected instead of already_resolved
-      .mockResolvedValueOnce({ outcome: 'no_show', transitioned: true });
+      .mockResolvedValueOnce({ outcome: 'coordinator_no_show', transitioned: true });
 
     const deps = makeDeps({ applyDisposition });
     const res = await runDispositionCycle(deps);

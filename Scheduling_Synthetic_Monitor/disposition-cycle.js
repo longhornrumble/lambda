@@ -6,28 +6,39 @@
  *   book (real propose→commit, is_synthetic:true) with event_end ALREADY IN THE PAST
  *   (or immediate — set via cyclePrefix='disposition' so BCH time-compression is active
  *   when STAGING_TEST_MODE is set) → invoke Attendance_Disposition_Handler with
- *   action:'attendance_check' → assert attendance_state='pending_attendance' + 3 minted
- *   §B4 purposes present → drive ONE disposition: applyDisposition({purpose:'no_show'})
- *   (the §E4 path with a volunteer-facing no_show reoffer — exercises more of the surface
- *   than attended_yes, which has no outbound) → assert Booking.status='no_show' +
- *   Booking.attendance_state='resolved' → assert idempotency: second applyDisposition
- *   yields outcome='already_resolved' → emit CycleSuccess/CycleFailure + SNS on failure.
+ *   action:'attendance_check' → assert attendance_state='pending_attendance' → drive ONE
+ *   disposition: applyDisposition({purpose:'didnt_connect'}) → assert
+ *   Booking.status='coordinator_no_show' + Booking.attendance_state='resolved' → assert
+ *   idempotency: second applyDisposition yields outcome='already_resolved' → emit
+ *   CycleSuccess/CycleFailure + SNS on failure.
  *
  * ── Design choice: applyDisposition (shared module), not HTTP redemption endpoint ──
- *   The work-order offered two paths: redeem the no_show token against the HTTP redemption
- *   surface (like revocation-observer.js), OR invoke the handler-side path. We choose the
+ *   The work-order offered two paths: redeem a token against the HTTP redemption surface
+ *   (like revocation-observer.js), OR invoke the handler-side path. We choose the
  *   handler-side path (applyDisposition from shared/scheduling/disposition.js) for two
  *   reasons:
  *     1. Less new surface: no HTTP fetch client in the monitor, no live REDEMPTION_BASE_URL
  *        dependency, no token extraction from the prompt email (which is not machine-readable
  *        in the synthetic path). The HTTP path would require the monitor to hold the JWT
- *        signing key (to mint its own no_show token) or extract the token from the
- *        confirmation email — both introduce state the monitor must not own.
+ *        signing key or extract the token from the confirmation email — both introduce state
+ *        the monitor must not own.
  *     2. Token hygiene: the attendance tokens are single-use (§13.7). Burning one inside a
  *        synthetic cycle would consume a real jti. The applyDisposition call is the same code
  *        path the Scheduling_Redemption_Handler calls after token redemption (§E4 §11.2),
  *        so we exercise the full disposition logic without touching the token layer.
  *   The applyDisposition dep is injected at the DI seam so tests stay AWS-free.
+ *
+ * ── Why 'didnt_connect' (not 'no_show') ──
+ *   §11.2: didnt_connect → coordinator_no_show sets status + attendance_state='resolved' with
+ *   NO outbound at all (no volunteer reoffer notice, no reschedule-token mint). Choosing
+ *   'no_show' would reach tokens.sign (requires the JWT signing key — the monitor must never
+ *   hold it) and notify.dispatchVolunteerNotice → defaultInvokeEmail (requires
+ *   lambda:InvokeFunction on send_email — ungranted on the monitor role). The
+ *   volunteer-notice outbound path (no_show/reschedule-token + email) stays covered by the
+ *   ATTEND/redemption unit tests; the synthetic cycle proves: attendance_check conditional
+ *   write, the status transition (via the single DDB UpdateItem that is the ONLY live
+ *   dependency here), attendance_state=resolved, and idempotency — with the monitor holding
+ *   NO signing key and sending NO mail.
  *
  * ── Synthetic booking shape ──
  *   createSyntheticBooking is reused verbatim. The resulting booking has status='booked' and
@@ -36,16 +47,22 @@
  *   the timing constraint is the ATTEND handler's own `status==='booked'` guard).
  *
  * ── Cleanup ──
- *   The synthetic booking ends with status='no_show' (a terminal status — never 'canceled').
- *   The nightly cleanup cycle (cleanup.js) deletes is_synthetic rows regardless of their
- *   terminal status: querySyntheticOlderThan filters on is_synthetic=true + item_type=booking
- *   + created_at < cutoff; status is irrelevant. No_show rows beyond the retention window
- *   are cleaned up exactly like canceled rows — no new cleanup logic needed.
+ *   The synthetic booking ends with status='coordinator_no_show' (a terminal status — never
+ *   'canceled'). The nightly cleanup cycle (cleanup.js) deletes is_synthetic rows regardless
+ *   of their terminal status: querySyntheticOlderThan filters on is_synthetic=true +
+ *   item_type=booking + created_at < cutoff; status is irrelevant. coordinator_no_show rows
+ *   beyond the retention window are cleaned up exactly like canceled rows — no new cleanup
+ *   logic needed.
  *
  * ── Prod-guard ──
  *   The cycle lives inside the same prod-guarded Lambda (index.js). The double-gate
  *   (is_synthetic on the row + STAGING_TEST_MODE on BCH) still applies. The disposition
  *   itself is a real DDB write — it only runs on a booking we just created as synthetic.
+ *
+ * ── Build note ──
+ *   The runtime require('../shared/scheduling/disposition') is resolved at build time by the
+ *   esbuild bundle (npm run build), same as other lambdas bundling shared modules — no
+ *   deploy-zip gap.
  */
 
 const syntheticBooking = require('./synthetic-booking');
@@ -69,11 +86,13 @@ function defaultApplyDisposition(args) {
 const POLL_ATTEMPTS = Number(process.env.DISPOSITION_POLL_ATTEMPTS || 8);
 const POLL_INTERVAL_MS = Number(process.env.DISPOSITION_POLL_INTERVAL_MS || 3000);
 
-// The §E4 disposition we drive in the synthetic cycle. 'no_show' is the most exercising
-// option: it sets status=no_show, attendance_state=resolved, AND fires the volunteer reoffer
-// notice (emails scheduling-monitor@myrecruiter.ai — an expected synthetic side-effect).
-const SYNTHETIC_DISPOSITION_PURPOSE = 'no_show';
-const EXPECTED_TERMINAL_STATUS = 'no_show'; // §E4: no_show → Booking.status='no_show'
+// The §E4 disposition we drive in the synthetic cycle. 'didnt_connect' → coordinator_no_show:
+// sets status + attendance_state='resolved' with NO outbound (no reschedule-token mint, no
+// volunteer reoffer email, no lambda:InvokeFunction on send_email). The monitor role has no
+// JWT signing key grant and no send_email invoke grant — using 'no_show' would reach both.
+// The volunteer-notice path stays covered by the ATTEND/redemption unit tests.
+const SYNTHETIC_DISPOSITION_PURPOSE = 'didnt_connect';
+const EXPECTED_TERMINAL_STATUS = 'coordinator_no_show'; // §E4: didnt_connect → coordinator_no_show
 const EXPECTED_ATTENDANCE_STATE = 'resolved'; // §E4: disposition clears the flow label
 
 function log(event, fields) {
@@ -151,10 +170,12 @@ async function runDispositionCycle(deps = {}) {
       booking_id: bookingId,
     });
 
-    // ── Step 4: drive ONE disposition (no_show) ─────────────────────────────────────────
+    // ── Step 4: drive ONE disposition (didnt_connect → coordinator_no_show) ────────────
     //   applyDisposition is the same function the Scheduling_Redemption_Handler calls after
     //   token redemption (§E4 §11.2). We inject it as a dep so tests stay AWS-free. The
     //   production default runs against the real BOOKING_TABLE (shared env var).
+    //   'didnt_connect' has no outbound (no token mint, no volunteer email) — the only live
+    //   dependency is the conditional DDB UpdateItem on the Booking row.
     const disposition = await applyDisposition({
       tenantId,
       bookingId,
