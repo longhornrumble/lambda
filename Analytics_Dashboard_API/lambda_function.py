@@ -61,6 +61,12 @@ from botocore.exceptions import ClientError
 from botocore.config import Config
 from boto3.dynamodb.types import TypeSerializer, TypeDeserializer
 import tenant_registry_ops
+from attribution_api import (
+    handle_attribution_summary,
+    handle_attribution_channel,
+    handle_attribution_entry_points_list,
+    handle_attribution_mint,
+)
 
 # Configure logging
 logger = logging.getLogger()
@@ -142,6 +148,14 @@ _BOOKING_CURSOR_KEYS = {
 # BOTH tables — a NEW grant, owed at deploy.
 APPOINTMENT_TYPE_TABLE = os.environ.get('APPOINTMENT_TYPE_TABLE', 'picasso-appointment-type')
 ROUTING_POLICY_TABLE = os.environ.get('ROUTING_POLICY_TABLE', 'picasso-routing-policy')
+
+# Attribution (WS-D) — C5 aggregates, C3 registry, C4b mint proxy
+# C5 re-home (2026-06-12): new env var + new table; legacy AGGREGATES_TABLE/
+# picasso-dashboard-aggregates are dead — using them yields silent all-zero responses.
+# ENTRY_POINTS_TABLE and MINT_FUNCTION_NAME are new; integrator glue must set them.
+AGGREGATES_TABLE = os.environ.get('ATTRIBUTION_AGGREGATES_TABLE', 'picasso-attribution-aggregates')
+ENTRY_POINTS_TABLE = os.environ.get('ENTRY_POINTS_TABLE', '')
+MINT_FUNCTION_NAME = os.environ.get('MINT_FUNCTION_NAME', '')
 
 # S3 Tenant Configuration
 S3_CONFIG_BUCKET = os.environ.get('S3_CONFIG_BUCKET', 'picasso-configs')
@@ -681,6 +695,30 @@ def lambda_handler(event, context):
         elif path.endswith('/preferences') and method == 'PATCH':
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_preferences_patch(auth_result, body)
+
+        # Attribution endpoints (WS-D — C6)
+        # More-specific /channels/{ch} must come before the prefix check.
+        elif '/attribution/channels/' in path and method == 'GET':
+            channel = path.split('/attribution/channels/')[-1].split('/')[0]
+            _attr_config = get_tenant_config(tenant_id) or {}
+            return handle_attribution_channel(
+                tenant_id, channel, params, _attr_config,
+                cors_response, user_role, validate_feature_access,
+            )
+        elif path.endswith('/attribution/summary') and method == 'GET':
+            _attr_config = get_tenant_config(tenant_id) or {}
+            return handle_attribution_summary(
+                tenant_id, params, _attr_config,
+                cors_response, user_role, validate_feature_access,
+            )
+        elif path.endswith('/attribution/entry-points') and method == 'GET':
+            return handle_attribution_entry_points_list(
+                tenant_id, cors_response, user_role, validate_feature_access,
+            )
+        elif path.endswith('/attribution/entry-points') and method == 'POST':
+            return handle_attribution_mint(
+                tenant_id, event, cors_response, user_role, validate_feature_access,
+            )
 
         else:
             return cors_response(404, {'error': f'Unknown endpoint: {path}'})
