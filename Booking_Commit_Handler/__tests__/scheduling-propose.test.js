@@ -287,3 +287,76 @@ describe('index.js scheduling_propose dispatch — fail-closed gate', () => {
     expect(res.slots).toHaveLength(2);
   });
 });
+
+// ─── §B16e date_window passthrough (WS-T3-DAYPICK-BE) ────────────────────────────────────
+
+describe('handleSchedulingPropose — §B16e date_window passthrough', () => {
+  it('absent date_window: pool.select is called WITHOUT dateWindow (shipped behavior unchanged)', async () => {
+    const { calls, injected } = baseInjected();
+    await handleSchedulingPropose(PROPOSE_EVENT, injected);
+    expect(calls.select).toHaveLength(1);
+    const selectArg = calls.select[0];
+    // No dateWindow key should be present when date_window is absent.
+    expect(selectArg.dateWindow).toBeUndefined();
+  });
+
+  it('present date_window: pool.select receives dateWindow with startISO/endISO mapped from start/end', async () => {
+    const { calls, injected } = baseInjected();
+    const eventWithWindow = {
+      ...PROPOSE_EVENT,
+      date_window: { start: '2026-07-06T00:00:00.000Z', end: '2026-07-07T00:00:00.000Z' },
+    };
+    await handleSchedulingPropose(eventWithWindow, injected);
+    expect(calls.select).toHaveLength(1);
+    const selectArg = calls.select[0];
+    expect(selectArg.dateWindow).toEqual({
+      startISO: '2026-07-06T00:00:00.000Z',
+      endISO: '2026-07-07T00:00:00.000Z',
+    });
+  });
+
+  it('date_window with only start: dateWindow.startISO is set, endISO is undefined', async () => {
+    const { calls, injected } = baseInjected();
+    const eventWithWindow = {
+      ...PROPOSE_EVENT,
+      date_window: { start: '2026-07-06T00:00:00.000Z' },
+    };
+    await handleSchedulingPropose(eventWithWindow, injected);
+    const selectArg = calls.select[0];
+    expect(selectArg.dateWindow.startISO).toBe('2026-07-06T00:00:00.000Z');
+    expect(selectArg.dateWindow.endISO).toBeUndefined();
+  });
+
+  it('date_window: outcome and response shape are unchanged (no regression)', async () => {
+    const { injected } = baseInjected();
+    const eventWithWindow = {
+      ...PROPOSE_EVENT,
+      date_window: { start: '2026-07-06T00:00:00.000Z', end: '2026-07-07T00:00:00.000Z' },
+    };
+    const res = await handleSchedulingPropose(eventWithWindow, injected);
+    // Response shape is identical to the no-window path.
+    expect(res.outcome).toBe('ok');
+    expect(res.poolSize).toBe(2);
+    expect(res.slots).toHaveLength(2);
+    expect(res.tieBreaker).toBe('round_robin');
+    expect(res.roundRobinCursor).toBeDefined();
+  });
+
+  it('date_window: the frozen windowStart/windowEnd fields still pass through unchanged', async () => {
+    const { calls, injected } = baseInjected();
+    const eventWithBoth = {
+      ...PROPOSE_EVENT,
+      windowStart: '2026-07-06T09:00:00Z',
+      windowEnd: '2026-07-06T17:00:00Z',
+      date_window: { start: '2026-07-06T00:00:00.000Z', end: '2026-07-07T00:00:00.000Z' },
+    };
+    await handleSchedulingPropose(eventWithBoth, injected);
+    const selectArg = calls.select[0];
+    expect(selectArg.windowStart).toBe('2026-07-06T09:00:00Z');
+    expect(selectArg.windowEnd).toBe('2026-07-06T17:00:00Z');
+    expect(selectArg.dateWindow).toEqual({
+      startISO: '2026-07-06T00:00:00.000Z',
+      endISO: '2026-07-07T00:00:00.000Z',
+    });
+  });
+});

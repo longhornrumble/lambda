@@ -219,18 +219,29 @@ describe('runNewBookingTurn — qualifying entry: propose + advance on ok', () =
     expect('windowEnd' in payload).toBe(false);
   });
 
-  test("outcome 'failed' (clean return, not a throw) → STAY in fromState, no advance", async () => {
+  test("outcome 'failed' (clean return, not a throw) → STAY in fromState, §B16e emits picker (not a crash)", async () => {
+    // §B16e: any non-ok outcome (including 'failed') triggers the day-picker (trigger a).
+    // The state must stay in qualifying (strand-prevention); a picker or escape is emitted.
     const saveState = jest.fn();
     const invokeProposal = jest.fn().mockResolvedValue({ outcome: 'failed', error: 'pool_read_error' });
+    const writes = [];
     const res = await runNewBookingTurn(baseTurn({
+      write: (msg) => writes.push(msg),
       bedrock: fakeBedrock({ action: 'none' }),
       deps: { loadState: async () => ({ state: 'qualifying' }), qualifyingContext: QCTX, invokeProposal, saveState },
     }));
-    expect(res).toMatchObject({ handled: true, executed: false, state: 'qualifying', reason: 'failed' });
-    expect(saveState).not.toHaveBeenCalled();
+    expect(res.handled).toBe(true);
+    expect(res.executed).toBe(false);
+    expect(res.state).toBe('qualifying'); // state MUST stay qualifying (strand-prevention)
+    // picker or escape must be emitted — scheduling_no_availability must NOT.
+    expect(writes.some((w) => w.includes('scheduling_no_availability'))).toBe(false);
+    expect(
+      writes.some((w) => w.includes('scheduling_day_picker') || w.includes('scheduling_notice'))
+    ).toBe(true);
   });
 
-  test("outcome 'no_availability' → STAY in qualifying (no advance, no strand)", async () => {
+  test("outcome 'no_availability' → STAY in qualifying (no advance, no strand); §B16e emits picker", async () => {
+    // §B16e replaces the scheduling_no_availability emit with the day-picker.
     const write = jest.fn();
     const saveState = jest.fn();
     const invokeProposal = jest.fn().mockResolvedValue({ outcome: 'no_availability', slots: [] });
@@ -239,9 +250,12 @@ describe('runNewBookingTurn — qualifying entry: propose + advance on ok', () =
       bedrock: fakeBedrock({ action: 'none' }),
       deps: { loadState: async () => ({ state: 'qualifying' }), qualifyingContext: QCTX, invokeProposal, saveState },
     }));
-    expect(res).toMatchObject({ handled: true, executed: false, state: 'qualifying', reason: 'no_availability' });
-    expect(saveState).not.toHaveBeenCalled(); // never advanced
-    expect(write.mock.calls[0][0]).toContain('scheduling_no_availability');
+    expect(res.handled).toBe(true);
+    expect(res.executed).toBe(false);
+    expect(res.state).toBe('qualifying'); // state MUST NOT advance (strand-prevention)
+    // §B16e: scheduling_no_availability is replaced by scheduling_day_picker.
+    expect(write.mock.calls.some((args) => args[0].includes('scheduling_no_availability'))).toBe(false);
+    expect(write.mock.calls.some((args) => args[0].includes('scheduling_day_picker'))).toBe(true);
   });
 
   test('no appointmentTypeId resolved yet (multi-type tenant asking which) → STAY qualifying, no propose', async () => {

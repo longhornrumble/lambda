@@ -24,6 +24,11 @@
  *
  * PII: the propose payload carries NO attendee identity (it stays in the BSH flow until
  * commit) — this route logs none (only tenant/appointment ids + counts).
+ *
+ * §B16e extension: OPTIONAL `date_window: { start, end }` (ISO8601 strings) is passed
+ * through to pool.select's `windowStart`/`windowEnd` (the existing §B16a window params)
+ * and ultimately to generateSlots's `dateWindow`. When absent, the shipped §B16a contract
+ * is byte-identical in behavior — no change to pool.select's call site or output shape.
  */
 
 const pool = require('../shared/scheduling/pool'); // C6 — the shipped orchestrator
@@ -49,7 +54,15 @@ async function handleSchedulingPropose(event = {}, injected = {}) {
   const _getRoutingPolicy = injected.getRoutingPolicy || candidateResolver.defaultGetRoutingPolicy;
   const logger = injected.logger || console;
 
-  const { tenantId, appointmentTypeId, userTimeZone, alreadyRejected, windowStart, windowEnd } = event;
+  const {
+    tenantId, appointmentTypeId, userTimeZone, alreadyRejected,
+    windowStart, windowEnd,
+    // §B16e: optional day-picker constraint — { start, end } ISO8601 strings.
+    // Absent → unchanged behavior; present → passed to pool.select as dateWindow so
+    // generateSlots constrains candidates to this day. Schema-discipline: tolerate
+    // missing fields (no crash when caller omits the field).
+    date_window,
+  } = event;
   if (!tenantId || !appointmentTypeId || !userTimeZone) {
     return { outcome: 'failed', slots: [], poolSize: 0, error: 'missing_required_fields' };
   }
@@ -91,7 +104,11 @@ async function handleSchedulingPropose(event = {}, injected = {}) {
     );
 
     // The SHIPPED C6 orchestrator — do NOT re-implement its freeBusy/eval/slot passes.
-    const result = await _select({
+    // §B16e: map date_window.{start,end} → dateWindow.{startISO,endISO} for generateSlots.
+    // pool.select already accepts windowStart/windowEnd for the §B16a availability window;
+    // the dateWindow param is a NEW additive param that threads into generateSlots only —
+    // pass it alongside so pool.select can forward it. Absent → no-op (undefined stripped).
+    const selectArgs = {
       tenantId,
       appointmentType,
       routingPolicy,
@@ -100,7 +117,15 @@ async function handleSchedulingPropose(event = {}, injected = {}) {
       alreadyRejected, // forwarded UNCHANGED → pool.select's `slot#${start}` re-offer dedup
       windowStart,
       windowEnd,
-    });
+    };
+    if (date_window != null) {
+      // Normalise to the shape generateSlots expects ({ startISO, endISO }).
+      selectArgs.dateWindow = {
+        startISO: date_window.start,
+        endISO: date_window.end,
+      };
+    }
+    const result = await _select(selectArgs);
 
     const orderedPool = (result && result.orderedPool) || [];
     const response = {

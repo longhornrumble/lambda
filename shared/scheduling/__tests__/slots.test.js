@@ -498,3 +498,144 @@ describe('validation', () => {
     expect(slots.length).toBeGreaterThan(0);
   });
 });
+
+// ─── §B16e dateWindow extension (WS-T3-DAYPICK-BE) ──────────────────────────────────
+
+describe('generateSlots — §B16e dateWindow (optional constraint)', () => {
+  // A Monday 09:00–12:00 window in Chicago with 60-min slots + 60-min granularity.
+  // 2026-07-06 is a Monday; 2026-07-13 is the following Monday.
+  const appt = {
+    duration_minutes: 60,
+    timezone: CHI,
+    availability_windows: everyDay([{ start: '09:00', end: '12:00' }]),
+  };
+  // now = 2026-07-01 00:00 UTC (before all test windows)
+  const NOW = '2026-07-01T00:00:00Z';
+
+  test('frozen 4-key call is byte-identical in behavior when dateWindow is absent', () => {
+    const withoutWindow = generateSlots({
+      busyIntervals: [],
+      appointmentType: appt,
+      userTimeZone: CHI,
+      alreadyRejected: [],
+      now: NOW,
+    });
+    const withUndefined = generateSlots({
+      busyIntervals: [],
+      appointmentType: appt,
+      userTimeZone: CHI,
+      alreadyRejected: [],
+      now: NOW,
+      dateWindow: undefined,
+    });
+    // Byte-identical: same slots in the same order.
+    expect(withUndefined).toEqual(withoutWindow);
+    expect(withoutWindow.length).toBeGreaterThan(0);
+  });
+
+  test('dateWindow constrains slots to the specified day', () => {
+    // Window = the full UTC day of 2026-07-06 (a Monday with 09:00–12:00 Chicago windows).
+    const startISO = '2026-07-06T00:00:00.000Z';
+    const endISO = '2026-07-07T00:00:00.000Z';
+    const slots = generateSlots({
+      busyIntervals: [],
+      appointmentType: appt,
+      userTimeZone: CHI,
+      alreadyRejected: [],
+      now: NOW,
+      dateWindow: { startISO, endISO },
+    });
+    expect(slots.length).toBeGreaterThan(0);
+    // Every slot must start within the window [startISO, endISO).
+    for (const s of slots) {
+      const ms = Date.parse(s.start);
+      expect(ms).toBeGreaterThanOrEqual(Date.parse(startISO));
+      expect(ms).toBeLessThan(Date.parse(endISO));
+    }
+    // No slots should appear from a DIFFERENT day (e.g. 2026-07-07 or later).
+    for (const s of slots) {
+      expect(s.start.startsWith('2026-07-06')).toBe(true);
+    }
+  });
+
+  test('dateWindow with only startISO applies lower bound (no upper cutoff)', () => {
+    // Only a startISO is supplied (no endISO). Slots should start from startISO onward.
+    const startISO = '2026-07-08T00:00:00.000Z'; // Wednesday
+    const slots = generateSlots({
+      busyIntervals: [],
+      appointmentType: appt,
+      userTimeZone: CHI,
+      alreadyRejected: [],
+      now: NOW,
+      dateWindow: { startISO },
+    });
+    expect(slots.length).toBeGreaterThan(0);
+    for (const s of slots) {
+      expect(Date.parse(s.start)).toBeGreaterThanOrEqual(Date.parse(startISO));
+    }
+  });
+
+  test('dateWindow with only endISO applies upper bound (no lower cutoff)', () => {
+    // Only an endISO is supplied. Slots should all start before endISO.
+    const endISO = '2026-07-02T00:00:00.000Z'; // tight window — one day ahead
+    const slots = generateSlots({
+      busyIntervals: [],
+      appointmentType: appt,
+      userTimeZone: CHI,
+      alreadyRejected: [],
+      now: NOW,
+      dateWindow: { endISO },
+    });
+    // 2026-07-01 is a Wednesday — check if any slots fall within the window.
+    // If there are slots they must be before endISO.
+    for (const s of slots) {
+      expect(Date.parse(s.start)).toBeLessThan(Date.parse(endISO));
+    }
+  });
+
+  test('dateWindow for a day with no windows returns empty array (no crash)', () => {
+    // Only Saturday windows — use a Monday-targeted window.
+    const satOnly = {
+      duration_minutes: 60,
+      timezone: CHI,
+      availability_windows: { sun: [], mon: [], tue: [], wed: [], thu: [], fri: [], sat: [{ start: '10:00', end: '16:00' }] },
+    };
+    const startISO = '2026-07-06T00:00:00.000Z'; // Monday
+    const endISO = '2026-07-07T00:00:00.000Z';
+    const slots = generateSlots({
+      busyIntervals: [],
+      appointmentType: satOnly,
+      userTimeZone: CHI,
+      alreadyRejected: [],
+      now: NOW,
+      dateWindow: { startISO, endISO },
+    });
+    expect(slots).toEqual([]);
+  });
+
+  test('dateWindow regression: alreadyRejected still dedupes within the window', () => {
+    // Generate slots for the window without rejects, collect their slotIds,
+    // then re-call with all of them in alreadyRejected → result is empty.
+    const startISO = '2026-07-06T00:00:00.000Z';
+    const endISO = '2026-07-07T00:00:00.000Z';
+    const base = generateSlots({
+      busyIntervals: [],
+      appointmentType: appt,
+      userTimeZone: CHI,
+      alreadyRejected: [],
+      now: NOW,
+      dateWindow: { startISO, endISO },
+    });
+    expect(base.length).toBeGreaterThan(0);
+
+    const dedupedSlots = generateSlots({
+      busyIntervals: [],
+      appointmentType: appt,
+      userTimeZone: CHI,
+      alreadyRejected: base.map((s) => s.slotId),
+      now: NOW,
+      dateWindow: { startISO, endISO },
+    });
+    expect(dedupedSlots).toEqual([]);
+  });
+});
