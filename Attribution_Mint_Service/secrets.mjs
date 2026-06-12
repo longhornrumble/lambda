@@ -43,6 +43,26 @@ export function setSmClient(client) {
  *
  * @returns {Promise<string|null>}
  */
+/**
+ * Operators storing the key via the Secrets Manager CONSOLE get a key/value
+ * JSON wrapper ({"api-key":"dub_..."}) instead of the raw string -- using it
+ * verbatim as a bearer token produces Dub 401s (live incident 2026-06-12).
+ * Accept both: raw string, or a JSON object with a recognizable key field
+ * (or exactly one string value).
+ */
+function extractKey(raw) {
+  if (!raw.startsWith('{')) return raw;
+  try {
+    const obj = JSON.parse(raw);
+    for (const k of ['api-key', 'apiKey', 'api_key', 'DUB_API_KEY', 'key', 'token']) {
+      if (typeof obj[k] === 'string' && obj[k].trim()) return obj[k].trim();
+    }
+    const strings = Object.values(obj).filter((v) => typeof v === 'string' && v.trim());
+    if (strings.length === 1) return strings[0].trim();
+  } catch { /* not JSON after all -- fall through to raw */ }
+  return raw;
+}
+
 export async function getDubApiKey() {
   if (_cachedKey !== undefined) return _cachedKey;
 
@@ -62,7 +82,7 @@ export async function getDubApiKey() {
       _cachedKey = null;
       return null;
     }
-    _cachedKey = value.trim();
+    _cachedKey = extractKey(value.trim());
     return _cachedKey;
   } catch (err) {
     // Never log the secret name value that was attempted — only that fetch failed.
