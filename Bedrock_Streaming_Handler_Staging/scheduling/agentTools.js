@@ -117,6 +117,9 @@ function sanitizeExcludeSlotIds(value) {
     .slice(0, 100);
 }
 
+// F6: cap on the persisted candidate_slots union (multi-day same-turn lookups).
+const MAX_PERSISTED_CANDIDATES = 10;
+
 // ─── TOOL 1: get_available_times ──────────────────────────────────────────────────────
 
 /**
@@ -142,6 +145,9 @@ function sanitizeExcludeSlotIds(value) {
  * @param {object}   params.deps         - { invokeProposal, saveState, qualifyingContext?, logger? }
  * @param {Function} [params.write]      - BSH SSE stream writer
  * @param {Function} [params.setSession] - callback receiving the updated session row
+ * @param {object}   [params.turnCandidates] - turn-scoped accumulator threaded by agentTurn
+ *   ({ slots: Array|null }): the candidate_slots THIS TURN's earlier calls already
+ *   persisted. See the F6 union note below. Absent (direct/legacy callers) → replace.
  * @returns {Promise<object>} the model-facing §B17c result
  */
 async function executeGetAvailableTimes({
@@ -153,6 +159,7 @@ async function executeGetAvailableTimes({
   deps = {},
   write,
   setSession,
+  turnCandidates,
 } = {}) {
   const logger = deps.logger || console;
 
@@ -270,10 +277,31 @@ async function executeGetAvailableTimes({
   if (res.tieBreaker != null) proposal.tieBreaker = res.tieBreaker;
   if (res.roundRobinCursor != null) proposal.roundRobinCursor = res.roundRobinCursor;
 
+  // F6 (live defect 2026-06-11): a multi-day ask ("Monday or Tuesday?") makes TWO dated
+  // calls in ONE turn; saveState is a PutItem whitelist write, so call 2's
+  // candidate_slots REPLACED call 1's — staging a first-day slot then failed with
+  // unknown_slot. Fix: UNION with the slots THIS TURN's earlier calls persisted,
+  // threaded by agentTurn via the turn-scoped accumulator (never guessed from
+  // timestamps; prior-TURN candidates are still replaced — the §B16b re-propose
+  // semantics). Dedupe by slotId (first occurrence wins — §B16b ordering is the
+  // propose route's presentation order, earlier call first), cap 10. The
+  // scheduling_slots SSE below still carries ONLY this call's slots (the widget merges).
+  const priorTurnSlots = (turnCandidates && Array.isArray(turnCandidates.slots))
+    ? turnCandidates.slots
+    : [];
+  const seenSlotIds = new Set();
+  const persistedSlots = [];
+  for (const s of [...priorTurnSlots, ...slots]) {
+    if (!s || !s.slotId || seenSlotIds.has(s.slotId)) continue;
+    seenSlotIds.add(s.slotId);
+    persistedSlots.push(s);
+    if (persistedSlots.length >= MAX_PERSISTED_CANDIDATES) break;
+  }
+
   const updatedSession = {
     ...(session || {}),
     state: 'proposing',
-    candidate_slots: slots,
+    candidate_slots: persistedSlots,
     proposal,
     rejected_slot_ids: alreadyRejected,
   };
@@ -282,7 +310,7 @@ async function executeGetAvailableTimes({
       tenantId,
       sessionId,
       state: 'proposing',
-      candidate_slots: slots,
+      candidate_slots: persistedSlots,
       proposal,
       rejected_slot_ids: alreadyRejected,
       // §B16d amendment: a previously captured attendee email survives a re-propose
@@ -291,6 +319,7 @@ async function executeGetAvailableTimes({
     });
   }
   if (typeof setSession === 'function') setSession(updatedSession);
+  if (turnCandidates) turnCandidates.slots = persistedSlots;
 
   // Emit the SHIPPED scheduling_slots SSE → existing widget chips (unchanged contract).
   if (typeof write === 'function') {
@@ -462,4 +491,5 @@ module.exports = {
   AGENT_TOOL_DEFINITIONS,
   executeGetAvailableTimes,
   executeRequestBookingConfirmation,
+  MAX_PERSISTED_CANDIDATES,
 };

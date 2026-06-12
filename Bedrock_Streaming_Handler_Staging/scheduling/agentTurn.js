@@ -95,7 +95,7 @@ const MAX_TOOL_ITERATIONS = 3;
 const MAX_HISTORY_MESSAGES = 12;
 
 // agent_turn_summary.prompt_version (§B17g) — bump when AGENT_NARRATION_RULES changes.
-const PROMPT_VERSION = 'b17e.v3';
+const PROMPT_VERSION = 'b17e.v4';
 
 // §B17b overflow: templated warm-honest copy (verbatim) + the shipped async-escape SSE.
 const OVERFLOW_COPY = 'I ran into a snag — let me get someone to help.';
@@ -149,6 +149,10 @@ const AGENT_NARRATION_RULES = [
     'separate tool calls (max 2 per turn). Without a date argument the tool only returns ' +
     'the earliest few openings — never conclude a specific future day is unavailable ' +
     'unless you queried THAT day.',
+  '15. When you call get_available_times, the times render as tappable buttons ' +
+    'automatically. NEVER enumerate individual times in your text — summarize instead ' +
+    "('Monday and Tuesday mornings are both open — tap a time below') and ask ONE " +
+    'closing question.',
 ].join('\n');
 
 // ─── §B17h kill-switch guard ───────────────────────────────────────────────────────────
@@ -471,7 +475,7 @@ async function streamModelCall({ bedrock, modelId, system, messages, write, sess
 // name (arbitrary attacker-shaped string) must never be serialized into audit lines.
 const KNOWN_TOOLS = new Set(['get_available_times', 'request_booking_confirmation']);
 
-async function runOneTool(toolUse, { iteration, tenantId, sessionId, tenantConfig, deps, write, getSession, setSession, userTranscript }) {
+async function runOneTool(toolUse, { iteration, tenantId, sessionId, tenantConfig, deps, write, getSession, setSession, userTranscript, turnCandidates }) {
   const logger = (deps && deps.logger) || console;
   const started = Date.now();
   let result;
@@ -486,6 +490,7 @@ async function runOneTool(toolUse, { iteration, tenantId, sessionId, tenantConfi
         deps,
         write,
         setSession,
+        turnCandidates,
       });
     } else if (toolUse.name === 'request_booking_confirmation') {
       result = await executeRequestBookingConfirmation({
@@ -653,6 +658,13 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
     liveSession = s;
   };
 
+  // F6 turn-scoped candidate accumulator: the candidate_slots THIS turn's earlier
+  // get_available_times calls persisted (slots: null until the first success). A later
+  // same-turn dated call UNIONs into these instead of replacing them, so a multi-day
+  // ask leaves BOTH days' slots stageable. Scoped to the turn — never carried across
+  // turns (prior-turn candidates still get replaced, the §B16b re-propose semantics).
+  const turnCandidates = { slots: null };
+
   // F1 (eval A9): prior session turns ride along — see buildAgentMessages.
   let messages = buildAgentMessages(conversationHistory, userText);
   const stopReasonSequence = [];
@@ -702,6 +714,7 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
           getSession,
           setSession,
           userTranscript,
+          turnCandidates,
         });
         toolResults.push({
           type: 'tool_result',

@@ -350,6 +350,102 @@ describe('executeGetAvailableTimes', () => {
     expect(args.deps.saveState).not.toHaveBeenCalled();
     expect(frames(args.write)).toHaveLength(0);
   });
+
+  // ── F6: same-turn multi-day union (live defect 2026-06-11 — second dated call's
+  // PutItem replaced the first day's candidate_slots → unknown_slot on a first-day chip)
+  describe('F6 same-turn candidate union (turnCandidates accumulator)', () => {
+    const MON_SLOT = Object.freeze({
+      slotId: 'm1',
+      start: '2026-06-15T14:00:00Z',
+      end: '2026-06-15T14:30:00Z',
+      label: 'Mon, Jun 15 · 9:00 AM',
+      candidateResourceIds: ['maya@org.example'],
+    });
+
+    test('second same-turn call UNIONs with the accumulator: prior slots first (§B16b order), new appended; accumulator updated', async () => {
+      const turnCandidates = { slots: [MON_SLOT] };
+      const args = tool1Args({
+        session: { state: 'proposing', session_id: 'sess-1', candidate_slots: [MON_SLOT] },
+        turnCandidates,
+      });
+      const result = await executeGetAvailableTimes(args); // PROPOSE_OK → [SLOT, SLOT2]
+
+      // persisted row = the UNION (both days stageable after the turn)
+      expect(args.deps.saveState).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate_slots: [MON_SLOT, SLOT, SLOT2] })
+      );
+      // live-session threading sees the union too (same-turn staging of EITHER day)
+      expect(args.setSession).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate_slots: [MON_SLOT, SLOT, SLOT2] })
+      );
+      // accumulator carries the union forward for a later same-turn call
+      expect(turnCandidates.slots).toEqual([MON_SLOT, SLOT, SLOT2]);
+      // SSE + model result stay PER-CALL (the widget merges; the model asked about THIS day)
+      const slotEvents = frames(args.write).filter((f) => f.type === 'scheduling_slots');
+      expect(slotEvents).toHaveLength(1);
+      expect(slotEvents[0].slots).toEqual([SLOT, SLOT2]);
+      expect(result.slots.map((s) => s.slot_id)).toEqual(['s1', 's2']);
+    });
+
+    test('union dedupes by slotId (first occurrence wins)', async () => {
+      const turnCandidates = { slots: [SLOT] };
+      const args = tool1Args({ turnCandidates });
+      await executeGetAvailableTimes(args); // PROPOSE_OK → [SLOT, SLOT2]; SLOT overlaps
+      expect(args.deps.saveState).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate_slots: [SLOT, SLOT2] })
+      );
+      expect(turnCandidates.slots).toEqual([SLOT, SLOT2]);
+    });
+
+    test('union caps the persisted candidates at 10', async () => {
+      const prior = Array.from({ length: 9 }, (_, i) => ({
+        slotId: `p${i}`,
+        start: `2026-06-15T1${i}:00:00Z`,
+        end: `2026-06-15T1${i}:30:00Z`,
+        label: `Mon · slot ${i}`,
+      }));
+      const turnCandidates = { slots: prior };
+      const args = tool1Args({ turnCandidates });
+      await executeGetAvailableTimes(args); // PROPOSE_OK → [SLOT, SLOT2]; union would be 11
+      const saved = args.deps.saveState.mock.calls[0][0].candidate_slots;
+      expect(saved).toHaveLength(10);
+      expect(saved.slice(0, 9)).toEqual(prior); // earlier-persisted slots win the cap
+      expect(saved[9]).toEqual(SLOT);
+      expect(turnCandidates.slots).toHaveLength(10);
+    });
+
+    test('prior-TURN candidates (empty accumulator) are still REPLACED — the union is same-turn only', async () => {
+      const args = tool1Args({
+        // MON_SLOT was persisted by an EARLIER turn → this lookup replaces it (§B16b
+        // re-propose semantics unchanged).
+        session: { state: 'proposing', session_id: 'sess-1', candidate_slots: [MON_SLOT] },
+        turnCandidates: { slots: null },
+      });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.saveState).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate_slots: [SLOT, SLOT2] })
+      );
+    });
+
+    test('malformed accumulator entries (no slotId / null) are skipped, never persisted', async () => {
+      const turnCandidates = { slots: [null, { label: 'orphan, no slotId' }, MON_SLOT] };
+      const args = tool1Args({ turnCandidates });
+      await executeGetAvailableTimes(args); // PROPOSE_OK → [SLOT, SLOT2]
+      expect(args.deps.saveState).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate_slots: [MON_SLOT, SLOT, SLOT2] })
+      );
+    });
+
+    test('no turnCandidates param at all (direct caller) → unchanged replace behavior', async () => {
+      const args = tool1Args({
+        session: { state: 'proposing', session_id: 'sess-1', candidate_slots: [MON_SLOT] },
+      });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.saveState).toHaveBeenCalledWith(
+        expect.objectContaining({ candidate_slots: [SLOT, SLOT2] })
+      );
+    });
+  });
 });
 
 // ── TOOL 2: executeRequestBookingConfirmation ─────────────────────────────────────────
