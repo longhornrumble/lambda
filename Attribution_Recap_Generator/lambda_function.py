@@ -13,14 +13,34 @@ Definitions: FROZEN_CONTRACTS §C7 (staff_hours, work_weeks, after_hours, floors
 PII constraints: FROZEN_CONTRACTS §C8 (C8.10: IDs + counts only at INFO)
 send_email contract: Lambdas/lambda/send_email/lambda_function.py (body key = JSON string)
 
+CAN-SPAM compliance (WS-I conditions):
+  Condition 1 - Postal address: RECAP_POSTAL_ADDRESS env rendered into footer HTML + text.
+                When empty/unset and RECAP_SEND_ENABLED=true -> send BLOCKED (error log
+                recap-blocked-no-postal-address, no send_email invoked).
+                Dry-run renders [POSTAL ADDRESS NOT CONFIGURED] placeholder.
+  Condition 2 - Suppression store: pk=TENANT#{id}, sk=SUPPRESS#recap#{email_lower},
+                created_at (ISO), source. NO TTL (permanent). Filter applied before
+                every send; suppression wins over tenant config every month.
+  Condition 3 - Tokenized unsubscribe link: {UNSUBSCRIBE_BASE_URL}?t={token} per-recipient.
+                Token = base64url(payload) + "." + base64url(hmac_sha256(key, payload)).
+                Payload = "{tenant_id}|{email_lower}|recap". Signing key from Secrets Manager
+                (UNSUB_SECRET_NAME). FAIL-CLOSED when secret absent or UNSUBSCRIBE_BASE_URL
+                unset while RECAP_SEND_ENABLED=true.
+
 Environment variables:
-  ATTRIBUTION_AGGREGATES_TABLE  DynamoDB table for aggregates (C5)
+  ATTRIBUTION_AGGREGATES_TABLE  DynamoDB table for aggregates (C5) + suppression rows
   TENANT_CONFIG_BUCKET          S3 bucket for tenant configs + mappings
   SEND_EMAIL_FUNCTION_NAME      Lambda function name for send_email
   DASHBOARD_BASE_URL            Base URL for the "Read your full briefing" CTA
   RECAP_SEND_ENABLED            'true' to actually send; anything else = dry-run (default)
+  RECAP_POSTAL_ADDRESS          Physical postal address for CAN-SPAM footer (condition 1)
+  UNSUB_SECRET_NAME             Secrets Manager secret name holding the HMAC signing key
+  UNSUBSCRIBE_BASE_URL          Base URL for the unsubscribe endpoint (no trailing slash)
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import logging
@@ -43,6 +63,9 @@ TENANT_CONFIG_BUCKET = os.environ.get('TENANT_CONFIG_BUCKET', '')
 SEND_EMAIL_FUNCTION_NAME = os.environ.get('SEND_EMAIL_FUNCTION_NAME', '')
 DASHBOARD_BASE_URL = os.environ.get('DASHBOARD_BASE_URL', 'https://app.myrecruiter.ai')
 RECAP_SEND_ENABLED = os.environ.get('RECAP_SEND_ENABLED', 'false')
+RECAP_POSTAL_ADDRESS = os.environ.get('RECAP_POSTAL_ADDRESS', '')
+UNSUB_SECRET_NAME = os.environ.get('UNSUB_SECRET_NAME', '')
+UNSUBSCRIBE_BASE_URL = os.environ.get('UNSUBSCRIBE_BASE_URL', '')
 
 # ---------------------------------------------------------------------------
 # C7 constants (FROZEN_CONTRACTS C7)
@@ -67,11 +90,140 @@ RECAP_SENT_TTL_DAYS = 420         # match C5 aggregate TTL
 _dynamodb = boto3.resource('dynamodb')
 _s3 = boto3.client('s3')
 _lambda_client = boto3.client('lambda')
+_secretsmanager = boto3.client('secretsmanager')
 
 # ---------------------------------------------------------------------------
 # In-process caches
 # ---------------------------------------------------------------------------
 _tenant_config_cache: Dict[str, Dict] = {}
+
+# UNSUB signing key cache: None = not yet fetched. False is never stored --
+# transient failures must not be cached; we retry on next invocation.
+_unsub_signing_key: Optional[bytes] = None
+
+
+# ---------------------------------------------------------------------------
+# HMAC signing key (Secrets Manager) -- condition 3
+# ---------------------------------------------------------------------------
+
+def _get_unsub_signing_key() -> Optional[bytes]:
+    """
+    Fetch the HMAC signing key from Secrets Manager.
+    Returns bytes on success, None on any error.
+    Successful fetches are cached for the lifetime of the container.
+    Transient failures are NOT cached -- we retry on next invocation.
+    SECURITY: key value is never logged.
+    """
+    global _unsub_signing_key
+    if _unsub_signing_key is not None:
+        return _unsub_signing_key
+
+    if not UNSUB_SECRET_NAME:
+        logger.error('UNSUB_SECRET_NAME env var is not set -- cannot fetch signing key')
+        return None
+
+    try:
+        resp = _secretsmanager.get_secret_value(SecretId=UNSUB_SECRET_NAME)
+    except ClientError as exc:
+        # Do NOT cache the failure -- next invocation will retry.
+        logger.error(
+            'Failed to fetch unsub signing key from Secrets Manager secret=%s: %s',
+            UNSUB_SECRET_NAME, exc.response['Error']['Code'],
+        )
+        return None
+    except Exception as exc:
+        logger.error('Unexpected error fetching unsub signing key: %s', type(exc).__name__)
+        return None
+
+    raw = resp.get('SecretString') or ''
+    if not raw:
+        logger.error('Unsub signing key secret is empty (secret=%s)', UNSUB_SECRET_NAME)
+        return None
+
+    key_bytes = raw.strip().encode('utf-8')
+    _unsub_signing_key = key_bytes
+    logger.info('Unsub signing key loaded (secret=%s)', UNSUB_SECRET_NAME)
+    return _unsub_signing_key
+
+
+# ---------------------------------------------------------------------------
+# Token helpers (condition 3)
+# Token format: base64url(payload) + "." + base64url(hmac_sha256(key, payload))
+# payload = "{tenant_id}|{email_lower}|recap"  (LOCKED -- must match Unsubscribe Lambda)
+# ---------------------------------------------------------------------------
+
+def _b64url_nopad(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b'=').decode('ascii')
+
+
+def _build_unsub_token(tenant_id: str, email: str, key: bytes) -> str:
+    """Build a per-recipient HMAC token. NEVER log this value."""
+    payload = f'{tenant_id}|{email.lower()}|recap'
+    payload_bytes = payload.encode('utf-8')
+    sig = hmac.new(key, payload_bytes, hashlib.sha256).digest()
+    return _b64url_nopad(payload_bytes) + '.' + _b64url_nopad(sig)
+
+
+# ---------------------------------------------------------------------------
+# Suppression helpers (condition 2)
+# Row schema: pk=TENANT#{tenant_id}, sk=SUPPRESS#recap#{email_lower}
+#             created_at (ISO), source ("unsubscribe_link"|"manual")
+#             NO TTL -- permanent.
+# ---------------------------------------------------------------------------
+
+def _suppression_sk(email: str) -> str:
+    return f'SUPPRESS#recap#{email.lower()}'
+
+
+def _fetch_suppressed_emails(tenant_id: str) -> set:
+    """
+    Query all SUPPRESS#recap# rows for a tenant.
+    Returns a set of lowercased email strings.
+    Returns empty set on any error.
+    """
+    if not ATTRIBUTION_AGGREGATES_TABLE:
+        return set()
+
+    try:
+        from boto3.dynamodb.conditions import Key
+        table = _dynamodb.Table(ATTRIBUTION_AGGREGATES_TABLE)
+        suppressed = set()
+        prefix = 'SUPPRESS#recap#'
+        query_kwargs: dict = {
+            'KeyConditionExpression': (
+                Key('pk').eq(f'TENANT#{tenant_id}') &
+                Key('sk').begins_with('SUPPRESS#recap#')
+            )
+        }
+        # Paginate: a busy tenant could accumulate more than one 1-MB page of
+        # suppression rows; without pagination those on later pages are silently
+        # honored -- every recipient on a page beyond the first would still
+        # receive the email.
+        while True:
+            resp = table.query(**query_kwargs)
+            for item in resp.get('Items', []):
+                sk = item.get('sk', '')
+                if sk.startswith(prefix):
+                    suppressed.add(sk[len(prefix):])
+            last_key = resp.get('LastEvaluatedKey')
+            if not last_key:
+                break
+            query_kwargs['ExclusiveStartKey'] = last_key
+        return suppressed
+    except ClientError as exc:
+        logger.error(
+            'Suppression query failed for tenant=%s: %s',
+            tenant_id[:8], exc.response['Error']['Code'],
+        )
+        return set()
+    except Exception as exc:
+        logger.error('Unexpected error querying suppressions for tenant=%s: %s', tenant_id[:8], type(exc).__name__)
+        return set()
+
+
+def _filter_suppressed(recipients: List[str], suppressed: set) -> List[str]:
+    """Filter out suppressed emails (case-insensitive)."""
+    return [r for r in recipients if r.lower() not in suppressed]
 
 
 # ---------------------------------------------------------------------------
@@ -98,10 +250,7 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
             'First real send is gated on communications-consent advisory + operator enablement.'
         )
 
-    # Compute prior calendar month (tenant-agnostic UTC anchor; actual tenant-local
-    # month string uses DEFAULT_TZ below but the "prior month" identity is the same).
     now_utc = datetime.now(timezone.utc)
-    # Subtract enough days to land in the previous month, then normalize to first day.
     first_of_current = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     last_of_prior = first_of_current - timedelta(days=1)
     prior_month_str = last_of_prior.strftime('%Y-%m')
@@ -115,7 +264,7 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
     logger.info('Enumerated %d total tenants', len(tenant_pairs))
 
     results = []
-    for tenant_hash, tenant_id in tenant_pairs:  # noqa: B007 (tenant_hash unused but kept for clarity)
+    for tenant_hash, tenant_id in tenant_pairs:  # noqa: B007
         try:
             outcome = _process_tenant(tenant_id, prior_month_str, dry_run)
             results.append({'tenant_id': tenant_id, 'outcome': outcome})
@@ -156,14 +305,20 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
 # ---------------------------------------------------------------------------
 def _process_tenant(tenant_id: str, month_str: str, dry_run: bool) -> str:
     """
-    Returns one of: 'skip_flag_off', 'skip_no_recipients', 'already_sent',
+    Returns one of: 'skip_flag_off', 'skip_no_recipients',
+                    'skip_all_suppressed', 'already_sent',
                     'sent', 'dry_run'.
+
+    CAN-SPAM conditions (fail-closed when RECAP_SEND_ENABLED=true):
+      - Postal address (condition 1): blocks send if RECAP_POSTAL_ADDRESS unset.
+      - Suppression filter (condition 2): applied before every send; suppressed
+        recipients removed; all-suppressed -> skip_all_suppressed.
+      - Tokenized unsubscribe link (condition 3): blocks send if signing key
+        unavailable or UNSUBSCRIBE_BASE_URL unset.
     """
     config = _get_tenant_config(tenant_id)
 
     # HARD GATE (locked decision #10): only tenants with dashboard_attribution truthy.
-    # Schema-tolerant: check both 'features' and 'feature_flags' (mirrors Analytics_Dashboard_API
-    # lambda_function.py:1452-1461 pattern -- cite).
     features = config.get('features', {})
     feature_flags = config.get('feature_flags', {})
     attribution_enabled = (
@@ -175,70 +330,145 @@ def _process_tenant(tenant_id: str, month_str: str, dry_run: bool) -> str:
 
     # Recipients: tenant config key attribution_recap.recipients (schema-tolerant).
     recap_config = config.get('attribution_recap', {})
-    recipients = recap_config.get('recipients', [])
-    if not recipients:
+    recipients_raw = recap_config.get('recipients', [])
+    if not recipients_raw:
         logger.info(
             'Tenant %s has no recap recipients configured -- skipping (attribution_recap.recipients)',
             tenant_id[:8],
         )
         return 'skip_no_recipients'
 
-    # Idempotency check: conditional marker row.
+    # Idempotency check.
     if _recap_already_sent(tenant_id, month_str):
         logger.info('Recap already sent for tenant=%s month=%s -- skipping', tenant_id[:8], month_str)
         return 'already_sent'
 
-    # Load aggregate data (C5 schema-tolerant reads).
+    # Load aggregate data.
     summary_row = _load_aggregate(tenant_id, f'attribution_summary#{month_str}')
     channel_rows = _load_channel_rows(tenant_id, month_str)
 
-    # Variant selection (pure function -- I2, locked).
+    # Variant selection.
     variant = _select_variant(summary_row, month_str, tenant_id)
 
-    # Org display name (schema-tolerant).
+    # Org display name.
     org_name = (
         config.get('organization_name')
         or config.get('chat_title')
         or tenant_id
     )
 
-    # Render HTML (table-based, inline styles, 620px, no runtime MJML dep).
-    html = _render_email(variant, summary_row, channel_rows, month_str, org_name, tenant_id)
+    # -----------------------------------------------------------------------
+    # CAN-SPAM condition 1: postal address
+    # -----------------------------------------------------------------------
+    postal_address = RECAP_POSTAL_ADDRESS.strip()
+    if not postal_address and not dry_run:
+        logger.error(
+            'recap-blocked-no-postal-address: tenant=%s month=%s -- '
+            'RECAP_POSTAL_ADDRESS env var is not set; blocking send.',
+            tenant_id[:8], month_str,
+        )
+        return 'skip_flag_off'
+
+    # Dry-run uses a visible placeholder so fixtures keep working.
+    postal_display = postal_address if postal_address else '[POSTAL ADDRESS NOT CONFIGURED]'
+
+    # -----------------------------------------------------------------------
+    # CAN-SPAM condition 3: signing key + base URL (preflight before suppression)
+    # -----------------------------------------------------------------------
+    signing_key: Optional[bytes] = None
+    if not dry_run:
+        if not UNSUBSCRIBE_BASE_URL:
+            logger.error(
+                'recap-blocked-no-unsub-url: tenant=%s month=%s -- '
+                'UNSUBSCRIBE_BASE_URL env var is not set; blocking send.',
+                tenant_id[:8], month_str,
+            )
+            return 'skip_flag_off'
+        signing_key = _get_unsub_signing_key()
+        if signing_key is None:
+            logger.error(
+                'recap-blocked-unsub-key-unavailable: tenant=%s month=%s -- '
+                'could not fetch signing key from Secrets Manager; blocking send.',
+                tenant_id[:8], month_str,
+            )
+            return 'skip_flag_off'
+
+    # -----------------------------------------------------------------------
+    # CAN-SPAM condition 2: suppression filter
+    # -----------------------------------------------------------------------
+    suppressed = _fetch_suppressed_emails(tenant_id)
+    recipients = _filter_suppressed(recipients_raw, suppressed)
+
+    if not recipients:
+        logger.info(
+            'All %d recipient(s) suppressed for tenant=%s month=%s -- skipping',
+            len(recipients_raw), tenant_id[:8], month_str,
+        )
+        return 'skip_all_suppressed'
+
+    if len(recipients) < len(recipients_raw):
+        logger.info(
+            'Suppression filtered %d of %d recipient(s) for tenant=%s month=%s',
+            len(recipients_raw) - len(recipients), len(recipients_raw),
+            tenant_id[:8], month_str,
+        )
 
     recipients_count = len(recipients)
-    html_bytes = len(html.encode('utf-8'))
-    logger.info(
-        'Recap rendered: tenant=%s month=%s variant=%s recipients_count=%d html_bytes=%d',
-        tenant_id[:8], month_str, variant, recipients_count, html_bytes,
-    )
 
     if dry_run:
-        # C8.10: never log body or recipient addresses at info level -- counts and IDs only.
+        # Render once to confirm no crash; placeholder token; no send.
+        html = _render_email(
+            variant, summary_row, channel_rows, month_str, org_name, tenant_id,
+            postal_address=postal_display,
+            unsub_url=f'{UNSUBSCRIBE_BASE_URL or "https://placeholder.invalid"}?t=PLACEHOLDER_TOKEN',
+        )
+        html_bytes = len(html.encode('utf-8'))
+        logger.info(
+            'Recap rendered (dry-run): tenant=%s month=%s variant=%s '
+            'recipients_count=%d html_bytes=%d',
+            tenant_id[:8], month_str, variant, recipients_count, html_bytes,
+        )
         return 'dry_run'
 
-    # Write idempotency marker BEFORE invoking send_email (best-effort; if send fails,
-    # next run will re-try because we don't mark on error).
+    # Write idempotency marker BEFORE invoking send_email.
     _mark_recap_sent(tenant_id, month_str)
 
-    # Invoke send_email Lambda per its contract (send_email/lambda_function.py:73-169).
-    # The Lambda parses event.get('body', '{}') as JSON; for Lambda-to-Lambda invocation
-    # the body must be a JSON-encoded string in the 'body' key of the Payload dict.
-    # Contract: to (list), subject (str), html_body (str), text_body (str, optional).
-    # (source: send_email/lambda_function.py:119-162)
+    # One send_email invoke per recipient, each with its own tokenized unsubscribe link.
     month_label = _month_label(month_str)
-    email_payload = {
-        'to': recipients,
-        'subject': f'Your {month_label} — by the numbers ({org_name})',
-        'html_body': html,
-        'text_body': _render_text_fallback(variant, summary_row, month_str, org_name),
-        'tags': {
-            'tenant_id': tenant_id[:50],
-            'email_type': 'attribution_recap',
-            'month': month_str,
-        },
-    }
+    subject = f'Your {month_label} — by the numbers ({org_name})'
 
-    _invoke_send_email(email_payload, tenant_id, month_str)
+    for recipient_email in recipients:
+        token = _build_unsub_token(tenant_id, recipient_email, signing_key)
+        unsub_url = f'{UNSUBSCRIBE_BASE_URL}?t={token}'
+
+        html = _render_email(
+            variant, summary_row, channel_rows, month_str, org_name, tenant_id,
+            postal_address=postal_display,
+            unsub_url=unsub_url,
+        )
+        text = _render_text_fallback(
+            variant, summary_row, month_str, org_name,
+            postal_address=postal_display,
+            unsub_url=unsub_url,
+        )
+
+        email_payload = {
+            'to': [recipient_email],
+            'subject': subject,
+            'html_body': html,
+            'text_body': text,
+            'tags': {
+                'tenant_id': tenant_id[:50],
+                'email_type': 'attribution_recap',
+                'month': month_str,
+            },
+        }
+        _invoke_send_email(email_payload, tenant_id, month_str)
+
+    logger.info(
+        'Recap rendered+sent: tenant=%s month=%s variant=%s recipients_count=%d',
+        tenant_id[:8], month_str, variant, recipients_count,
+    )
     return 'sent'
 
 
@@ -252,43 +482,19 @@ def _select_variant(
 ) -> str:
     """
     Returns one of: 'first_month', 'small_tenant', 'bad_month', 'good_month'.
-
     Pure function: no I/O, no side-effects.
-    I2 logic (locked):
-      - first_month: no prior-month row detectable (conversations == 0 AND we have
-        a zero row; use a different signal: no prior_month key in summary, or month
-        is the first month in the data -> we approximate by checking if conversations
-        is 0 AND no prior_month_conversations either. Simplest: any month where
-        conversations == 0 with no signal of prior activity is first_month. Actually
-        the spec says "no deltas" -- so first_month = when prior_month_conversations
-        is absent/0, AND current conversations == 0.  We'll treat: current == 0
-        and no prior data = first_month; current == 0 with prior data = zero_month
-        (treat as bad_month); current > 0 with no prior = still first_month for
-        "no deltas" flavor.
-        Simplification: first_month when conversations > 0 but prior_conversations
-        is None (can't compute delta). This is the safest "no deltas" trigger.
-      - small_tenant: conversations > 0 AND < SMALL_TENANT_FLOOR
-      - bad_month: conversations >= SMALL_TENANT_FLOOR AND leads < prior_leads
-      - good_month: default
-
-    All four variants are handled; this is a pure switch on the aggregate data.
     """
     conversations = int(summary_row.get('conversations', 0))
     leads = int(summary_row.get('leads', 0))
-    prior_conversations = summary_row.get('prior_conversations')  # None if absent
-    prior_leads = summary_row.get('prior_leads')                  # None if absent
+    prior_conversations = summary_row.get('prior_conversations')
+    prior_leads = summary_row.get('prior_leads')
 
-    # first_month: can't compute any delta (no prior data at all)
     if prior_conversations is None:
         return 'first_month'
 
-    prior_conv_int = int(prior_conversations) if prior_conversations is not None else None
-
-    # small_tenant: below floor (including zero)
     if conversations < SMALL_TENANT_FLOOR:
         return 'small_tenant'
 
-    # bad_month: leads declined (only meaningful above floor)
     if prior_leads is not None and leads < int(prior_leads):
         return 'bad_month'
 
@@ -297,11 +503,8 @@ def _select_variant(
 
 # ---------------------------------------------------------------------------
 # Email rendering -- table-based, inline styles, 620px max-width
-# No runtime MJML; tables not flexbox; degrades in Gmail/Outlook.
-# Design spec: docs/roadmap/attribution-mockups/attribution-monthly-infographic-mockup.html
 # ---------------------------------------------------------------------------
 
-# Brand / color constants (emerald palette from design spec)
 _EMERALD_50 = '#ecfdf5'
 _EMERALD_100 = '#d1fae5'
 _EMERALD_200 = '#a7f3d0'
@@ -329,57 +532,45 @@ def _render_email(
     month_str: str,
     org_name: str,
     tenant_id: str,
+    postal_address: str = '',
+    unsub_url: str = '',
 ) -> str:
     """
     Render the full email HTML string.
     Table-based layout, inline styles, max-width 620px.
     No dollar signs anywhere (locked decision #5 / C7).
     No per-person data (C8 -- aggregates only).
+    postal_address: rendered in footer (CAN-SPAM condition 1).
+    unsub_url: per-recipient tokenized unsubscribe URL (CAN-SPAM condition 3).
     """
     month_label = _month_label(month_str)
 
-    # C7 metrics (schema-tolerant: None -> 0 via 'or 0')
     conversations = int(summary_row.get('conversations') or 0)
     leads = int(summary_row.get('leads') or 0)
     conversation_minutes = int(summary_row.get('conversation_minutes') or 0)
     after_hours = int(summary_row.get('after_hours_conversations') or 0)
     after_hours_pct = round(after_hours / conversations * 100) if conversations > 0 else 0
 
-    # C7: staff_hours = conversation_minutes / 60; work_weeks = staff_hours / 40
     staff_hours = conversation_minutes / 60.0
     work_weeks = staff_hours / WORK_WEEK_HOURS
 
-    # Deltas (absent = None -> "—")
     prior_conv = summary_row.get('prior_conversations')
     prior_leads_val = summary_row.get('prior_leads')
     conv_delta_str = _pct_delta_str(conversations, prior_conv)
     leads_delta_str = _pct_delta_str(leads, prior_leads_val)
 
-    # Topics (top 3 from first available channel row, or empty)
     topics = _extract_top_topics(channel_rows)
-
-    # Channel MVP (above CONFIDENCE_FLOOR, best lead rate)
     mvp_channel = _find_mvp_channel(channel_rows)
 
-    # CTA URL
     cta_url = f'{DASHBOARD_BASE_URL}/attribution'
 
-    # Superlatives from summary_row (only render when source data present; never empty)
     self_booked_pct = summary_row.get('self_booked_pct')
     median_first_response = summary_row.get('median_first_response_minutes')
 
-    # -----------------------------------------------------------------------
-    # Build HTML sections based on variant
-    # -----------------------------------------------------------------------
     body_sections = []
-
-    # ---- Brand row ----
     body_sections.append(_section_brand(month_label))
-
-    # ---- Title section ----
     body_sections.append(_section_title(variant, month_label, org_name))
 
-    # ---- Hero: after-hours stat (always present; for small/first: simplified) ----
     if variant == 'first_month':
         body_sections.append(_section_hero_first(after_hours, conversations, month_label))
     elif variant == 'small_tenant':
@@ -387,37 +578,25 @@ def _render_email(
     else:
         body_sections.append(_section_hero(after_hours, after_hours_pct))
 
-    # ---- Big three: conversations / leads / staff-hours ----
-    # For small_tenant: no rates; always show absolute numbers.
     body_sections.append(_section_big_three(
         variant, conversations, leads, staff_hours, work_weeks,
         conv_delta_str, leads_delta_str,
     ))
 
-    # ---- Channel MVP (above floor + evidence only; skip for first_month + small_tenant) ----
     if variant not in ('first_month', 'small_tenant') and mvp_channel:
         body_sections.append(_section_channel_mvp(mvp_channel))
 
-    # ---- Topics bar chart (top 3; skip if no data) ----
     if topics:
         body_sections.append(_section_topics(topics, variant))
 
-    # ---- Superlatives strip (only when source data present; never empty) ----
     superlatives = _build_superlatives(self_booked_pct, median_first_response, after_hours)
     if superlatives and variant not in ('small_tenant',):
         body_sections.append(_section_superlatives(superlatives))
 
-    # ---- CTA ----
     body_sections.append(_section_cta(month_label, cta_url, variant))
+    body_sections.append(_section_footer(org_name, DASHBOARD_BASE_URL, postal_address, unsub_url))
 
-    # ---- Footer (always) ----
-    body_sections.append(_section_footer(org_name, DASHBOARD_BASE_URL))
-
-    # -----------------------------------------------------------------------
-    # Wrap sections in outer table shell (email-client safe)
-    # -----------------------------------------------------------------------
     inner_html = '\n'.join(body_sections)
-
     preheader_text = _preheader_text(variant, month_label, conversations)
 
     return f"""<!DOCTYPE html>
@@ -449,11 +628,11 @@ def _preheader_text(variant: str, month_label: str, conversations: int) -> str:
         return f'Your AI team member answered {conversations} conversations in {month_label}.'
     if variant == 'bad_month':
         return f'Your {month_label} recap — every conversation counts.'
-    return f'Your mission worked nights this month. Here\'s the proof in one scroll.'
+    return "Your mission worked nights this month. Here's the proof in one scroll."
 
 
 # ---------------------------------------------------------------------------
-# HTML section builders (all return table-row strings)
+# HTML section builders
 # ---------------------------------------------------------------------------
 
 def _section_brand(month_label: str) -> str:
@@ -479,14 +658,13 @@ def _section_brand(month_label: str) -> str:
 
 
 def _section_title(variant: str, month_label: str, org_name: str) -> str:
-    # Escape org_name for HTML
     org_safe = _html_escape(org_name)
     if variant == 'first_month':
         subtitle = 'Welcome to Mission Intelligence. Your AI team member was on the clock all month.'
     elif variant == 'bad_month':
-        subtitle = 'Some months are quieter. Here\'s what your AI team member still delivered.'
+        subtitle = "Some months are quieter. Here's what your AI team member still delivered."
     elif variant == 'small_tenant':
-        subtitle = f'Every conversation counts. Here\'s what happened in {month_label}.'
+        subtitle = f"Every conversation counts. Here's what happened in {month_label}."
     else:
         subtitle = 'While your team was doing the mission, your AI team member was answering the door. Here\'s what happened.'
 
@@ -498,7 +676,6 @@ def _section_title(variant: str, month_label: str, org_name: str) -> str:
 
 
 def _section_hero(after_hours: int, after_hours_pct: int) -> str:
-    """Good/bad month hero: after-hours stat."""
     night_label = f'{after_hours:,}' if after_hours > 0 else '0'
     chip_pct = f'<span style="background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:5px 12px;font-size:11px;font-weight:700;color:{_WHITE};display:inline-block;margin:4px 4px 0 0;"><b style="color:{_EMERALD_200};">{after_hours_pct}%</b> of all engagement</span>'
 
@@ -515,7 +692,6 @@ def _section_hero(after_hours: int, after_hours_pct: int) -> str:
 
 
 def _section_hero_first(after_hours: int, total: int, month_label: str) -> str:
-    """First-month hero."""
     night_label = f'{after_hours:,}' if after_hours else '0'
     total_label = f'{total:,}' if total else '0'
     return f"""<tr><td style="padding:22px 36px 0;">
@@ -530,7 +706,6 @@ def _section_hero_first(after_hours: int, total: int, month_label: str) -> str:
 
 
 def _section_hero_small(total: int, after_hours: int) -> str:
-    """Small-tenant hero: proud, no rates."""
     total_label = f'{total:,}'
     return f"""<tr><td style="padding:22px 36px 0;">
 <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%">
@@ -552,8 +727,6 @@ def _section_big_three(
     conv_delta_str: str,
     leads_delta_str: str,
 ) -> str:
-    """Big three stats: conversations / leads / staff-hours. No dollar signs (C7)."""
-    # Format hours: whole number if >=10, one decimal otherwise
     if staff_hours >= 10:
         hours_label = f'~{int(round(staff_hours))} hrs'
     else:
@@ -561,7 +734,6 @@ def _section_big_three(
 
     ww_label = f'{work_weeks:.1f} work-wks'
 
-    # For small_tenant: no delta labels (I2 -- no rates, no comparisons)
     if variant in ('small_tenant',):
         conv_delta_html = ''
         leads_delta_html = ''
@@ -599,11 +771,9 @@ def _section_big_three(
 
 
 def _section_channel_mvp(mvp: Dict) -> str:
-    """Channel MVP trophy card."""
     channel_safe = _html_escape(mvp.get('channel', '').replace('_', ' ').title())
     leads = int(mvp.get('leads', 0))
     conversations = int(mvp.get('conversations', 0))
-    # Rate: leads / conversations (no dollar sign; time/count only per C7/decision#5)
     if conversations > 0 and leads > 0:
         rate_pct = round(leads / conversations * 100)
         evidence = f'<strong style="color:{_EMERALD_700};">{rate_pct}% lead rate</strong> from {conversations:,} conversations.'
@@ -631,7 +801,6 @@ def _section_channel_mvp(mvp: Dict) -> str:
 
 
 def _section_topics(topics: List[Tuple[str, int]], variant: str) -> str:
-    """Top-3 topic bars + quiet overachiever note."""
     if not topics:
         return ''
 
@@ -658,11 +827,8 @@ def _section_topics(topics: List[Tuple[str, int]], variant: str) -> str:
         )
 
     bars_html = '\n'.join(bars)
-
-    # Quiet overachiever note: shown only if we have >3 topics; skip for small_tenant
     note_html = ''
     if len(topics) > 3 and variant not in ('small_tenant',):
-        # Show 4th topic as the quiet overachiever
         overachiever = topics[3][0] if len(topics) > 3 else None
         if overachiever:
             note_html = f'<tr><td style="padding-top:10px;"><span style="font-size:12px;color:{_SLATE_500};">Quiet overachiever: <strong style="color:{_EMERALD_700};">{_html_escape(overachiever)}</strong> conversations kept the team informed.</span></td></tr>'
@@ -677,11 +843,6 @@ def _section_topics(topics: List[Tuple[str, int]], variant: str) -> str:
 
 
 def _section_superlatives(superlatives: List[Tuple[str, str, str]]) -> str:
-    """
-    Superlatives strip. Only rendered when source data is present.
-    Each tuple: (emoji, bold_label, description).
-    Never renders an empty superlative (I2).
-    """
     cells = []
     border_style = f'1px solid {_SLATE_100}'
     for i, (emoji, label, desc) in enumerate(superlatives):
@@ -715,33 +876,46 @@ def _section_cta(month_label: str, cta_url: str, variant: str) -> str:
 </td></tr>"""
 
 
-def _section_footer(org_name: str, dashboard_base: str) -> str:
+def _section_footer(
+    org_name: str,
+    dashboard_base: str,
+    postal_address: str = '',
+    unsub_url: str = '',
+) -> str:
     """
-    Footer: why-you're-receiving-this + settings + unsubscribe + epistemic one-liner.
+    Footer: why-receiving + settings + unsubscribe + postal address.
+    CAN-SPAM condition 1: postal_address rendered inline.
+    CAN-SPAM condition 3: unsub_url is the per-recipient tokenized link.
     C8.10 compliant: no PII; aggregate counts only in body above.
     """
     org_safe = _html_escape(org_name)
     settings_url = f'{dashboard_base}/settings/notifications'
-    unsubscribe_url = f'{dashboard_base}/unsubscribe'
+    postal_html = f'<br>{_html_escape(postal_address)}' if postal_address else ''
+    actual_unsub_url = unsub_url if unsub_url else f'{dashboard_base}/unsubscribe'
 
     return f"""<tr><td style="text-align:center;font-size:10px;color:{_SLATE_400};padding:22px 36px 26px;line-height:1.6;border-top:1px solid {_SLATE_100};margin-top:22px;">
   You&rsquo;re receiving this because Mission Intelligence is enabled for {org_safe}.<br>
-  Every number is something MyRecruiter directly witnessed.<br>
+  Every number is something MyRecruiter directly witnessed.{postal_html}<br>
   <a href="{settings_url}" style="color:{_SLATE_400};">Monthly recap settings</a> &middot;
-  <a href="{unsubscribe_url}" style="color:{_SLATE_400};">Unsubscribe</a>
+  <a href="{actual_unsub_url}" style="color:{_SLATE_400};">Unsubscribe</a>
 </td></tr>"""
 
 
 # ---------------------------------------------------------------------------
-# Text fallback (plain-text version for email clients that don't render HTML)
+# Text fallback
 # ---------------------------------------------------------------------------
 def _render_text_fallback(
     variant: str,
     summary_row: Dict,
     month_str: str,
     org_name: str,
+    postal_address: str = '',
+    unsub_url: str = '',
 ) -> str:
-    """Plain-text fallback. No dollar signs. No per-person data."""
+    """Plain-text fallback. No dollar signs. No per-person data.
+    CAN-SPAM condition 1: postal_address appended.
+    CAN-SPAM condition 3: unsub_url rendered as plain text link.
+    """
     month_label = _month_label(month_str)
     conversations = int(summary_row.get('conversations', 0))
     leads = int(summary_row.get('leads', 0))
@@ -751,6 +925,7 @@ def _render_text_fallback(
     after_hours = int(summary_row.get('after_hours_conversations', 0))
 
     cta_url = f'{DASHBOARD_BASE_URL}/attribution'
+    actual_unsub_url = unsub_url if unsub_url else f'{DASHBOARD_BASE_URL}/unsubscribe'
 
     lines = [
         f'YOUR {month_label.upper()}, BY THE NUMBERS',
@@ -765,8 +940,10 @@ def _render_text_fallback(
         '',
         f'You are receiving this because Mission Intelligence is enabled for {org_name}.',
         f'Settings: {DASHBOARD_BASE_URL}/settings/notifications',
-        f'Unsubscribe: {DASHBOARD_BASE_URL}/unsubscribe',
+        f'Unsubscribe: {actual_unsub_url}',
     ]
+    if postal_address:
+        lines.append(postal_address)
     return '\n'.join(lines)
 
 
@@ -786,10 +963,6 @@ def _month_label(month_str: str) -> str:
 
 
 def _pct_delta_str(current: int, prior) -> str:
-    """
-    Returns a delta string like '▲ 18%' or '▼ 5%', or '' if prior is None/0.
-    No dollar signs (C7/decision#5).
-    """
     if prior is None:
         return ''
     try:
@@ -805,13 +978,9 @@ def _pct_delta_str(current: int, prior) -> str:
 
 
 def _extract_top_topics(channel_rows: List[Dict]) -> List[Tuple[str, int]]:
-    """
-    Aggregate topic_counts across all channel rows; return top-TOPICS_TOP_N+1
-    (one extra for the quiet-overachiever note).
-    """
     merged: Dict[str, int] = {}
     for row in channel_rows:
-        data = row.get('data', row)  # handle both raw DDB item and stripped data dict
+        data = row.get('data', row)
         tc = data.get('topic_counts', {}) or {}
         for topic, count in tc.items():
             try:
@@ -823,15 +992,10 @@ def _extract_top_topics(channel_rows: List[Dict]) -> List[Tuple[str, int]]:
         return []
 
     sorted_topics = sorted(merged.items(), key=lambda x: x[1], reverse=True)
-    return sorted_topics[:TOPICS_TOP_N + 1]  # +1 for quiet-overachiever
+    return sorted_topics[:TOPICS_TOP_N + 1]
 
 
 def _find_mvp_channel(channel_rows: List[Dict]) -> Optional[Dict]:
-    """
-    Channel MVP: best lead rate above CONFIDENCE_FLOOR.
-    Returns dict with channel/leads/conversations/rate or None.
-    FROZEN_CONTRACTS C7 floor.
-    """
     best = None
     best_rate = -1.0
 
@@ -842,7 +1006,7 @@ def _find_mvp_channel(channel_rows: List[Dict]) -> Optional[Dict]:
         channel = row.get('channel', data.get('channel', ''))
 
         if conversations < CONFIDENCE_FLOOR:
-            continue  # C7 floor
+            continue
 
         rate = leads / conversations if conversations > 0 else 0.0
         if rate > best_rate:
@@ -862,11 +1026,6 @@ def _build_superlatives(
     median_first_response,
     after_hours: int,
 ) -> List[Tuple[str, str, str]]:
-    """
-    Build superlatives list (emoji, label, description).
-    Only include entries where source data is present.
-    Never returns an empty superlative entry (I2).
-    """
     items = []
 
     if after_hours and after_hours > 0:
@@ -892,7 +1051,6 @@ def _build_superlatives(
 
 
 def _html_escape(text: str) -> str:
-    """Minimal HTML escaping for user-provided strings."""
     return (
         str(text)
         .replace('&', '&amp;')
@@ -905,15 +1063,9 @@ def _html_escape(text: str) -> str:
 
 # ---------------------------------------------------------------------------
 # DynamoDB: aggregate reads (FROZEN_CONTRACTS C5)
-# pk = TENANT#{tenant_id}, sk = METRIC#{key}
 # ---------------------------------------------------------------------------
 
 def _load_aggregate(tenant_id: str, metric_key: str) -> Dict:
-    """
-    Schema-tolerant read from ATTRIBUTION_AGGREGATES_TABLE.
-    Returns {} on any error or missing row.
-    FROZEN_CONTRACTS C5: pk/sk lowercase.
-    """
     if not ATTRIBUTION_AGGREGATES_TABLE:
         return {}
 
@@ -924,7 +1076,6 @@ def _load_aggregate(tenant_id: str, metric_key: str) -> Dict:
             'sk': f'METRIC#{metric_key}',
         })
         item = resp.get('Item', {})
-        # 'data' sub-dict contains the aggregate fields (C5 shape from Attribution_Aggregator)
         return item.get('data', {}) or {}
     except ClientError as exc:
         logger.error(
@@ -941,11 +1092,6 @@ def _load_aggregate(tenant_id: str, metric_key: str) -> Dict:
 
 
 def _load_channel_rows(tenant_id: str, month_str: str) -> List[Dict]:
-    """
-    Load all attribution_channel rows for a tenant + month.
-    Returns list of dicts; each has 'channel' and 'data' keys (schema-tolerant).
-    FROZEN_CONTRACTS C5: sk pattern = METRIC#attribution_channel#{YYYY-MM}#{channel}
-    """
     if not ATTRIBUTION_AGGREGATES_TABLE:
         return []
 
@@ -962,7 +1108,6 @@ def _load_channel_rows(tenant_id: str, month_str: str) -> List[Dict]:
         rows = []
         for item in resp.get('Items', []):
             sk = item.get('sk', '')
-            # Extract channel from sk: METRIC#attribution_channel#{month}#{channel}
             suffix = sk[len(prefix):]
             rows.append({
                 'channel': suffix,
@@ -984,10 +1129,7 @@ def _load_channel_rows(tenant_id: str, month_str: str) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Idempotency marker (FROZEN_CONTRACTS I3)
-# pk = TENANT#{tenant_id}, sk = METRIC#recap_sent#{YYYY-MM}
-# conditional_expression = attribute_not_exists(sk)
-# ttl = now + 420 days
+# Idempotency marker
 # ---------------------------------------------------------------------------
 
 def _recap_sent_sk(month_str: str) -> str:
@@ -995,10 +1137,6 @@ def _recap_sent_sk(month_str: str) -> str:
 
 
 def _recap_already_sent(tenant_id: str, month_str: str) -> bool:
-    """
-    Returns True if the idempotency marker row already exists.
-    Schema-tolerant: returns False on any read error (safe to re-try).
-    """
     if not ATTRIBUTION_AGGREGATES_TABLE:
         return False
 
@@ -1018,11 +1156,6 @@ def _recap_already_sent(tenant_id: str, month_str: str) -> bool:
 
 
 def _mark_recap_sent(tenant_id: str, month_str: str) -> None:
-    """
-    Write idempotency marker with conditional_expression = attribute_not_exists(sk).
-    ConditionalCheckFailedException -> already sent, skip.
-    Other errors -> log and proceed (best-effort idempotency).
-    """
     if not ATTRIBUTION_AGGREGATES_TABLE:
         return
 
@@ -1042,7 +1175,6 @@ def _mark_recap_sent(tenant_id: str, month_str: str) -> None:
         )
     except ClientError as exc:
         if exc.response['Error']['Code'] == 'ConditionalCheckFailedException':
-            # Race condition -- already marked by concurrent invocation; safe to ignore.
             logger.info(
                 'Recap marker already exists (race condition) for tenant=%s month=%s',
                 tenant_id[:8], month_str,
@@ -1052,23 +1184,20 @@ def _mark_recap_sent(tenant_id: str, month_str: str) -> None:
                 'Failed to write recap marker for tenant=%s month=%s: %s',
                 tenant_id[:8], month_str, exc,
             )
+            # Raise so the per-tenant try/except in lambda_handler absorbs it
+            # and marks this tenant as errored.  Fall-through here would send
+            # emails without a marker, guaranteeing a double-send on every
+            # EventBridge retry until the DynamoDB condition is restored.
+            raise
 
 
 # ---------------------------------------------------------------------------
 # send_email Lambda invocation
-# Contract: send_email/lambda_function.py:73-169
-# The Lambda parses event.get('body', '{}') as a JSON string.
-# For Lambda-to-Lambda invocation the Payload must include a 'body' key
-# whose value is a JSON-encoded string.
-# Required fields: to (list), subject (str), html_body or text_body (str).
-# (send_email/lambda_function.py:119-162)
 # ---------------------------------------------------------------------------
 
 def _invoke_send_email(payload: Dict, tenant_id: str, month_str: str) -> None:
     """
     Invoke the send_email Lambda per its Lambda-to-Lambda contract.
-    send_email/lambda_function.py:73 parses event.get('body', '{}') as JSON.
-    We wrap the payload as {'body': json.dumps(payload)}.
     C8.10: do NOT log recipient addresses or HTML body at INFO level.
     """
     if not SEND_EMAIL_FUNCTION_NAME:
@@ -1078,7 +1207,6 @@ def _invoke_send_email(payload: Dict, tenant_id: str, month_str: str) -> None:
         )
         return
 
-    # Wrap per send_email contract (send_email/lambda_function.py:82-84,119-162)
     invoke_payload = {'body': json.dumps(payload)}
 
     try:
@@ -1097,7 +1225,6 @@ def _invoke_send_email(payload: Dict, tenant_id: str, month_str: str) -> None:
             )
             return
 
-        # Parse nested body (send_email returns {'statusCode': 200, 'body': '{...}'})
         response_body = {}
         body_str = result.get('body', '{}')
         if isinstance(body_str, str):
@@ -1133,16 +1260,9 @@ def _invoke_send_email(payload: Dict, tenant_id: str, month_str: str) -> None:
 
 # ---------------------------------------------------------------------------
 # Tenant enumeration + config
-# Mirrors Attribution_Aggregator/lambda_function.py _get_active_tenant_pairs
-# and _get_tenant_config (same config bucket, same mapping pattern).
 # ---------------------------------------------------------------------------
 
 def _get_active_tenant_pairs() -> List[Tuple[str, str]]:
-    """
-    Enumerate (tenant_hash, tenant_id) pairs from TENANT_CONFIG_BUCKET/mappings/.
-    Schema-tolerant: missing bucket env -> empty list.
-    C8.10: log counts only.
-    """
     if not TENANT_CONFIG_BUCKET:
         logger.warning('TENANT_CONFIG_BUCKET not configured -- cannot enumerate tenants')
         return []
@@ -1171,7 +1291,6 @@ def _get_active_tenant_pairs() -> List[Tuple[str, str]]:
 
 
 def _load_tenant_mapping(tenant_hash: str) -> Optional[Dict]:
-    """Schema-tolerant mapping load."""
     if not TENANT_CONFIG_BUCKET:
         return None
     try:
@@ -1190,13 +1309,6 @@ def _load_tenant_mapping(tenant_hash: str) -> Optional[Dict]:
 
 
 def _get_tenant_config(tenant_id: str) -> Dict:
-    """
-    Schema-tolerant read of tenant config.
-    Three fallback layers:
-    1. TENANT_CONFIG_BUCKET env missing -> return {}
-    2. Config object missing (NoSuchKey) -> return {}
-    3. Any field absent in config -> caller uses .get(key, default)
-    """
     if tenant_id in _tenant_config_cache:
         return _tenant_config_cache[tenant_id]
 
@@ -1206,9 +1318,6 @@ def _get_tenant_config(tenant_id: str) -> Dict:
         return {}
 
     config: Dict = {}
-    # Try both config key patterns seen in the repo (Analytics_Dashboard_API uses
-    # 'tenants/{id}/{id}-config.json'; Attribution_Aggregator uses 'tenants/{id}/config.json').
-    # Try the Analytics_Dashboard_API pattern first (most prevalent), fall back to Aggregator pattern.
     for key in [
         f'tenants/{tenant_id}/{tenant_id}-config.json',
         f'tenants/{tenant_id}/config.json',
