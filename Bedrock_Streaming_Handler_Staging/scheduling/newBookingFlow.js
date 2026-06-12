@@ -513,7 +513,11 @@ async function _propose({ tenantId, sessionId, fromState, prior, qctx, config, d
     });
   }
   if (typeof write === 'function') {
-    write(`data: ${JSON.stringify({ type: 'scheduling_slots', slots, session_id: sessionId })}\n\n`);
+    // §B18b: forward context when the propose result carries it (ADDITIVE; omit when absent —
+    // old-shape tolerant per CLAUDE.md schema discipline).
+    const sseEvent = { type: 'scheduling_slots', slots, session_id: sessionId };
+    if (res.context != null) sseEvent.context = res.context;
+    write(`data: ${JSON.stringify(sseEvent)}\n\n`);
   }
   return { handled: true, executed: false, state: next.state, slots };
 }

@@ -1033,7 +1033,7 @@ describe('agentTurn — F3/F5 prompt rules (live-eval G1/A7 + A2/A3)', () => {
   test('rule 15 (chips carry the times): never enumerate individual times; summarize + ONE closing question', () => {
     expect(AGENT_NARRATION_RULES).toContain('render as tappable buttons');
     expect(AGENT_NARRATION_RULES).toContain('NEVER enumerate individual times in your text');
-    expect(AGENT_NARRATION_RULES).toContain('ask ONE closing question');
+    expect(AGENT_NARRATION_RULES).toContain('ask ONE closing question (unless presenting available times — see rule 17)');
   });
 
   test('rule 16 (day-part bounds): time-of-day requests pass after_time/before_time; unbounded conclusions banned', () => {
@@ -1042,8 +1042,15 @@ describe('agentTurn — F3/F5 prompt rules (live-eval G1/A7 + A2/A3)', () => {
     expect(AGENT_NARRATION_RULES).toContain('NEVER conclude a time-of-day is unavailable without a bounded query');
   });
 
-  test('PROMPT_VERSION bumped for the rules change (§B17g)', () => {
-    expect(PROMPT_VERSION).toBe('b17e.v5');
+  test('rule 17 — §B17e rule-12: no model-authored closing question when chips are rendered', () => {
+    // §B18 offer-presentation: the FE renders refinement microcopy; model must not add a trailing question.
+    expect(AGENT_NARRATION_RULES).toContain('do NOT author a trailing closing question');
+    expect(AGENT_NARRATION_RULES).toContain('The interface renders refinement microcopy');
+    expect(AGENT_NARRATION_RULES).toContain('Summarize');
+  });
+
+  test('PROMPT_VERSION bumped to b17e.v6 for the rule-17 change (§B17g)', () => {
+    expect(PROMPT_VERSION).toBe('b17e.v6');
   });
 });
 

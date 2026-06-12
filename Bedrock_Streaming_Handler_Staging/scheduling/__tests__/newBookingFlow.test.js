@@ -1005,3 +1005,57 @@ describe('runNewBookingTurn — deterministic widget actions (§B16b amendment)'
     expect(saveState).toHaveBeenCalledWith(expect.objectContaining({ attendee_email: 'kept@example.com' }));
   });
 });
+
+// ─── §B18b context forwarding: _propose old-shape fixture tests ──────────────────────
+
+describe('_propose — §B18b context forwarding (old-shape fixture)', () => {
+  test('_propose result WITH context → scheduling_slots SSE carries context', async () => {
+    const write = jest.fn();
+    const invokeProposal = jest.fn().mockResolvedValue({
+      outcome: 'ok',
+      slots: [SLOT],
+      poolSize: 1,
+      context: { duration_minutes: 30, conference_type: 'google_meet', conference_label: 'Google Meet', tz_label: 'Central Time' },
+    });
+    await runNewBookingTurn(baseTurn({
+      write,
+      deps: {
+        loadState: async () => ({ state: 'qualifying' }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState: jest.fn(),
+      },
+    }));
+    const slotFrames = write.mock.calls
+      .map(([s]) => s)
+      .filter((s) => typeof s === 'string' && s.includes('scheduling_slots'))
+      .map((s) => JSON.parse(s.slice('data: '.length)));
+    expect(slotFrames.length).toBeGreaterThan(0);
+    expect(slotFrames[0].context).toEqual({ duration_minutes: 30, conference_type: 'google_meet', conference_label: 'Google Meet', tz_label: 'Central Time' });
+  });
+
+  test('_propose result WITHOUT context (old shape) → no context key on SSE, no crash', async () => {
+    const write = jest.fn();
+    const invokeProposal = jest.fn().mockResolvedValue({
+      outcome: 'ok',
+      slots: [SLOT],
+      poolSize: 1,
+      // context deliberately absent — old shape
+    });
+    await runNewBookingTurn(baseTurn({
+      write,
+      deps: {
+        loadState: async () => ({ state: 'qualifying' }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState: jest.fn(),
+      },
+    }));
+    const slotFrames = write.mock.calls
+      .map(([s]) => s)
+      .filter((s) => typeof s === 'string' && s.includes('scheduling_slots'))
+      .map((s) => JSON.parse(s.slice('data: '.length)));
+    expect(slotFrames.length).toBeGreaterThan(0);
+    expect(slotFrames[0]).not.toHaveProperty('context'); // old-shape: absent, not null
+  });
+});

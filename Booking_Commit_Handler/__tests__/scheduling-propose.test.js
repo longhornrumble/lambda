@@ -360,3 +360,141 @@ describe('handleSchedulingPropose — §B16e date_window passthrough', () => {
     });
   });
 });
+
+// ─── §B18a/b — diverse-3 sampling arg + context envelope ────────────────────────────
+
+const APPT_MEET = {
+  appointment_type_id: 'apt-meet',
+  routing_policy_id: 'rp-1',
+  name: 'Intake',
+  timezone: 'America/Chicago',
+  duration_minutes: 30,
+  conference_type: 'google_meet',
+};
+
+describe('handleSchedulingPropose — §B18a sampling arg always passed', () => {
+  it('unconditionally passes sampling: { mode: daypart-diverse, count: 3 } to pool.select', async () => {
+    const { calls, injected } = baseInjected();
+    await handleSchedulingPropose(PROPOSE_EVENT, injected);
+    expect(calls.select).toHaveLength(1);
+    expect(calls.select[0].sampling).toEqual({ mode: 'daypart-diverse', count: 3 });
+  });
+
+  it('sampling arg is present even when date_window is also supplied', async () => {
+    const { calls, injected } = baseInjected();
+    await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, date_window: { start: '2026-07-06T00:00:00Z', end: '2026-07-07T00:00:00Z' } },
+      injected
+    );
+    expect(calls.select[0].sampling).toEqual({ mode: 'daypart-diverse', count: 3 });
+  });
+});
+
+describe('handleSchedulingPropose — §B18b context envelope', () => {
+  it('context present on outcome:ok for a google_meet 30-min type in America/Chicago', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => APPT_MEET,
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'America/Chicago' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context).toBeDefined();
+    expect(out.context.duration_minutes).toBe(30);
+    expect(out.context.conference_type).toBe('google_meet');
+    expect(out.context.conference_label).toBe('Google Meet');
+    // tz_label should be a string (not an IANA id like 'America/Chicago')
+    expect(typeof out.context.tz_label).toBe('string');
+    expect(out.context.tz_label).not.toBe('America/Chicago');
+    // Typical values: 'Central Time', 'Central Daylight Time', 'CDT', 'CST'
+    expect(out.context.tz_label.length).toBeGreaterThan(0);
+  });
+
+  it('duration_minutes: 0 survives as 0 (?? semantics — not coerced to null)', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => ({ ...APPT_MEET, duration_minutes: 0 }),
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'America/Chicago' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context.duration_minutes).toBe(0);
+  });
+
+  it('missing duration_minutes field → null', async () => {
+    const { duration_minutes: _omit, ...APPT_NO_DURATION } = APPT_MEET;
+    const { injected } = baseInjected({
+      getAppointmentType: async () => APPT_NO_DURATION,
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'America/Chicago' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context.duration_minutes).toBeNull();
+  });
+
+  it('unknown conference_type → null label', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => ({
+        ...APPT_MEET,
+        conference_type: 'carrier_pigeon',
+      }),
+    });
+    const out = await handleSchedulingPropose(PROPOSE_EVENT, injected);
+    expect(out.context.conference_label).toBeNull();
+  });
+
+  it('context absent on outcome:no_availability (additive — only on ok)', async () => {
+    const { injected } = baseInjected({
+      poolSelect: async () => ({ status: 'SLOT_UNAVAILABLE', poolBranch: 'empty', orderedPool: [], tieBreaker: 'round_robin', roundRobinCursor: null, slots: [] }),
+    });
+    const out = await handleSchedulingPropose(PROPOSE_EVENT, injected);
+    expect(out.outcome).toBe('no_availability');
+    expect(out.context).toBeUndefined();
+  });
+
+  it('old-shape fixture: handler with no context on propose result → no context on response (forward-compat)', async () => {
+    // Simulates calling the handler as if pool.select returned no context (old shape).
+    // The pool.select mock returns PROPOSED_RETURN which has no context field.
+    const { injected } = baseInjected();
+    // PROPOSED_RETURN has no .context → result.context is undefined → response must not crash
+    const out = await handleSchedulingPropose(PROPOSE_EVENT, injected);
+    expect(out.outcome).toBe('ok');
+    // context is built by the handler itself, not from pool.select — it should be present
+    // (handler builds it from appointmentType + userTimeZone).
+    expect(out.context).toBeDefined(); // always present on ok, per §B18b
+  });
+});
+
+// ── §B18b tz_label null paths ─────────────────────────────────────────────────────────
+
+describe('handleSchedulingPropose — §B18b tz_label null paths', () => {
+  it('invalid userTimeZone → context.tz_label === null', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => APPT_MEET,
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'Not/AReal_Zone' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context).toBeDefined();
+    expect(out.context.tz_label).toBeNull();
+  });
+
+  it('another invalid userTimeZone (Also/Invalid) → context.tz_label === null', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => APPT_MEET,
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'Also/Invalid' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context).toBeDefined();
+    expect(out.context.tz_label).toBeNull();
+  });
+});

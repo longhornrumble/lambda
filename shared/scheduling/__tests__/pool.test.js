@@ -774,3 +774,439 @@ describe('select — REAL-PATH dateWindow filter (fix #1+#2: no poolSelect mock)
     expect(['SLOTS_PROPOSED', 'SLOT_UNAVAILABLE']).toContain(result.status);
   });
 });
+
+// ─── §B18a diverse-3 sampling ─────────────────────────────────────────────────────────
+
+// Helpers for diverse-sampling tests:
+// makeSlot(isoStart, isoEnd, label) — returns a merged-shape slot (before chip conversion)
+// The mock setup returns these directly from slots.generateSlots, which pool merges into
+// byStart before calling the sampling logic.
+
+// NOTE: all ISO times are UTC. daypartOf uses the userTimeZone to classify.
+// TZ = 'America/Chicago' = UTC-5 (CST) or UTC-6 (CDT).
+// For determinism we use CDT (Jun 2026): UTC-5.
+// morning  < 12:00 CDT = < 17:00 UTC
+// midday   12:00–14:59 CDT = 17:00–19:59 UTC
+// afternoon >= 15:00 CDT = >= 20:00 UTC
+
+function makeRawSlot(start, end, label) {
+  return { slotId: `maya|${start}`, start, end, label, resourceId: 'maya' };
+}
+
+// A reusable setup helper: returns pool.select with slots.generateSlots mocked.
+async function selectWithDiverseSampling(rawSlots) {
+  availability.getBusyIntervals.mockResolvedValue(fb());
+  routing.evaluatePool.mockResolvedValue({
+    ordered: ['maya'],
+    tieBreaker: 'round_robin',
+    roundRobinCursor: null,
+  });
+  slots.generateSlots.mockReturnValue(rawSlots);
+
+  return pool.select({
+    tenantId: TENANT,
+    appointmentType: APPT,
+    routingPolicy: POLICY,
+    candidates: [{ resourceId: 'maya' }],
+    userTimeZone: TZ,
+    now: '2026-06-02T12:00:00Z',
+    sampling: { mode: 'daypart-diverse', count: 3 },
+  });
+}
+
+describe('select — §B18a diverse-3 sampling', () => {
+  it('morning + midday + afternoon on the same day → 3 chips, 3 distinct dayparts, chronological', async () => {
+    // In CDT (UTC-5): 14:00 UTC = 09:00 AM CDT (morning), 18:00 UTC = 13:00 CDT (midday), 21:00 UTC = 16:00 CDT (afternoon)
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),  // morning
+      makeRawSlot('2026-06-03T18:00:00Z', '2026-06-03T18:30:00Z', 'Tue 1 PM'),  // midday
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),  // afternoon
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'), // second morning
+    ];
+    const res = await selectWithDiverseSampling(rawSlots);
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(3);
+    // All 3 dayparts represented
+    const starts = res.slots.map((s) => s.start);
+    expect(starts).toContain('2026-06-03T14:00:00Z'); // morning pick-1
+    expect(starts).toContain('2026-06-03T18:00:00Z'); // midday pick-2
+    expect(starts).toContain('2026-06-03T21:00:00Z'); // afternoon pick-3
+    // Chronological
+    for (let i = 1; i < starts.length; i++) {
+      expect(starts[i] > starts[i - 1]).toBe(true);
+    }
+  });
+
+  it('morning-only day 1, afternoon-only day 2 → picks span dayparts across days (day-spread fallback)', async () => {
+    // Day 1: two morning slots; day 2: one afternoon slot
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'),  // morning
+      makeRawSlot('2026-06-04T21:00:00Z', '2026-06-04T21:30:00Z', 'Wed 4 PM'),   // afternoon
+    ];
+    const res = await selectWithDiverseSampling(rawSlots);
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(3);
+    const starts = res.slots.map((s) => s.start);
+    // pick-1: earliest morning day-1
+    expect(starts).toContain('2026-06-03T14:00:00Z');
+    // pick-2: should try different daypart same day, fail, then day-spread to Wed afternoon
+    expect(starts).toContain('2026-06-04T21:00:00Z');
+    // pick-3: another morning from day-1 (only daypart left)
+    expect(starts).toContain('2026-06-03T15:00:00Z');
+    // Chronological
+    for (let i = 1; i < starts.length; i++) {
+      expect(starts[i] > starts[i - 1]).toBe(true);
+    }
+  });
+
+  it('all candidates one daypart (afternoon only) → day-spread within that daypart, chronological', async () => {
+    const rawSlots = [
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),
+      makeRawSlot('2026-06-04T21:00:00Z', '2026-06-04T21:30:00Z', 'Wed 4 PM'),
+      makeRawSlot('2026-06-05T21:00:00Z', '2026-06-05T21:30:00Z', 'Thu 4 PM'),
+      makeRawSlot('2026-06-06T21:00:00Z', '2026-06-06T21:30:00Z', 'Fri 4 PM'),
+    ];
+    const res = await selectWithDiverseSampling(rawSlots);
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(3);
+    const starts = res.slots.map((s) => s.start);
+    // All different (no duplicate)
+    expect(new Set(starts).size).toBe(3);
+    // Chronological
+    for (let i = 1; i < starts.length; i++) {
+      expect(starts[i] > starts[i - 1]).toBe(true);
+    }
+  });
+
+  it('alreadyRejected filtered BEFORE sampling — a rejected earliest slot never reappears as pick-1', async () => {
+    // Earliest morning is rejected; pick-1 must be the next available morning
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning (rejected)
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'),  // morning
+      makeRawSlot('2026-06-03T18:00:00Z', '2026-06-03T18:30:00Z', 'Tue 1 PM'),   // midday
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),   // afternoon
+    ];
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    slots.generateSlots.mockReturnValue(rawSlots);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      alreadyRejected: ['slot#2026-06-03T14:00:00Z'], // earliest rejected
+      now: '2026-06-02T12:00:00Z',
+      sampling: { mode: 'daypart-diverse', count: 3 },
+    });
+
+    const starts = res.slots.map((s) => s.start);
+    expect(starts).not.toContain('2026-06-03T14:00:00Z'); // rejected slot absent
+    expect(res.slots).toHaveLength(3);
+  });
+
+  it('≤3 candidates after filtering → all returned, sorted chronologically', async () => {
+    const rawSlots = [
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),
+    ];
+    const res = await selectWithDiverseSampling(rawSlots);
+    expect(res.slots).toHaveLength(2);
+    expect(res.slots[0].start).toBe('2026-06-03T14:00:00Z'); // sorted
+    expect(res.slots[1].start).toBe('2026-06-03T21:00:00Z');
+  });
+
+  it('NO sampling arg → output identical to pre-change earliest-first behavior (regression)', async () => {
+    const rawSlots = [
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'),
+      makeRawSlot('2026-06-03T18:00:00Z', '2026-06-03T18:30:00Z', 'Tue 1 PM'),
+    ];
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    slots.generateSlots.mockReturnValue(rawSlots);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      maxSlots: 3,
+      // NO sampling arg
+    });
+
+    expect(res.slots).toHaveLength(3);
+    // Earliest-first (default behavior)
+    expect(res.slots[0].start).toBe('2026-06-03T14:00:00Z');
+    expect(res.slots[1].start).toBe('2026-06-03T15:00:00Z');
+    expect(res.slots[2].start).toBe('2026-06-03T18:00:00Z');
+  });
+
+  it('diverse mode passes CANDIDATE_CAP=48 to generateSlots (not maxSlots=5)', async () => {
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    slots.generateSlots.mockReturnValue([]);
+
+    await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      sampling: { mode: 'daypart-diverse', count: 3 },
+    });
+
+    const call = slots.generateSlots.mock.calls[0][0];
+    expect(call.maxSlots).toBe(48); // CANDIDATE_CAP
+  });
+
+  it('count=2 → returns exactly 2 picks (pick-1 + pick-2) sorted chronologically, not 3', async () => {
+    // 4 slots across morning/midday/afternoon on the same day.
+    // count=2: algorithm picks p1 (morning) and p2 (midday), then hits the count<3 branch
+    // and returns 2 chips sorted chronologically — afternoon slot must be absent.
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning (pick-1)
+      makeRawSlot('2026-06-03T18:00:00Z', '2026-06-03T18:30:00Z', 'Tue 1 PM'),   // midday  (pick-2)
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),   // afternoon (must be absent)
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'),  // second morning
+    ];
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({
+      ordered: ['maya'],
+      tieBreaker: 'round_robin',
+      roundRobinCursor: null,
+    });
+    slots.generateSlots.mockReturnValue(rawSlots);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      sampling: { mode: 'daypart-diverse', count: 2 },
+    });
+
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(2);
+    const starts = res.slots.map((s) => s.start);
+    // pick-1: earliest morning
+    expect(starts).toContain('2026-06-03T14:00:00Z');
+    // pick-2: different daypart (midday)
+    expect(starts).toContain('2026-06-03T18:00:00Z');
+    // afternoon slot excluded (count=2 stops after pick-2)
+    expect(starts).not.toContain('2026-06-03T21:00:00Z');
+    // Sorted chronologically
+    expect(starts[0]).toBe('2026-06-03T14:00:00Z');
+    expect(starts[1]).toBe('2026-06-03T18:00:00Z');
+    // _daypart annotation stripped from output
+    expect(res.slots[0]).not.toHaveProperty('_daypart');
+    expect(res.slots[1]).not.toHaveProperty('_daypart');
+  });
+
+  // Fix A adversarial: all-morning, 2 days, 4 candidates → pick-2 MUST take the
+  // different-day tier. 4 slots (> count) so the ≤count early-return cannot mask
+  // the pick logic — a 3-slot set returns all 3 regardless and proves nothing.
+  // Old (pre-fix) last-resort picked earliest-remaining day1-10:00 → all-day1 chips.
+  it('pick-2 different-day tier: all-morning [day1-9, day1-10, day1-11, day2-9] → day2-9 picked, day1-11 excluded', async () => {
+    // day1 9:00/10:00/11:00 CDT = 2026-06-03T14:00/15:00/16:00Z (all morning)
+    // day2 9:00 CDT = 2026-06-04T14:00:00Z (morning)
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning day1
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'),  // morning day1
+      makeRawSlot('2026-06-03T16:00:00Z', '2026-06-03T16:30:00Z', 'Tue 11 AM'),  // morning day1
+      makeRawSlot('2026-06-04T14:00:00Z', '2026-06-04T14:30:00Z', 'Wed 9 AM'),   // morning day2
+    ];
+    const res = await selectWithDiverseSampling(rawSlots);
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(3);
+    const starts = res.slots.map((s) => s.start);
+    // pick-1: day1-9:00 (earliest)
+    // pick-2: different daypart → none (all morning) → DIFFERENT DAY → day2-9:00
+    // pick-3: third daypart → none → day not yet represented → none → earliest remaining → day1-10:00
+    // sorted chronologically: day1-9, day1-10, day2-9; day1-11 must NOT appear
+    expect(starts).toEqual([
+      '2026-06-03T14:00:00Z', // day1-9
+      '2026-06-03T15:00:00Z', // day1-10
+      '2026-06-04T14:00:00Z', // day2-9
+    ]);
+    expect(starts).not.toContain('2026-06-03T16:00:00Z'); // day1-11 (old code's all-day1 failure)
+  });
+
+  // Fix B adversarial: all-morning 4 slots across 3 days → pick-3 uses "day not yet represented" tier
+  it('pick-3 day-not-yet-represented tier: all-morning [day1-9, day2-9, day2-10, day3-9] → picks = day1-9, day2-9, day3-9', async () => {
+    // day1-9 = 2026-06-03T14:00Z, day2-9 = 2026-06-04T14:00Z, day2-10 = 2026-06-04T15:00Z, day3-9 = 2026-06-05T14:00Z
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning day1
+      makeRawSlot('2026-06-04T14:00:00Z', '2026-06-04T14:30:00Z', 'Wed 9 AM'),   // morning day2
+      makeRawSlot('2026-06-04T15:00:00Z', '2026-06-04T15:30:00Z', 'Wed 10 AM'),  // morning day2
+      makeRawSlot('2026-06-05T14:00:00Z', '2026-06-05T14:30:00Z', 'Thu 9 AM'),   // morning day3
+    ];
+    const res = await selectWithDiverseSampling(rawSlots);
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(3);
+    const starts = res.slots.map((s) => s.start);
+    // pick-1: day1-9 (earliest)
+    // pick-2: different daypart → none → different day → day2-9
+    // pick-3: third daypart → none → day not yet represented → day3-9 (day2-10 excluded)
+    // sorted: day1-9, day2-9, day3-9
+    expect(starts).toContain('2026-06-03T14:00:00Z'); // day1-9
+    expect(starts).toContain('2026-06-04T14:00:00Z'); // day2-9
+    expect(starts).toContain('2026-06-05T14:00:00Z'); // day3-9
+    expect(starts).not.toContain('2026-06-04T15:00:00Z'); // day2-10 excluded
+    for (let i = 1; i < starts.length; i++) {
+      expect(starts[i] > starts[i - 1]).toBe(true);
+    }
+  });
+
+  // Fix D: single-day dateWindow + sampling
+  it('single-day dateWindow + sampling: diversity within that day only', async () => {
+    const dateWindow = { startISO: '2026-06-03T00:00:00.000Z', endISO: '2026-06-03T24:00:00.000Z' };
+    // 3 slots on a single day spanning different dayparts
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning
+      makeRawSlot('2026-06-03T18:00:00Z', '2026-06-03T18:30:00Z', 'Tue 1 PM'),   // midday
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),   // afternoon
+    ];
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    slots.generateSlots.mockReturnValue(rawSlots);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      sampling: { mode: 'daypart-diverse', count: 3 },
+      dateWindow,
+    });
+
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(3);
+    // All returned slots fall within the dateWindow
+    for (const slot of res.slots) {
+      expect(slot.start >= dateWindow.startISO).toBe(true);
+      expect(slot.start < dateWindow.endISO).toBe(true);
+    }
+    // dateWindow was forwarded to slots.generateSlots
+    const call = slots.generateSlots.mock.calls[0][0];
+    expect(call.dateWindow).toEqual(dateWindow);
+  });
+
+  // Fix F: diverse mode + all candidates in alreadyRejected → SLOT_UNAVAILABLE
+  it('diverse mode + ALL candidates in alreadyRejected → SLOT_UNAVAILABLE (combined path)', async () => {
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),
+      makeRawSlot('2026-06-03T18:00:00Z', '2026-06-03T18:30:00Z', 'Tue 1 PM'),
+    ];
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    slots.generateSlots.mockReturnValue(rawSlots);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      sampling: { mode: 'daypart-diverse', count: 3 },
+      alreadyRejected: ['slot#2026-06-03T14:00:00Z', 'slot#2026-06-03T18:00:00Z'],
+    });
+
+    expect(res.status).toBe('SLOT_UNAVAILABLE');
+    expect(res.slots).toHaveLength(0);
+  });
+
+  // Fix G: daypartOf invalid-TZ catch test
+  it('daypartOf BAD_TZ catch: invalid timezone + mixed slots → graceful 3 chronological chips, no throw', async () => {
+    // BAD_TZ causes daypartOf to throw → catch returns 'morning' for all slots
+    // All 4 slots are 'morning' (fallback), diversity logic falls through to fallbacks
+    const rawSlots = [
+      makeRawSlot('2026-06-03T10:00:00Z', '2026-06-03T10:30:00Z', 'S1'),
+      makeRawSlot('2026-06-03T12:00:00Z', '2026-06-03T12:30:00Z', 'S2'),
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'S3'),
+      makeRawSlot('2026-06-03T16:00:00Z', '2026-06-03T16:30:00Z', 'S4'),
+    ];
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    slots.generateSlots.mockReturnValue(rawSlots);
+
+    let res;
+    expect(async () => {
+      res = await pool.select({
+        tenantId: TENANT,
+        appointmentType: APPT,
+        routingPolicy: POLICY,
+        candidates: [{ resourceId: 'maya' }],
+        userTimeZone: 'BAD_TZ',
+        now: '2026-06-02T12:00:00Z',
+        sampling: { mode: 'daypart-diverse', count: 3 },
+      });
+    }).not.toThrow();
+
+    res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: 'BAD_TZ',
+      now: '2026-06-02T12:00:00Z',
+      sampling: { mode: 'daypart-diverse', count: 3 },
+    });
+
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(3);
+    // chips sorted chronologically
+    const starts = res.slots.map((s) => s.start);
+    for (let i = 1; i < starts.length; i++) {
+      expect(starts[i] > starts[i - 1]).toBe(true);
+    }
+  });
+});
+
+// ─── Default-cap pin test (Fix H) ────────────────────────────────────────────────────
+
+describe('select — default-cap pin', () => {
+  it('default-cap pin: 7+ generated slots, NO maxSlots arg, NO sampling arg → exactly 5 chips (DEFAULT_MAX_SLOTS)', async () => {
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya'], tieBreaker: 'round_robin', roundRobinCursor: null });
+    // Generate 7 raw slots
+    slots.generateSlots.mockReturnValue([
+      makeRawSlot('2026-06-03T10:00:00Z', '2026-06-03T10:30:00Z', 'S1'),
+      makeRawSlot('2026-06-03T11:00:00Z', '2026-06-03T11:30:00Z', 'S2'),
+      makeRawSlot('2026-06-03T12:00:00Z', '2026-06-03T12:30:00Z', 'S3'),
+      makeRawSlot('2026-06-03T13:00:00Z', '2026-06-03T13:30:00Z', 'S4'),
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'S5'),
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'S6'),
+      makeRawSlot('2026-06-03T16:00:00Z', '2026-06-03T16:30:00Z', 'S7'),
+    ]);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      // NO maxSlots, NO sampling
+    });
+
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(5); // DEFAULT_MAX_SLOTS
+    // sorted chronologically
+    const starts = res.slots.map((s) => s.start);
+    for (let i = 1; i < starts.length; i++) {
+      expect(starts[i] > starts[i - 1]).toBe(true);
+    }
+  });
+});

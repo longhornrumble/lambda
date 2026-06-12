@@ -390,3 +390,27 @@ describe('postFormOffer — PII: the attendee email is NEVER logged', () => {
     }
   });
 });
+
+// ─── §B18b context forwarding: postFormOffer old-shape fixture ────────────────────────
+
+describe('postFormOffer — §B18b context forwarding (old-shape fixture)', () => {
+  test('propose result WITH context → emitSse called with context field', async () => {
+    const ctx = { duration_minutes: 30, conference_type: 'google_meet', conference_label: 'Google Meet', tz_label: 'Central Time' };
+    const deps = makeDeps({
+      invokeProposal: jest.fn().mockResolvedValue({ ...OK_RESULT, context: ctx }),
+    });
+    await call(deps);
+    expect(deps.emitSse).toHaveBeenCalledTimes(1);
+    const emitArg = deps.emitSse.mock.calls[0][0];
+    expect(emitArg.context).toEqual(ctx);
+  });
+
+  test('propose result WITHOUT context (old shape) → emitSse called WITHOUT context, no crash', async () => {
+    // OK_RESULT has no context field — old shape
+    const deps = makeDeps();
+    await call(deps);
+    expect(deps.emitSse).toHaveBeenCalledTimes(1);
+    const emitArg = deps.emitSse.mock.calls[0][0];
+    expect(emitArg).not.toHaveProperty('context'); // old-shape: absent, not null
+  });
+});

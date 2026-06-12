@@ -213,7 +213,11 @@ async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = 
         });
       }
       if (typeof deps.emitSse === 'function') {
-        deps.emitSse({ type: 'scheduling_slots', slots, session_id: sessionId });
+        // §B18b: forward context when the propose result carries it (ADDITIVE; omit when absent —
+        // old-shape tolerant per CLAUDE.md schema discipline).
+        const sseEvent = { type: 'scheduling_slots', slots, session_id: sessionId };
+        if (slotsResult.context != null) sseEvent.context = slotsResult.context;
+        deps.emitSse(sseEvent);
       }
       _audit(logger, { tenant_id: tenantId, session_id: sessionId, outcome: 'ok', slot_count: slots.length, email_present: true });
       return { offerText: OFFER_TEXT_OK, slotsResult };

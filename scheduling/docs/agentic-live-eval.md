@@ -158,6 +158,19 @@ live staging** (real model judgment / increment-2 behavior).
 - **FAIL:** an **unbounded** re-query of the same window (it re-returns the same morning slots plus the same-results note) narrated as "afternoons are closed/booked" — the 2026-06-12 live defect; invented afternoon times (G3); G1 trips.
 - **Tier:** jest (mechanics — `agentEvals.test.js` A14) + live (model behavior).
 
+### A15 — offer diversity (§B18a diverse-3 sampling)
+- **Setup:** a tenant with a multi-daypart calendar (morning + midday + afternoon availability in at least one day); `scheduling_propose` returns diverse chips from the `daypart-diverse` sampler.
+- **Action:** trigger one offer turn (qualify → propose path, or a `get_available_times` call on a multi-daypart day).
+- **Pass criteria:** the `scheduling_slots` SSE carries **3 chips** spanning **≥2 distinct dayparts** — OR ≥2 distinct days when one day cannot provide two dayparts; chips are in **chronological order**; `context` envelope is present on the SSE with `duration_minutes`, `conference_label`, and `tz_label` populated.
+- **Result:** _(leave blank — filled at eval time)_
+
+### A16 — no trailing closing question when chips are rendered (§B17e rule 17)
+- **Setup:** same multi-daypart session as A15 (or any offer turn that emits `scheduling_slots` chips); `PROMPT_VERSION` = `b17e.v6`.
+- **Action:** observe the agent's narration text that accompanies the chip emission.
+- **Pass criteria:** the agent's response does **NOT** end with a closing question ("Which works best for you?", "Does one of these work?", or any equivalent); the narration is a one-sentence summary at most; the widget's refinement microcopy carries the refinement affordance.
+- **Result:** _(leave blank — filled at eval time)_
+- **Tier:** live only (prompt rule)
+
 ---
 
 ## 2. Track D — deterministic surfaces (D3, D4)

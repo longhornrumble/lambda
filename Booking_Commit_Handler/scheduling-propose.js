@@ -47,6 +47,44 @@ function outcomeForStatus(status) {
   return status === 'SLOTS_PROPOSED' ? 'ok' : 'no_availability';
 }
 
+// §B18b conference_type → human label map.
+const CONFERENCE_LABELS = {
+  google_meet: 'Google Meet',
+  zoom: 'Zoom',
+  phone: 'Phone call',
+  in_person: 'In person',
+};
+
+// §B18b: build the ADDITIVE context envelope from a resolved AppointmentType row.
+// All fields null-tolerant; context itself always present on outcome:'ok'.
+function buildProposalContext(appointmentType, userTimeZone) {
+  const duration_minutes = appointmentType?.duration_minutes ?? null;
+  const conference_type = (appointmentType && appointmentType.conference_type) || 'google_meet';
+  const conference_label = CONFERENCE_LABELS[conference_type] ?? null;
+
+  // §B18b tz_label: generic zone name in userTimeZone (Intl longGeneric → shortGeneric → short
+  // → null on all failures). Never the raw IANA id.
+  let tz_label = null;
+  if (userTimeZone) {
+    const formats = ['longGeneric', 'shortGeneric', 'short'];
+    for (const timeZoneName of formats) {
+      try {
+        const parts = new Intl.DateTimeFormat('en-US', { timeZone: userTimeZone, timeZoneName })
+          .formatToParts(new Date());
+        const part = parts.find((p) => p.type === 'timeZoneName');
+        if (part && part.value) {
+          tz_label = part.value;
+          break;
+        }
+      } catch {
+        // try next format
+      }
+    }
+  }
+
+  return { duration_minutes, conference_type, conference_label, tz_label };
+}
+
 async function handleSchedulingPropose(event = {}, injected = {}) {
   const _select = injected.poolSelect || pool.select;
   const _resolveCandidates = injected.resolveCandidates || candidateResolver.resolveCandidates;
@@ -108,6 +146,9 @@ async function handleSchedulingPropose(event = {}, injected = {}) {
     // pool.select already accepts windowStart/windowEnd for the §B16a availability window;
     // the dateWindow param is a NEW additive param that threads into generateSlots only —
     // pass it alongside so pool.select can forward it. Absent → no-op (undefined stripped).
+    //
+    // §B18a: UNCONDITIONALLY pass sampling: { mode: 'daypart-diverse', count: 3 } so this
+    // route always returns 3 diverse chips (no flag — §B18a mandates it).
     const selectArgs = {
       tenantId,
       appointmentType,
@@ -117,6 +158,7 @@ async function handleSchedulingPropose(event = {}, injected = {}) {
       alreadyRejected, // forwarded UNCHANGED → pool.select's `slot#${start}` re-offer dedup
       windowStart,
       windowEnd,
+      sampling: { mode: 'daypart-diverse', count: 3 }, // §B18a — always
     };
     if (date_window != null) {
       // Normalise to the shape generateSlots expects ({ startISO, endISO }).
@@ -137,6 +179,12 @@ async function handleSchedulingPropose(event = {}, injected = {}) {
     };
     if (result && result.tieBreaker != null) response.tieBreaker = result.tieBreaker;
     if (result && result.roundRobinCursor != null) response.roundRobinCursor = result.roundRobinCursor;
+
+    // §B18b: ADDITIVE context envelope — built from the resolved AppointmentType + userTimeZone.
+    // Always present on outcome:'ok'. Readers MUST tolerate its absence (old-shape compat).
+    if (response.outcome === 'ok') {
+      response.context = buildProposalContext(appointmentType, userTimeZone);
+    }
 
     logLine(logger, 'scheduling_propose_result', {
       tenant_id: tenantId, appointment_type_id: appointmentTypeId,
