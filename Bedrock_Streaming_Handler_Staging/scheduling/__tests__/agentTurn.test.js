@@ -337,12 +337,45 @@ describe('agentTurn — §B17b loop', () => {
 
     const f = frames(write);
     expect(f).toContainEqual({ type: 'text', content: OVERFLOW_COPY, session_id: 'sess-1' });
-    expect(f).toContainEqual({ type: 'scheduling_notice', reason: 'agent_overflow', session_id: 'sess-1' });
+    expect(f).toContainEqual({ type: 'scheduling_notice', notice: 'agent_overflow', session_id: 'sess-1' });
 
     const summary = audit.find((e) => e.event_type === 'agent_turn_summary');
     expect(summary.overflow).toBe(true);
     expect(summary.stop_reason_sequence).toEqual(['tool_use', 'tool_use', 'tool_use']);
     expect(summary.iterations).toBe(3); // §B17b verbatim loop: each requested tool within budget executes
+  });
+
+  test('caps tool_use blocks executed per iteration to 2 (3 parallel requests → only first 2 run)', async () => {
+    // One model response carrying THREE parallel tool_use blocks.
+    const bedrock = fakeBedrock([
+      streamFrom([
+        chunk({ type: 'message_start' }),
+        chunk({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'tu_1', name: 'get_available_times', input: {} } }),
+        chunk({ type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{}' } }),
+        chunk({ type: 'content_block_stop', index: 0 }),
+        chunk({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'tu_2', name: 'get_available_times', input: {} } }),
+        chunk({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{}' } }),
+        chunk({ type: 'content_block_stop', index: 1 }),
+        chunk({ type: 'content_block_start', index: 2, content_block: { type: 'tool_use', id: 'tu_3', name: 'get_available_times', input: {} } }),
+        chunk({ type: 'content_block_delta', index: 2, delta: { type: 'input_json_delta', partial_json: '{}' } }),
+        chunk({ type: 'content_block_stop', index: 2 }),
+        chunk({ type: 'message_delta', delta: { stop_reason: 'tool_use' } }),
+        chunk({ type: 'message_stop' }),
+      ]),
+      textResponse('Here are the openings'),
+    ]);
+    const audit = [];
+    const deps = makeDeps({ bedrock, audit });
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write }));
+
+    // only the first 2 tool_use blocks were executed (cap = catalog size)
+    expect(deps.invokeProposal).toHaveBeenCalledTimes(2);
+    expect(audit.filter((e) => e.event_type === 'agent_tool_call')).toHaveLength(2);
+    const body2 = JSON.parse(bedrock.send.mock.calls[1][0].input.body);
+    expect(body2.messages[2].content.map((r) => r.tool_use_id)).toEqual(['tu_1', 'tu_2']);
+    expect(audit.find((e) => e.event_type === 'agent_turn_summary').iterations).toBe(2);
   });
 
   test('kill-switch: env AGENTIC_SCHEDULING_DISABLED suppresses entry (no model call, no SSE, no audit)', async () => {
@@ -384,7 +417,7 @@ describe('agentTurn — §B17b loop', () => {
 
     const f = frames(write);
     expect(f.some((x) => x.type === 'text')).toBe(true);
-    expect(f).toContainEqual({ type: 'scheduling_notice', reason: 'agent_error', session_id: 'sess-1' });
+    expect(f).toContainEqual({ type: 'scheduling_notice', notice: 'agent_error', session_id: 'sess-1' });
     const summary = audit.find((e) => e.event_type === 'agent_turn_summary');
     expect(summary.stop_reason_sequence).toContain('error');
     // err.name-only logging — the error MESSAGE never reaches the logs
@@ -606,8 +639,29 @@ describe('agentTurn — tool-execution failure modes', () => {
     expect(deps.invokeProposal).not.toHaveBeenCalled();
     expect(deps.saveState).not.toHaveBeenCalled();
     const toolCall = audit.find((e) => e.event_type === 'agent_tool_call');
-    expect(toolCall.tool).toBe('delete_all_bookings');
+    expect(toolCall.tool).toBe('unknown'); // §B17g: audit tool field clamped to the catalog
     expect(toolCall.outcome).toBe('lookup_failed');
+  });
+
+  test("a pathological 5000-char tool name is clamped: audit tool === 'unknown'; raw name never serialized", async () => {
+    const hugeName = 'x'.repeat(5000);
+    const bedrock = fakeBedrock([
+      toolUseResponse({ name: hugeName, input: {} }),
+      textResponse('I cannot do that.'),
+    ]);
+    const audit = [];
+    const logLines = [];
+    const deps = makeDeps({ bedrock, audit, logLines });
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write }));
+
+    const toolCall = audit.find((e) => e.event_type === 'agent_tool_call');
+    expect(toolCall.tool).toBe('unknown');
+    expect(toolCall.outcome).toBe('lookup_failed');
+    // the raw model-supplied name is absent from EVERY serialized audit event and log line
+    expect(JSON.stringify(audit)).not.toContain(hugeName);
+    expect(logLines.join('\n')).not.toContain(hugeName);
   });
 
   test('malformed (unparseable) streamed tool-input JSON degrades to {} → executors fail it closed', async () => {

@@ -414,6 +414,29 @@ describe('executeRequestBookingConfirmation', () => {
     expect(result).toEqual({ staged: true, label: SLOT.label });
   });
 
+  test('§B17c VERBATIM-MATCH guard is case-insensitive: user typed vol@example.com, model supplies VOL@EXAMPLE.COM → accepted', async () => {
+    const args = tool2Args({
+      input: { slot_id: 's1', attendee_email: 'VOL@EXAMPLE.COM' },
+      userTranscript: ['hi', 'sure — vol@example.com works'],
+    });
+    const result = await executeRequestBookingConfirmation(args);
+    expect(result).toEqual({ staged: true, label: SLOT.label });
+    // staged lowercase-normalized
+    expect(args.deps.saveState).toHaveBeenCalledWith(
+      expect.objectContaining({ attendee_email: 'vol@example.com' })
+    );
+  });
+
+  test('§B17c VERBATIM-MATCH guard: an address the user never typed in ANY case → invalid_email', async () => {
+    const args = tool2Args({
+      input: { slot_id: 's1', attendee_email: 'Invented@Model.Example' },
+      userTranscript: ['hi', 'book me for friday'], // no email in any casing
+    });
+    const result = await executeRequestBookingConfirmation(args);
+    expect(result).toEqual({ error: 'invalid_email' });
+    expect(args.deps.saveState).not.toHaveBeenCalled();
+  });
+
   test('§B17c VERBATIM-MATCH guard: equals the session-row captured attendee_email → accepted', async () => {
     const args = tool2Args({
       input: { slot_id: 's1', attendee_email: 'captured@example.com' },

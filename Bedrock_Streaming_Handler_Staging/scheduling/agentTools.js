@@ -378,17 +378,23 @@ async function executeRequestBookingConfirmation({
   }
 
   // 2. Email shape (EMAIL_SHAPE imported from newBookingEntry — §B17c: DO NOT copy).
-  const email = typeof input.attendee_email === 'string' ? input.attendee_email.trim() : '';
+  //    Case-normalized to lowercase: email matching is case-insensitive in practice,
+  //    and the model often re-cases what the user typed.
+  const email = typeof input.attendee_email === 'string' ? input.attendee_email.trim().toLowerCase() : '';
   if (!email || email.length > 254 || !EMAIL_SHAPE.test(email)) {
     return { error: 'invalid_email' };
   }
 
   // 3. ANTI-HALLUCINATION GUARD (§B17c #3, governance pass 2026-06-12): the model cannot
   //    stage an address the user never typed. Verbatim containment in the user-side
-  //    transcript, or exact equality with the session row's captured attendee_email.
-  const capturedEmail = session && typeof session.attendee_email === 'string' ? session.attendee_email : null;
+  //    transcript, or exact equality with the session row's captured attendee_email —
+  //    both compared case-insensitively (lowercased) so a model-re-cased copy of the
+  //    user's own address is accepted while invented addresses stay rejected.
+  const capturedEmail = session && typeof session.attendee_email === 'string'
+    ? session.attendee_email.toLowerCase()
+    : null;
   const inTranscript = Array.isArray(userTranscript)
-    && userTranscript.some((t) => typeof t === 'string' && t.includes(email));
+    && userTranscript.some((t) => typeof t === 'string' && t.toLowerCase().includes(email));
   if (!inTranscript && email !== capturedEmail) {
     logger.warn('[WS-AG-CORE] request_booking_confirmation rejected: attendee_email failed the verbatim-match guard');
     return { error: 'invalid_email' };

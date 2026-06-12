@@ -67,7 +67,8 @@
  *   The loop body executes tool calls on every iteration the model requests one,
  *   per the §B17b pseudocode. Overflow = the model STILL wants tools after the final
  *   iteration; recorded via agent_turn_summary.overflow=true + the scheduling_notice
- *   (reason 'agent_overflow') + templated warm-honest copy. No 4th model call is ever
+ *   (notice 'agent_overflow' — §B17b pinned key, the shipped convention) + templated
+ *   warm-honest copy. No 4th model call is ever
  *   made. The agent_tool_call outcome value 'overflow' is reserved for a refused tool
  *   execution; under the verbatim loop every requested tool within budget executes,
  *   so the canonical overflow record is the turn summary (flagged to the integrator
@@ -325,6 +326,10 @@ async function streamModelCall({ bedrock, modelId, system, messages, write, sess
 
 // ─── tool execution wrapper (audit + result envelope) ──────────────────────────────────
 
+// §B17g: the audit `tool` field is clamped to the §B17c catalog — a model-invented
+// name (arbitrary attacker-shaped string) must never be serialized into audit lines.
+const KNOWN_TOOLS = new Set(['get_available_times', 'request_booking_confirmation']);
+
 async function runOneTool(toolUse, { iteration, tenantId, sessionId, tenantConfig, deps, write, getSession, setSession, userTranscript }) {
   const logger = (deps && deps.logger) || console;
   const started = Date.now();
@@ -370,7 +375,7 @@ async function runOneTool(toolUse, { iteration, tenantId, sessionId, tenantConfi
   emitAgentToolCall(deps, {
     tenantId,
     sessionId,
-    tool: toolUse.name,
+    tool: KNOWN_TOOLS.has(toolUse.name) ? toolUse.name : 'unknown',
     outcome,
     latencyMs: Date.now() - started,
     iteration,
@@ -515,9 +520,11 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
       }
 
       // Execute tool call(s) server-side; the executor emits the tool's UI SSE event.
-      // (Each tool_use block in the response gets its tool_result — the API requires it.)
+      // (Each executed tool_use block gets its tool_result — the API requires it.)
+      // Cap executions per iteration to 2 (catalog size; §B17b sets no cap — defensive
+      // against N parallel staging writes).
       const toolResults = [];
-      for (const toolUse of toolUses) {
+      for (const toolUse of toolUses.slice(0, 2)) {
         toolCallCount += 1;
         const result = await runOneTool(toolUse, {
           iteration: i + 1, // §B17g: 1-based loop index
@@ -549,7 +556,7 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
     if (lastStopReason === 'tool_use') {
       if (write) {
         write(`data: ${JSON.stringify({ type: 'text', content: OVERFLOW_COPY, session_id: sessionId })}\n\n`);
-        write(`data: ${JSON.stringify({ type: 'scheduling_notice', reason: 'agent_overflow', session_id: sessionId })}\n\n`);
+        write(`data: ${JSON.stringify({ type: 'scheduling_notice', notice: 'agent_overflow', session_id: sessionId })}\n\n`);
       }
       emitAgentTurnSummary(deps, {
         tenantId,
@@ -577,7 +584,7 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
     logger.error(`[WS-AG-CORE] agent turn failed (non-fatal): error_name=${(err && err.name) || 'unknown'}`);
     if (write) {
       write(`data: ${JSON.stringify({ type: 'text', content: AGENT_ERROR_COPY, session_id: sessionId })}\n\n`);
-      write(`data: ${JSON.stringify({ type: 'scheduling_notice', reason: 'agent_error', session_id: sessionId })}\n\n`);
+      write(`data: ${JSON.stringify({ type: 'scheduling_notice', notice: 'agent_error', session_id: sessionId })}\n\n`);
     }
     stopReasonSequence.push('error');
     emitAgentTurnSummary(deps, {
