@@ -169,6 +169,7 @@ live staging** (real model judgment / increment-2 behavior).
 - **Action:** observe the agent's narration text that accompanies the chip emission.
 - **Pass criteria:** the agent's response does **NOT** end with a closing question ("Which works best for you?", "Does one of these work?", or any equivalent); the narration is a one-sentence summary at most; the widget's refinement microcopy carries the refinement affordance.
 - **Result:** _(leave blank — filled at eval time)_
+- **Tier:** live only (prompt rule)
 
 ---
 

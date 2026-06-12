@@ -248,7 +248,14 @@ function sampleDaypartDiverse(merged, count, userTimeZone) {
       if (!usedDayparts.has(c._daypart)) { p2 = c; break; }
     }
   }
-  // last resort: any different slot (daypart exhausted)
+  // different day than pick-1, regardless of daypart
+  if (!p2) {
+    for (const c of withDaypart) {
+      if (usedStarts.has(c.start)) continue;
+      if (c.start.slice(0, 10) !== p1Day) { p2 = c; break; }
+    }
+  }
+  // last resort: any different slot (daypart exhausted, same day only)
   if (!p2) {
     for (const c of withDaypart) {
       if (!usedStarts.has(c.start)) { p2 = c; break; }
@@ -276,13 +283,22 @@ function sampleDaypartDiverse(merged, count, userTimeZone) {
       if (!usedDayparts.has(c._daypart)) { p3 = c; break; }
     }
   }
+  // earliest on a day not yet represented
+  if (!p3) {
+    const p2Day = p2.start.slice(0, 10);
+    for (const c of withDaypart) {
+      if (usedStarts.has(c.start)) continue;
+      const cDay = c.start.slice(0, 10);
+      if (cDay !== p1Day && cDay !== p2Day) { p3 = c; break; }
+    }
+  }
   if (!p3) {
     for (const c of withDaypart) {
       if (!usedStarts.has(c.start)) { p3 = c; break; }
     }
   }
   // p3 is always found here: merged.length > 3 and only 2 starts are used, so at
-  // least 2 unique starts remain after p1+p2.
+  // least 2 unique starts remain after p1+p2 (final fallback is always-found).
   picks.push(p3);
 
   // Sort chronologically; strip the _daypart annotation.

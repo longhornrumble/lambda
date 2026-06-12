@@ -159,7 +159,7 @@ const AGENT_NARRATION_RULES = [
   '15. When you call get_available_times, the times render as tappable buttons ' +
     'automatically. NEVER enumerate individual times in your text — summarize instead ' +
     "('Monday and Tuesday mornings are both open — tap a time below') and ask ONE " +
-    'closing question.',
+    'closing question (unless presenting available times — see rule 17).',
   "16. For time-of-day requests (morning/afternoon/evening/'after 3'), pass " +
     'after_time/before_time with the date. Afternoon = 12:00–17:00, evening = 17:00 ' +
     'onward, morning = before 12:00. The tool returns the earliest openings within ' +

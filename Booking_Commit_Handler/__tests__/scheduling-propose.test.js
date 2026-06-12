@@ -443,3 +443,33 @@ describe('handleSchedulingPropose — §B18b context envelope', () => {
     expect(out.context).toBeDefined(); // always present on ok, per §B18b
   });
 });
+
+// ── §B18b tz_label null paths ─────────────────────────────────────────────────────────
+
+describe('handleSchedulingPropose — §B18b tz_label null paths', () => {
+  it('invalid userTimeZone → context.tz_label === null', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => APPT_MEET,
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'Not/AReal_Zone' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context).toBeDefined();
+    expect(out.context.tz_label).toBeNull();
+  });
+
+  it('another invalid userTimeZone (Also/Invalid) → context.tz_label === null', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => APPT_MEET,
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'Also/Invalid' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context).toBeDefined();
+    expect(out.context.tz_label).toBeNull();
+  });
+});

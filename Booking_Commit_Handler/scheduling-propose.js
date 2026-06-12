@@ -58,7 +58,7 @@ const CONFERENCE_LABELS = {
 // §B18b: build the ADDITIVE context envelope from a resolved AppointmentType row.
 // All fields null-tolerant; context itself always present on outcome:'ok'.
 function buildProposalContext(appointmentType, userTimeZone) {
-  const duration_minutes = (appointmentType && appointmentType.duration_minutes) || null;
+  const duration_minutes = appointmentType?.duration_minutes ?? null;
   const conference_type = (appointmentType && appointmentType.conference_type) || 'google_meet';
   const conference_label = CONFERENCE_LABELS[conference_type] ?? null;
 
