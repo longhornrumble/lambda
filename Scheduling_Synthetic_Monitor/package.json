@@ -34,7 +34,9 @@
       "booking-table.js",
       "scheduled-messages-table.js",
       "bch-client.js",
+      "attend-client.js",
       "alerts.js",
+      "disposition-cycle.js",
       "index.js"
     ],
     "coverageThreshold": {
