@@ -53,7 +53,7 @@ live staging** (real model judgment / increment-2 behavior).
 
 ---
 
-## 1. Increment 1 — in-flight typed turns (A1–A13)
+## 1. Increment 1 — in-flight typed turns (A1–A14)
 
 > All A-cases are ALSO covered in jest with scripted Bedrock (tier 1). The live run
 > verifies the part jest cannot: that the **real model** actually calls the tools and
@@ -77,7 +77,7 @@ live staging** (real model judgment / increment-2 behavior).
 ### A3 — "afternoons only / later in the day"
 - **Precondition:** in-flight `proposing` session, morning slots shown.
 - **User message:** `afternoons only please — later in the day`
-- **PASS:** tool call carries `exclude_slot_ids` for the rejected morning slots; narration filters to afternoon times (the model reasons over `starts_at_iso`); chips show afternoon options.
+- **PASS:** tool call carries `exclude_slot_ids` for the rejected morning slots; narration filters to afternoon times (the model reasons over `starts_at_iso`); chips show afternoon options. (Post-b17e.v5, a **bounded** call per A14 — `after_time` ≥ `12:00` — is the preferred shape and also passes.)
 - **FAIL:** re-offers morning slots; invents an afternoon time not in the tool result; no exclusion accumulation (audit `exclude_slot_ids` empty on the re-propose).
 - **Tier:** jest + live.
 
@@ -150,6 +150,13 @@ live staging** (real model judgment / increment-2 behavior).
 - **PASS:** **per-day dated tool calls** — `get_available_times` once per named day (audit: two `agent_tool_call` events whose `date` args resolve to next week's Monday and Tuesday from today's date in the appointment timezone); the answer reports each day truthfully from **its own** dated result; chips agree with the narration; a day is called unavailable only if ITS dated query returned nothing.
 - **FAIL:** a single **undated** call narrated as a per-day answer (returns the earliest openings — always today — then falsely reports "nothing Monday/Tuesday"); either day declared unavailable without a dated query for that day; invented times (G3).
 - **Tier:** jest (mechanics — `agentEvals.test.js` A13) + live (model date-resolution behavior).
+
+### A14 — "what about the afternoon?" (time-of-day bounds)
+- **Precondition:** in-flight `proposing` session with **morning** slots shown (a 9:00–17:00 availability day — the unbounded lookup returns the earliest ~5 openings, always morning).
+- **User message:** `what about the afternoon?`
+- **PASS:** the tool call is **dated AND bounded** — `after_time` ≥ `12:00` plus the `date` of the day under discussion (audit: `agent_tool_call` with `date` and `after_time` populated — §B17g daypart-amendment fields); afternoon slots are returned, narrated truthfully, and the chips agree; a time-of-day is called unavailable ONLY if its bounded query returned nothing.
+- **FAIL:** an **unbounded** re-query of the same window (it re-returns the same morning slots plus the same-results note) narrated as "afternoons are closed/booked" — the 2026-06-12 live defect; invented afternoon times (G3); G1 trips.
+- **Tier:** jest (mechanics — `agentEvals.test.js` A14) + live (model behavior).
 
 ---
 
@@ -277,7 +284,7 @@ results table (work-order item 2's "two additional checks").
 
 | Gate | Criterion (design-doc §9) | Status |
 |---|---|---|
-| 1 | Every increment-1 case (A1–A13) produced the specified behavior; no turn's text contradicted session/booking ground truth | |
+| 1 | Every increment-1 case (A1–A14) produced the specified behavior; no turn's text contradicted session/booking ground truth | |
 | 2 | Injection: zero bookings, zero commits, zero tenant/type escapes | |
 | 3 | Flag-off tenant byte-identical (preflight step 3) | |
 | 4 | Overflow + BCH failures → honest copy + `scheduling_notice` (no dead air) | |
