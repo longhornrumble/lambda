@@ -739,12 +739,13 @@ describeAgent('Appendix A increment-1 evals (§B17b loop through the real agentT
     expect(slotWrites).toHaveLength(0);
   });
 
-  test('A13: "Monday or Tuesday of next week?" → per-day DATED tool calls; each day answered from its own result', async () => {
+  test('A13: "Monday or Tuesday of next week?" → per-day DATED calls; session row holds the UNION; first-day slot stageable; summary narration', async () => {
     const store = memoryStateStore(rowQualifying());
     const bedrock = scriptedBedrock([
       { toolUse: { id: 'toolu_mon', name: 'get_available_times', input: { date: '2026-06-15' } }, stopReason: 'tool_use' },
       { toolUse: { id: 'toolu_tue', name: 'get_available_times', input: { date: '2026-06-16' } }, stopReason: 'tool_use' },
-      { text: 'Monday Jun 15 has 9:00 AM or 2:30 PM, and Tuesday Jun 16 has 3:00 PM — do any of those work?', stopReason: 'end_turn' },
+      // §B17e rule 15: SUMMARIZE — the chips render the individual times, the text never enumerates them.
+      { text: 'Monday and Tuesday both have real openings — tap a time below that works for you. Which day is better?', stopReason: 'end_turn' },
     ]);
     const deps = makeDeps({ bedrock, store, proposeResults: [PROPOSE_MONDAY, PROPOSE_TUESDAY] });
     deps.nowMs = NOW_MS; // injectable clock — the today-line gives the model its anchor
@@ -782,6 +783,46 @@ describeAgent('Appendix A increment-1 evals (§B17b loop through the real agentT
     expect(streamedText(rec.frames)).toContain('Tuesday');
     expect(eventsOfType(rec.frames, 'scheduling_slots')).toHaveLength(2);
     expect(deps.invokeBookingCommit).not.toHaveBeenCalled();
+
+    // F6 union (live defect 2026-06-11): the SESSION row's candidate_slots must contain
+    // BOTH days' slots after the turn (union, ≤10) — the second dated call's PutItem
+    // whitelist write must NOT have replaced the first day's candidates.
+    const persistedIds = (store.row.candidate_slots || []).map((s) => s.slotId);
+    expect(persistedIds).toEqual(['s1', 's2', 's3']);
+    expect(store.row.candidate_slots.length).toBeLessThanOrEqual(10);
+
+    // §B17e rule 15: the final narration SUMMARIZES — never more than 2 individual clock
+    // times in the streamed text (the chips carry the times).
+    const clockTimes = streamedText(rec.frames).match(/\d{1,2}:\d{2}/g) || [];
+    expect(clockTimes.length).toBeLessThanOrEqual(2);
+
+    // Staging a slot from the FIRST call's day (Monday s1) on the NEXT turn must succeed
+    // (outcome staged — NOT unknown_slot) against the persisted union row.
+    const bedrock2 = scriptedBedrock([
+      { toolUse: { name: 'request_booking_confirmation', input: { slot_id: 's1', attendee_email: 'vol@host.example' } }, stopReason: 'tool_use' },
+      { text: 'All set — review the card below and press Confirm when you are ready.', stopReason: 'end_turn' },
+    ]);
+    const deps2 = makeDeps({ bedrock: bedrock2, store });
+    const rec2 = sseRecorder();
+    await agentTurn(turnArgs({
+      userText: 'the Monday 9am works — my email is vol@host.example',
+      history: [
+        { role: 'user', content: 'Do you have something on Monday or Tuesday of next week?' },
+        { role: 'assistant', content: 'Monday and Tuesday both have real openings — tap a time below that works for you. Which day is better?' },
+      ],
+      sessionRow: store.row,
+      deps: deps2,
+      writer: rec2.writer,
+    }));
+
+    const stagedResults = toolResultContents(bedrock2.calls[1]);
+    expect(stagedResults).toHaveLength(1);
+    expect(stagedResults[0]).toMatchObject({ staged: true });
+    expect(stagedResults[0].error).toBeUndefined(); // explicitly NOT unknown_slot
+    expect(eventsOfType(rec2.frames, 'scheduling_confirm')).toHaveLength(1);
+    expect(store.row.state).toBe('confirming');
+    expect(store.row.selected_slot && store.row.selected_slot.slotId).toBe('s1');
+    expect(deps2.invokeBookingCommit).not.toHaveBeenCalled();
   });
 });
 

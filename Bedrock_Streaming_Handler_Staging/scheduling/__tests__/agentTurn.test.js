@@ -992,8 +992,14 @@ describe('agentTurn — F3/F5 prompt rules (live-eval G1/A7 + A2/A3)', () => {
     expect(AGENT_NARRATION_RULES).toContain('never describe a morning time as afternoon');
   });
 
+  test('rule 15 (chips carry the times): never enumerate individual times; summarize + ONE closing question', () => {
+    expect(AGENT_NARRATION_RULES).toContain('render as tappable buttons');
+    expect(AGENT_NARRATION_RULES).toContain('NEVER enumerate individual times in your text');
+    expect(AGENT_NARRATION_RULES).toContain('ask ONE closing question');
+  });
+
   test('PROMPT_VERSION bumped for the rules change (§B17g)', () => {
-    expect(PROMPT_VERSION).toBe('b17e.v3');
+    expect(PROMPT_VERSION).toBe('b17e.v4');
   });
 });
 
