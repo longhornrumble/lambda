@@ -1,7 +1,7 @@
 /**
  * DynamoDB registry access for Attribution entry-point records (C3).
  *
- * Table: env ENTRY_POINTS_TABLE (e.g. picasso-entry-points-staging)
+ * Table: env ENTRY_POINTS_TABLE (e.g. picasso-entry-points — bare name per uniform-env-rules; account boundary = env)
  * PK: tenant_id (S)
  * SK: entry_point_id (S)
  *

@@ -58,17 +58,21 @@ export async function getDubApiKey() {
     const resp = await client.send(new GetSecretValueCommand({ SecretId: secretName }));
     const value = resp.SecretString ?? '';
     if (!value.trim()) {
+      // Secret is present but genuinely empty — cache null so we don't re-fetch.
       _cachedKey = null;
       return null;
     }
     _cachedKey = value.trim();
     return _cachedKey;
   } catch (err) {
-    // Never log the secret name value that was attempted — only that fetch failed
+    // Never log the secret name value that was attempted — only that fetch failed.
+    // Do NOT cache null on transient errors: leave _cachedKey as undefined so the
+    // next invocation retries. Caching null here would poison the container for
+    // its lifetime after a single network blip.
     console.warn('[Attribution/secrets] Failed to fetch DUB_SECRET_NAME; mint will degrade to DUB_ERROR', {
       errorName: err.name,
     });
-    _cachedKey = null;
+    // _cachedKey stays undefined — retry on next call.
     return null;
   }
 }

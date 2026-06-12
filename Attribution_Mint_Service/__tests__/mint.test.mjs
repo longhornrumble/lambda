@@ -67,14 +67,15 @@ function makeDdbMock({ putThrows = null, getResult = null } = {}) {
   return {
     send: jest.fn(async (command) => {
       const name = command.constructor?.name ?? '';
-      if (name === 'PutCommand' || command instanceof Object && command.input?.ConditionExpression) {
+      if (name === 'PutCommand' || (command instanceof Object && command.input?.ConditionExpression)) {
         if (putThrows) throw putThrows;
         return {};
       }
       if (name === 'GetCommand') {
         return { Item: getResult };
       }
-      return {};
+      // Item 13: throw on unrecognized commands rather than silently falling through.
+      throw new Error(`Unexpected DynamoDB command in test mock: ${name || JSON.stringify(command)}`);
     }),
   };
 }
@@ -599,14 +600,22 @@ describe('handler', () => {
     expect(body.error.code).toBe('VALIDATION');
   });
 
-  it('parses JSON string body (API Gateway proxy format)', async () => {
-    const response = await handler({ body: JSON.stringify(makeValidBody()) });
+  it('accepts direct IAM invocation (plain object, no wrapper)', async () => {
+    // The API Gateway string-body branch was removed (item 11 — surface reduction).
+    // IAM invoke passes the event object directly as the body.
+    const response = await handler(makeValidBody());
     expect(response.statusCode).toBe(201);
   });
 
-  it('returns 400 for invalid JSON body', async () => {
-    const response = await handler({ body: '{ bad json' });
+  it('returns 400 for unknown action when action field is missing', async () => {
+    const body = makeValidBody();
+    delete body.action;
+    const response = await handler(body);
     expect(response.statusCode).toBe(400);
+    const parsed = JSON.parse(response.body);
+    expect(parsed.error.code).toBe('VALIDATION');
+    // Item 3: error message must be static — no raw input reflected.
+    expect(parsed.error.message).toBe('Unknown action');
   });
 
   it('returns 409 for SUFFIX_TAKEN', async () => {
@@ -632,5 +641,254 @@ describe('handler', () => {
     expect(response.statusCode).toBe(502);
     const body = JSON.parse(response.body);
     expect(body.error.code).toBe('DUB_ERROR');
+  });
+});
+
+// ============================================================
+// Item 1 — 409 registry-existence idempotent path (C4)
+// ============================================================
+
+describe('mintEntryPoint — Dub 409 no-suffix idempotent retry (item 1)', () => {
+  it('returns ok:true with STORED fields when registry row exists (idempotent)', async () => {
+    // Dub 409 (no suffix) → getEntryPoint returns an existing row.
+    globalThis.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      headers: { get: () => null },
+      json: async () => ({}),
+    });
+
+    const existingRow = {
+      tenant_id: 'TENANT123',
+      entry_point_id: 'ep_STORED001',
+      dub_short_link: 'https://myrctr.link/stored-key',
+      dub_link_id: 'dub_stored_001',
+      destination_url: 'https://example.org/gala?ep=ep_STORED001',
+      created_at: '2026-01-01T00:00:00.000Z',
+    };
+    setDocClient(makeDdbMock({ getResult: existingRow }));
+
+    const result = await mintEntryPoint(makeValidBody());
+    expect(result.ok).toBe(true);
+    expect(result.entry_point.entry_point_id).toBe('ep_STORED001');
+    expect(result.entry_point.short_link).toBe('https://myrctr.link/stored-key');
+    expect(result.entry_point.dub_link_id).toBe('dub_stored_001');
+    expect(result.entry_point.created_at).toBe('2026-01-01T00:00:00.000Z');
+  });
+
+  it('returns CONFLICT when Dub 409 (no suffix) and registry row is absent', async () => {
+    // Dub 409 (no suffix) → getEntryPoint returns null (orphan Dub link).
+    globalThis.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 409,
+      headers: { get: () => null },
+      json: async () => ({}),
+    });
+    setDocClient(makeDdbMock({ getResult: null }));
+
+    const result = await mintEntryPoint(makeValidBody());
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('CONFLICT');
+  });
+});
+
+// ============================================================
+// Item 2 — Unicode @ bypass (C8.13)
+// ============================================================
+
+describe('validateMintRequest — Unicode @ bypass (item 2)', () => {
+  it('rejects full-width @ (U+FF20) in label via NFKC normalization', () => {
+    const err = validateMintRequest(makeValidBody({ label: 'jane＠example.com' }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/@/);
+  });
+
+  it('rejects full-width @ in campaign', () => {
+    const err = validateMintRequest(makeValidBody({ campaign: 'user＠org' }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/@/);
+  });
+
+  it('rejects full-width @ in placement', () => {
+    const err = validateMintRequest(makeValidBody({ placement: 'lead＠campaign' }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/@/);
+  });
+});
+
+// ============================================================
+// Item 4 — Secrets cache: transient error then success
+// ============================================================
+
+describe('getDubApiKey — transient error does not poison cache (item 4)', () => {
+  it('returns key on second call after first call threw transiently', async () => {
+    let callCount = 0;
+    const smMock = {
+      send: jest.fn(async () => {
+        callCount++;
+        if (callCount === 1) throw new Error('TransientNetworkError');
+        return { SecretString: 'real-api-key' };
+      }),
+    };
+    setSmClient(smMock);
+
+    // First call — should throw → return null but NOT cache null.
+    const first = await mintEntryPoint(makeValidBody());
+    expect(first.ok).toBe(false);
+    expect(first.error.code).toBe('DUB_ERROR');
+
+    // Reset Dub fetch mock for the second call
+    globalThis.fetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => makeDubSuccessResponse(),
+    });
+
+    // Second call — cache was not poisoned; secret fetch retries and succeeds.
+    const second = await mintEntryPoint(makeValidBody());
+    expect(second.ok).toBe(true);
+    expect(smMock.send).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ============================================================
+// Item 5 — Fragment URL: ?ep= placed before fragment
+// ============================================================
+
+describe('buildDestinationUrl — fragment URL (item 5)', () => {
+  it('places ?ep= before the # fragment, not inside it', async () => {
+    const result = await mintEntryPoint(makeValidBody({
+      target: { type: 'site_url', url: 'https://example.org/page#section' },
+    }));
+    expect(result.ok).toBe(true);
+    const dest = result.entry_point.destination_url;
+    // ep param must appear before the fragment
+    const epIndex = dest.indexOf('?ep=');
+    const hashIndex = dest.indexOf('#');
+    expect(epIndex).toBeGreaterThan(-1);
+    expect(hashIndex).toBeGreaterThan(-1);
+    expect(epIndex).toBeLessThan(hashIndex);
+    // Confirm attribution id is in the query string, not the fragment
+    expect(dest).toMatch(/\?ep=ep_[0-9A-HJKMNP-TV-Z]{26}#section$/);
+  });
+});
+
+// ============================================================
+// Item 6 — Retry-After NaN guard (HTTP-date header)
+// ============================================================
+
+describe('dubClient — Retry-After NaN guard (item 6)', () => {
+  it('uses 1s fallback when Retry-After header is an HTTP-date (non-numeric)', async () => {
+    jest.useFakeTimers();
+
+    globalThis.fetch
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        // HTTP-date format → parseInt → NaN
+        headers: { get: (h) => h === 'Retry-After' ? 'Fri, 20 Jun 2026 12:00:00 GMT' : null },
+        json: async () => ({}),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => makeDubSuccessResponse(),
+      });
+
+    const promise = mintEntryPoint(makeValidBody());
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result.ok).toBe(true);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+  }, 10000);
+
+  it('caps Retry-After at 30 s even when header value is very large', async () => {
+    jest.useFakeTimers();
+
+    globalThis.fetch
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: { get: (h) => h === 'Retry-After' ? '9999' : null },
+        json: async () => ({}),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => makeDubSuccessResponse(),
+      });
+
+    const promise = mintEntryPoint(makeValidBody());
+    await jest.runAllTimersAsync();
+    const result = await promise;
+    expect(result.ok).toBe(true);
+  }, 10000);
+});
+
+// ============================================================
+// Item 7 — Assert the Dub POST body fields individually
+// ============================================================
+
+describe('mintEntryPoint — Dub POST body assertions (item 7)', () => {
+  it('sends correct externalId, domain, tenantId, tagNames, and url with ?ep=', async () => {
+    const result = await mintEntryPoint(makeValidBody());
+    expect(result.ok).toBe(true);
+
+    const fetchCall = globalThis.fetch.mock.calls[0];
+    expect(fetchCall[0]).toBe('https://api.dub.co/links');
+    expect(fetchCall[1].method).toBe('POST');
+
+    const sentBody = JSON.parse(fetchCall[1].body);
+
+    // externalId must match the minted ep_ id
+    expect(sentBody.externalId).toBe(result.entry_point.entry_point_id);
+    // domain must be the configured Dub domain
+    expect(sentBody.domain).toBe('myrctr.link');
+    // tenantId must be the request tenant_id
+    expect(sentBody.tenantId).toBe('TENANT123');
+    // tagNames must be exactly [tenant_id]
+    expect(sentBody.tagNames).toEqual(['TENANT123']);
+    // url must contain ?ep= (the destination URL with ep appended)
+    expect(sentBody.url).toContain('?ep=');
+    expect(sentBody.url).toContain(result.entry_point.entry_point_id);
+  });
+});
+
+// ============================================================
+// Item 8 — tenant_id length cap ≤128
+// ============================================================
+
+describe('validateMintRequest — tenant_id length cap (item 8)', () => {
+  it('rejects tenant_id > 128 chars', () => {
+    const err = validateMintRequest(makeValidBody({ tenant_id: 'x'.repeat(129) }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/tenant_id/);
+    expect(err?.message).toMatch(/128/);
+  });
+
+  it('accepts tenant_id exactly 128 chars', () => {
+    expect(validateMintRequest(makeValidBody({ tenant_id: 'x'.repeat(128) }))).toBeNull();
+  });
+});
+
+// ============================================================
+// Item 9 — Empty-string suffix treated as absent (validation error)
+// ============================================================
+
+describe('validateMintRequest — empty-string suffix (item 9)', () => {
+  it('rejects empty string suffix', () => {
+    const err = validateMintRequest(makeValidBody({ suffix: '' }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/empty string/);
+  });
+
+  it('accepts undefined suffix (field omitted)', () => {
+    const body = makeValidBody();
+    delete body.suffix;
+    expect(validateMintRequest(body)).toBeNull();
   });
 });

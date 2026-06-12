@@ -15,6 +15,18 @@
 export const DUB_API_BASE = 'https://api.dub.co';
 
 /**
+ * Maximum milliseconds to wait on a Dub 429 Retry-After before capping.
+ * 30 s is the house convention (matches the existing sleep cap in index.mjs).
+ */
+export const MAX_RETRY_WAIT_MS = 30_000;
+
+/**
+ * Dub domain used for all minted shortlinks.
+ * Defaults to 'myrctr.link' so glue code needs no env var unless overriding.
+ */
+export const DUB_DOMAIN = process.env.DUB_DOMAIN ?? 'myrctr.link';
+
+/**
  * Build the QR URL for a Dub shortlink (public GET, no API call needed).
  * Spec: C4 — size 1000, level H (error correction high for print).
  * @param {string} shortLink
@@ -40,7 +52,7 @@ export function buildQrUrl(shortLink) {
 export async function dubMintLink(apiKey, { destinationUrl, entryPointId, tenantId, suffix }) {
   const payload = {
     url: destinationUrl,
-    domain: 'myrctr.link',
+    domain: DUB_DOMAIN,
     externalId: entryPointId,
     tenantId,
     tagNames: [tenantId],
@@ -60,7 +72,13 @@ export async function dubMintLink(apiKey, { destinationUrl, entryPointId, tenant
   });
 
   if (response.status === 429) {
-    const retryAfter = parseInt(response.headers.get('Retry-After') ?? '1', 10);
+    // Parse Retry-After — the header may be a delta-seconds integer or an HTTP-date.
+    // parseInt of an HTTP-date string produces NaN; guard so we never setTimeout(NaN).
+    // Cap at MAX_RETRY_WAIT_MS / 1000 (30 s house convention).
+    const raw = parseInt(response.headers.get('Retry-After') ?? '', 10);
+    const retryAfter = Number.isFinite(raw) && raw > 0
+      ? Math.min(raw, MAX_RETRY_WAIT_MS / 1000)
+      : 1;
     throw new DubRateLimitError(retryAfter);
   }
 

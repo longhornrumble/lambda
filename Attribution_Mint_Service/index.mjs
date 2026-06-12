@@ -43,12 +43,14 @@ import { getDubApiKey } from './secrets.mjs';
 // ---------------------------------------------------------------------------
 
 /**
- * Append ?ep={id} to the destination URL.
- * If the URL already has query params, use &ep=; otherwise use ?ep=.
+ * Append ?ep={id} to the destination URL using the URL API so that
+ * fragment-bearing URLs (e.g. https://host/path#anchor) are handled
+ * correctly — searchParams are placed before the fragment, not inside it.
  */
 function buildDestinationUrl(baseUrl, entryPointId) {
-  const separator = baseUrl.includes('?') ? '&' : '?';
-  return `${baseUrl}${separator}ep=${entryPointId}`;
+  const u = new URL(baseUrl);
+  u.searchParams.set('ep', entryPointId);
+  return u.href;
 }
 
 /**
@@ -116,10 +118,10 @@ export async function mintEntryPoint(body) {
           suffix: suffix || undefined,
         });
       } catch (retryErr) {
-        return _handleDubError(retryErr, tenant_id, entryPointId, suffix);
+        return await _handleDubError(retryErr, tenant_id, entryPointId, suffix);
       }
     } else {
-      return _handleDubError(err, tenant_id, entryPointId, suffix);
+      return await _handleDubError(err, tenant_id, entryPointId, suffix);
     }
   }
 
@@ -202,21 +204,42 @@ export async function mintEntryPoint(body) {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-function _handleDubError(err, tenant_id, entryPointId, suffix) {
+async function _handleDubError(err, tenant_id, entryPointId, suffix) {
   if (err instanceof DubConflictError) {
-    // 409 on externalId: already minted previously?
-    // The contract requires success IFF registry row exists; otherwise CONFLICT.
-    // However: since we just generated a fresh ULID, externalId collision here
-    // means a prior (partial) mint minted to Dub but registry write failed.
-    // We cannot distinguish suffix-collision from externalId-collision here
-    // without inspecting the Dub response body. Per C4: custom-suffix collision
-    // returns SUFFIX_TAKEN; externalId collision (fresh ULID) is extremely rare —
-    // treat as CONFLICT (caller can retry).
     if (suffix) {
-      // A custom suffix was provided — more likely suffix key collision.
+      // A custom suffix was provided — this is a key collision (SUFFIX_TAKEN).
       return {
         ok: false,
         error: { code: 'SUFFIX_TAKEN', message: `Custom suffix is already taken` },
+      };
+    }
+    // No custom suffix — externalId collision means Dub already has this ep_ id.
+    // Per C4: check the registry. If the row exists, this is an idempotent retry
+    // (previous mint succeeded but the caller did not receive the response).
+    // Return ok:true with stored fields. If the row is absent, the Dub link is an
+    // orphan (registry write failed after a prior Dub mint) — return CONFLICT.
+    let existingRow = null;
+    try {
+      existingRow = await getEntryPoint(tenant_id, entryPointId);
+    } catch (lookupErr) {
+      console.warn('[Attribution/mint] Registry lookup failed on Dub 409', {
+        tenant_id,
+        entry_point_id: entryPointId,
+        errorName: lookupErr.name,
+      });
+    }
+    if (existingRow) {
+      // Idempotent: row exists — return the stored fields as success.
+      return {
+        ok: true,
+        entry_point: {
+          entry_point_id: existingRow.entry_point_id,
+          short_link: existingRow.dub_short_link,
+          qr_url: buildQrUrl(existingRow.dub_short_link),
+          destination_url: existingRow.destination_url,
+          dub_link_id: existingRow.dub_link_id,
+          created_at: existingRow.created_at,
+        },
       };
     }
     return {
@@ -261,23 +284,15 @@ async function _tryCleanupDubLink(apiKey, dubLinkId, entryPointId, tenant_id) {
 // ---------------------------------------------------------------------------
 
 export async function handler(event) {
-  // Support both direct invocation (plain JSON body) and API Gateway proxy events
-  let body = event;
-  if (typeof event.body === 'string') {
-    try {
-      body = JSON.parse(event.body);
-    } catch {
-      return {
-        statusCode: 400,
-        body: JSON.stringify({ ok: false, error: { code: 'VALIDATION', message: 'Invalid JSON body' } }),
-      };
-    }
-  }
+  // IAM-invoke-only: the event IS the body (plain JSON object).
+  // The API Gateway string-body path has been removed — this Lambda is invoked
+  // directly via IAM; a string body surface is unnecessary and widens attack surface.
+  const body = event;
 
   if (body.action !== 'mint') {
     return {
       statusCode: 400,
-      body: JSON.stringify({ ok: false, error: { code: 'VALIDATION', message: `Unknown action: ${body.action}` } }),
+      body: JSON.stringify({ ok: false, error: { code: 'VALIDATION', message: 'Unknown action' } }),
     };
   }
 

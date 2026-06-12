@@ -14,6 +14,8 @@ const MAX_LABEL_LEN = 128;
 const MAX_CAMPAIGN_LEN = 128;
 const MAX_PLACEMENT_LEN = 128;
 const MAX_SUFFIX_LEN = 190;
+// tenant_id becomes a DDB partition key and Dub tag — cap it defensively.
+const MAX_TENANT_ID_LEN = 128;
 
 // Only utm_* query params are allowed in the destination URL (ep is added by the service).
 const ALLOWED_QUERY_PARAM_RE = /^utm_/;
@@ -67,6 +69,8 @@ export function validateDestinationUrl(urlStr) {
 
 /**
  * Validate a taxonomy field (label, campaign, placement) per C8.13.
+ * NFKC-normalises the value before the @ check so that full-width variants
+ * such as U+FF20 (＠) are caught alongside the ASCII @ (U+0040).
  * @param {string} value
  * @param {string} fieldName
  * @param {number} maxLen
@@ -79,7 +83,8 @@ function validateTaxonomyField(value, fieldName, maxLen) {
   if (value.length > maxLen) {
     return `${fieldName} must be ${maxLen} characters or fewer (got ${value.length})`;
   }
-  if (value.includes('@')) {
+  // Normalize to NFC-compatible form before checking for @ variants (C8.13 unicode-bypass guard).
+  if (value.normalize('NFKC').includes('@')) {
     return `${fieldName} must not contain '@' — never name an individual in attribution taxonomy`;
   }
   return null;
@@ -99,6 +104,9 @@ export function validateMintRequest(body) {
 
   if (!tenant_id || typeof tenant_id !== 'string' || !tenant_id.trim()) {
     return { code: 'VALIDATION', message: 'tenant_id is required' };
+  }
+  if (tenant_id.length > MAX_TENANT_ID_LEN) {
+    return { code: 'VALIDATION', message: `tenant_id must be ${MAX_TENANT_ID_LEN} characters or fewer (got ${tenant_id.length})` };
   }
 
   const labelErr = validateTaxonomyField(label, 'label', MAX_LABEL_LEN);
@@ -130,10 +138,23 @@ export function validateMintRequest(body) {
     if (typeof suffix !== 'string') {
       return { code: 'VALIDATION', message: 'suffix must be a string when provided' };
     }
+    // Treat empty string as absent — a zero-length key would silently drop through
+    // validation and produce unexpected Dub API behavior.
+    if (suffix.length === 0) {
+      return { code: 'VALIDATION', message: 'suffix must not be an empty string; omit the field to use an auto-generated key' };
+    }
     if (suffix.length > MAX_SUFFIX_LEN) {
       return { code: 'VALIDATION', message: `suffix must be ${MAX_SUFFIX_LEN} characters or fewer` };
     }
   }
+
+  // Item 10 (C4 obligation): when no tenant site-domain list is available to verify
+  // the destination URL's domain, emit a warn so a CloudWatch metric filter can count it.
+  // This is a best-effort observability hook — it does NOT block the mint.
+  console.warn('[Attribution/mint] destination-domain-unverified', {
+    tenant_id,
+    metric: 'attribution.destination.unverified',
+  });
 
   return null;
 }
