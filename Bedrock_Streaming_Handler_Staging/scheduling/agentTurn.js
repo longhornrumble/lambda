@@ -87,8 +87,12 @@ const { checkSensitiveContext, userSideTranscript } = require('./sensitiveContex
 // §B17b LOOP INVARIANT.
 const MAX_TOOL_ITERATIONS = 3;
 
+// F1 (eval A9): max prior-session messages threaded into the agent model call.
+// Bounded so a long session cannot blow the prompt; newest turns win.
+const MAX_HISTORY_MESSAGES = 12;
+
 // agent_turn_summary.prompt_version (§B17g) — bump when AGENT_NARRATION_RULES changes.
-const PROMPT_VERSION = 'b17e.v1';
+const PROMPT_VERSION = 'b17e.v2';
 
 // §B17b overflow: templated warm-honest copy (verbatim) + the shipped async-escape SSE.
 const OVERFLOW_COPY = 'I ran into a snag — let me get someone to help.';
@@ -111,9 +115,12 @@ const SUPPRESSION_CLOSE_COPY =
 const AGENT_NARRATION_RULES = [
   'SCHEDULING AGENT RULES (locked):',
   '1. You have live scheduling tools: you can look up REAL times and stage NEW bookings. ' +
-    'You cannot reschedule, cancel, or see existing bookings — offer the email/human ' +
-    'fallback for those. If a tool fails, say the lookup failed right now; never say you ' +
-    'lack scheduling access, never invent times.',
+    'The construction "I don\'t have access" (and any variant implying you lack access) is ' +
+    'BANNED — never say it. For requests about an EXISTING appointment (seeing, changing, ' +
+    'rescheduling, or canceling one), say: "I can\'t see or change existing appointments — ' +
+    'but our team can; want me to get you their contact, or set up a NEW time?" If a tool ' +
+    'fails, say the lookup failed right now; never say you lack scheduling access, never ' +
+    'invent times.',
   '2. Never state or imply a booking exists. Confirmed bookings are announced by the ' +
     'system, not you.',
   '3. Only mention times returned by get_available_times this conversation.',
@@ -127,6 +134,12 @@ const AGENT_NARRATION_RULES = [
   '10. Avoid guarantee language about offered times (a slot can be taken until confirmed).',
   '11. (increment 2 only) Offer booking only when the suggestion gate passes; ' +
     '"just exploring" gets learning content, never a booking pitch.',
+  '12. When the user asks for a different day or a different time of day, call ' +
+    'get_available_times with the appropriate date and exclude_slot_ids listing the slot ' +
+    'IDs already shown. If the tool returns the SAME times or no alternatives, say plainly ' +
+    'that nothing else is open — never affirm availability the tool did not return.',
+  "13. Derive morning/afternoon/evening from each slot's starts_at_iso in the user's time " +
+    'zone — never describe a morning time as afternoon (or the reverse).',
 ].join('\n');
 
 // ─── §B17h kill-switch guard ───────────────────────────────────────────────────────────
@@ -175,6 +188,52 @@ function buildStateLine(sessionRow) {
     sessionRow.attendee_email.trim()
   );
   return `[scheduling state: ${state} | staged slot: ${staged} | email: ${emailKnown ? 'known' : 'unknown'}]`;
+}
+
+// ─── F1 (eval A9) — agent messages carry the session, not a lone sentence ──────────────
+
+/**
+ * Build the §B17b messages array: prior session turns + this turn's user text.
+ * Live-eval A9 root cause: with `messages = [{role:'user', content: userText}]` the
+ * model saw a bare email (or "the 10am works") with NO conversation context — it could
+ * never link an email to the slot discussed a turn earlier, so multi-turn flows died
+ * with 0 tool calls. Prior turns are threaded as plain text messages (§B17b shape
+ * preserved: strictly alternating roles, opening with 'user'), newest-first capped at
+ * MAX_HISTORY_MESSAGES, consecutive same-role turns merged (the API rejects
+ * non-alternating roles), tolerating the codebase's mixed {content}/{text} shapes.
+ *
+ * @param {Array}  conversationHistory
+ * @param {string} userText
+ * @returns {Array<{role: string, content: string}>}
+ */
+function buildAgentMessages(conversationHistory, userText) {
+  const turns = [];
+  for (const m of Array.isArray(conversationHistory) ? conversationHistory : []) {
+    if (!m || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    const text = typeof m.content === 'string' ? m.content : typeof m.text === 'string' ? m.text : '';
+    if (!text.trim()) continue;
+    turns.push({ role: m.role, content: text });
+  }
+  const recent = turns.slice(-MAX_HISTORY_MESSAGES);
+  // Defensive: some widget payloads include the in-flight turn in history — drop it.
+  if (
+    recent.length &&
+    recent[recent.length - 1].role === 'user' &&
+    recent[recent.length - 1].content.trim() === userText.trim()
+  ) {
+    recent.pop();
+  }
+  const merged = [];
+  for (const t of recent) {
+    const last = merged[merged.length - 1];
+    if (last && last.role === t.role) last.content += `\n${t.content}`;
+    else merged.push({ role: t.role, content: t.content });
+  }
+  while (merged.length && merged[0].role !== 'user') merged.shift(); // must open with 'user'
+  const last = merged[merged.length - 1];
+  if (last && last.role === 'user') last.content += `\n${userText}`;
+  else merged.push({ role: 'user', content: userText });
+  return merged;
 }
 
 // ─── §B17g audit emitters (EXHAUSTIVE allowlists — emit nothing not listed) ────────────
@@ -267,6 +326,10 @@ async function streamModelCall({ bedrock, modelId, system, messages, write, sess
   let stopReason = null;
   const blocks = [];
   let current = null;
+  // F4: whether THIS model call has streamed text yet — used with turnState.textEmitted
+  // (any text streamed by an EARLIER iteration this turn) to emit a paragraph separator
+  // so segments across tool iterations never concatenate ("…for you.Here are…").
+  let emittedTextThisCall = false;
 
   const flushCurrent = () => {
     if (!current) return;
@@ -305,7 +368,13 @@ async function streamModelCall({ bedrock, modelId, system, messages, write, sess
       const delta = data.delta || {};
       if (delta.type === 'text_delta' && delta.text) {
         if (typeof write === 'function') {
+          // F4: first text of a later iteration → separator frame before it.
+          if (!emittedTextThisCall && turnState.textEmitted) {
+            write(`data: ${JSON.stringify({ type: 'text', content: '\n\n', session_id: sessionId })}\n\n`);
+          }
           write(`data: ${JSON.stringify({ type: 'text', content: delta.text, session_id: sessionId })}\n\n`);
+          emittedTextThisCall = true;
+          turnState.textEmitted = true;
         }
         if (current && current.type === 'text') current.text += delta.text;
         else if (!current) current = { type: 'text', text: delta.text }; // defensive
@@ -470,12 +539,30 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
     return;
   }
 
-  // §B17b system prompt: persona/KB prompt + §B17e block + §B17d state line.
+  // F2 (eval A4): KB context for the agent turn — injectable + FAIL-SOFT. The seam is
+  // deps.retrieveKB (the integrator threads shared/bedrock-core's retrieveKB); unwired
+  // seam or a retrieval error → proceed without KB. The turn never dies on retrieval.
+  let kbContext = '';
+  if (typeof deps.retrieveKB === 'function') {
+    try {
+      kbContext = (await deps.retrieveKB(userText, tenantConfig)) || '';
+    } catch (err) {
+      logger.error(`[WS-AG-CORE] agent KB retrieval failed (non-fatal — proceeding without KB): error_name=${(err && err.name) || 'unknown'}`);
+      kbContext = '';
+    }
+  }
+
+  // §B17b system prompt: persona prompt + §B17e block + KB context + §B17d state line.
+  // KB sits UNDER the scheduling rules (§B17e rule 1 supersedes KB for anything
+  // scheduling-shaped — F2/eval A4).
   const personaPrompt =
     (event && typeof event.systemPrompt === 'string' && event.systemPrompt) ||
     sanitizeTonePromptV4(tenantConfig && tenantConfig.tone_prompt) ||
     'You are a helpful assistant.';
-  const system = `${personaPrompt}\n\n${AGENT_NARRATION_RULES}\n\n${buildStateLine(sessionRow)}`;
+  const kbBlock = kbContext
+    ? `\n\nKNOWLEDGE BASE CONTEXT (the scheduling rules above supersede anything here about scheduling, availability, or booking):\n<knowledge_base_context>\n${kbContext}\n</knowledge_base_context>`
+    : '';
+  const system = `${personaPrompt}\n\n${AGENT_NARRATION_RULES}${kbBlock}\n\n${buildStateLine(sessionRow)}`;
 
   // §B17c guard #3 input: the session's USER-SIDE transcript (incl. this turn).
   const userTranscript = userSideTranscript(conversationHistory, userText);
@@ -488,11 +575,12 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
     liveSession = s;
   };
 
-  let messages = [{ role: 'user', content: userText }];
+  // F1 (eval A9): prior session turns ride along — see buildAgentMessages.
+  let messages = buildAgentMessages(conversationHistory, userText);
   const stopReasonSequence = [];
   let toolCallCount = 0;
   let lastStopReason = null;
-  const turnState = { streamStarted: false };
+  const turnState = { streamStarted: false, textEmitted: false };
 
   try {
     // ── the §B17b bounded loop (verbatim) ──
@@ -606,6 +694,8 @@ module.exports = {
   PROMPT_VERSION,
   // exported for tests + WS-AG-EVAL
   buildStateLine,
+  buildAgentMessages,
+  MAX_HISTORY_MESSAGES,
   AGENT_NARRATION_RULES,
   OVERFLOW_COPY,
   SUPPRESSION_COPY,

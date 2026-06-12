@@ -45,9 +45,15 @@ const DEFAULT_CATEGORIES = Object.freeze([
     patterns: [
       /suicid/i,
       /self[\s-]?harm/i,
-      /kill (myself|himself|herself|themselves)/i,
-      /hurt (myself|themselves)/i,
-      /end (my|his|her|their) (own )?life/i,
+      /kill(ing)? (myself|himself|herself|themselves)/i,
+      // live-eval A8 gap (2026-06-12): "hurting myself" / "thoughts of harming myself"
+      // class phrasings missed the old /hurt (myself...)/ — inflections now covered.
+      /hurt(ing|s)? (myself|himself|herself|themselves)/i,
+      /harm(ing|s)? (myself|himself|herself|themselves)/i,
+      /end(ing|s)? (my|his|her|their) (own )?life/i,
+      /want(s|ed)? to die\b/i,
+      /\bend it all\b/i,
+      /better off (dead|without me)/i,
       /don'?t want to (live|be alive|go on)/i,
       /no reason to live/i,
     ],

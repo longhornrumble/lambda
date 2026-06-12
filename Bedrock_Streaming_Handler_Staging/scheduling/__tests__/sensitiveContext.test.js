@@ -63,6 +63,14 @@ describe('checkSensitiveContext — category trips', () => {
     ['psychiatric_crisis', "I've been having panic attacks every day"],
     ['custody_legal', "I'm in a custody battle for my kids"],
     ['custody_legal', 'I have a court date next week'],
+    // live-eval A8 gap (2026-06-12): "hurting/harming myself" class phrasings that the
+    // v1 matcher missed — the model generated copy mid-crisis. Now pinned.
+    ['self_harm_suicide', "I'm dealing with thoughts of hurting myself"],
+    ['self_harm_suicide', "honestly I've been thinking about hurting myself lately"],
+    ['self_harm_suicide', 'I keep thinking about harming myself'],
+    ['self_harm_suicide', 'some days I just want to die'],
+    ['self_harm_suicide', 'I want to end it all'],
+    ['self_harm_suicide', "they'd be better off without me"],
     ['minor_self_identification', "I'm 15 years old, can I volunteer?"],
     ['minor_self_identification', "I'm a minor but I want to help"],
     ['minor_self_identification', "I'm in high school right now"],
@@ -85,6 +93,9 @@ describe('checkSensitiveContext — category trips', () => {
       'my phone died so I missed your message', // "died" alone must not trip grief
       'I am 25 years old',
       'never mind, cancel that', // "cancel" of the flow is not legal-context
+      'will this hurt my chances of being matched?', // "hurt" without a self-target
+      'can we end it earlier, like 3pm?', // "end it" without "all"
+      'I want to diet better this year', // "die" inside a longer word
     ];
     for (const phrase of benign) {
       expect(checkSensitiveContext({ userText: phrase })).toEqual({ tripped: false });

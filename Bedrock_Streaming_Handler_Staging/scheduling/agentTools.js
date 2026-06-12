@@ -297,15 +297,29 @@ async function executeGetAvailableTimes({
     write(`data: ${JSON.stringify({ type: 'scheduling_slots', slots, session_id: sessionId })}\n\n`);
   }
 
+  // F5 (eval A2/A3): when a re-lookup returns the SAME times the session already had,
+  // say so in the note — the model must never narrate "other options" it did not receive.
+  const priorIds = (session && Array.isArray(session.candidate_slots))
+    ? session.candidate_slots.map((s) => s && s.slotId).filter(Boolean)
+    : [];
+  const newIds = slots.map((s) => s.slotId);
+  const sameAsBefore =
+    priorIds.length > 0 &&
+    newIds.length === priorIds.length &&
+    newIds.every((id) => priorIds.includes(id));
+
   // §B17c output to model. GENERIC slots only (label + starts_at_iso) — coordinator
   // identity (candidateResourceIds) is server-side data and never reaches the model.
   return {
     slots: slots.map((s) => ({ slot_id: s.slotId, label: s.label, starts_at_iso: s.start })),
     user_time_zone: userTimeZone,
-    note:
-      'These are the only real, bookable times. Offer them conversationally; the chips are ' +
-      'already on screen. The user can tap a chip, or you can stage one with ' +
-      'request_booking_confirmation once you have their email. A time can be taken until confirmed.',
+    note: sameAsBefore
+      ? 'SAME results as before — no new times opened up. Tell the user plainly that ' +
+        'nothing else is open right now (never affirm new availability you did not ' +
+        'receive), and offer a different day or the email/human fallback.'
+      : 'These are the only real, bookable times. Offer them conversationally; the chips are ' +
+        'already on screen. The user can tap a chip, or you can stage one with ' +
+        'request_booking_confirmation once you have their email. A time can be taken until confirmed.',
   };
 }
 

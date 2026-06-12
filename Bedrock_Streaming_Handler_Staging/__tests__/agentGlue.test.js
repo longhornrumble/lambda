@@ -262,6 +262,24 @@ describe('§B17a agent-turn routing branch (wiring 1)', () => {
     expect(responseStream.end).toHaveBeenCalled();
   });
 
+  it('(a2) bare-email turn at proposing: §B16d capture-miss falls through to the agent (live-eval A9 routing pin)', async () => {
+    __mockStore.loadState.mockResolvedValue(inFlightRow);
+    captureAttendeeEmail.mockResolvedValue({ captured: false, reason: 'no_confirming_session' });
+
+    const responseStream = mockResponseStream();
+    await indexModule.handler(chatEvent({ user_input: 'chris+x@myrecruiter.ai' }), responseStream, {});
+
+    expect(captureAttendeeEmail).toHaveBeenCalledTimes(1); // the §B16d branch ran first…
+    expect(agentTurn).toHaveBeenCalledTimes(1); // …and its miss fell through to the agent
+    const call = agentTurn.mock.calls[0][0];
+    expect(call.event.userText).toBe('chris+x@myrecruiter.ai');
+    // F2 (eval A4): the shared KB seam is threaded into the agent deps
+    expect(call.deps.retrieveKB).toBe(retrieveKB);
+    const chunks = responseStream.getChunks().join('');
+    expect(chunks).toContain(AGENT_NARRATION);
+    expect(chunks).toContain('[DONE]');
+  });
+
   it('(b) flag off → legacy path byte-identical (Bedrock called, agent never consulted, no agent-branch state read)', async () => {
     loadConfig.mockResolvedValue(flagOffConfig);
     // Even WITH an in-flight row present, flag off must never reach the agent.
