@@ -16,15 +16,22 @@ The orphaned picasso-analytics S3 lake write was removed (data-retention-strateg
 §5/§9 — zero consumer: Athena dormant, no Glue, no S3 notifications, dashboard
 reads DynamoDB). The per-event DDB record already covers everything used.
 
+PAGE_VIEW handling (FROZEN_CONTRACTS C1.3 / C8.5 / C8.6):
+- session_id prefix "pv_" identifies PAGE_VIEW sessions
+- ga_client_id is optional; never required
+- NO IP enrichment; no geo-IP anywhere (C8.6)
+- Duplicate PAGE_VIEW events on same PK/SK are idempotent overwrites (C8.5)
+- DDB key: SESSION#{session_id} / STEP#{step_number:03d} — same as all events
+
 Event Schema (v1.0.0):
 {
     "schema_version": "1.0.0",
-    "session_id": "sess_abc123_xyz789",
+    "session_id": "sess_abc123_xyz789",  // or "pv_<random>" for PAGE_VIEW
     "tenant_id": "fo85e6a06dcdf4",  // Actually tenant_hash from frontend
     "timestamp": "2025-12-19T06:00:00.000Z",
     "step_number": 1,
     "event": {
-        "type": "ACTION_CHIP_CLICKED",
+        "type": "ACTION_CHIP_CLICKED",  // or "PAGE_VIEW"
         "payload": {...}
     },
     "ga_client_id": "123456789.1234567890" (optional)
@@ -264,13 +271,23 @@ def enrich_event(event_data):
         'environment': ENVIRONMENT
     }
 
-    # Add optional fields
+    # Add optional fields (schema-tolerant — old events lack these)
     if event_data.get('ga_client_id'):
         enriched['ga_client_id'] = event_data['ga_client_id']
 
     if event_data.get('attribution'):
         enriched['attribution'] = event_data['attribution']
 
+    # For CONVERSATION_STARTED: extract entry_point_id from attribution payload so
+    # the aggregator can resolve provenance without re-parsing the nested payload
+    # (FROZEN_CONTRACTS C1.1 — attribution object lives in event.payload.attribution)
+    if event_type == 'CONVERSATION_STARTED':
+        attribution_payload = event_payload.get('attribution', {}) or {}
+        ep_id = attribution_payload.get('entry_point_id') or event_payload.get('entry_point_id')
+        if ep_id:
+            enriched['entry_point_id'] = ep_id
+
+    # C8.6: no IP enrichment, no geo-IP anywhere in this processor
     return enriched
 
 
@@ -379,9 +396,21 @@ def write_session_event(event):
     if event.get('event_payload'):
         item['event_payload'] = {'S': json.dumps(event['event_payload'])}
 
-    # Add optional fields
+    # Add optional fields (schema-tolerant)
     if event.get('ga_client_id'):
         item['ga_client_id'] = {'S': event['ga_client_id']}
+
+    # Store entry_point_id at top level for fast provenance resolution in aggregator
+    if event.get('entry_point_id'):
+        item['entry_point_id'] = {'S': event['entry_point_id']}
+
+    # Store attribution blob (from CONVERSATION_STARTED) for aggregator enrichment
+    # C8.10: not logged at info level; stored in DDB for aggregation only
+    if event.get('attribution'):
+        try:
+            item['attribution'] = {'S': json.dumps(event['attribution'])}
+        except (TypeError, ValueError):
+            pass
 
     try:
         dynamodb.put_item(
