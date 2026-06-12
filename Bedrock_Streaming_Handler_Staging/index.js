@@ -40,6 +40,11 @@ const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
 // the recovery loop; engages on the widget's scheduling_intent:'new_booking' signal or an
 // in-flight new-booking session row.
 const { runNewBookingEntry } = require('./scheduling/newBookingEntry');
+// Deterministic-entry copy (§B16d hardening): the start_scheduling click bypasses Bedrock,
+// so these templated lines are the ONLY assistant text on that turn.
+const SCHEDULING_ENTRY_COPY = 'Happy to set that up — let me pull up some openings for you…';
+const SCHEDULING_ENTRY_FALLBACK_COPY =
+  "I couldn't pull up available times just now. Please try again in a few minutes.";
 const { buildSchedulingDeps } = require('./scheduling/schedulingStateStore');
 const { corsHeaders } = require('./cors-helper');
 
@@ -457,6 +462,56 @@ const streamingHandler = async (event, responseStream, context) => {
         console.error('Showcase mode error:', error);
         write(`data: ${JSON.stringify({ type: 'error', error: `Showcase processing failed: ${error.message}` })}\n\n`);
         write('data: [DONE]\n\n');
+        streamEnded = true;
+        responseStream.end();
+        return;
+      }
+    }
+
+    // start_scheduling CTA click — a DETERMINISTIC route, not a chat turn (mirrors the
+    // show_showcase bypass above). The click carries zero ambiguity, and streaming a KB
+    // answer here co-mingles legacy KB scheduling copy with the live booking flow and
+    // narrates outcomes the state machine never produced (QA 2026-06-12, P0-2). Emit one
+    // templated line, then run the §B16d entry hook with `bedrock: null` — its action
+    // detector is fail-closed to {action:'none'} without a client, so the qualifying
+    // session is created and propose → scheduling_slots fires with NO model call anywhere.
+    // Scheduling disabled → fall through to normal chat (unchanged behavior, fail-open
+    // to plain conversation like every other CTA).
+    if (routingMetadata.scheduling_intent === 'new_booking' && isSchedulingEnabled(config)) {
+      console.log('📅 start_scheduling click detected — bypassing Bedrock for deterministic scheduling entry');
+      try {
+        write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_ENTRY_COPY, session_id: sessionId })}\n\n`);
+        const entry = await runNewBookingEntry({
+          responseText: '',
+          conversationHistory,
+          tenantId: config?.tenant_id,
+          sessionId,
+          config,
+          bedrock: null, // deterministic entry — never invoke the detector model
+          write,
+          routingMetadata,
+          deps: { ...schedulingDeps, ...newBookingDep },
+        });
+        if (!entry || entry.handled !== true) {
+          // Never leave the click in dead air (propose seam down, entry error, etc.)
+          write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_ENTRY_FALLBACK_COPY, session_id: sessionId })}\n\n`);
+        }
+        write('data: [DONE]\n\n');
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = null;
+        }
+        streamEnded = true;
+        responseStream.end();
+        return;
+      } catch (error) {
+        console.error('Scheduling entry bypass error:', error);
+        write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_ENTRY_FALLBACK_COPY, session_id: sessionId })}\n\n`);
+        write('data: [DONE]\n\n');
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = null;
+        }
         streamEnded = true;
         responseStream.end();
         return;
