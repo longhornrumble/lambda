@@ -132,29 +132,134 @@ async function resolveSchedulingBinding({ tenantId, sessionId, deps = {} } = {})
   }
 }
 
+// ─── §B17d session-state line (Track-D fix 1 — WS-TRACKD-BE) ─────────────────────────────
+//
+// The in-flight NEW-booking states that get a §B17d state line. NOT 'booked' (a booked arc
+// is finished) and NOT the recovery loop's 'rescheduling'/'canceling' (those are driven by
+// the §B10 binding block above). Mirrors newBookingEntry's IN_FLIGHT_STATES.
+const NEW_BOOKING_IN_FLIGHT_STATES = Object.freeze(['qualifying', 'proposing', 'confirming']);
+
+/**
+ * Build the §B17d session-state line from a live C9 session row:
+ *   "[scheduling state: <state> | staged slot: <label> (<slotId>) | email: <known|unknown>]"
+ *
+ * Purpose (§B17d / design-doc §0 QA residual): the non-agent (legacy / flag-off) chat path
+ * must stop claiming "no scheduling access" for in-flight new-booking sessions — the model
+ * gets server-derived state awareness even though click turns never reach it.
+ *
+ * Rules (§B17d, LOCKED):
+ *  - ALWAYS derived from server state (the session row) — never model output.
+ *  - staged slot = the row's `selected_slot` when present (label looked up in
+ *    `candidate_slots`, same pattern as newBookingEntry.captureAttendeeEmail), else "none".
+ *  - PII RULE (pinned wording, governance pass 2026-06-12): the email segment is EXACTLY
+ *    "email: known" or "email: unknown" — the raw address NEVER appears in the line.
+ *    Defensively, '@' is also stripped from the slot label so the whole line is
+ *    '@'-free by construction (§B17g jest assertion).
+ *
+ * @param {object|null} sessionRow - the live C9 row ({ state, candidate_slots?,
+ *   selected_slot?, attendee_email? }) or null
+ * @returns {string} the state line, or '' when the row is not an in-flight new-booking session
+ */
+function buildNewBookingStateLine(sessionRow) {
+  if (!sessionRow || !NEW_BOOKING_IN_FLIGHT_STATES.includes(sessionRow.state)) return '';
+
+  let staged = 'none';
+  const selected = sessionRow.selected_slot;
+  if (selected && selected.slotId) {
+    // Schema discipline + never-break-chat: tolerate a corrupt/legacy row shape — a
+    // non-array candidate_slots must not throw out of the prompt-injection path.
+    const candidates = Array.isArray(sessionRow.candidate_slots) ? sessionRow.candidate_slots : [];
+    const fromCandidates = candidates.find(
+      (s) => s && s.slotId === selected.slotId
+    );
+    const rawLabel =
+      (fromCandidates && fromCandidates.label) || selected.label || selected.start || '';
+    // Labels are server-generated (§B16a pool.select chips) — sanitize defensively anyway:
+    // strip the line's own structural chars ([ ] |), newlines, and '@'; cap length.
+    const label = String(rawLabel)
+      .replace(/[\[\]|@\r\n]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 40);
+    staged = label ? `${label} (${selected.slotId})` : `(${selected.slotId})`;
+  }
+
+  const email =
+    typeof sessionRow.attendee_email === 'string' && sessionRow.attendee_email.trim()
+      ? 'known'
+      : 'unknown';
+
+  return `[scheduling state: ${sessionRow.state} | staged slot: ${staged} | email: ${email}]`;
+}
+
+/**
+ * Read the live C9 session row for this chat session, non-fatally. Returns null when the
+ * `deps.loadState` seam is unwired (the integrator wires it, same seam as the deterministic
+ * pipeline's schedulingStateStore), on missing keys / placeholder session ids, or on any
+ * error (a degraded state read must never break normal chat). PII-safe: logs only the
+ * error shape — never the tenantId/sessionId.
+ * @param {object} params - { tenantId, sessionId, deps: { loadState } }
+ * @returns {Promise<object|null>}
+ */
+async function resolveNewBookingSessionRow({ tenantId, sessionId, deps = {} } = {}) {
+  if (typeof deps.loadState !== 'function') return null;
+  if (!tenantId || !sessionId) return null;
+  if (sessionId === 'unknown' || sessionId === 'default') return null;
+  try {
+    return await deps.loadState({ tenantId, sessionId });
+  } catch (err) {
+    console.error(
+      `[WS-TRACKD] new-booking state read skipped (non-fatal): error_name=${(err && err.name) || 'unknown'}`
+    );
+    return null;
+  }
+}
+
 /**
  * Convenience wrapper for the BSH handler call-site (mirrors injectFormContext): prepend
  * the <scheduling_context> block to an already-built prompt. One awaited line per site.
  * Non-fatal — returns basePrompt UNCHANGED when there's no binding to inject (so a normal
  * chat session is untouched).
+ *
+ * Track-D fix 1 (ADDITIVE — §B17d): when the session carries an in-flight NEW-booking row
+ * (qualifying | proposing | confirming, read via the injected `deps.loadState` seam), the
+ * §B17d state line is ALSO prepended. The existing §B10 recovery-binding injection is
+ * unchanged; with no binding AND no in-flight new-booking session the prompt is returned
+ * byte-identical (no-regression).
  * @param {string} basePrompt
  * @param {object} params - { tenantId, sessionId, deps }
  * @returns {Promise<string>}
  */
 async function injectSchedulingContext(basePrompt, params = {}) {
+  let prompt = basePrompt;
+
   const binding = await resolveSchedulingBinding(params);
-  if (!binding) return basePrompt;
-  const block = buildSchedulingContextBlock(binding, initStateFromIntent(binding.intent));
-  return block ? `${block}\n\n${basePrompt}` : basePrompt;
+  if (binding) {
+    const block = buildSchedulingContextBlock(binding, initStateFromIntent(binding.intent));
+    if (block) prompt = `${block}\n\n${prompt}`;
+  }
+
+  // §B17d (additive): in-flight new-booking state line. Recovery rows ('rescheduling' /
+  // 'canceling') never match NEW_BOOKING_IN_FLIGHT_STATES, so the recovery path above is
+  // untouched. A recovery_intent re-entry that landed in 'qualifying' (B-remainder) DOES
+  // get the line — that session is a new-booking arc.
+  const sessionRow = await resolveNewBookingSessionRow(params);
+  const stateLine = buildNewBookingStateLine(sessionRow);
+  if (stateLine) prompt = `${stateLine}\n\n${prompt}`;
+
+  return prompt;
 }
 
 module.exports = {
   injectSchedulingContext,
   resolveSchedulingBinding,
   buildSchedulingContextBlock,
+  buildNewBookingStateLine,
+  resolveNewBookingSessionRow,
   initStateFromIntent,
   isSchedulingEnabled,
   escapeForContext,
   STATE_FOR_INTENT,
+  NEW_BOOKING_IN_FLIGHT_STATES,
   CONTEXT_INSTRUCTION,
 };
