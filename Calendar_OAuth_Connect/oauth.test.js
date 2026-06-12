@@ -6,14 +6,16 @@ jest.mock('google-auth-library', () => {
   const getToken = jest.fn();
   const getAccessToken = jest.fn();
   const setCredentials = jest.fn();
+  const revokeToken = jest.fn();
   function OAuth2Client(opts) {
     this.opts = opts;
     this.generateAuthUrl = generateAuthUrl;
     this.getToken = getToken;
     this.getAccessToken = getAccessToken;
     this.setCredentials = setCredentials;
+    this.revokeToken = revokeToken;
   }
-  OAuth2Client._spies = { generateAuthUrl, getToken, getAccessToken, setCredentials };
+  OAuth2Client._spies = { generateAuthUrl, getToken, getAccessToken, setCredentials, revokeToken };
   return { OAuth2Client };
 });
 
@@ -87,6 +89,25 @@ describe('probeRefresh', () => {
     await expect(oauth.probeRefresh({ clientId: 'c', clientSecret: 's', refreshToken: '1//rt' })).rejects.toMatchObject({
       response: { data: { error: 'invalid_grant' } },
     });
+  });
+});
+
+describe('revokeToken (§E11b)', () => {
+  test('success: calls client.revokeToken with the refreshToken', async () => {
+    spies.revokeToken.mockResolvedValue({});
+    await oauth.revokeToken({ refreshToken: '1//refresh' });
+    expect(spies.revokeToken).toHaveBeenCalledWith('1//refresh');
+  });
+
+  test('network error propagates (caller is best-effort and must handle the throw)', async () => {
+    spies.revokeToken.mockRejectedValue(new Error('network error'));
+    await expect(oauth.revokeToken({ refreshToken: '1//rt' })).rejects.toThrow('network error');
+  });
+
+  test('4xx from Google propagates (caller must not block disconnect on this)', async () => {
+    const err = Object.assign(new Error('revoke failed'), { status: 400 });
+    spies.revokeToken.mockRejectedValue(err);
+    await expect(oauth.revokeToken({ refreshToken: '1//rt' })).rejects.toMatchObject({ status: 400 });
   });
 });
 
