@@ -1011,14 +1011,17 @@ describe('select — §B18a diverse-3 sampling', () => {
     expect(res.slots[1]).not.toHaveProperty('_daypart');
   });
 
-  // Fix A adversarial: all-morning, 2 days → pick-2 uses "different day" tier
-  it('pick-2 different-day tier: all-morning 3 slots (day1-9, day1-10, day2-9) → picks use different day for p2, chronological output', async () => {
-    // day1-9:00 CDT = 2026-06-03T14:00:00Z (morning)
-    // day1-10:00 CDT = 2026-06-03T15:00:00Z (morning)
-    // day2-9:00 CDT = 2026-06-04T14:00:00Z (morning)
+  // Fix A adversarial: all-morning, 2 days, 4 candidates → pick-2 MUST take the
+  // different-day tier. 4 slots (> count) so the ≤count early-return cannot mask
+  // the pick logic — a 3-slot set returns all 3 regardless and proves nothing.
+  // Old (pre-fix) last-resort picked earliest-remaining day1-10:00 → all-day1 chips.
+  it('pick-2 different-day tier: all-morning [day1-9, day1-10, day1-11, day2-9] → day2-9 picked, day1-11 excluded', async () => {
+    // day1 9:00/10:00/11:00 CDT = 2026-06-03T14:00/15:00/16:00Z (all morning)
+    // day2 9:00 CDT = 2026-06-04T14:00:00Z (morning)
     const rawSlots = [
       makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning day1
       makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'),  // morning day1
+      makeRawSlot('2026-06-03T16:00:00Z', '2026-06-03T16:30:00Z', 'Tue 11 AM'),  // morning day1
       makeRawSlot('2026-06-04T14:00:00Z', '2026-06-04T14:30:00Z', 'Wed 9 AM'),   // morning day2
     ];
     const res = await selectWithDiverseSampling(rawSlots);
@@ -1026,15 +1029,15 @@ describe('select — §B18a diverse-3 sampling', () => {
     expect(res.slots).toHaveLength(3);
     const starts = res.slots.map((s) => s.start);
     // pick-1: day1-9:00 (earliest)
-    // pick-2: different daypart → none (all morning) → different day → day2-9:00
-    // pick-3: third daypart → none → day not yet represented → none (day1+day2 both seen) → earliest remaining → day1-10:00
-    // sorted chronologically: day1-9, day1-10, day2-9
-    expect(starts[0]).toBe('2026-06-03T14:00:00Z'); // day1-9
-    expect(starts[1]).toBe('2026-06-03T15:00:00Z'); // day1-10
-    expect(starts[2]).toBe('2026-06-04T14:00:00Z'); // day2-9
-    for (let i = 1; i < starts.length; i++) {
-      expect(starts[i] > starts[i - 1]).toBe(true);
-    }
+    // pick-2: different daypart → none (all morning) → DIFFERENT DAY → day2-9:00
+    // pick-3: third daypart → none → day not yet represented → none → earliest remaining → day1-10:00
+    // sorted chronologically: day1-9, day1-10, day2-9; day1-11 must NOT appear
+    expect(starts).toEqual([
+      '2026-06-03T14:00:00Z', // day1-9
+      '2026-06-03T15:00:00Z', // day1-10
+      '2026-06-04T14:00:00Z', // day2-9
+    ]);
+    expect(starts).not.toContain('2026-06-03T16:00:00Z'); // day1-11 (old code's all-day1 failure)
   });
 
   // Fix B adversarial: all-morning 4 slots across 3 days → pick-3 uses "day not yet represented" tier
