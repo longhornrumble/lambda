@@ -83,6 +83,9 @@ const {
   executeRequestBookingConfirmation,
 } = require('./agentTools');
 const { checkSensitiveContext, userSideTranscript } = require('./sensitiveContext');
+// Shipped server-side qualifying-context resolver (appointment type / timezone) — the
+// today-line is computed in the appointment timezone (see resolveAgentTimeZone).
+const { resolveQualifyingContext } = require('./newBookingEntry');
 
 // §B17b LOOP INVARIANT.
 const MAX_TOOL_ITERATIONS = 3;
@@ -92,7 +95,7 @@ const MAX_TOOL_ITERATIONS = 3;
 const MAX_HISTORY_MESSAGES = 12;
 
 // agent_turn_summary.prompt_version (§B17g) — bump when AGENT_NARRATION_RULES changes.
-const PROMPT_VERSION = 'b17e.v2';
+const PROMPT_VERSION = 'b17e.v3';
 
 // §B17b overflow: templated warm-honest copy (verbatim) + the shipped async-escape SSE.
 const OVERFLOW_COPY = 'I ran into a snag — let me get someone to help.';
@@ -140,6 +143,12 @@ const AGENT_NARRATION_RULES = [
     'that nothing else is open — never affirm availability the tool did not return.',
   "13. Derive morning/afternoon/evening from each slot's starts_at_iso in the user's time " +
     'zone — never describe a morning time as afternoon (or the reverse).',
+  "14. When the user names a specific day or relative day ('Monday', 'next week', " +
+    "'tomorrow'), resolve it to YYYY-MM-DD using today's date and PASS the `date` " +
+    "argument. For a multi-day ask (e.g. 'Monday or Tuesday'), check each day with " +
+    'separate tool calls (max 2 per turn). Without a date argument the tool only returns ' +
+    'the earliest few openings — never conclude a specific future day is unavailable ' +
+    'unless you queried THAT day.',
 ].join('\n');
 
 // ─── §B17h kill-switch guard ───────────────────────────────────────────────────────────
@@ -188,6 +197,69 @@ function buildStateLine(sessionRow) {
     sessionRow.attendee_email.trim()
   );
   return `[scheduling state: ${state} | staged slot: ${staged} | email: ${emailKnown ? 'known' : 'unknown'}]`;
+}
+
+// ─── date awareness — the today-line (live-eval A1/A13 root cause) ─────────────────────
+//
+// Without today's date in the system prompt the model cannot resolve "Monday of next
+// week" → YYYY-MM-DD: it omits the tool's `date` arg, the default lookup returns only
+// the earliest few openings (always today), and the model then truthfully narrates a
+// FALSE "nothing Monday/Tuesday". Rule 14 above tells it to pass `date`; the today-line
+// gives it the anchor to compute one.
+
+const DEFAULT_AGENT_TIME_ZONE = 'America/Chicago';
+
+/**
+ * Resolve the timezone the today-line is computed in: appointment-type timezone first
+ * (qctx — prefers the integrator's deps.qualifyingContext, the same seam agentTools
+ * uses; else the shipped resolver over the tenant config), then the qctx
+ * user_time_zone, then America/Chicago. The shipped resolver DEFAULTS its userTimeZone
+ * to 'UTC' when nothing is configured — for DATE awareness that default is treated as
+ * unresolved (UTC mis-states "today" for US evenings), so the platform home zone wins
+ * instead. An appointment type EXPLICITLY configured to 'UTC' is honored.
+ *
+ * @param {object} params - { tenantConfig, deps }
+ * @returns {string} IANA timezone
+ */
+function resolveAgentTimeZone({ tenantConfig, deps } = {}) {
+  let qctx = null;
+  if (deps && deps.qualifyingContext && typeof deps.qualifyingContext === 'object') {
+    qctx = deps.qualifyingContext;
+  } else {
+    try {
+      qctx = resolveQualifyingContext({ config: tenantConfig });
+    } catch {
+      qctx = null; // resolver failure must never kill the turn — default tz instead
+    }
+  }
+  const apptType = qctx && qctx.appointment_type;
+  const apptTz = apptType && (apptType.timezone || apptType.time_zone);
+  if (apptTz) return apptTz;
+  const userTz = qctx && (qctx.userTimeZone || qctx.user_time_zone);
+  if (userTz && userTz !== 'UTC') return userTz;
+  return DEFAULT_AGENT_TIME_ZONE;
+}
+
+/**
+ * Build "[today: Friday, June 12, 2026 — timezone: America/Chicago]" — formatted in the
+ * appointment timezone via native Intl (no tz lib — same constraint as dayPicker). An
+ * invalid configured timezone falls back to the default rather than killing the turn.
+ *
+ * @param {number} nowMs    - epoch ms (injectable via deps.nowMs — the dayPicker pattern)
+ * @param {string} timeZone - IANA tz from resolveAgentTimeZone
+ * @returns {string}
+ */
+function buildTodayLine(nowMs, timeZone) {
+  const opts = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' };
+  let tz = timeZone || DEFAULT_AGENT_TIME_ZONE;
+  let formatted;
+  try {
+    formatted = new Intl.DateTimeFormat('en-US', { timeZone: tz, ...opts }).format(new Date(nowMs));
+  } catch {
+    tz = DEFAULT_AGENT_TIME_ZONE; // RangeError on a bad configured tz string
+    formatted = new Intl.DateTimeFormat('en-US', { timeZone: tz, ...opts }).format(new Date(nowMs));
+  }
+  return `[today: ${formatted} — timezone: ${tz}]`;
 }
 
 // ─── F1 (eval A9) — agent messages carry the session, not a lone sentence ──────────────
@@ -552,9 +624,11 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
     }
   }
 
-  // §B17b system prompt: persona prompt + §B17e block + KB context + §B17d state line.
-  // KB sits UNDER the scheduling rules (§B17e rule 1 supersedes KB for anything
-  // scheduling-shaped — F2/eval A4).
+  // §B17b system prompt: persona prompt + §B17e block + KB context + today-line +
+  // §B17d state line. KB sits UNDER the scheduling rules (§B17e rule 1 supersedes KB
+  // for anything scheduling-shaped — F2/eval A4). The today-line (date awareness —
+  // rule 14's anchor) rides with the state line, computed in the appointment timezone
+  // with an injectable clock (deps.nowMs — the dayPicker test pattern).
   const personaPrompt =
     (event && typeof event.systemPrompt === 'string' && event.systemPrompt) ||
     sanitizeTonePromptV4(tenantConfig && tenantConfig.tone_prompt) ||
@@ -562,7 +636,11 @@ async function agentTurn({ event, context, sessionRow, tenantConfig, deps = {}, 
   const kbBlock = kbContext
     ? `\n\nKNOWLEDGE BASE CONTEXT (the scheduling rules above supersede anything here about scheduling, availability, or booking):\n<knowledge_base_context>\n${kbContext}\n</knowledge_base_context>`
     : '';
-  const system = `${personaPrompt}\n\n${AGENT_NARRATION_RULES}${kbBlock}\n\n${buildStateLine(sessionRow)}`;
+  // Number.isFinite (not just != null): this runs OUTSIDE the loop's try — a garbage
+  // injected clock must fall back to the real one, never throw out of agentTurn.
+  const nowMs = Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
+  const todayLine = buildTodayLine(nowMs, resolveAgentTimeZone({ tenantConfig, deps }));
+  const system = `${personaPrompt}\n\n${AGENT_NARRATION_RULES}${kbBlock}\n\n${todayLine}\n${buildStateLine(sessionRow)}`;
 
   // §B17c guard #3 input: the session's USER-SIDE transcript (incl. this turn).
   const userTranscript = userSideTranscript(conversationHistory, userText);
@@ -694,6 +772,9 @@ module.exports = {
   PROMPT_VERSION,
   // exported for tests + WS-AG-EVAL
   buildStateLine,
+  buildTodayLine,
+  resolveAgentTimeZone,
+  DEFAULT_AGENT_TIME_ZONE,
   buildAgentMessages,
   MAX_HISTORY_MESSAGES,
   AGENT_NARRATION_RULES,

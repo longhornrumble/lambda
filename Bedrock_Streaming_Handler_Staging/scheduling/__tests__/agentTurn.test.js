@@ -21,6 +21,9 @@ const {
   MAX_TOOL_ITERATIONS,
   PROMPT_VERSION,
   buildStateLine,
+  buildTodayLine,
+  resolveAgentTimeZone,
+  DEFAULT_AGENT_TIME_ZONE,
   buildAgentMessages,
   MAX_HISTORY_MESSAGES,
   AGENT_NARRATION_RULES,
@@ -990,7 +993,150 @@ describe('agentTurn — F3/F5 prompt rules (live-eval G1/A7 + A2/A3)', () => {
   });
 
   test('PROMPT_VERSION bumped for the rules change (§B17g)', () => {
-    expect(PROMPT_VERSION).toBe('b17e.v2');
+    expect(PROMPT_VERSION).toBe('b17e.v3');
+  });
+});
+
+// ── date awareness (live-eval A1/A13): today-line + the rule-14 date-resolution rule ───
+
+describe('agentTurn — date awareness (today-line in the appointment timezone)', () => {
+  // Friday, June 12, 2026 12:00 PM in America/Chicago (17:00 UTC).
+  const NOON_CDT_FRI_JUN_12 = Date.parse('2026-06-12T17:00:00Z');
+
+  test('system prompt carries the today-line, formatted in the appointment TZ via the injectable clock (deps.nowMs)', async () => {
+    const bedrock = fakeBedrock([textResponse('ok')]);
+    const deps = makeDeps({ bedrock }); // qualifyingContext: America/Chicago
+    deps.nowMs = NOON_CDT_FRI_JUN_12;
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write }));
+
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.system).toContain('[today: Friday, June 12, 2026 — timezone: America/Chicago]');
+    // placed with the §B17d state line (immediately above it)
+    const todayIdx = body.system.indexOf('[today:');
+    const stateIdx = body.system.indexOf('[scheduling state:');
+    expect(todayIdx).toBeGreaterThan(-1);
+    expect(todayIdx).toBeLessThan(stateIdx);
+    expect(body.system.slice(todayIdx, stateIdx)).toBe(
+      '[today: Friday, June 12, 2026 — timezone: America/Chicago]\n'
+    );
+  });
+
+  test('appointment-TZ date wins at a UTC date boundary (late Chicago evening = next day UTC)', async () => {
+    // 2026-06-13T03:30:00Z is still Friday, June 12, 10:30 PM in America/Chicago.
+    const bedrock = fakeBedrock([textResponse('ok')]);
+    const deps = makeDeps({ bedrock });
+    deps.nowMs = Date.parse('2026-06-13T03:30:00Z');
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write }));
+
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.system).toContain('[today: Friday, June 12, 2026 — timezone: America/Chicago]');
+    expect(body.system).not.toContain('June 13');
+  });
+
+  test('resolveAgentTimeZone: appt-type tz > qctx user_time_zone > America/Chicago (resolver UTC default treated as unresolved)', () => {
+    // 1. appointment-type timezone wins (incl. snake_case)
+    expect(resolveAgentTimeZone({
+      deps: { qualifyingContext: { appointment_type: { timezone: 'America/New_York' }, userTimeZone: 'America/Denver' } },
+    })).toBe('America/New_York');
+    expect(resolveAgentTimeZone({
+      deps: { qualifyingContext: { appointment_type: { time_zone: 'America/New_York' } } },
+    })).toBe('America/New_York');
+    // 2. qctx user_time_zone next (camel or snake)
+    expect(resolveAgentTimeZone({ deps: { qualifyingContext: { userTimeZone: 'America/Denver' } } })).toBe('America/Denver');
+    expect(resolveAgentTimeZone({ deps: { qualifyingContext: { user_time_zone: 'America/Denver' } } })).toBe('America/Denver');
+    // 3. unwired qctx seam → shipped resolver over the tenant config (sole appt type)
+    expect(resolveAgentTimeZone({ tenantConfig: CONFIG, deps: {} })).toBe('America/Chicago');
+    expect(resolveAgentTimeZone({
+      tenantConfig: { scheduling: { appointment_types: { a: { timezone: 'America/Los_Angeles' } } } },
+      deps: {},
+    })).toBe('America/Los_Angeles');
+    // 4. nothing configured: the resolver's 'UTC' DEFAULT is unresolved → platform home zone
+    expect(resolveAgentTimeZone({ tenantConfig: {}, deps: {} })).toBe(DEFAULT_AGENT_TIME_ZONE);
+    expect(resolveAgentTimeZone({})).toBe(DEFAULT_AGENT_TIME_ZONE);
+    // 5. an appointment type EXPLICITLY configured to UTC is honored
+    expect(resolveAgentTimeZone({
+      deps: { qualifyingContext: { appointment_type: { timezone: 'UTC' } } },
+    })).toBe('UTC');
+    // 6. a THROWING resolver path degrades to the default — never out of the turn
+    expect(resolveAgentTimeZone({
+      tenantConfig: { get scheduling() { throw new Error('hostile config'); } },
+      deps: {},
+    })).toBe(DEFAULT_AGENT_TIME_ZONE);
+    expect(DEFAULT_AGENT_TIME_ZONE).toBe('America/Chicago');
+  });
+
+  test('buildTodayLine: pinned format; an invalid configured tz falls back to the default instead of throwing', () => {
+    expect(buildTodayLine(NOON_CDT_FRI_JUN_12, 'America/Chicago')).toBe(
+      '[today: Friday, June 12, 2026 — timezone: America/Chicago]'
+    );
+    // 03:30 UTC Sat Jun 13 renders as Fri Jun 12 in Chicago but Sat Jun 13 in UTC
+    expect(buildTodayLine(Date.parse('2026-06-13T03:30:00Z'), 'UTC')).toBe(
+      '[today: Saturday, June 13, 2026 — timezone: UTC]'
+    );
+    expect(buildTodayLine(NOON_CDT_FRI_JUN_12, 'Not/AZone')).toBe(
+      '[today: Friday, June 12, 2026 — timezone: America/Chicago]'
+    );
+    // falsy tz → default (resolveAgentTimeZone never returns falsy; defensive)
+    expect(buildTodayLine(NOON_CDT_FRI_JUN_12, undefined)).toBe(
+      '[today: Friday, June 12, 2026 — timezone: America/Chicago]'
+    );
+  });
+
+  test('garbage injected clock (non-numeric deps.nowMs) falls back to the real clock — the turn never throws', async () => {
+    const bedrock = fakeBedrock([textResponse('ok')]);
+    const deps = makeDeps({ bedrock });
+    deps.nowMs = 'not-a-clock'; // Invalid-Date bait — runs OUTSIDE the loop's try
+    const write = jest.fn();
+
+    await expect(agentTurn(baseTurn({ deps, write }))).resolves.toBeUndefined();
+
+    expect(bedrock.send).toHaveBeenCalledTimes(1); // turn completed
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.system).toMatch(/\[today: [A-Z][a-z]+, [A-Z][a-z]+ \d{1,2}, \d{4} — timezone: America\/Chicago\]/);
+  });
+
+  test('rule 14 (date resolution) carries the locked wording; banned undated-day-conclusion phrasing present', () => {
+    expect(AGENT_NARRATION_RULES).toContain("resolve it to YYYY-MM-DD using today's date and PASS the `date` argument");
+    expect(AGENT_NARRATION_RULES).toContain('check each day with separate tool calls (max 2 per turn)');
+    expect(AGENT_NARRATION_RULES).toContain(
+      'Without a date argument the tool only returns the earliest few openings'
+    );
+    expect(AGENT_NARRATION_RULES).toContain(
+      'never conclude a specific future day is unavailable unless you queried THAT day'
+    );
+  });
+
+  test('scripted-Bedrock: named-day ask → model passes date; dated tool result flows back through the loop', async () => {
+    const bedrock = fakeBedrock([
+      toolUseResponse({ name: 'get_available_times', input: { date: '2026-06-15' } }),
+      textResponse('Monday June 15 has a 2:00 PM open — want it?'),
+    ]);
+    const audit = [];
+    const deps = makeDeps({ bedrock, audit });
+    deps.nowMs = NOON_CDT_FRI_JUN_12;
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write, userText: 'do you have something Monday of next week?' }));
+
+    // the model HAD the anchor (today-line) on the call that produced the dated tool use
+    const body1 = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body1.system).toContain('[today: Friday, June 12, 2026 — timezone: America/Chicago]');
+    // the date arg became the propose route's date_window for THAT day
+    expect(deps.invokeProposal).toHaveBeenCalledTimes(1);
+    expect(deps.invokeProposal.mock.calls[0][0].date_window).toEqual({
+      start: '2026-06-15T00:00:00.000Z',
+      end: '2026-06-16T00:00:00.000Z',
+    });
+    // the dated tool result re-entered the loop
+    const body2 = JSON.parse(bedrock.send.mock.calls[1][0].input.body);
+    const toolResult = JSON.parse(body2.messages[2].content[0].content);
+    expect(toolResult.slots).toEqual([{ slot_id: 's1', label: SLOT.label, starts_at_iso: SLOT.start }]);
+    // §B17g audit carries the date arg
+    expect(audit.find((e) => e.event_type === 'agent_tool_call').date).toBe('2026-06-15');
   });
 });
 
