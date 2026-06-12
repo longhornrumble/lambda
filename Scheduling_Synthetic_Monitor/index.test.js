@@ -75,6 +75,13 @@ describe('index — handler cycle dispatch', () => {
     expect(runRevocationObserve).toHaveBeenCalledWith({ slug: '/cancel', token: 'tok' }, expect.any(Object));
   });
 
+  test('routes disposition → runDispositionCycle', async () => {
+    const runDispositionCycle = jest.fn().mockResolvedValue({ cycle: 'disposition', success: true });
+    const res = await handler({ cycle: 'disposition' }, {}, { runDispositionCycle });
+    expect(runDispositionCycle).toHaveBeenCalled();
+    expect(res.cycle).toBe('disposition');
+  });
+
   test('unknown cycle → structured failure (no throw)', async () => {
     const res = await handler({ cycle: 'nope' }, {});
     expect(res).toMatchObject({ success: false });
