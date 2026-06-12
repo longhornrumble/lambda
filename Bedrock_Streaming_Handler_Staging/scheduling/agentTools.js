@@ -29,8 +29,8 @@
  *
  * ── Server authority (§B17c) ──
  *   tenantId / sessionId / appointmentTypeId / userTimeZone come from server
- *   context/config — NEVER from model args. The model supplies only: date,
- *   exclude_slot_ids, slot_id, attendee_email, attendee_name. slot_id is validated
+ *   context/config — NEVER from model args. The model supplies only: date, after_time,
+ *   before_time, exclude_slot_ids, slot_id, attendee_email, attendee_name. slot_id is validated
  *   against SERVER-persisted candidates; attendee_email against EMAIL_SHAPE + the
  *   verbatim-match guard. Model-supplied timestamps are not an input anywhere.
  *
@@ -42,8 +42,12 @@
 const { transition, IllegalStateTransition } = require('../../shared/scheduling/stateMachine');
 // §B17c: EMAIL_SHAPE is IMPORTED from the shipped entry-hook — never copied.
 const { EMAIL_SHAPE, resolveQualifyingContext } = require('./newBookingEntry');
-// §B16e shipped helper: model-supplied `date` → the propose route's date_window.
-const { dateWindowForDay } = require('./dayPicker');
+// §B16e shipped helpers: model-supplied `date` → the propose route's date_window;
+// localDateString resolves TODAY for date-less day-part bounds (deps.nowMs clock).
+const { dateWindowForDay, localDateString } = require('./dayPicker');
+// Shipped DST-correct civil-time resolver (native Intl, no tz lib): 'HH:MM' day-part
+// bounds → UTC instants in the appointment timezone (2026-06-12 daypart amendment).
+const { zonedWallTimeToUtc } = require('../../shared/scheduling/slots');
 
 // ─── tool definitions (anthropic tool-use schema; descriptions verbatim §B17c) ───────
 
@@ -52,14 +56,29 @@ const AGENT_TOOL_DEFINITIONS = Object.freeze([
     name: 'get_available_times',
     description:
       'Look up real, bookable appointment times. Use whenever the user wants to schedule, ' +
-      'see times, or asks about a specific day or time of day. Never invent times — only ' +
-      'ones returned here exist.',
+      'see times, or asks about a specific day or time of day — optionally bound by time ' +
+      "of day (after_time/before_time, e.g. afternoons = after_time '12:00'). Never " +
+      'invent times — only ones returned here exist.',
     input_schema: {
       type: 'object',
       properties: {
         date: {
           type: 'string',
           description: 'Optional YYYY-MM-DD — constrain the lookup to a specific calendar day.',
+        },
+        after_time: {
+          type: 'string',
+          description:
+            "Optional 'HH:MM' 24-hour lower bound in the appointment timezone — only times " +
+            "at or after this are returned (e.g. afternoons = '12:00'). Applies to `date`, " +
+            'or to today when no date is given.',
+        },
+        before_time: {
+          type: 'string',
+          description:
+            "Optional 'HH:MM' 24-hour upper bound in the appointment timezone — only times " +
+            "before this are returned (e.g. mornings = before_time '12:00'). Applies to " +
+            '`date`, or to today when no date is given.',
         },
         exclude_slot_ids: {
           type: 'array',
@@ -120,6 +139,55 @@ function sanitizeExcludeSlotIds(value) {
 // F6: cap on the persisted candidate_slots union (multi-day same-turn lookups).
 const MAX_PERSISTED_CANDIDATES = 10;
 
+// ─── day-part bounds (after_time/before_time — live defect 2026-06-12) ────────────────
+//
+// The §B16a propose route returns the EARLIEST ~5 openings of whatever window it is
+// given, so a 9:00–17:00 availability day always yields morning slots — and an
+// unbounded re-query for "the afternoon" re-returns the same mornings (plus the F5
+// same-results note), leaving the model to honestly mis-narrate open afternoons as
+// closed. after_time/before_time give the model a way to EXPRESS time-of-day; the
+// executor maps them onto the §B16e date_window as UTC instants computed IN THE
+// APPOINTMENT TIMEZONE via the shipped Intl-based civil-time math (no new deps).
+
+// Timezone the bounds (and agentTurn's today-line) resolve in: appointment-type
+// timezone → qctx user timezone → the platform home zone. The shipped resolver
+// DEFAULTS userTimeZone to 'UTC' when nothing is configured — treated as unresolved
+// here (UTC mis-states the civil day/time for US tenants); an appointment type
+// EXPLICITLY configured to 'UTC' is honored (it arrives via appointment_type.timezone).
+const DEFAULT_AGENT_TIME_ZONE = 'America/Chicago';
+
+function timeZoneForQctx(qctx) {
+  const apptType = qctx && qctx.appointment_type;
+  const apptTz = apptType && (apptType.timezone || apptType.time_zone);
+  if (apptTz) return apptTz;
+  const userTz = qctx && (qctx.userTimeZone || qctx.user_time_zone);
+  if (userTz && userTz !== 'UTC') return userTz;
+  return DEFAULT_AGENT_TIME_ZONE;
+}
+
+// 'HH:MM' (24h) → { h, m }; null on anything else (same shape rule as the
+// availability-window parser in shared/scheduling/slots.js).
+function parseHm24(value) {
+  if (typeof value !== 'string') return null;
+  const m = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const mi = Number(m[2]);
+  if (h > 23 || mi > 59) return null;
+  return { h, m: mi };
+}
+
+// Structured error for malformed / nonexistent (DST-gap) / inverted bounds.
+function invalidTimeResult() {
+  return {
+    error: 'invalid_time',
+    note:
+      "after_time/before_time must be 'HH:MM' 24-hour times that exist on the requested " +
+      "day in the appointment timezone, with after_time earlier than before_time " +
+      "(e.g. afternoons = after_time '12:00'). Fix the bounds and retry.",
+  };
+}
+
 // ─── TOOL 1: get_available_times ──────────────────────────────────────────────────────
 
 /**
@@ -134,10 +202,12 @@ const MAX_PERSISTED_CANDIDATES = 10;
  * it has no write authority over them — staging accepts only slot_id validated
  * against server-persisted candidates.
  *
- * Errors to model: { error: 'no_availability' | 'lookup_failed', note }.
+ * Errors to model: { error: 'no_availability' | 'lookup_failed', note } — plus
+ * { error: 'invalid_time', note } for malformed/nonexistent/inverted day-part bounds
+ * (2026-06-12 daypart amendment).
  *
  * @param {object} params
- * @param {object}   params.input        - model args: { date?, exclude_slot_ids? }
+ * @param {object}   params.input        - model args: { date?, after_time?, before_time?, exclude_slot_ids? }
  * @param {object}   [params.session]    - the live session row (may be null pre-session)
  * @param {string}   params.tenantId     - server context (NOT model args)
  * @param {string}   params.sessionId    - server context (NOT model args)
@@ -169,8 +239,8 @@ async function executeGetAvailableTimes({
   const userTimeZone = qctxUserTimeZone(qctx);
 
   if (typeof deps.invokeProposal !== 'function') {
-    // Unwired seam — an honest transient failure to the model (§B17c error vocabulary
-    // is closed: no_availability | lookup_failed).
+    // Unwired seam — an honest transient failure to the model (§B17c error vocabulary:
+    // no_availability | lookup_failed | invalid_time per the 2026-06-12 amendment).
     logger.warn('[WS-AG-CORE] get_available_times unavailable (propose seam unwired)');
     return {
       error: 'lookup_failed',
@@ -231,17 +301,73 @@ async function executeGetAvailableTimes({
   // Model `date` arg → the §B16e date_window passthrough (shipped). An invalid /
   // non-calendar date from the model is an honest lookup_failed (never a silent
   // unconstrained lookup the model would then mis-narrate as day-specific).
-  if (input.date != null) {
-    let dateWindow;
+  //
+  // Day-part bounds (2026-06-12 amendment): optional after_time/before_time ('HH:MM',
+  // 24h) narrow the window to a time of day. Instants are computed in the appointment
+  // timezone (resolved like the today-line: appt-type tz → user tz → America/Chicago)
+  // via the shipped zonedWallTimeToUtc (DST-correct). Bounds without a date apply to
+  // TODAY in that timezone (deps.nowMs clock — the dayPicker test pattern). Malformed,
+  // nonexistent (spring-forward gap), or inverted bounds → structured invalid_time.
+  let afterHm = null;
+  let beforeHm = null;
+  if (input.after_time != null) {
+    afterHm = parseHm24(input.after_time);
+    if (afterHm == null) return invalidTimeResult();
+  }
+  if (input.before_time != null) {
+    beforeHm = parseHm24(input.before_time);
+    if (beforeHm == null) return invalidTimeResult();
+  }
+  const hasBounds = !!(afterHm || beforeHm);
+
+  if (input.date != null || hasBounds) {
+    const boundsTz = timeZoneForQctx(qctx);
+    const nowMs = Number.isFinite(deps.nowMs) ? deps.nowMs : Date.now();
+    const dateStr = input.date != null ? String(input.date) : localDateString(nowMs, boundsTz);
+    let dayWindow;
     try {
-      dateWindow = dateWindowForDay(String(input.date));
+      dayWindow = dateWindowForDay(dateStr);
     } catch {
       return {
         error: 'lookup_failed',
         note: 'That date could not be used for a lookup. Ask the user for the day again (YYYY-MM-DD resolvable), or offer the email fallback.',
       };
     }
-    proposePayload.date_window = { start: dateWindow.startISO, end: dateWindow.endISO };
+    // Date-only mapping stays byte-identical to the shipped §B16e behavior (the full
+    // UTC calendar day). With bounds, explicit edges become exact instants in the
+    // bounds timezone; the implicit edge widens to that timezone's civil-day edge (so
+    // an evening lower bound is not clipped by the conservative UTC-day end). A
+    // midnight that does not exist in the zone (rare DST-at-midnight zones) keeps the
+    // conservative UTC edge instead.
+    let startISO = dayWindow.startISO;
+    let endISO = dayWindow.endISO;
+    if (hasBounds) {
+      const [y, mo, d] = dateStr.split('-').map(Number);
+      if (afterHm) {
+        const ms = zonedWallTimeToUtc(y, mo, d, afterHm.h, afterHm.m, boundsTz);
+        if (ms == null) return invalidTimeResult(); // spring-forward gap
+        startISO = new Date(ms).toISOString();
+      } else {
+        const ms = zonedWallTimeToUtc(y, mo, d, 0, 0, boundsTz);
+        if (ms != null) startISO = new Date(ms).toISOString();
+      }
+      if (beforeHm) {
+        const ms = zonedWallTimeToUtc(y, mo, d, beforeHm.h, beforeHm.m, boundsTz);
+        if (ms == null) return invalidTimeResult(); // spring-forward gap
+        endISO = new Date(ms).toISOString();
+      } else {
+        const next = new Date(Date.UTC(y, mo - 1, d + 1)); // next civil day (pure calendar math)
+        const ms = zonedWallTimeToUtc(
+          next.getUTCFullYear(), next.getUTCMonth() + 1, next.getUTCDate(), 0, 0, boundsTz
+        );
+        if (ms != null) endISO = new Date(ms).toISOString();
+      }
+      // Inverted bounds (after ≥ before) can only be a model error — fail loudly
+      // instead of running a guaranteed-empty lookup the model would then narrate as
+      // "nothing open in the afternoon" (the exact defect class this fixes).
+      if (Date.parse(startISO) >= Date.parse(endISO)) return invalidTimeResult();
+    }
+    proposePayload.date_window = { start: startISO, end: endISO };
   }
 
   let res;
@@ -492,4 +618,8 @@ module.exports = {
   executeGetAvailableTimes,
   executeRequestBookingConfirmation,
   MAX_PERSISTED_CANDIDATES,
+  // Shared timezone precedence (day-part bounds here + agentTurn's today-line — one
+  // source of truth so the model's date anchor and the bounds always agree).
+  DEFAULT_AGENT_TIME_ZONE,
+  timeZoneForQctx,
 };

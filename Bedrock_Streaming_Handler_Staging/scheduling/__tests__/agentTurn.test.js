@@ -305,6 +305,44 @@ describe('agentTurn — §B17b loop', () => {
     expect(summary.overflow).toBe(false);
   });
 
+  test("§B17g allowlist carries after_time/before_time on a bounded lookup (non-PII 'HH:MM' civil times) — EXACT shape", async () => {
+    const bedrock = fakeBedrock([
+      toolUseResponse({
+        name: 'get_available_times',
+        input: { date: '2026-06-19', after_time: '12:00', before_time: '17:00' },
+      }),
+      textResponse('The afternoon has real openings — tap a time below.'),
+    ]);
+    const audit = [];
+    const deps = makeDeps({ bedrock, audit });
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write, userText: 'what about the afternoon?' }));
+
+    // the bounds became tz-resolved instants on the propose seam (CDT in June = UTC-5)
+    expect(deps.invokeProposal).toHaveBeenCalledTimes(1);
+    expect(deps.invokeProposal.mock.calls[0][0].date_window).toEqual({
+      start: '2026-06-19T17:00:00.000Z',
+      end: '2026-06-19T22:00:00.000Z',
+    });
+    // exact allowlist shape — after_time/before_time present, nothing else added
+    expect(audit.filter((e) => e.event_type === 'agent_tool_call')).toEqual([
+      {
+        event_type: 'agent_tool_call',
+        tenant_id: 'TEN',
+        session_id: 'sess-1',
+        tool: 'get_available_times',
+        outcome: 'ok',
+        latency_ms: expect.any(Number),
+        iteration: 1,
+        email_present: false,
+        date: '2026-06-19',
+        after_time: '12:00',
+        before_time: '17:00',
+      },
+    ]);
+  });
+
   test('system prompt = persona + §B17e block + §B17d state line; tools attached; user text is the message', async () => {
     const bedrock = fakeBedrock([textResponse('ok')]);
     const deps = makeDeps({ bedrock });
@@ -998,8 +1036,14 @@ describe('agentTurn — F3/F5 prompt rules (live-eval G1/A7 + A2/A3)', () => {
     expect(AGENT_NARRATION_RULES).toContain('ask ONE closing question');
   });
 
+  test('rule 16 (day-part bounds): time-of-day requests pass after_time/before_time; unbounded conclusions banned', () => {
+    expect(AGENT_NARRATION_RULES).toContain('pass after_time/before_time with the date');
+    expect(AGENT_NARRATION_RULES).toContain('Afternoon = 12:00–17:00, evening = 17:00 onward, morning = before 12:00');
+    expect(AGENT_NARRATION_RULES).toContain('NEVER conclude a time-of-day is unavailable without a bounded query');
+  });
+
   test('PROMPT_VERSION bumped for the rules change (§B17g)', () => {
-    expect(PROMPT_VERSION).toBe('b17e.v4');
+    expect(PROMPT_VERSION).toBe('b17e.v5');
   });
 });
 
