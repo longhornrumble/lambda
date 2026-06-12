@@ -53,6 +53,7 @@ const CLAIMS = {
   tenant_id: 'MYR384719',
   coordinator_id: 'maya@example.org',
   coordinator_email: 'maya@example.org',
+  purpose: 'disconnect', // §E11b: ADA mints disconnect tokens with this claim
 };
 const CONNECTED_SECRET = {
   refresh_token: 'rt-secret-value',
@@ -191,6 +192,18 @@ describe('verify-fail → 4xx', () => {
     });
     expect(res.statusCode).toBe(400);
   });
+
+  test('event.body field absent (undefined) → 400 (gracefully treated as empty body)', async () => {
+    // Lambda Function URL can omit the body field entirely on a POST with no body.
+    // The route must not throw and must return 400 (verify is called with undefined init).
+    state.verify.mockRejectedValue(Object.assign(new Error('malformed'), { code: 'malformed' }));
+    const res = await handler({
+      rawPath: '/connection/disconnect',
+      requestContext: { http: { method: 'POST' } },
+      // no body field at all
+    });
+    expect(res.statusCode).toBe(400);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -234,18 +247,13 @@ describe('revoke-fail-still-disconnects', () => {
 // 5. offboarder-fail-still-200
 // ─────────────────────────────────────────────────────────────────────────────
 describe('offboarder-fail-still-200', () => {
-  test('Offboarder invoke throws → 200 { status:disconnected, watch:pending }', async () => {
+  test('Offboarder SDK throw (throttle/network) → 200 { status:disconnected, watch:none }', async () => {
+    // InvocationType:'Event' -- SDK throws on error (no FunctionError on async invocations).
+    // ok:false → watch:'none' (dispatch not accepted; cleanup deferred to next expiry/sweep).
     lambdaMock.on(InvokeCommand).rejects(new Error('throttled'));
     const res = await handler(discEvent());
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ status: 'disconnected', watch: 'pending' });
-  });
-
-  test('Offboarder FunctionError → 200 { watch:pending }', async () => {
-    lambdaMock.on(InvokeCommand).resolves({ FunctionError: 'Unhandled', StatusCode: 200 });
-    const res = await handler(discEvent());
-    expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).watch).toBe('pending');
+    expect(JSON.parse(res.body)).toEqual({ status: 'disconnected', watch: 'none' });
   });
 
   test('markDisconnected failure → 500 generic (stamp is authoritative; offboard never reached)', async () => {
@@ -288,18 +296,18 @@ describe('idempotency', () => {
     expect(oauth.revokeToken).not.toHaveBeenCalled();
   });
 
-  test('secrets read failure → treats as no-secret → 200 { watch:none }', async () => {
-    // Secrets Manager unavailable: we still proceed to markDisconnected-less path
-    // because we can't read the refresh_token to revoke. We log WARN and skip the
-    // already-disconnected early return (because we genuinely don't know the state),
-    // but since secret is null we fall through to the idempotent path.
+  test('secrets read failure → treats as no-secret → 200 { watch:none }, NO markDisconnected', async () => {
+    // SM outage: secret=null falls through to the idempotent early-return.
+    // Critically, markDisconnected must NOT be called -- we cannot confirm state,
+    // so we must not write a stamp that might be wrong (item 1 locking assertion).
     secrets.readCoordinator.mockRejectedValue(new Error('sm down'));
     const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
     const res = await handler(discEvent());
     warnSpy.mockRestore();
-    // Secret read failed → secret=null path → 200 idempotent
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ status: 'disconnected', watch: 'none' });
+    // LOCKING ASSERTION: SM outage must NOT call markDisconnected (no stamp on uncertain state).
+    expect(secrets.markDisconnected).not.toHaveBeenCalled();
   });
 });
 
@@ -313,17 +321,16 @@ describe('ordering', () => {
     secrets.readCoordinator.mockImplementation(async () => { order.push('readCoordinator'); return CONNECTED_SECRET; });
     oauth.revokeToken.mockImplementation(async () => { order.push('revokeToken'); });
     secrets.markDisconnected.mockImplementation(async () => { order.push('markDisconnected'); return { found: true }; });
-    // Offboarder is async Event-type invoke; assert it happens after stamp by checking call count post-handler.
-    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+    // Capture the Offboarder InvokeCommand in the same order array so we can assert stamp-before-offboard.
+    lambdaMock.on(InvokeCommand).callsFake(() => { order.push('offboarder'); return Promise.resolve({ StatusCode: 202 }); });
 
     const res = await handler(discEvent());
     expect(res.statusCode).toBe(200);
     // Core ordering contract (§E11b): verify → revoke → stamp → offboard
     expect(order.indexOf('verify')).toBeLessThan(order.indexOf('revokeToken'));
     expect(order.indexOf('revokeToken')).toBeLessThan(order.indexOf('markDisconnected'));
-    // markDisconnected is called before handler returns, and InvokeCommand is sent after it
-    expect(order.indexOf('markDisconnected')).toBeGreaterThan(-1);
-    expect(lambdaMock.commandCalls(InvokeCommand).length).toBe(1); // Offboarder was invoked
+    // STAMP-BEFORE-OFFBOARD: the contract requires markDisconnected precedes the Offboarder invoke.
+    expect(order.indexOf('markDisconnected')).toBeLessThan(order.indexOf('offboarder'));
   });
 
   test('verify is called with typ:init (not typ:state)', async () => {
@@ -418,13 +425,46 @@ describe('no jti burn', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 11. purpose claim (§E11b cross-purpose replay defense)
+// ─────────────────────────────────────────────────────────────────────────────
+describe('purpose claim', () => {
+  test('token without purpose claim → 400 (connect/status token is invalid here)', async () => {
+    // A connect or status URL token has no 'purpose' claim; must be rejected by disconnect.
+    state.verify.mockResolvedValue({ ...CLAIMS, purpose: undefined });
+    const res = await handler(discEvent());
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body)).toEqual({ error: 'invalid_request' });
+    // No secrets work must happen on a wrong-purpose token
+    expect(secrets.readCoordinator).not.toHaveBeenCalled();
+    expect(secrets.markDisconnected).not.toHaveBeenCalled();
+  });
+
+  test('token with wrong purpose → 400', async () => {
+    state.verify.mockResolvedValue({ ...CLAIMS, purpose: 'connect' });
+    const res = await handler(discEvent());
+    expect(res.statusCode).toBe(400);
+    expect(secrets.readCoordinator).not.toHaveBeenCalled();
+  });
+
+  test('token with purpose:disconnect → proceeds normally', async () => {
+    state.verify.mockResolvedValue({ ...CLAIMS, purpose: 'disconnect' });
+    const res = await handler(discEvent());
+    expect(res.statusCode).toBe(200);
+    expect(secrets.readCoordinator).toHaveBeenCalled();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Happy path end-to-end
 // ─────────────────────────────────────────────────────────────────────────────
 describe('happy path', () => {
-  test('full success → 200 { status:disconnected, watch:stopped }', async () => {
+  test('full success → 200 { status:disconnected, watch:pending } (async dispatch confirmed, not completion)', async () => {
+    // InvocationType:'Event' returns 202 on successful dispatch; ok:true → watch:'pending'.
+    // 'pending' = cleanup dispatched (not yet confirmed complete). The dashboard FE should
+    // treat 'pending' as success-with-cleanup-in-progress -- the stamp is authoritative.
     const res = await handler(discEvent());
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ status: 'disconnected', watch: 'stopped' });
+    expect(JSON.parse(res.body)).toEqual({ status: 'disconnected', watch: 'pending' });
   });
 
   test('identity comes from the token, not from body fields (slot-poisoning defense)', async () => {

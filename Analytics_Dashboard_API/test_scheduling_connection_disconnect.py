@@ -118,6 +118,30 @@ def test_coordinator_id_is_lower_cased_caller_email():
     assert captured_tokens[0]['tenant_id'] == TENANT
 
 
+def test_disconnect_token_has_purpose_claim():
+    """ADA must mint the init token with purpose:'disconnect' (§E11b cross-purpose replay defense)."""
+    captured_tokens = []
+
+    original_sign = lf._sign_oauth_state
+
+    def capture_sign(typ, claims, ttl, **kwargs):
+        if typ == 'init':
+            captured_tokens.append(claims.copy())
+        return original_sign(typ, claims, ttl, **kwargs)
+
+    with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL), \
+         patch.object(lf, '_sign_oauth_state', side_effect=capture_sign), \
+         patch.object(urllib.request, 'urlopen',
+                      return_value=_make_upstream_response({'status': 'disconnected', 'watch': 'pending'})):
+        handle_scheduling_connection_disconnect(TENANT, EMAIL)
+
+    assert len(captured_tokens) == 1
+    assert captured_tokens[0].get('purpose') == 'disconnect', (
+        "disconnect mint must include purpose:'disconnect' so the OAuth Lambda can reject "
+        "a cross-purpose connect/status token replayed against the disconnect endpoint"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # body-carried token: must NOT appear in any URL or log
 # --------------------------------------------------------------------------- #
@@ -276,10 +300,39 @@ def test_feature_gate_denied_returns_403():
     with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL), \
          patch.object(lf, 'validate_feature_access', return_value=denied) as gate, \
          patch.object(urllib.request, 'urlopen') as mock_open:
-        resp = handle_scheduling_connection_disconnect(TENANT, EMAIL)
+        resp = handle_scheduling_connection_disconnect(TENANT, EMAIL, user_role='admin')
     assert resp['statusCode'] == 403
-    gate.assert_called_once_with(TENANT, 'dashboard_scheduling', lf._request_user_role)
+    # user_role is now passed explicitly (item 8: param threading, not global read).
+    gate.assert_called_once_with(TENANT, 'dashboard_scheduling', 'admin')
     mock_open.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# SELF-ONLY: super-admin X-Tenant-Override must be rejected (item 7)
+# --------------------------------------------------------------------------- #
+
+def test_super_admin_override_rejected_403():
+    """disconnect with tenant_override_active=True → 403 generic, no upstream call."""
+    with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL), \
+         patch.object(urllib.request, 'urlopen') as mock_open:
+        resp = handle_scheduling_connection_disconnect(
+            TENANT, EMAIL, user_role='super_admin', tenant_override_active=True
+        )
+    assert resp['statusCode'] == 403
+    body = json.loads(resp['body'])
+    assert 'error' in body
+    mock_open.assert_not_called()
+
+
+def test_super_admin_own_tenant_allowed():
+    """super_admin acting on their OWN tenant (no override) is permitted."""
+    with patch.object(lf, 'OAUTH_FUNCTION_URL', OAUTH_URL), \
+         patch.object(urllib.request, 'urlopen',
+                      return_value=_make_upstream_response({'status': 'disconnected', 'watch': 'pending'})):
+        resp = handle_scheduling_connection_disconnect(
+            TENANT, EMAIL, user_role='super_admin', tenant_override_active=False
+        )
+    assert resp['statusCode'] == 200
 
 
 # --------------------------------------------------------------------------- #
