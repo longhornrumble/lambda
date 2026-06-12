@@ -743,7 +743,7 @@ jobs:
             staging_function: Attribution_Recap_Generator
             handler: lambda_function.lambda_handler
             runtime: python
-            include_globs: 'lambda_function.py'
+            include_globs: 'lambda_function.py __init__.py'
             env_vars: ''
             smoke_path: ''
             smoke_expect_status: ''
