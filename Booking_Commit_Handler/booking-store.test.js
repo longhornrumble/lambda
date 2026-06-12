@@ -88,13 +88,20 @@ describe('buildBookingItem — GSI keys + status discipline', () => {
     expect(withNames.appointment_type_name.S).toBe('Volunteer intake');
   });
 
-  it('sets all optional fields when present (conference id, join url, reschedule link)', () => {
+  it('sets all optional fields when present (conference id, join url, html link, reschedule link)', () => {
     const item = store.buildBookingItem({
       ...fields, conferenceId: 'z-1', joinUrl: 'https://zoom.us/j/z-1', rescheduleOfBookingId: 'booking#old',
+      htmlLink: 'https://www.google.com/calendar/event?eid=abc123',
     });
     expect(item.conference_id.S).toBe('z-1');
     expect(item.channel_details.S).toBe('https://zoom.us/j/z-1');
+    expect(item.html_link.S).toBe('https://www.google.com/calendar/event?eid=abc123');
     expect(item.reschedule_of_booking_id.S).toBe('booking#old');
+  });
+
+  it('omits html_link when the insert response carried none (old-shape parity)', () => {
+    const item = store.buildBookingItem(fields);
+    expect(item.html_link).toBeUndefined();
   });
 });
 
