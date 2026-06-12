@@ -77,7 +77,7 @@ jobs:
           - source_dir: Analytics_Dashboard_API
             prod_function: Analytics_Dashboard_API
             runtime: python
-            include_globs: 'lambda_function.py tenant_registry_ops.py'
+            include_globs: 'lambda_function.py tenant_registry_ops.py attribution_api.py attribution_rules.py'
             alias: ''
             # ADA smokes against its own Function URL (looked up at deploy
             # time); MFS/BSH smoke through CloudFront instead (smoke_url).

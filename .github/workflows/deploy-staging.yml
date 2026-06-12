@@ -193,7 +193,7 @@ jobs:
             runtime: python
             # Files included in the deployment zip (anything not listed is excluded).
             # Keep this surgical — exclude tests, migration scripts, build helpers.
-            include_globs: 'lambda_function.py tenant_registry_ops.py'
+            include_globs: 'lambda_function.py tenant_registry_ops.py attribution_api.py attribution_rules.py'
             # env_vars are managed out-of-band for this Lambda today. The step
             # below MERGES matrix env_vars with existing live env vars (matrix
             # wins on conflict) so populating this list adds/overrides without
