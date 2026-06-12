@@ -164,3 +164,50 @@ describe('buildDayStrip — tomorrow anchored in user local time (fix #9)', () =
     expect(days.map((d) => d.date)).not.toContain(todayDate);
   });
 });
+
+// ─── Track-D fix 2 (WS-TRACKD-BE): formatDayLabel formats the CIVIL date, not the ────────
+//     UTC-midnight instant (QA P1-4 — labels rendered one day behind in US timezones).
+
+describe('formatDayLabel — civil date, not UTC-midnight instant (Track-D fix 2)', () => {
+  test('2026-06-15 in America/Chicago (UTC-5) renders "Mon, Jun 15" (not "Sun, Jun 14")', () => {
+    expect(_formatDayLabel('2026-06-15', 'America/Chicago')).toBe('Mon, Jun 15');
+  });
+
+  test('2026-06-15 in America/New_York (UTC-4) renders "Mon, Jun 15"', () => {
+    expect(_formatDayLabel('2026-06-15', 'America/New_York')).toBe('Mon, Jun 15');
+  });
+
+  test('2026-06-15 in UTC renders "Mon, Jun 15" (no regression)', () => {
+    expect(_formatDayLabel('2026-06-15', 'UTC')).toBe('Mon, Jun 15');
+  });
+
+  test('TZ-shift regression: DST fall-back date 2026-11-01 in America/Chicago still formats the correct civil day', () => {
+    // 2026-11-01 spans the midnight rollback (CDT→CST) in America/Chicago. The old code
+    // formatted the UTC-midnight INSTANT (2026-11-01T00:00:00Z = Oct 31, 7 PM CDT) and
+    // rendered "Sat, Oct 31" — one civil day behind. The civil date must render Nov 1.
+    expect(_formatDayLabel('2026-11-01', 'America/Chicago')).toBe('Sun, Nov 1');
+  });
+
+  test('extreme-offset zones render the same civil day (label is tz-independent by construction)', () => {
+    // Pago Pago (UTC-11) and Kiritimati (UTC+14) bracket the full tz range: the old
+    // instant-based formatting disagreed across them by up to two calendar days.
+    expect(_formatDayLabel('2026-06-15', 'Pacific/Pago_Pago')).toBe('Mon, Jun 15');
+    expect(_formatDayLabel('2026-06-15', 'Pacific/Kiritimati')).toBe('Mon, Jun 15');
+  });
+
+  test('buildDayStrip labels agree with their civil dates in a US timezone (the P1-4 regression)', () => {
+    // 2026-06-14T18:00:00Z = 1 PM CDT — strip starts Mon Jun 15 (Chicago tomorrow).
+    const nowMs = Date.UTC(2026, 5, 14, 18, 0, 0);
+    const days = buildDayStrip({ userTimeZone: 'America/Chicago', nowMs, maxAdvanceDays: 60 });
+    expect(days.length).toBe(7);
+    for (const d of days) {
+      // The label's day-of-month must equal the civil date's day-of-month. Under the old
+      // instant-based formatting every Chicago label showed the PREVIOUS day.
+      const civilDayOfMonth = String(Number(d.date.slice(8, 10)));
+      expect(d.label.endsWith(` ${civilDayOfMonth}`)).toBe(true);
+      // And the full label must equal the civil-date rendering exactly.
+      expect(d.label).toBe(_formatDayLabel(d.date, 'America/Chicago'));
+    }
+    expect(days[0]).toEqual({ date: '2026-06-15', label: 'Mon, Jun 15' });
+  });
+});

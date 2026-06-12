@@ -38,16 +38,27 @@ const MAX_PICKER_CYCLES = 3;
 // ─── Day-strip generation ─────────────────────────────────────────────────────────
 
 /**
- * Format a UTC date as "Mon, Jun 15" in the given IANA timezone.
- * Uses native Intl — no tz library.
+ * Format a civil date ('YYYY-MM-DD') as "Mon, Jun 15". Uses native Intl — no tz library.
+ *
+ * Track-D fix 2 (WS-TRACKD-BE, QA P1-4): this used to format the UTC-MIDNIGHT INSTANT of
+ * the date in the user's timezone, rendering one calendar day behind for any zone west of
+ * UTC (e.g. '2026-06-15T00:00:00Z' → "Sun, Jun 14" in America/Chicago). The strip's `date`
+ * values are already CIVIL dates in the user's zone (localDateString), so the label must
+ * render that civil date directly: parse Y/M/D from the string, anchor at UTC midnight,
+ * and format IN UTC — the label is the same civil day in every timezone by construction.
+ *
+ * @param {string} dateStr - civil date 'YYYY-MM-DD' (already the user's local calendar day)
+ * @param {string} [_userTimeZone] - accepted for call-site symmetry; intentionally UNUSED —
+ *   the civil day must not shift with the viewer's timezone (that was the regression).
  */
-function formatDayLabel(utcMs, userTimeZone) {
+function formatDayLabel(dateStr, _userTimeZone) {
+  const [y, m, d] = String(dateStr).split('-').map(Number);
   return new Intl.DateTimeFormat('en-US', {
-    timeZone: userTimeZone,
+    timeZone: 'UTC',
     weekday: 'short',
     month: 'short',
     day: 'numeric',
-  }).format(new Date(utcMs));
+  }).format(new Date(Date.UTC(y, m - 1, d)));
 }
 
 /**
@@ -109,10 +120,9 @@ function buildDayStrip({ userTimeZone, nowMs, maxAdvanceDays = 60, stripSize = 7
       continue;
     }
     if (probeMs > cutoffMs) break; // clipped to max_advance_days (exclusive upper bound)
-    // Parse the local date string (YYYY-MM-DD) for UTC midnight of that day.
-    const [y, m, d] = localDate.split('-').map(Number);
-    const dayMidnightMs = Date.UTC(y, m - 1, d);
-    const label = formatDayLabel(dayMidnightMs, tz);
+    // Track-D fix 2: label the CIVIL date string itself (tz-independent) — formatting the
+    // UTC-midnight instant in the user's tz rendered the previous day for US zones (P1-4).
+    const label = formatDayLabel(localDate, tz);
     days.push({ date: localDate, label });
     probeMs += 24 * 60 * 60 * 1000;
   }
