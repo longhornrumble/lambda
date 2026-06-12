@@ -921,6 +921,12 @@ def _dub_get(path: str, params: Dict, secret: str) -> Any:
     if not path.startswith('/analytics'):
         raise ValueError(f'Forbidden Dub path: {path}')
 
+    # C4 amendment 2026-06-12: personal-type Dub keys resolve a workspace only
+    # via ?workspaceId=. Read at call time so tests can toggle the env var.
+    workspace_id = os.environ.get('DUB_WORKSPACE_ID', '')
+    if workspace_id and 'workspaceId' not in params:
+        params = {**params, 'workspaceId': workspace_id}
+
     query = urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
     url = f'{DUB_BASE_URL}{path}?{query}'
 

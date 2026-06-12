@@ -27,6 +27,16 @@ export const MAX_RETRY_WAIT_MS = 30_000;
 export const DUB_DOMAIN = process.env.DUB_DOMAIN ?? 'myrctr.link';
 
 /**
+ * Optional workspace scoping (C4 amendment 2026-06-12): the operator's Dub keys
+ * are personal-type, which Dub only resolves to a workspace when requests carry
+ * ?workspaceId=. Read at call time (not module load) so tests can toggle it.
+ */
+function wsQuery() {
+  const ws = process.env.DUB_WORKSPACE_ID ?? '';
+  return ws ? `?workspaceId=${encodeURIComponent(ws)}` : '';
+}
+
+/**
  * Build the QR URL for a Dub shortlink (public GET, no API call needed).
  * Spec: C4 — size 1000, level H (error correction high for print).
  * @param {string} shortLink
@@ -64,7 +74,7 @@ export async function dubMintLink(apiKey, { destinationUrl, entryPointId, tenant
     payload.key = suffix;
   }
 
-  const response = await fetch(`${DUB_API_BASE}/links`, {
+  const response = await fetch(`${DUB_API_BASE}/links${wsQuery()}`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -119,7 +129,7 @@ export async function dubMintLink(apiKey, { destinationUrl, entryPointId, tenant
  * @returns {Promise<void>}
  */
 export async function dubDeleteLink(apiKey, dubLinkId) {
-  const response = await fetch(`${DUB_API_BASE}/links/${dubLinkId}`, {
+  const response = await fetch(`${DUB_API_BASE}/links/${dubLinkId}${wsQuery()}`, {
     method: 'DELETE',
     headers: { Authorization: `Bearer ${apiKey}` },
   });
