@@ -7,7 +7,7 @@
  * `scheduling/docs/agentic-live-eval.md` at the repo root.
  *
  * Covers (work-order WS-AG-EVAL done-bar item 1):
- *  - Appendix-A increment-1 cases A1–A13, asserted THROUGH the §B17b `agentTurn`
+ *  - Appendix-A increment-1 cases A1–A14, asserted THROUGH the §B17b `agentTurn`
  *    interface (never around it — agentTurn itself is NOT mocked; only its deps are)
  *  - §B17g '@'-free-logs assertion + §B17d state-line never contains the raw email
  *  - injection: fabricated attendee_email ("; DROP TABLE bookings; --") → invalid_email,
@@ -60,9 +60,20 @@ const SLOTS = Object.freeze([
 const AFTERNOON_SLOTS = Object.freeze([
   { slotId: 's4', start: '2026-06-17T19:00:00.000Z', end: '2026-06-17T19:30:00.000Z', label: 'Wed, Jun 17 · 2:00 PM' },
 ]);
+// A14 fixtures: a 9:00–17:00 availability day — the unbounded lookup returned mornings;
+// the BOUNDED (after_time '12:00') re-query returns that day's afternoon openings.
+const MORNING_SLOTS = Object.freeze([
+  { slotId: 'am1', start: '2026-06-15T14:00:00.000Z', end: '2026-06-15T14:30:00.000Z', label: 'Mon, Jun 15 · 9:00 AM' },
+  { slotId: 'am2', start: '2026-06-15T15:00:00.000Z', end: '2026-06-15T15:30:00.000Z', label: 'Mon, Jun 15 · 10:00 AM' },
+]);
+const AFTERNOON_BOUNDED_SLOTS = Object.freeze([
+  { slotId: 'pm1', start: '2026-06-15T18:00:00.000Z', end: '2026-06-15T18:30:00.000Z', label: 'Mon, Jun 15 · 1:00 PM' },
+  { slotId: 'pm2', start: '2026-06-15T19:30:00.000Z', end: '2026-06-15T20:00:00.000Z', label: 'Mon, Jun 15 · 2:30 PM' },
+]);
 
 const PROPOSE_OK = Object.freeze({ outcome: 'ok', slots: SLOTS.map((s) => ({ ...s })), poolSize: 2, tieBreaker: 'round_robin' });
 const PROPOSE_AFTERNOON = Object.freeze({ outcome: 'ok', slots: AFTERNOON_SLOTS.map((s) => ({ ...s })), poolSize: 2 });
+const PROPOSE_AFTERNOON_BOUNDED = Object.freeze({ outcome: 'ok', slots: AFTERNOON_BOUNDED_SLOTS.map((s) => ({ ...s })), poolSize: 2 });
 const PROPOSE_NO_AVAIL = Object.freeze({ outcome: 'no_availability' });
 // A13 per-day results: Monday Jun 15 slots vs Tuesday Jun 16 slot.
 const PROPOSE_MONDAY = Object.freeze({ outcome: 'ok', slots: [SLOTS[0], SLOTS[1]].map((s) => ({ ...s })), poolSize: 2 });
@@ -422,7 +433,7 @@ describeAgent('§B17h kill switches — zero model invocations when blocked', ()
   });
 });
 
-// ── Appendix A increment-1 cases (A1–A12) ────────────────────────────────────────────────
+// ── Appendix A increment-1 cases (A1–A14) ────────────────────────────────────────────────
 
 describeAgent('Appendix A increment-1 evals (§B17b loop through the real agentTurn)', () => {
   afterEach(() => { delete process.env.AGENTIC_SCHEDULING_DISABLED; });
@@ -823,6 +834,59 @@ describeAgent('Appendix A increment-1 evals (§B17b loop through the real agentT
     expect(store.row.state).toBe('confirming');
     expect(store.row.selected_slot && store.row.selected_slot.slotId).toBe('s1');
     expect(deps2.invokeBookingCommit).not.toHaveBeenCalled();
+  });
+
+  test('A14: morning chips shown, "what about the afternoon?" → DATED + BOUNDED call (after_time ≥ 12:00); afternoon slots returned and narrated', async () => {
+    // Live defect 2026-06-12: an UNBOUNDED re-query of the same 9:00–17:00 window
+    // re-returned the earliest (morning) slots + the F5 same-results note, and the
+    // model honestly mis-narrated open afternoons as closed. The b17e.v5 rule 16 +
+    // the after_time/before_time tool args make the bounded query expressible.
+    const store = memoryStateStore({
+      tenantId: TENANT,
+      session_id: SESSION,
+      state: 'proposing',
+      candidate_slots: MORNING_SLOTS.map((s) => ({ ...s })),
+      rejected_slot_ids: [],
+    });
+    const bedrock = scriptedBedrock([
+      { toolUse: { name: 'get_available_times', input: { date: '2026-06-15', after_time: '12:00' } }, stopReason: 'tool_use' },
+      { text: 'The afternoon is open too — tap a time below. Which works best for you?', stopReason: 'end_turn' },
+    ]);
+    const deps = makeDeps({ bedrock, store, proposeResults: [PROPOSE_AFTERNOON_BOUNDED] });
+    deps.nowMs = NOW_MS;
+    const rec = sseRecorder();
+    await agentTurn(turnArgs({
+      userText: 'what about the afternoon?',
+      history: [
+        { role: 'user', content: 'anything on Monday June 15?' },
+        { role: 'assistant', content: 'Monday morning has real openings — tap a time below.' },
+      ],
+      sessionRow: store.row,
+      deps,
+      writer: rec.writer,
+    }));
+
+    // ONE bounded, dated lookup: date + after_time mapped server-side onto the §B16a
+    // date_window as instants in the appointment timezone (America/Chicago default;
+    // CDT in June): 2026-06-15 12:00 CT → 17:00Z; implicit end = the civil-day end →
+    // 2026-06-16 00:00 CT = 05:00Z. NOT an unbounded re-query of the same window.
+    expect(deps.invokeProposal).toHaveBeenCalledTimes(1);
+    expect(deps.invokeProposal.mock.calls[0][0].date_window).toEqual({
+      start: '2026-06-15T17:00:00.000Z',
+      end: '2026-06-16T05:00:00.000Z',
+    });
+    // afternoon slots reached the model — it can never honestly claim afternoons are closed
+    const results = toolResultContents(bedrock.calls[1]);
+    expect(results).toHaveLength(1);
+    expect(results[0].slots.map((s) => s.slot_id)).toEqual(['pm1', 'pm2']);
+    // the same-results note must NOT fire — the bounded query returned NEW slots
+    expect(results[0].note).not.toContain('SAME results as before');
+    // narrated truthfully + rendered as chips
+    expect(streamedText(rec.frames).toLowerCase()).toContain('afternoon');
+    const slotEvents = eventsOfType(rec.frames, 'scheduling_slots');
+    expect(slotEvents).toHaveLength(1);
+    expect(slotEvents[0].slots.map((s) => s.slotId)).toEqual(['pm1', 'pm2']);
+    expect(deps.invokeBookingCommit).not.toHaveBeenCalled();
   });
 });
 
