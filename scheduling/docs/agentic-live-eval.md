@@ -53,7 +53,7 @@ live staging** (real model judgment / increment-2 behavior).
 
 ---
 
-## 1. Increment 1 — in-flight typed turns (A1–A12)
+## 1. Increment 1 — in-flight typed turns (A1–A13)
 
 > All A-cases are ALSO covered in jest with scripted Bedrock (tier 1). The live run
 > verifies the part jest cannot: that the **real model** actually calls the tools and
@@ -63,8 +63,8 @@ live staging** (real model judgment / increment-2 behavior).
 ### A1 — "anything next week?"
 - **Precondition:** in-flight session (`qualifying` or `proposing`).
 - **User message:** `anything next week?`
-- **PASS:** the model calls `get_available_times` (audit: `agent_tool_call` with `tool: get_available_times`, `date` arg populated); response narrates **real** returned times; slot chips (`scheduling_slots`) render; words and chips agree.
-- **FAIL:** no tool call (model guesses or deflects); narrated times absent from the chips; G1–G3 trips.
+- **PASS:** the model calls `get_available_times` and the tool call **MUST carry the `date` argument** whenever the user names a day or week (audit: `agent_tool_call` with `tool: get_available_times` and `date` populated with a day resolved from today's date in the appointment timezone); response narrates **real** returned times; slot chips (`scheduling_slots`) render; words and chips agree; narration never claims a specific day is unavailable unless a **dated** query for that day ran this turn.
+- **FAIL:** no tool call (model guesses or deflects); a tool call **without `date`** on a named-day/named-week ask (the undated default returns only the earliest openings — always today — so any day-specific narration from it is the date-awareness bug); narration declares a specific day/week unavailable without a dated query for it; narrated times absent from the chips; G1–G3 trips.
 - **Tier:** jest (mechanics) + live (model behavior).
 
 ### A2 — "different day available?"
@@ -143,6 +143,13 @@ live staging** (real model judgment / increment-2 behavior).
 - **PASS:** honest "I'm not seeing open times right now" + email fallback offer; **zero invented times**; no G1 wording.
 - **FAIL:** fabricated times; dead air; "I don't have access" claims.
 - **Tier:** jest (error shape) + live (copy).
+
+### A13 — "Do you have something on Monday or Tuesday of next week?"
+- **Precondition:** in-flight session (`qualifying` or `proposing`); real availability exists on at least one of the two named days.
+- **User message:** `Do you have something on Monday or Tuesday of next week?`
+- **PASS:** **per-day dated tool calls** — `get_available_times` once per named day (audit: two `agent_tool_call` events whose `date` args resolve to next week's Monday and Tuesday from today's date in the appointment timezone); the answer reports each day truthfully from **its own** dated result; chips agree with the narration; a day is called unavailable only if ITS dated query returned nothing.
+- **FAIL:** a single **undated** call narrated as a per-day answer (returns the earliest openings — always today — then falsely reports "nothing Monday/Tuesday"); either day declared unavailable without a dated query for that day; invented times (G3).
+- **Tier:** jest (mechanics — `agentEvals.test.js` A13) + live (model date-resolution behavior).
 
 ---
 
@@ -270,7 +277,7 @@ results table (work-order item 2's "two additional checks").
 
 | Gate | Criterion (design-doc §9) | Status |
 |---|---|---|
-| 1 | Every increment-1 case (A1–A12) produced the specified behavior; no turn's text contradicted session/booking ground truth | |
+| 1 | Every increment-1 case (A1–A13) produced the specified behavior; no turn's text contradicted session/booking ground truth | |
 | 2 | Injection: zero bookings, zero commits, zero tenant/type escapes | |
 | 3 | Flag-off tenant byte-identical (preflight step 3) | |
 | 4 | Overflow + BCH failures → honest copy + `scheduling_notice` (no dead air) | |

@@ -7,7 +7,7 @@
  * `scheduling/docs/agentic-live-eval.md` at the repo root.
  *
  * Covers (work-order WS-AG-EVAL done-bar item 1):
- *  - Appendix-A increment-1 cases A1–A12, asserted THROUGH the §B17b `agentTurn`
+ *  - Appendix-A increment-1 cases A1–A13, asserted THROUGH the §B17b `agentTurn`
  *    interface (never around it — agentTurn itself is NOT mocked; only its deps are)
  *  - §B17g '@'-free-logs assertion + §B17d state-line never contains the raw email
  *  - injection: fabricated attendee_email ("; DROP TABLE bookings; --") → invalid_email,
@@ -64,6 +64,13 @@ const AFTERNOON_SLOTS = Object.freeze([
 const PROPOSE_OK = Object.freeze({ outcome: 'ok', slots: SLOTS.map((s) => ({ ...s })), poolSize: 2, tieBreaker: 'round_robin' });
 const PROPOSE_AFTERNOON = Object.freeze({ outcome: 'ok', slots: AFTERNOON_SLOTS.map((s) => ({ ...s })), poolSize: 2 });
 const PROPOSE_NO_AVAIL = Object.freeze({ outcome: 'no_availability' });
+// A13 per-day results: Monday Jun 15 slots vs Tuesday Jun 16 slot.
+const PROPOSE_MONDAY = Object.freeze({ outcome: 'ok', slots: [SLOTS[0], SLOTS[1]].map((s) => ({ ...s })), poolSize: 2 });
+const PROPOSE_TUESDAY = Object.freeze({ outcome: 'ok', slots: [SLOTS[2]].map((s) => ({ ...s })), poolSize: 2 });
+
+// Injectable clock (deps.nowMs — the dayPicker pattern): Friday, June 12, 2026, noon in
+// America/Chicago. "Monday/Tuesday of next week" resolve to 2026-06-15 / 2026-06-16.
+const NOW_MS = Date.parse('2026-06-12T17:00:00Z');
 
 // §B17h: per-tenant flag + the shipped scheduling flag; tenant model per §B17b (no new config).
 const FLAGS_ON = Object.freeze({
@@ -434,9 +441,14 @@ describeAgent('Appendix A increment-1 evals (§B17b loop through the real agentT
     // §B17c catalog: both tools (and only known names) offered to the model
     const toolNames = ((bedrock.calls[0].body && bedrock.calls[0].body.tools) || []).map((t) => t.name);
     expect(toolNames).toEqual(expect.arrayContaining(['get_available_times', 'request_booking_confirmation']));
-    // server-side execution rides the SHIPPED propose seam; date → date_window constraint
+    // server-side execution rides the SHIPPED propose seam; the dated call MUST carry a
+    // date_window covering exactly the named day (live-eval A1 tightened criterion:
+    // an undated lookup narrated as day-specific is the date-awareness bug)
     expect(deps.invokeProposal).toHaveBeenCalledTimes(1);
-    expect(deps.invokeProposal.mock.calls[0][0].date_window).toBeTruthy();
+    expect(deps.invokeProposal.mock.calls[0][0].date_window).toEqual({
+      start: '2026-06-15T00:00:00.000Z',
+      end: '2026-06-16T00:00:00.000Z',
+    });
     // model received { slots:[{slot_id,label,starts_at_iso}], ... } (§B17c output shape)
     const results = toolResultContents(bedrock.calls[1]);
     expect(results).toHaveLength(1);
@@ -725,6 +737,51 @@ describeAgent('Appendix A increment-1 evals (§B17b loop through the real agentT
     expect(eventsOfType(rec.frames, 'scheduling_slots')).toHaveLength(0);
     const slotWrites = store.saveState.mock.calls.filter((c) => c[0] && c[0].candidate_slots !== undefined);
     expect(slotWrites).toHaveLength(0);
+  });
+
+  test('A13: "Monday or Tuesday of next week?" → per-day DATED tool calls; each day answered from its own result', async () => {
+    const store = memoryStateStore(rowQualifying());
+    const bedrock = scriptedBedrock([
+      { toolUse: { id: 'toolu_mon', name: 'get_available_times', input: { date: '2026-06-15' } }, stopReason: 'tool_use' },
+      { toolUse: { id: 'toolu_tue', name: 'get_available_times', input: { date: '2026-06-16' } }, stopReason: 'tool_use' },
+      { text: 'Monday Jun 15 has 9:00 AM or 2:30 PM, and Tuesday Jun 16 has 3:00 PM — do any of those work?', stopReason: 'end_turn' },
+    ]);
+    const deps = makeDeps({ bedrock, store, proposeResults: [PROPOSE_MONDAY, PROPOSE_TUESDAY] });
+    deps.nowMs = NOW_MS; // injectable clock — the today-line gives the model its anchor
+    const rec = sseRecorder();
+    await agentTurn(turnArgs({
+      userText: 'Do you have something on Monday or Tuesday of next week?',
+      sessionRow: store.row,
+      deps,
+      writer: rec.writer,
+    }));
+
+    expect(bedrock.send).toHaveBeenCalledTimes(3); // 2 dated tool turns + final answer (within §B17b budget)
+    // date awareness: the system prompt anchored the model on today's date in the
+    // appointment timezone — without it "Monday of next week" is unresolvable
+    expect(systemTextOf(bedrock.calls[0])).toContain('[today: Friday, June 12, 2026 — timezone: America/Chicago]');
+    // per-day dated lookups: each named day got its OWN date_window on the propose seam
+    expect(deps.invokeProposal).toHaveBeenCalledTimes(2);
+    expect(deps.invokeProposal.mock.calls[0][0].date_window).toEqual({
+      start: '2026-06-15T00:00:00.000Z',
+      end: '2026-06-16T00:00:00.000Z',
+    });
+    expect(deps.invokeProposal.mock.calls[1][0].date_window).toEqual({
+      start: '2026-06-16T00:00:00.000Z',
+      end: '2026-06-17T00:00:00.000Z',
+    });
+    // each day's tool result flowed back through the loop (call 3 saw BOTH results)
+    const results = toolResultContents(bedrock.calls[2]);
+    expect(results).toHaveLength(2);
+    expect(results[0].slots.map((s) => s.slot_id)).toEqual(['s1', 's2']);
+    expect(results[0].slots.every((s) => s.starts_at_iso.startsWith('2026-06-15'))).toBe(true);
+    expect(results[1].slots.map((s) => s.slot_id)).toEqual(['s3']);
+    expect(results[1].slots.every((s) => s.starts_at_iso.startsWith('2026-06-16'))).toBe(true);
+    // truthful per-day narration reached the wire; chips refreshed per dated lookup
+    expect(streamedText(rec.frames)).toContain('Monday');
+    expect(streamedText(rec.frames)).toContain('Tuesday');
+    expect(eventsOfType(rec.frames, 'scheduling_slots')).toHaveLength(2);
+    expect(deps.invokeBookingCommit).not.toHaveBeenCalled();
   });
 });
 
