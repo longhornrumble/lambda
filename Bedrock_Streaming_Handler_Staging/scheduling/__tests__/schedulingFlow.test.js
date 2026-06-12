@@ -543,7 +543,8 @@ describe('§B16e scheduling_day_selected signal', () => {
       deps: {
         qualifyingContext: QCTX,
         schedulingDaySelected: DAY,
-        loadState: async () => ({ state: 'qualifying', picker_cycles: 1, picker_days: [] }),
+        // fix #5: DAY must be in picker_days for the offered-strip validation to pass.
+        loadState: async () => ({ state: 'qualifying', picker_cycles: 1, picker_days: [{ date: DAY, label: 'Mon, Jul 6' }] }),
         saveState: async () => {},
         invokeProposal: async (payload) => {
           proposeCalls.push(payload);
@@ -568,7 +569,8 @@ describe('§B16e scheduling_day_selected signal', () => {
   });
 
   test('signal on no_availability day → re-emit picker (same days), state stays', async () => {
-    const persistedDays = [{ date: '2026-07-02', label: 'Thu, Jul 2' }, { date: '2026-07-03', label: 'Fri, Jul 3' }];
+    // fix #5: persistedDays must include DAY for the offered-strip validation to pass.
+    const persistedDays = [{ date: DAY, label: 'Mon, Jul 6' }, { date: '2026-07-07', label: 'Tue, Jul 7' }, { date: '2026-07-08', label: 'Wed, Jul 8' }];
     const { write, writes } = collectWrites();
     const savedStates = [];
     const res = await runNewBookingTurn({
@@ -612,7 +614,8 @@ describe('§B16e scheduling_day_selected signal', () => {
         qualifyingContext: QCTX,
         schedulingDaySelected: DAY,
         // picker_cycles = 3 → on the next emit it becomes 4 > MAX (3) → escape.
-        loadState: async () => ({ state: 'qualifying', picker_cycles: MAX_PICKER_CYCLES, picker_days: [] }),
+        // fix #5: DAY must be in picker_days for the offered-strip validation to pass.
+        loadState: async () => ({ state: 'qualifying', picker_cycles: MAX_PICKER_CYCLES, picker_days: [{ date: DAY, label: 'Mon, Jul 6' }] }),
         saveState: async (s) => savedStates.push(s),
         invokeProposal: async () => ({ outcome: 'no_availability', slots: [], poolSize: 0 }),
         logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },

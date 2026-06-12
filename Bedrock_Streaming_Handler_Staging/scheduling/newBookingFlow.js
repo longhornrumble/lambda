@@ -57,6 +57,25 @@ const {
   emitPickerEscapeNotice,
 } = require('./dayPicker');
 
+// ─── picker_days shape validator (fix #7) ────────────────────────────────────────────
+// Validates persisted prior.picker_days before re-emitting it. Returns true only when
+// the value is an array of {date: YYYY-MM-DD, label: string <= 40 chars} objects.
+// Invalid/corrupt persisted strip → caller rebuilds fresh instead of emitting junk.
+const DAY_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function isValidDayStrip(days) {
+  if (!Array.isArray(days) || days.length === 0) return false;
+  return days.every(
+    (d) =>
+      d &&
+      typeof d === 'object' &&
+      typeof d.date === 'string' &&
+      DAY_DATE_RE.test(d.date) &&
+      typeof d.label === 'string' &&
+      d.label.length <= 40
+  );
+}
+
 // The three §B16b structured actions. Anything else (incl. unparseable output) → 'none'.
 const ACTIONS = Object.freeze(['select_slot', 'confirm_book', 'none']);
 
@@ -289,15 +308,24 @@ async function _handleDaySelected({ tenantId, sessionId, state, prior, qctx, day
     return { handled: true, executed: false, state: next.state, slots };
   }
 
+  if (outcome === 'failed') {
+    // Transient BCH/infra error — do NOT touch state, do NOT emit a picker, do NOT
+    // increment picker_cycles (same rule as _propose: outcome:'failed' is not a §B16e trigger).
+    (logger || console).warn(`[WS-T3-DAYPICK] day-constrained propose returned outcome='failed' (non-fatal, no picker): tenant=${tenantId}`);
+    return { handled: true, executed: false, state, reason: 'propose_failed_outcome' };
+  }
+
   // no_availability for the selected day → re-emit the picker (same 7 days when persisted,
   // else rebuild). Counts as another picker cycle (→ escape when > MAX_PICKER_CYCLES).
   (logger || console).info(
     JSON.stringify({ event: 'day_selected_no_availability', tenant_id: tenantId, session_id: sessionId, day: daySelected })
   );
-  // Re-use the persisted strip if available (§B16e: "same 7 days"); fallback to a fresh strip
-  // (e.g., state was saved without picker_days by an earlier impl).
-  const persistedDays = prior && prior.picker_days;
-  const pickerCycles = (prior && typeof prior.picker_cycles === 'number' ? prior.picker_cycles : 0) + 1;
+  // Re-use the persisted strip if available (§B16e: "same 7 days") — but only if it
+  // shape-validates (array, each item { date: YYYY-MM-DD, label: string <= 40 chars }).
+  // Invalid/corrupt persisted strip → rebuild fresh instead of emitting junk.
+  const rawPersistedDays = prior && prior.picker_days;
+  const persistedDays = isValidDayStrip(rawPersistedDays) ? rawPersistedDays : null;
+  const pickerCycles = (prior && Number.isFinite(prior.picker_cycles) ? prior.picker_cycles : 0) + 1;
   if (pickerCycles > MAX_PICKER_CYCLES) {
     emitPickerEscapeNotice(write, sessionId);
     if (deps.saveState) {
@@ -337,7 +365,7 @@ async function _handleDaySelected({ tenantId, sessionId, state, prior, qctx, day
  * Cycle count rides in `prior.picker_cycles` (schema-discipline: absent → 0).
  */
 async function _emitPickerOrEscape({ tenantId, sessionId, fromState, prior, qctx, write, deps, logger }) {
-  const pickerCycles = (prior && typeof prior.picker_cycles === 'number' ? prior.picker_cycles : 0) + 1;
+  const pickerCycles = (prior && Number.isFinite(prior.picker_cycles) ? prior.picker_cycles : 0) + 1;
   if (pickerCycles > MAX_PICKER_CYCLES) {
     // §9.3 async escape: too many picker cycles → stop trying, notify by email.
     emitPickerEscapeNotice(write, sessionId);
@@ -356,10 +384,15 @@ async function _emitPickerOrEscape({ tenantId, sessionId, fromState, prior, qctx
   }
 
   const userTimeZone = ctxUserTimeZone(qctx);
-  const maxAdvanceDays = Number(
-    (qctx.appointmentType && qctx.appointmentType.max_advance_days) ||
-    (qctx.appointment_type && qctx.appointment_type.max_advance_days)
-  ) || 60;
+  // §8: clamp maxAdvanceDays — negative/zero/fractional/NaN config must not produce an
+  // empty strip. Math.max(1, ...) ensures at least one day is always available.
+  const maxAdvanceDays = Math.max(
+    1,
+    Number(
+      (qctx.appointmentType && qctx.appointmentType.max_advance_days) ||
+      (qctx.appointment_type && qctx.appointment_type.max_advance_days)
+    ) || 60
+  );
   const days = buildDayStrip({ userTimeZone, maxAdvanceDays });
   emitDayPicker(write, sessionId, days, userTimeZone);
 
@@ -439,6 +472,14 @@ async function _propose({ tenantId, sessionId, fromState, prior, qctx, config, d
   }
 
   const outcome = res && res.outcome;
+  if (outcome === 'failed') {
+    // Transient BCH/infra error — do NOT touch state, do NOT emit a picker, do NOT
+    // increment picker_cycles. The graceful-error path is a non-fatal no-op: the
+    // chat turn already streamed; BSH surfaces its own "we'll follow up" handling.
+    // Pre-PR behavior restored: outcome:'failed' is NOT a §B16e trigger.
+    (logger || console).warn(`[WS-NEWBOOK] propose returned outcome='failed' (non-fatal, no picker): tenant=${tenantId}`);
+    return { handled: true, executed: false, state: fromState, reason: 'propose_failed_outcome' };
+  }
   if (outcome !== 'ok') {
     // §B16e TRIGGER (a): invokeProposal returns 'no_availability' → emit the day-picker
     // so the volunteer can try a different day. STATE RULE (strand-prevention): stay in
@@ -601,6 +642,20 @@ async function runNewBookingTurn({
     // commits anything). Schema-discipline: tolerate absent (normal non-picker turns).
     const daySelected = deps.schedulingDaySelected;
     if (daySelected && /^\d{4}-\d{2}-\d{2}$/.test(daySelected)) {
+      // §B16e strip validation: the selected day MUST be present in the persisted
+      // `prior.picker_days` strip. A date not offered (past, stale, never-emitted,
+      // or from a different session) is silently ignored — fall through to normal chat
+      // (no propose, no cycle burn, no SSE). Shape-validation of picker_days is in
+      // _handleDaySelected (fix #7); absent picker_days → no offered set → ignore.
+      const offeredDays = prior && Array.isArray(prior.picker_days) ? prior.picker_days : null;
+      if (offeredDays && !offeredDays.some((d) => d && d.date === daySelected)) {
+        (logger || console).warn(`[WS-T3-DAYPICK] scheduling_day_selected='${daySelected}' not in offered strip — ignored`);
+        // Fall through: return handled:false so the normal turn continues.
+        return { handled: false, reason: 'day_not_offered' };
+      }
+      // When no strip has been persisted yet (first-turn day-selected with no prior
+      // picker_days) we have no offered set to validate against — accept the signal
+      // (the picker was just emitted this turn and the state store may not yet have it).
       return await _handleDaySelected({
         tenantId, sessionId, state, prior, qctx, daySelected, deps, write, logger,
       });
@@ -708,7 +763,7 @@ async function runNewBookingTurn({
         // (schema-discipline: absent → 0). On the qualifying entry this is the first propose,
         // so only 'proposing' self-loops count toward the trigger.
         if (state === 'proposing') {
-          const noneCount = (prior && typeof prior.proposing_none_count === 'number' ? prior.proposing_none_count : 0) + 1;
+          const noneCount = (prior && Number.isFinite(prior.proposing_none_count) ? prior.proposing_none_count : 0) + 1;
           if (noneCount >= 2) {
             // Trigger b fires — hand off to the picker (which tracks its own cycle count).
             return await _emitPickerOrEscape({

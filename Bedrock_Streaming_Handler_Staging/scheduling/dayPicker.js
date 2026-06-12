@@ -51,6 +51,20 @@ function formatDayLabel(utcMs, userTimeZone) {
 }
 
 /**
+ * Return the YYYY-MM-DD date string for `epochMs` in the given IANA timezone,
+ * using native Intl (no tz lib). This is the "local date" the user sees.
+ */
+function localDateString(epochMs, timeZone) {
+  const fmt = new Intl.DateTimeFormat('en-CA', { // en-CA yields YYYY-MM-DD natively
+    timeZone: timeZone || 'UTC',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return fmt.format(new Date(epochMs)); // "2026-06-15"
+}
+
+/**
  * Build the 7-day candidate strip starting from `now`, respecting `max_advance_days`.
  *
  * @param {object} params
@@ -59,23 +73,48 @@ function formatDayLabel(utcMs, userTimeZone) {
  * @param {number} [params.maxAdvanceDays] - upper bound on days ahead (default 60)
  * @param {number} [params.stripSize]    - number of days in the strip (default 7)
  * @returns {{ date: string, label: string }[]}  YYYY-MM-DD + Intl-formatted label
+ *
+ * §9: "tomorrow" is anchored in the user's local timezone (Intl-based, no tz lib)
+ * rather than UTC midnight. A Pacific user at 11 PM on Jun 14 UTC sees "Jun 15"
+ * (their local tomorrow) as the first strip day, not "Jun 15 UTC" which may already
+ * be "Jun 15" in UTC but still "Jun 14" in their local time.
  */
 function buildDayStrip({ userTimeZone, nowMs, maxAdvanceDays = 60, stripSize = 7 } = {}) {
   const ref = nowMs != null ? nowMs : Date.now();
-  // "Tomorrow" starts at the next UTC midnight; strip starts day+1 from now.
-  const todayMidnightUtc = new Date(ref);
-  todayMidnightUtc.setUTCHours(0, 0, 0, 0);
-  const tomorrowMs = todayMidnightUtc.getTime() + 24 * 60 * 60 * 1000;
-  const cutoffMs = ref + maxAdvanceDays * 24 * 60 * 60 * 1000;
+  const tz = userTimeZone || 'UTC';
+
+  // §8: clamp maxAdvanceDays — negative/zero/fractional config must not produce an
+  // empty strip. Math.max(1, ...) ensures at least one day is always available.
+  const effectiveMaxDays = Math.max(1, Number(maxAdvanceDays) || 60);
+
+  // Find "today" as a YYYY-MM-DD in the user's local timezone.
+  const todayLocalDate = localDateString(ref, tz);
+
+  // Build a set of consecutive day strings starting from tomorrow (today + 1 day).
+  // We advance one calendar day at a time by adding 24h in epoch ms, then re-derive
+  // the local date string. This correctly handles DST transitions (a 23h or 25h day
+  // in the user's zone doesn't skip or double a calendar date because we always
+  // re-project through Intl rather than assuming 24h === 1 day in wall-clock time).
+  const cutoffMs = ref + effectiveMaxDays * 24 * 60 * 60 * 1000;
 
   const days = [];
-  for (let i = 0; i < stripSize; i++) {
-    const dayMs = tomorrowMs + i * 24 * 60 * 60 * 1000;
-    if (dayMs >= cutoffMs) break; // clipped to max_advance_days
-    const d = new Date(dayMs);
-    const date = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-    const label = formatDayLabel(dayMs, userTimeZone || 'UTC');
-    days.push({ date, label });
+  let probeMs = ref + 24 * 60 * 60 * 1000; // start 24h ahead; will skip if still today
+  let safetyLimit = stripSize + 3; // never loop more than stripSize + a DST buffer
+  while (days.length < stripSize && safetyLimit-- > 0) {
+    const localDate = localDateString(probeMs, tz);
+    if (localDate === todayLocalDate) {
+      // Still "today" in local time (e.g. we advanced 24h but DST spring-forward
+      // means it's still the same local date) — advance another hour and retry.
+      probeMs += 60 * 60 * 1000;
+      continue;
+    }
+    if (probeMs > cutoffMs) break; // clipped to max_advance_days (exclusive upper bound)
+    // Parse the local date string (YYYY-MM-DD) for UTC midnight of that day.
+    const [y, m, d] = localDate.split('-').map(Number);
+    const dayMidnightMs = Date.UTC(y, m - 1, d);
+    const label = formatDayLabel(dayMidnightMs, tz);
+    days.push({ date: localDate, label });
+    probeMs += 24 * 60 * 60 * 1000;
   }
   return days;
 }
@@ -97,7 +136,24 @@ function dateWindowForDay(datePicked) {
     throw new Error(`dayPicker.dateWindowForDay: invalid date '${datePicked}'`);
   }
   const [year, month, day] = datePicked.split('-').map(Number);
+
+  // Calendar-valid civil-date check: round-trip through Date.UTC and verify
+  // the components match exactly. This kills overflow dates like 2026-02-31
+  // (silently rolls to Mar 3), 2026-13-01 (invalid month), 2026-00-01 (month 0).
+  // Also bounds the year to [2020, 2100] so pathological values are rejected early.
+  if (year < 2020 || year > 2100) {
+    throw new Error(`dayPicker.dateWindowForDay: year out of range '${datePicked}'`);
+  }
   const startMs = Date.UTC(year, month - 1, day);
+  const check = new Date(startMs);
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() + 1 !== month ||
+    check.getUTCDate() !== day
+  ) {
+    throw new Error(`dayPicker.dateWindowForDay: invalid civil date '${datePicked}'`);
+  }
+
   const endMs = startMs + 24 * 60 * 60 * 1000;
   return {
     startISO: new Date(startMs).toISOString(),

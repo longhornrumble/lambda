@@ -219,9 +219,9 @@ describe('runNewBookingTurn — qualifying entry: propose + advance on ok', () =
     expect('windowEnd' in payload).toBe(false);
   });
 
-  test("outcome 'failed' (clean return, not a throw) → STAY in fromState, §B16e emits picker (not a crash)", async () => {
-    // §B16e: any non-ok outcome (including 'failed') triggers the day-picker (trigger a).
-    // The state must stay in qualifying (strand-prevention); a picker or escape is emitted.
+  test("outcome 'failed' (transient BCH/infra error) → graceful no-op: no picker, no saveState, stay in fromState (fix #4)", async () => {
+    // Fix #4: outcome:'failed' is a transient infra error, NOT a §B16e trigger.
+    // Pre-PR behavior restored: no picker emit, no picker_cycles increment, NO saveState.
     const saveState = jest.fn();
     const invokeProposal = jest.fn().mockResolvedValue({ outcome: 'failed', error: 'pool_read_error' });
     const writes = [];
@@ -233,11 +233,11 @@ describe('runNewBookingTurn — qualifying entry: propose + advance on ok', () =
     expect(res.handled).toBe(true);
     expect(res.executed).toBe(false);
     expect(res.state).toBe('qualifying'); // state MUST stay qualifying (strand-prevention)
-    // picker or escape must be emitted — scheduling_no_availability must NOT.
-    expect(writes.some((w) => w.includes('scheduling_no_availability'))).toBe(false);
-    expect(
-      writes.some((w) => w.includes('scheduling_day_picker') || w.includes('scheduling_notice'))
-    ).toBe(true);
+    expect(res.reason).toBe('propose_failed_outcome');
+    // KEY assertions for fix #4: no picker emitted, no saveState called
+    expect(writes.some((w) => w.includes('scheduling_day_picker'))).toBe(false);
+    expect(writes.some((w) => w.includes('scheduling_notice'))).toBe(false);
+    expect(saveState).not.toHaveBeenCalled(); // RESTORED pin: fix #4 requirement
   });
 
   test("outcome 'no_availability' → STAY in qualifying (no advance, no strand); §B16e emits picker", async () => {
@@ -581,5 +581,290 @@ describe('NEW_BOOKING_STATES', () => {
     expect(NEW_BOOKING_STATES).toEqual(['qualifying', 'proposing', 'confirming', 'booked']);
     expect(NEW_BOOKING_STATES).not.toContain('rescheduling');
     expect(NEW_BOOKING_STATES).not.toContain('canceling');
+  });
+});
+
+// ── audit fix #5: scheduling_day_selected validated against offered strip ────────────
+
+describe('runNewBookingTurn — scheduling_day_selected validated against offered strip (fix #5)', () => {
+  const OFFERED_DAYS = [
+    { date: '2026-06-20', label: 'Sat, Jun 20' },
+    { date: '2026-06-21', label: 'Sun, Jun 21' },
+    { date: '2026-06-22', label: 'Mon, Jun 22' },
+  ];
+
+  test('past date (not in offered strip) → silent no-op: no propose, no cycle burn, no SSE', async () => {
+    const invokeProposal = jest.fn();
+    const saveState = jest.fn();
+    const write = jest.fn();
+    // A date that was never offered (2026-06-01 is not in OFFERED_DAYS)
+    const res = await runNewBookingTurn(baseTurn({
+      write,
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'qualifying', picker_days: OFFERED_DAYS }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState,
+        schedulingDaySelected: '2026-06-01', // past/not-offered date
+      },
+    }));
+    expect(res.handled).toBe(false); // fall-through: not handled → normal chat
+    expect(res.reason).toBe('day_not_offered');
+    expect(invokeProposal).not.toHaveBeenCalled(); // no propose
+    expect(saveState).not.toHaveBeenCalled();      // no cycle burn
+    expect(write).not.toHaveBeenCalled();           // no SSE
+  });
+
+  test('valid-format-but-not-offered date → same no-op behavior', async () => {
+    const invokeProposal = jest.fn();
+    const saveState = jest.fn();
+    // 2026-07-15 is a valid YYYY-MM-DD but not in OFFERED_DAYS
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'qualifying', picker_days: OFFERED_DAYS }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState,
+        schedulingDaySelected: '2026-07-15',
+      },
+    }));
+    expect(res.handled).toBe(false);
+    expect(res.reason).toBe('day_not_offered');
+    expect(invokeProposal).not.toHaveBeenCalled();
+    expect(saveState).not.toHaveBeenCalled();
+  });
+
+  test('offered date → proceeds to _handleDaySelected (invokeProposal called)', async () => {
+    const invokeProposal = jest.fn().mockResolvedValue({ ...PROPOSE_OK });
+    const saveState = jest.fn();
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'qualifying', picker_days: OFFERED_DAYS }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState,
+        schedulingDaySelected: '2026-06-20', // IS in OFFERED_DAYS
+      },
+    }));
+    expect(invokeProposal).toHaveBeenCalledTimes(1);
+    expect(res.handled).toBe(true);
+  });
+
+  test('no picker_days persisted yet → accept signal (first-turn: strip just emitted, not yet in state)', async () => {
+    const invokeProposal = jest.fn().mockResolvedValue({ ...PROPOSE_OK });
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'qualifying' /* no picker_days */ }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState: jest.fn(),
+        schedulingDaySelected: '2026-06-20',
+      },
+    }));
+    expect(invokeProposal).toHaveBeenCalledTimes(1); // accepted (no strip to validate against)
+    expect(res.handled).toBe(true);
+  });
+});
+
+// ── audit fix #6: NaN guards for picker_cycles + proposing_none_count ────────────────
+
+describe('runNewBookingTurn — NaN guards for picker_cycles and proposing_none_count (fix #6)', () => {
+  test('picker_cycles = NaN in prior state → treated as 0, does not propagate NaN', async () => {
+    const saveState = jest.fn();
+    const invokeProposal = jest.fn().mockResolvedValue({ outcome: 'no_availability', slots: [] });
+    const res = await runNewBookingTurn(baseTurn({
+      write: jest.fn(),
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'qualifying', picker_cycles: NaN }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState,
+      },
+    }));
+    // NaN → treated as 0, incremented to 1 (under MAX_PICKER_CYCLES=3 → picker emitted)
+    expect(res.reason).toMatch(/day_picker/);
+    const saved = saveState.mock.calls[0] && saveState.mock.calls[0][0];
+    expect(Number.isFinite(saved && saved.picker_cycles)).toBe(true); // no NaN persisted
+  });
+
+  test('proposing_none_count = NaN in prior state → treated as 0, does not propagate NaN', async () => {
+    const saveState = jest.fn();
+    const invokeProposal = jest.fn().mockResolvedValue({ ...PROPOSE_OK });
+    // In 'proposing' with noneCount NaN → should be treated as 0 (< 2 threshold → re-propose)
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ state: 'proposing', candidate_slots: [SLOT], proposing_none_count: NaN }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState,
+      },
+    }));
+    expect(invokeProposal).toHaveBeenCalledTimes(1); // re-proposed (not escaped to picker)
+    expect(res.handled).toBe(true);
+  });
+});
+
+// ── audit fix #7: shape-validate picker_days before re-emit ──────────────────────────
+//
+// Shape validation applies in _handleDaySelected (the no_availability re-emit path).
+// Test via _handleDaySelected directly (bypassing the offered-strip gate in runNewBookingTurn)
+// to isolate the re-emit shape-validation from the offered-day gate (fix #5).
+
+describe('_handleDaySelected (no_availability path) — shape-validates picker_days before re-emitting (fix #7)', () => {
+  const { _handleDaySelected } = require('../newBookingFlow');
+
+  const OFFERED_DAYS = [
+    { date: '2026-06-20', label: 'Sat, Jun 20' },
+    { date: '2026-06-21', label: 'Sun, Jun 21' },
+  ];
+
+  test('corrupt picker_days (wrong shape) → rebuild fresh strip instead of emitting junk', async () => {
+    const saveState = jest.fn();
+    const writes = [];
+    // Corrupt shape: objects have no 'date' field → isValidDayStrip returns false → rebuild
+    const corruptDays = [{ day: 'Mon', lbl: 'bad' }, { day: 'Tue', lbl: 'also-bad' }];
+
+    await _handleDaySelected({
+      tenantId: 'TEN', sessionId: 'sess-1', state: 'qualifying',
+      prior: { picker_cycles: 0, picker_days: corruptDays },
+      qctx: QCTX,
+      daySelected: '2026-06-20',
+      deps: {
+        invokeProposal: async () => ({ outcome: 'no_availability', slots: [] }),
+        saveState,
+      },
+      write: (msg) => writes.push(msg),
+      logger: { warn: jest.fn(), info: jest.fn(), error: jest.fn() },
+    });
+
+    // A picker must still be emitted (rebuilt fresh)
+    expect(writes.some((w) => w.includes('scheduling_day_picker'))).toBe(true);
+
+    // The saved picker_days must be a valid fresh strip (not the corrupt one)
+    const savedArg = saveState.mock.calls[0] && saveState.mock.calls[0][0];
+    if (savedArg && savedArg.picker_days) {
+      for (const d of savedArg.picker_days) {
+        expect(typeof d.date).toBe('string');
+        expect(d.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+        expect(typeof d.label).toBe('string');
+      }
+      // Specifically: the corrupt days must NOT have been persisted
+      expect(savedArg.picker_days).not.toEqual(corruptDays);
+    }
+  });
+
+  test('valid picker_days → re-emitted unchanged (same strip) on no_availability', async () => {
+    const saveState = jest.fn();
+    const writes = [];
+
+    await _handleDaySelected({
+      tenantId: 'TEN', sessionId: 'sess-1', state: 'qualifying',
+      prior: { picker_cycles: 0, picker_days: OFFERED_DAYS },
+      qctx: QCTX,
+      daySelected: '2026-06-20',
+      deps: {
+        invokeProposal: async () => ({ outcome: 'no_availability', slots: [] }),
+        saveState,
+      },
+      write: (msg) => writes.push(msg),
+      logger: { warn: jest.fn(), info: jest.fn(), error: jest.fn() },
+    });
+
+    // The emitted picker should contain the valid persisted days unchanged
+    const emitted = writes.find((w) => w.includes('scheduling_day_picker'));
+    expect(emitted).toBeDefined();
+    const parsed = JSON.parse(emitted.replace(/^data: /, '').trim());
+    expect(parsed.days).toEqual(OFFERED_DAYS);
+  });
+
+  test('null picker_days → rebuild fresh strip on no_availability', async () => {
+    const saveState = jest.fn();
+    const writes = [];
+
+    await _handleDaySelected({
+      tenantId: 'TEN', sessionId: 'sess-1', state: 'qualifying',
+      prior: { picker_cycles: 0, picker_days: null },
+      qctx: QCTX,
+      daySelected: '2026-06-20',
+      deps: {
+        invokeProposal: async () => ({ outcome: 'no_availability', slots: [] }),
+        saveState,
+      },
+      write: (msg) => writes.push(msg),
+      logger: { warn: jest.fn(), info: jest.fn(), error: jest.fn() },
+    });
+
+    // A picker must be emitted (rebuilt fresh from scratch)
+    expect(writes.some((w) => w.includes('scheduling_day_picker'))).toBe(true);
+  });
+});
+
+// ── audit fix #10: pin tests ──────────────────────────────────────────────────────────
+
+describe('runNewBookingTurn — pin tests (fix #10)', () => {
+  const confirmingState = { state: 'confirming', selected_slot: SLOT, proposal: { poolSize: 2 } };
+
+  // (a) scheduling_day_selected arriving in 'confirming' state → silent no-op
+  test('scheduling_day_selected in confirming state → silent no-op (no SSE, no state write)', async () => {
+    const invokeProposal = jest.fn();
+    const saveState = jest.fn();
+    const write = jest.fn();
+    const res = await runNewBookingTurn(baseTurn({
+      write,
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({ ...confirmingState, picker_days: [{ date: '2026-06-20', label: 'Sat, Jun 20' }] }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState,
+        schedulingDaySelected: '2026-06-20', // valid format + offered, but state is 'confirming'
+      },
+    }));
+    // _handleDaySelected returns { handled:false } when state !== qualifying/proposing
+    expect(invokeProposal).not.toHaveBeenCalled();
+    expect(saveState).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    // Either handled:false (day_selected_wrong_state path) or normal chat (no SSE commit)
+    expect(res.executed).toBeFalsy();
+  });
+
+  // (b) proposing_none_count reset after successful day-selection→ok advance is INTENDED
+  // The reset happens because on a successful ok from _handleDaySelected, saveState is
+  // called with the proposing state but WITHOUT proposing_none_count (not carried forward
+  // in the ok path) — this is intentional: the user chose a day, slots were found, so
+  // the none-count should be reset for the new context.
+  test('proposing_none_count is NOT carried forward on successful day-selection→ok advance (intentional reset)', async () => {
+    const saveState = jest.fn();
+    const OFFERED_DAYS = [{ date: '2026-06-20', label: 'Sat, Jun 20' }];
+    const invokeProposal = jest.fn().mockResolvedValue({ ...PROPOSE_OK });
+    await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'none' }),
+      deps: {
+        loadState: async () => ({
+          state: 'qualifying',
+          picker_days: OFFERED_DAYS,
+          // Some prior proposing_none_count from a previous turn
+          proposing_none_count: 1,
+        }),
+        qualifyingContext: QCTX,
+        invokeProposal,
+        saveState,
+        schedulingDaySelected: '2026-06-20',
+      },
+    }));
+    expect(saveState).toHaveBeenCalledTimes(1);
+    const savedArg = saveState.mock.calls[0][0];
+    // proposing_none_count is intentionally absent from the ok-advance saveState
+    // (only picker_cycles is carried forward in the ok path, per the implementation).
+    // This reset is correct: after the user picks a day and slots are found, the none-
+    // loop for the new context starts fresh.
+    expect(savedArg.proposing_none_count).toBeUndefined(); // intentional reset
+    expect(savedArg.state).toBe('proposing'); // did advance
   });
 });
