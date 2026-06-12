@@ -254,7 +254,8 @@ function sampleDaypartDiverse(merged, count, userTimeZone) {
       if (!usedStarts.has(c.start)) { p2 = c; break; }
     }
   }
-  if (!p2) return picks.map(({ _daypart: _, ...rest }) => rest);
+  // p2 is always found here: merged has unique starts (byStart Map dedup), and
+  // merged.length > count >= 1 guarantees at least one other unique start remains.
   picks.push(p2);
   usedDayparts.add(p2._daypart);
   usedStarts.add(p2.start);
@@ -280,7 +281,8 @@ function sampleDaypartDiverse(merged, count, userTimeZone) {
       if (!usedStarts.has(c.start)) { p3 = c; break; }
     }
   }
-  if (!p3) return picks.map(({ _daypart: _, ...rest }) => rest).sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  // p3 is always found here: merged.length > 3 and only 2 starts are used, so at
+  // least 2 unique starts remain after p1+p2.
   picks.push(p3);
 
   // Sort chronologically; strip the _daypart annotation.

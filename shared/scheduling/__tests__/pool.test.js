@@ -965,4 +965,49 @@ describe('select — §B18a diverse-3 sampling', () => {
     const call = slots.generateSlots.mock.calls[0][0];
     expect(call.maxSlots).toBe(48); // CANDIDATE_CAP
   });
+
+  it('count=2 → returns exactly 2 picks (pick-1 + pick-2) sorted chronologically, not 3', async () => {
+    // 4 slots across morning/midday/afternoon on the same day.
+    // count=2: algorithm picks p1 (morning) and p2 (midday), then hits the count<3 branch
+    // and returns 2 chips sorted chronologically — afternoon slot must be absent.
+    const rawSlots = [
+      makeRawSlot('2026-06-03T14:00:00Z', '2026-06-03T14:30:00Z', 'Tue 9 AM'),   // morning (pick-1)
+      makeRawSlot('2026-06-03T18:00:00Z', '2026-06-03T18:30:00Z', 'Tue 1 PM'),   // midday  (pick-2)
+      makeRawSlot('2026-06-03T21:00:00Z', '2026-06-03T21:30:00Z', 'Tue 4 PM'),   // afternoon (must be absent)
+      makeRawSlot('2026-06-03T15:00:00Z', '2026-06-03T15:30:00Z', 'Tue 10 AM'),  // second morning
+    ];
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({
+      ordered: ['maya'],
+      tieBreaker: 'round_robin',
+      roundRobinCursor: null,
+    });
+    slots.generateSlots.mockReturnValue(rawSlots);
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT,
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya' }],
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      sampling: { mode: 'daypart-diverse', count: 2 },
+    });
+
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(2);
+    const starts = res.slots.map((s) => s.start);
+    // pick-1: earliest morning
+    expect(starts).toContain('2026-06-03T14:00:00Z');
+    // pick-2: different daypart (midday)
+    expect(starts).toContain('2026-06-03T18:00:00Z');
+    // afternoon slot excluded (count=2 stops after pick-2)
+    expect(starts).not.toContain('2026-06-03T21:00:00Z');
+    // Sorted chronologically
+    expect(starts[0]).toBe('2026-06-03T14:00:00Z');
+    expect(starts[1]).toBe('2026-06-03T18:00:00Z');
+    // _daypart annotation stripped from output
+    expect(res.slots[0]).not.toHaveProperty('_daypart');
+    expect(res.slots[1]).not.toHaveProperty('_daypart');
+  });
 });
