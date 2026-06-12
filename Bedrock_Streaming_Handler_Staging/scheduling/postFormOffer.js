@@ -15,10 +15,22 @@
  *      the later confirm step (request_booking_confirmation / the deterministic confirm
  *      card) does NOT need to re-ask for the email.
  *
- * MODULE + TESTS ONLY: the integrator wires the call site in form_handler.js. Call-site
- * note for the integrator: invoke this only when no scheduling session is already in
- * flight for the chat session (a mid-booking form submission must not be clobbered by a
- * fresh offer) — the integrator has loadState at the call site.
+ * MODULE + TESTS ONLY: the integrator wires the call site in form_handler.js.
+ *
+ * ── Layered in-flight clobber guard (adversarial-audit fix 3) ──
+ *   A mid-booking form submission must not be clobbered by a fresh offer. Two layers:
+ *   1. Integrator guard (call site): invoke this only when no scheduling session is
+ *      already in flight — the integrator has loadState at the call site.
+ *   2. Self-defense (this module): when the OPTIONAL `deps.loadState` seam is wired, the
+ *      session row is read BEFORE any propose; a 'proposing'/'confirming' row (staged
+ *      slots / a staged pick that a fresh propose + saveState would clobber) → returns
+ *      `{ suppressed: true, reason: 'session_in_flight' }` with NO propose, NO saveState,
+ *      NO SSE. A failed read also SUPPRESSES (`reason: 'session_state_unverifiable'`) —
+ *      a write you can't verify is safe to make is safe to skip. 'qualifying' deliberately
+ *      proceeds: nothing staged to clobber, and the offer (slots + pre-filled email) is
+ *      the natural next step for that arc — including the retry after this module's own
+ *      no_availability path left the row in 'qualifying'.
+ *   When `deps.loadState` is absent, behavior is unchanged (layer 1 alone governs).
  *
  * ── Boundary (§B14, LOCKED) ──
  *   This module NEVER calls `invokeBookingCommit` and NEVER advances the session to
@@ -48,6 +60,9 @@
  *     suppresses the offer silently); slotsResult carries the outcome.
  *   Guard-rejected (feature off / no usable email / no resolvable appointment type /
  *     seam unwired) → { offerText: null, slotsResult: null } (no propose attempted).
+ *   Self-defense guard (deps.loadState wired; audit fix 3) → { offerText: null,
+ *     slotsResult: null, suppressed: true, reason: 'session_in_flight' |
+ *     'session_state_unverifiable' } (no propose attempted).
  */
 
 const { isSchedulingEnabled } = require('./bindingContext');
@@ -63,6 +78,11 @@ const OFFER_TEXT_OK =
 const OFFER_TEXT_NO_AVAILABILITY =
   "Would you like to book a quick call? I don't see any open times right now — " +
   'but I\'m happy to check other days if you\'d like.';
+
+// The session states the self-defense guard suppresses on: rows carrying staged slots
+// ('proposing') or a staged pick ('confirming') that a fresh propose + saveState would
+// clobber. Deliberately NOT 'qualifying' — see the module-header guard note.
+const IN_FLIGHT_GUARD_STATES = Object.freeze(['proposing', 'confirming']);
 
 /**
  * PII-safe audit emit: a single JSON line, fields fixed here — NEVER the email itself
@@ -81,11 +101,13 @@ function _audit(logger, fields) {
  * @param {string} params.sessionId    - the chat session id
  * @param {object} params.attendee     - { email, first_name?, last_name?, phone? } from the
  *   form submission's canonical contact
- * @param {object} params.deps         - { invokeProposal, emitSse, saveState?, logger? }
+ * @param {object} params.deps         - { invokeProposal, emitSse, saveState?, loadState?, logger? }
  *   invokeProposal: the §B16a BCH seam (REQUIRED — without it there is nothing to offer)
  *   emitSse: injected SSE emitter; called with the event OBJECT (the integrator owns the
  *     wire format) — { type:'scheduling_slots', slots, session_id }
  *   saveState: the §B16b shared staging path (schedulingStateStore whitelist)
+ *   loadState: OPTIONAL self-defense seam (audit fix 3) — when wired, the session row is
+ *     read first and an in-flight 'proposing'/'confirming' row suppresses the offer
  * @returns {Promise<{offerText: string|null, slotsResult: object|null}>}
  */
 async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = {}) {
@@ -108,6 +130,28 @@ async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = 
     if (typeof deps.invokeProposal !== 'function') {
       logger.warn('[WS-TRACKD] postFormOffer: propose seam (deps.invokeProposal) not wired — offer skipped');
       return suppressed;
+    }
+
+    // ── Self-defense in-flight clobber guard (audit fix 3 — layer 2; see module header) ──
+    // Read the session BEFORE any propose: an in-flight 'proposing'/'confirming' row must
+    // not be clobbered by a fresh offer. When deps.loadState is absent the integrator's
+    // call-site guard (layer 1) alone governs — behavior unchanged.
+    if (typeof deps.loadState === 'function') {
+      let existingRow;
+      try {
+        existingRow = await deps.loadState({ tenantId, sessionId });
+      } catch (err) {
+        // SUPPRESS on a failed read (NOT fail-open): a write you can't verify is safe to
+        // make is safe to skip — the user keeps the in-chat path; nothing gets clobbered.
+        // PII-safe: err.name only.
+        logger.error(`[WS-TRACKD] postFormOffer state read failed (offer suppressed): error_name=${(err && err.name) || 'unknown'}`);
+        _audit(logger, { tenant_id: tenantId, session_id: sessionId, outcome: 'skipped', reason: 'session_state_unverifiable', email_present: true });
+        return { offerText: null, slotsResult: null, suppressed: true, reason: 'session_state_unverifiable' };
+      }
+      if (existingRow && IN_FLIGHT_GUARD_STATES.includes(existingRow.state)) {
+        _audit(logger, { tenant_id: tenantId, session_id: sessionId, outcome: 'skipped', reason: 'session_in_flight', email_present: true });
+        return { offerText: null, slotsResult: null, suppressed: true, reason: 'session_in_flight' };
+      }
     }
 
     // Appointment-type / timezone resolution — the shipped §B16d logic, reused.
@@ -138,6 +182,10 @@ async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = 
       slotsResult = await deps.invokeProposal(proposePayload);
     } catch (err) {
       // PII-safe: err.name only.
+      // AUDIT-EVENT FLOW (dual-catch note, audit fix 5): this inner catch RETURNS, so the
+      // outer catch below never sees an invoke-throw — exactly ONE 'failed' audit event
+      // fires on that path. Do NOT add a second _audit in the outer catch "for symmetry":
+      // any future rethrow/refactor here would then double-fire the event.
       logger.error(`[WS-TRACKD] postFormOffer propose invoke failed (offer suppressed): error_name=${(err && err.name) || 'unknown'}`);
       _audit(logger, { tenant_id: tenantId, session_id: sessionId, outcome: 'failed', email_present: true });
       return { offerText: null, slotsResult: { outcome: 'failed' } };
@@ -191,6 +239,9 @@ async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = 
     return { offerText: null, slotsResult };
   } catch (err) {
     // Never break the form-completion turn over an offer. PII-safe: err.name only.
+    // NO _audit here BY DESIGN (audit fix 5): the invoke-throw path already audited and
+    // returned in the inner catch above — adding one here would double-fire if that catch
+    // ever rethrows. Throws reaching THIS catch (e.g. saveState/emitSse) are log-only.
     logger.error(`[WS-TRACKD] postFormOffer failed (non-fatal, offer suppressed): error_name=${(err && err.name) || 'unknown'}`);
     return suppressed;
   }
@@ -200,4 +251,5 @@ module.exports = {
   postFormOffer,
   OFFER_TEXT_OK,
   OFFER_TEXT_NO_AVAILABILITY,
+  IN_FLIGHT_GUARD_STATES,
 };

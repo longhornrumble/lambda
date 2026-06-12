@@ -10,7 +10,7 @@
  * Plus the §B14 boundary: never commits, never stages 'confirming'/'booked'.
  */
 
-const { postFormOffer, OFFER_TEXT_OK, OFFER_TEXT_NO_AVAILABILITY } = require('../postFormOffer');
+const { postFormOffer, OFFER_TEXT_OK, OFFER_TEXT_NO_AVAILABILITY, IN_FLIGHT_GUARD_STATES } = require('../postFormOffer');
 
 const EMAIL = 'jane.doe+app@acme-volunteers.org';
 
@@ -235,6 +235,93 @@ describe('postFormOffer — guards (fail-closed, no propose attempted)', () => {
     expect(await postFormOffer({ tenantConfig: TENANT_CONFIG, sessionId: '', attendee: { email: EMAIL }, deps }))
       .toEqual({ offerText: null, slotsResult: null });
     expect(deps.invokeProposal).not.toHaveBeenCalled();
+  });
+});
+
+describe('postFormOffer — self-defense in-flight clobber guard (audit fix 3, deps.loadState)', () => {
+  test('the guard set is exactly proposing/confirming (qualifying deliberately proceeds)', () => {
+    expect([...IN_FLIGHT_GUARD_STATES].sort()).toEqual(['confirming', 'proposing']);
+  });
+
+  test('in-flight proposing session → suppressed (session_in_flight); NO propose, NO saveState, NO SSE', async () => {
+    const deps = makeDeps({ loadState: jest.fn().mockResolvedValue({ state: 'proposing', candidate_slots: SLOTS_3 }) });
+    const out = await call(deps);
+    expect(out.suppressed).toBe(true);
+    expect(out.reason).toBe('session_in_flight');
+    expect(out.offerText).toBeNull();
+    expect(out.slotsResult).toBeNull();
+    expect(deps.loadState).toHaveBeenCalledWith({ tenantId: 'TEN123', sessionId: 'sess-1' });
+    expect(deps.invokeProposal).not.toHaveBeenCalled();
+    expect(deps.saveState).not.toHaveBeenCalled();
+    expect(deps.emitSse).not.toHaveBeenCalled();
+  });
+
+  test('in-flight confirming session (staged pick) → suppressed the same way', async () => {
+    const deps = makeDeps({ loadState: jest.fn().mockResolvedValue({ state: 'confirming', selected_slot: { slotId: 's1' } }) });
+    const out = await call(deps);
+    expect(out.suppressed).toBe(true);
+    expect(out.reason).toBe('session_in_flight');
+    expect(deps.invokeProposal).not.toHaveBeenCalled();
+    expect(deps.saveState).not.toHaveBeenCalled();
+    expect(deps.emitSse).not.toHaveBeenCalled();
+  });
+
+  test('qualifying session → proceeds (nothing staged to clobber; offer is the natural upgrade)', async () => {
+    const deps = makeDeps({ loadState: jest.fn().mockResolvedValue({ state: 'qualifying' }) });
+    const out = await call(deps);
+    expect(out.offerText).toBe(OFFER_TEXT_OK);
+    expect(deps.invokeProposal).toHaveBeenCalledTimes(1);
+    expect(deps.saveState).toHaveBeenCalledTimes(1);
+  });
+
+  test('no existing session (loadState → null) → proceeds normally', async () => {
+    const deps = makeDeps({ loadState: jest.fn().mockResolvedValue(null) });
+    const out = await call(deps);
+    expect(out.offerText).toBe(OFFER_TEXT_OK);
+    expect(deps.invokeProposal).toHaveBeenCalledTimes(1);
+  });
+
+  test('loadState throws → SUPPRESS (a write you can\'t verify is safe to skip); NO propose, NO saveState, NO SSE', async () => {
+    const deps = makeDeps({ loadState: jest.fn().mockRejectedValue(new Error('ddb down')) });
+    const out = await call(deps);
+    expect(out.suppressed).toBe(true);
+    expect(out.reason).toBe('session_state_unverifiable');
+    expect(out.offerText).toBeNull();
+    expect(out.slotsResult).toBeNull();
+    expect(deps.invokeProposal).not.toHaveBeenCalled();
+    expect(deps.saveState).not.toHaveBeenCalled();
+    expect(deps.emitSse).not.toHaveBeenCalled();
+  });
+
+  test('deps.loadState absent → current behavior unchanged (the integrator guard alone governs)', async () => {
+    const deps = makeDeps(); // makeDeps wires no loadState
+    expect(deps.loadState).toBeUndefined();
+    const out = await call(deps);
+    expect(out.offerText).toBe(OFFER_TEXT_OK);
+    expect('suppressed' in out).toBe(false);
+  });
+
+  test('suppression audit events are PII-safe (reason + email_present boolean; never the email / any "@")', async () => {
+    for (const loadState of [
+      jest.fn().mockResolvedValue({ state: 'proposing' }),
+      jest.fn().mockRejectedValue(new Error(`boom ${EMAIL}`)),
+    ]) {
+      const deps = makeDeps({ loadState });
+      await call(deps);
+      const lines = [];
+      for (const fn of [deps.logger.info, deps.logger.warn, deps.logger.error]) {
+        for (const args of fn.mock.calls) lines.push(args.join(' '));
+      }
+      expect(lines.length).toBeGreaterThan(0);
+      for (const line of lines) {
+        expect(line).not.toContain(EMAIL);
+        expect(line).not.toContain('@');
+      }
+      const auditLines = lines.filter((l) => l.includes('post_form_offer'));
+      expect(auditLines.length).toBe(1);
+      expect(auditLines[0]).toContain('"outcome":"skipped"');
+      expect(auditLines[0]).toContain('"email_present":true');
+    }
   });
 });
 

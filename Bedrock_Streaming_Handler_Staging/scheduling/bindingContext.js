@@ -153,8 +153,9 @@ const NEW_BOOKING_IN_FLIGHT_STATES = Object.freeze(['qualifying', 'proposing', '
  *    `candidate_slots`, same pattern as newBookingEntry.captureAttendeeEmail), else "none".
  *  - PII RULE (pinned wording, governance pass 2026-06-12): the email segment is EXACTLY
  *    "email: known" or "email: unknown" — the raw address NEVER appears in the line.
- *    Defensively, '@' is also stripped from the slot label so the whole line is
- *    '@'-free by construction (§B17g jest assertion).
+ *    Defensively, '@' is also stripped from BOTH the slot label AND the slotId (every
+ *    interpolated value gets the same neutralization) so the whole line is '@'-free by
+ *    construction (§B17g jest assertion).
  *
  * @param {object|null} sessionRow - the live C9 row ({ state, candidate_slots?,
  *   selected_slot?, attendee_email? }) or null
@@ -181,7 +182,16 @@ function buildNewBookingStateLine(sessionRow) {
       .replace(/\s+/g, ' ')
       .trim()
       .slice(0, 40);
-    staged = label ? `${label} (${selected.slotId})` : `(${selected.slotId})`;
+    // Adversarial-audit fix 1: the slotId is interpolated into the same line — give it the
+    // SAME neutralization as the label so the '@'-free / structural-char-free guarantee
+    // holds by construction for EVERY interpolated value (a slotId is attacker-influenced
+    // only via a corrupt row, but the guarantee must not depend on that assumption).
+    const safeSlotId = String(selected.slotId)
+      .replace(/[\[\]|@\r\n]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 40);
+    staged = label ? `${label} (${safeSlotId})` : `(${safeSlotId})`;
   }
 
   const email =
