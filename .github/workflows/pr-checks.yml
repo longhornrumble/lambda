@@ -262,6 +262,9 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.calendar_oauth_connect }}
           - lambda: Attribution_Mint_Service
             changed: ${{ needs.detect-changes.outputs.attribution_mint_service }}
+            # ESM (.mjs) jest suite — requires the vm-modules flag the local
+            # `npm test` script sets; the CI step invokes npx jest directly.
+            node_options: --experimental-vm-modules
 
     steps:
       - name: Skip unchanged Lambda (shared/ not changed either)
@@ -320,6 +323,9 @@ jobs:
         # Jest 30 may exit 1 on open handles even when tests pass — the
         # --json output is authoritative, so we check success from that.
         shell: bash {0}
+        env:
+          # Empty for CJS suites; matrix entries opt in (e.g. ESM .mjs suites).
+          NODE_OPTIONS: ${{ matrix.node_options || '' }}
         run: |
           npx jest --no-cache --forceExit --json --outputFile=/tmp/jest-results.json \
             --coverage --coverageReporters=text --coverageReporters=lcov 2>&1 || true
