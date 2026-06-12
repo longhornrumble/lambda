@@ -67,6 +67,7 @@ jobs:
       analytics_event_processor: ${{ steps.filter.outputs.analytics_event_processor }}
       attribution_aggregator:        ${{ steps.filter.outputs.attribution_aggregator }}
       attribution_recap_generator:   ${{ steps.filter.outputs.attribution_recap_generator }}
+      attribution_unsubscribe:       ${{ steps.filter.outputs.attribution_unsubscribe }}
       ses_event_handler:             ${{ steps.filter.outputs.ses_event_handler }}
       session_archiver:          ${{ steps.filter.outputs.session_archiver }}
       pii_dsar:                  ${{ steps.filter.outputs.pii_dsar }}
@@ -168,6 +169,8 @@ jobs:
               - 'Attribution_Aggregator/**'
             attribution_recap_generator:
               - 'Attribution_Recap_Generator/**'
+            attribution_unsubscribe:
+              - 'Attribution_Unsubscribe/**'
             ses_event_handler:
               - 'ses_event_handler/**'
             session_archiver:
@@ -437,6 +440,7 @@ jobs:
       needs.detect-changes.outputs.analytics_event_processor == 'true' ||
       needs.detect-changes.outputs.attribution_aggregator == 'true' ||
       needs.detect-changes.outputs.attribution_recap_generator == 'true' ||
+      needs.detect-changes.outputs.attribution_unsubscribe == 'true' ||
       needs.detect-changes.outputs.ses_event_handler == 'true' ||
       needs.detect-changes.outputs.session_archiver == 'true' ||
       needs.detect-changes.outputs.pii_dsar == 'true' ||
@@ -471,6 +475,10 @@ jobs:
           - lambda: Attribution_Recap_Generator
             changed: ${{ needs.detect-changes.outputs.attribution_recap_generator }}
             # boto3 from Lambda runtime; no requirements.txt (Wave 2 WS-H).
+            has_requirements: false
+          - lambda: Attribution_Unsubscribe
+            changed: ${{ needs.detect-changes.outputs.attribution_unsubscribe }}
+            # boto3 from Lambda runtime; no requirements.txt (Wave 2 WS-I).
             has_requirements: false
           - lambda: ses_event_handler
             changed: ${{ needs.detect-changes.outputs.ses_event_handler }}
