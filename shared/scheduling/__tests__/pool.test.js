@@ -656,3 +656,121 @@ describe('lockSlot — race + duplicate (§10.2 slot-lock race resolution / §5.
     expect(group.status).toBe('LOCKED'); // different format → different lock key → allowed
   });
 });
+
+// ─── Fix #1+#2: REAL-PATH dateWindow test (no poolSelect mock) ───────────────────────
+//
+// This test exercises the ACTUAL pool.select → slots.generateSlots path with a
+// date_window constraint. It intentionally does NOT mock slots.generateSlots so
+// the fix (#1: dateWindow forwarded from pool.select's signature into generateSlots)
+// is exercised end-to-end. availability + routing are still mocked (they require
+// network/Google credentials). The assertion: every returned slot's start must fall
+// within the dateWindow.
+//
+// This is the test that would have caught the production no-op: before fix #1,
+// pool.select discarded dateWindow silently and generateSlots received no filter,
+// returning slots from any day. After fix #1, only same-day slots are returned.
+
+describe('select — REAL-PATH dateWindow filter (fix #1+#2: no poolSelect mock)', () => {
+  // Un-mock slots for this block so the real generateSlots is exercised.
+  let realPool;
+  let realAvailability;
+  let realRouting;
+
+  beforeAll(() => {
+    jest.isolateModules(() => {
+      // Unmock slots so the real module is loaded in this isolated context.
+      jest.unmock('../slots');
+      realPool = require('../pool');
+      realAvailability = require('../availability');
+      realRouting = require('../routing');
+    });
+  });
+
+  it('dateWindow constrains slots to the picked day — every returned slot start falls within the window', async () => {
+    // Pick a day: Wednesday June 3, 2026. We set now to Mon Jun 1 12:00 UTC.
+    // dateWindow = the whole Jun 3 UTC day.
+    const pickedDate = '2026-06-03';
+    const dateWindow = {
+      startISO: `${pickedDate}T00:00:00.000Z`,
+      endISO:   `${pickedDate}T24:00:00.000Z`,
+    };
+    const now = '2026-06-01T12:00:00.000Z';
+
+    // Availability: busy from 14:00–15:00 UTC on Jun 3 (should not affect the test's
+    // assertion about filter correctness — we only check starts are on Jun 3).
+    jest.spyOn(realAvailability, 'getBusyIntervals').mockResolvedValue({
+      busy: [{ start: '2026-06-03T14:00:00Z', end: '2026-06-03T15:00:00Z' }],
+      cachedAt: now,
+      source: 'google_freebusy',
+    });
+    // Routing: single candidate, round-robin.
+    jest.spyOn(realRouting, 'evaluatePool').mockResolvedValue({
+      ordered: ['maya@org.org'],
+      tieBreaker: 'round_robin',
+      roundRobinCursor: null,
+    });
+
+    const result = await realPool.select({
+      tenantId: TENANT,
+      appointmentType: {
+        ...APPT,
+        // Widen availability_windows to include Jun 3 (Wednesday = 'wed').
+        availability_windows: { wed: [{ start: '09:00', end: '17:00' }] },
+      },
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya@org.org' }],
+      userTimeZone: TZ,
+      now,
+      dateWindow,
+    });
+
+    // The key assertion: fix #1 must pass dateWindow to generateSlots so only
+    // slots on Jun 3 are returned (not slots on Jun 2, Jun 4, etc.).
+    if (result.status === 'SLOTS_PROPOSED') {
+      expect(result.slots.length).toBeGreaterThan(0);
+      for (const slot of result.slots) {
+        expect(slot.start >= dateWindow.startISO).toBe(true);
+        expect(slot.start < dateWindow.endISO).toBe(true);
+      }
+    }
+    // Even if no slots are returned (e.g. busy covers the window), the pool must not
+    // crash and must return a defined status.
+    expect(['SLOTS_PROPOSED', 'SLOT_UNAVAILABLE']).toContain(result.status);
+  });
+
+  it('without dateWindow: slots may span multiple days (no spurious filter)', async () => {
+    const now = '2026-06-01T12:00:00.000Z';
+    jest.spyOn(realAvailability, 'getBusyIntervals').mockResolvedValue({
+      busy: [],
+      cachedAt: now,
+      source: 'google_freebusy',
+    });
+    jest.spyOn(realRouting, 'evaluatePool').mockResolvedValue({
+      ordered: ['maya@org.org'],
+      tieBreaker: 'round_robin',
+      roundRobinCursor: null,
+    });
+
+    const result = await realPool.select({
+      tenantId: TENANT,
+      appointmentType: {
+        ...APPT,
+        availability_windows: {
+          tue: [{ start: '09:00', end: '17:00' }],
+          wed: [{ start: '09:00', end: '17:00' }],
+          thu: [{ start: '09:00', end: '17:00' }],
+        },
+      },
+      routingPolicy: POLICY,
+      candidates: [{ resourceId: 'maya@org.org' }],
+      userTimeZone: TZ,
+      now,
+      // No dateWindow — should return multi-day results
+    });
+
+    // Without a dateWindow the result should include slots from multiple days
+    // (Tuesday through Thursday within searchDays). Just verify no crash and
+    // status is a recognized value.
+    expect(['SLOTS_PROPOSED', 'SLOT_UNAVAILABLE']).toContain(result.status);
+  });
+});

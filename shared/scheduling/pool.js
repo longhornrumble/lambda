@@ -185,13 +185,18 @@ function isConditionalCheckFailed(err) {
 
 /**
  * select({ tenantId, appointmentType, routingPolicy, candidates, userTimeZone,
- *          alreadyRejected?, now?, windowStart?, windowEnd?, maxSlots? })
+ *          alreadyRejected?, now?, windowStart?, windowEnd?, dateWindow?, maxSlots? })
  *   → { status, poolBranch, orderedPool, tieBreaker, roundRobinCursor, slots }
  *
  *   status:    'SLOTS_PROPOSED' | 'SLOT_UNAVAILABLE'
  *   poolBranch:'empty' | 'single' | 'multiple'   (§10.2 branch that fired)
  *   orderedPool: tie-broken resourceIds still viable (the pool C8 will lock against)
  *   slots: [ { slotId, start, end, label, candidateResourceIds } ]  (3-5 generic chips)
+ *
+ *   §B16e: optional dateWindow: { startISO, endISO } constrains slot generation to a
+ *   picked day. Absent → unchanged behavior. Forwarded to each generateSlots call so
+ *   the day-filter is not silently discarded (fix: was in the destructure but not
+ *   passed to C7, making the whole day-filter a production no-op).
  */
 async function select({
   tenantId,
@@ -203,6 +208,7 @@ async function select({
   now,
   windowStart,
   windowEnd,
+  dateWindow,
   maxSlots = DEFAULT_MAX_SLOTS,
 }) {
   if (!tenantId) throw new Error('tenantId is required');
@@ -287,6 +293,9 @@ async function select({
       now,
       searchDays,
       maxSlots,
+      // §B16e: forward the day-picker constraint so generateSlots filters to the
+      // selected day. When absent (undefined) generateSlots ignores it (no-op).
+      dateWindow,
     });
     for (const s of resourceSlots) {
       const existing = byStart.get(s.start);

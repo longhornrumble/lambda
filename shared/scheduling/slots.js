@@ -46,6 +46,12 @@
  *         collect chips; maxSlots (default 5) / minSlots (default 3, advisory only).
  *     Fewer than minSlots may be returned when the horizon is genuinely sparse;
  *     the tiered no-slots fallback (§9.3) is the caller's job, not C7's.
+ *   • SLOT-GEN EXTENSION (§B16e backwards-compatible, mirrors the §B3 resourceId
+ *     precedent): dateWindow: { startISO, endISO } constrains candidate generation
+ *     to the window (inclusive start, exclusive end). When absent the scan is
+ *     unchanged — the frozen 4-key call is byte-identical in behavior (regression
+ *     tests verify no drift). Neither key is required; a partial window (only
+ *     startISO OR only endISO) applies only the supplied bound.
  *   • `busyIntervals` = array of { start: ISO8601, end: ISO8601 } (the §B1 `.busy`
  *     array for the chosen resource). buffer_minutes pads each busy interval on both
  *     sides so a candidate keeps the configured gap from existing commitments.
@@ -177,6 +183,9 @@ function generateSlots({
   now = undefined,
   searchDays = 14,
   maxSlots = 5,
+  // §B16e: OPTIONAL dateWindow — constrains generation to the specified UTC range.
+  // Absent → unchanged behavior (frozen 4-key call is byte-identical).
+  dateWindow = undefined,
 } = {}) {
   if (!appointmentType || typeof appointmentType !== 'object') {
     throw new Error('appointmentType is required');
@@ -221,6 +230,17 @@ function generateSlots({
   }
   const earliestStartMs = nowMs + minLead * 60 * 1000;
 
+  // §B16e dateWindow: parse the optional bounds once. NaN / absent → no bound applied.
+  const windowStartMs =
+    dateWindow && dateWindow.startISO != null ? Date.parse(dateWindow.startISO) : NaN;
+  const windowEndMs =
+    dateWindow && dateWindow.endISO != null ? Date.parse(dateWindow.endISO) : NaN;
+  // The effective lower bound is the LATER of earliestStart and the window start.
+  const effectiveEarliestMs =
+    !Number.isNaN(windowStartMs) && windowStartMs > earliestStartMs
+      ? windowStartMs
+      : earliestStartMs;
+
   // Pre-parse busy intervals once. buffer pads each on both sides.
   const bufMs = buffer * 60 * 1000;
   const busy = (Array.isArray(busyIntervals) ? busyIntervals : [])
@@ -241,7 +261,7 @@ function generateSlots({
   const slots = [];
   const seenStarts = new Set(); // dedupe identical instants (e.g. fall-back ambiguity)
 
-  const startCivil = civilDateInZone(earliestStartMs, businessTz);
+  const startCivil = civilDateInZone(effectiveEarliestMs, businessTz);
 
   for (let dayOffset = 0; dayOffset < searchDays && slots.length < maxSlots; dayOffset += 1) {
     const { year, month, day } = addCivilDays(
@@ -270,7 +290,9 @@ function generateSlots({
         const minute = mins % 60;
         const startMs = zonedWallTimeToUtc(year, month, day, hour, minute, businessTz);
         if (startMs == null) continue; // nonexistent wall clock (spring-forward gap)
-        if (startMs < earliestStartMs) continue;
+        if (startMs < effectiveEarliestMs) continue;
+        // §B16e: apply the upper bound of the dateWindow when supplied.
+        if (!Number.isNaN(windowEndMs) && startMs >= windowEndMs) continue;
 
         const endMs = startMs + durationMs;
         if (conflictsWithBusy(startMs, endMs)) continue;
