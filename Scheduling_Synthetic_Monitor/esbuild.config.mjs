@@ -10,6 +10,10 @@ const LAMBDA_EXTERNALS = [
   '@aws-sdk/client-dynamodb',
   '@aws-sdk/client-lambda',
   '@aws-sdk/client-sns',
+  // Pulled transitively by ../shared/scheduling/disposition.js -> tokens.js (the
+  // disposition cycle); runtime ships it, same as the others (Calendar_OAuth_Connect
+  // precedent for shared-pulled clients).
+  '@aws-sdk/client-secrets-manager',
 ];
 
 await esbuild.build({
