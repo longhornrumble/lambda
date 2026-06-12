@@ -411,6 +411,31 @@ describe('handleSchedulingPropose — §B18b context envelope', () => {
     expect(out.context.tz_label.length).toBeGreaterThan(0);
   });
 
+  it('duration_minutes: 0 survives as 0 (?? semantics — not coerced to null)', async () => {
+    const { injected } = baseInjected({
+      getAppointmentType: async () => ({ ...APPT_MEET, duration_minutes: 0 }),
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'America/Chicago' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context.duration_minutes).toBe(0);
+  });
+
+  it('missing duration_minutes field → null', async () => {
+    const { duration_minutes: _omit, ...APPT_NO_DURATION } = APPT_MEET;
+    const { injected } = baseInjected({
+      getAppointmentType: async () => APPT_NO_DURATION,
+    });
+    const out = await handleSchedulingPropose(
+      { ...PROPOSE_EVENT, appointmentTypeId: 'apt-meet', userTimeZone: 'America/Chicago' },
+      injected
+    );
+    expect(out.outcome).toBe('ok');
+    expect(out.context.duration_minutes).toBeNull();
+  });
+
   it('unknown conference_type → null label', async () => {
     const { injected } = baseInjected({
       getAppointmentType: async () => ({
