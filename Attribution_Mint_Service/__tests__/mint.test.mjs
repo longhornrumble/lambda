@@ -834,7 +834,7 @@ describe('dubClient — Retry-After NaN guard (item 6)', () => {
 // ============================================================
 
 describe('mintEntryPoint — Dub POST body assertions (item 7)', () => {
-  it('sends correct externalId, domain, tenantId, tagNames, and url with ?ep=', async () => {
+  it('sends correct externalId, domain, tenantId, and url with ?ep= (no tagNames)', async () => {
     const result = await mintEntryPoint(makeValidBody());
     expect(result.ok).toBe(true);
 
@@ -850,8 +850,8 @@ describe('mintEntryPoint — Dub POST body assertions (item 7)', () => {
     expect(sentBody.domain).toBe('myrctr.link');
     // tenantId must be the request tenant_id
     expect(sentBody.tenantId).toBe('TENANT123');
-    // tagNames must be exactly [tenant_id]
-    expect(sentBody.tagNames).toEqual(['TENANT123']);
+    // tagNames must be ABSENT (C4 amendment: Dub 404s on nonexistent tags)
+    expect(sentBody.tagNames).toBeUndefined();
     // url must contain ?ep= (the destination URL with ep appended)
     expect(sentBody.url).toContain('?ep=');
     expect(sentBody.url).toContain(result.entry_point.entry_point_id);

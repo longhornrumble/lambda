@@ -55,7 +55,9 @@ export async function dubMintLink(apiKey, { destinationUrl, entryPointId, tenant
     domain: DUB_DOMAIN,
     externalId: entryPointId,
     tenantId,
-    tagNames: [tenantId],
+    // tagNames deliberately omitted (C4 amendment 2026-06-12): Dub 404s on
+    // tags that don't pre-exist in the workspace, and per-tenant filtering
+    // uses tenantId/externalId — Dub-side tags add nothing to the pipeline.
     comments: 'Attribution entry point — minted by MyRecruiter',
   };
   if (suffix) {
