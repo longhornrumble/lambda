@@ -7,6 +7,7 @@ importlib.reload() to re-evaluate them under different env conditions.
 """
 
 import importlib
+import logging
 import os
 from unittest.mock import patch
 
@@ -39,6 +40,21 @@ def test_ses_sender_uses_env_when_set(monkeypatch, reload_module):
     monkeypatch.setenv('SES_SENDER_ADDRESS', 'notify@staging.myrecruiter.ai')
     lf = reload_module()
     assert lf.SES_SENDER == 'notify@staging.myrecruiter.ai'
+
+
+def test_ses_sender_warns_loudly_when_env_unset(monkeypatch, reload_module, caplog):
+    """Hardcoded fallback must not be silent — operators need the signal."""
+    monkeypatch.delenv('SES_SENDER_ADDRESS', raising=False)
+    with caplog.at_level(logging.WARNING):
+        reload_module()
+    assert any('SENDER_ENV_MISSING' in r.message for r in caplog.records)
+
+
+def test_ses_sender_no_warning_when_env_set(monkeypatch, reload_module, caplog):
+    monkeypatch.setenv('SES_SENDER_ADDRESS', 'notify@staging.myrecruiter.ai')
+    with caplog.at_level(logging.WARNING):
+        reload_module()
+    assert not any('SENDER_ENV_MISSING' in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------

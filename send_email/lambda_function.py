@@ -24,7 +24,10 @@ logger.setLevel(logging.INFO)
 ses = boto3.client('ses')
 
 # Configuration
-DEFAULT_SENDER = os.environ.get('DEFAULT_SENDER', 'notify@myrecruiter.ai')
+DEFAULT_SENDER = os.environ.get('DEFAULT_SENDER')
+if not DEFAULT_SENDER:
+    logger.warning("SENDER_ENV_MISSING — using hardcoded fallback notify@myrecruiter.ai; set DEFAULT_SENDER")
+    DEFAULT_SENDER = 'notify@myrecruiter.ai'
 CONFIGURATION_SET = os.environ.get('CONFIGURATION_SET', 'picasso-emails')
 
 

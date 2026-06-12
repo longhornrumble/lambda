@@ -55,6 +55,21 @@ NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-n
 notification_sends_table = dynamodb.Table(NOTIFICATION_SENDS_TABLE)
 
 
+def _default_from_email() -> str:
+    """Default SES sender when the tenant config doesn't specify one.
+
+    Env-var-driven (SES_FROM_EMAIL) so staging routes through a verified
+    staging identity without code change. Falls back to the legacy prod
+    hardcoded sender — with a loud warning — so prod (envs not yet set)
+    keeps working unchanged.
+    """
+    email = os.environ.get('SES_FROM_EMAIL')
+    if email:
+        return email
+    logger.warning("⚠️ SENDER_ENV_MISSING — using hardcoded fallback notify@myrecruiter.ai; set SES_FROM_EMAIL")
+    return 'notify@myrecruiter.ai'
+
+
 def _validate_webhook_url(url: Optional[str]) -> Tuple[bool, Optional[str]]:
     """Validate a webhook URL to prevent SSRF.
 
@@ -1237,7 +1252,9 @@ class FormHandler:
             html_body = f"<div>{body_text.replace(chr(10), '<br>')}</div>"
 
             from_email = self.tenant_config.get('notification_settings', {}).get(
-                'from_email', self.tenant_config.get('from_email', 'notify@myrecruiter.ai'))
+                'from_email', self.tenant_config.get('from_email'))
+            if from_email is None:
+                from_email = _default_from_email()
 
             ses.send_email(
                 Source=from_email,

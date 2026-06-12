@@ -6974,7 +6974,10 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
 # Sender identity for all outbound SES emails from this API. Env-var driven
 # so staging can route through a verified staging identity (e.g.,
 # notify@staging.myrecruiter.ai) without changing code.
-SES_SENDER = os.environ.get('SES_SENDER_ADDRESS', 'notify@myrecruiter.ai')
+SES_SENDER = os.environ.get('SES_SENDER_ADDRESS')
+if not SES_SENDER:
+    logger.warning("SENDER_ENV_MISSING — using hardcoded fallback notify@myrecruiter.ai; set SES_SENDER_ADDRESS")
+    SES_SENDER = 'notify@myrecruiter.ai'
 
 # Comma-separated allowlist of recipient email domains for test-send
 # endpoints. Empty / unset = no restriction (prod default). Staging sets

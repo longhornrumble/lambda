@@ -42,3 +42,41 @@ test('appendTokenToUrl: falsy URL passes through (defensive)', () => {
   assert.equal(appendTokenToUrl(null, 'tok'), null);
   assert.equal(appendTokenToUrl(undefined, 'tok'), undefined);
 });
+
+// DEFAULT_SENDER is a module-level env read. Query-string imports give each
+// test a fresh module evaluation (separate ESM cache entry) so both env
+// states can be exercised in one process.
+
+test('DEFAULT_SENDER: env set → env used, no SENDER_ENV_MISSING warning', async () => {
+  const original = process.env.DEFAULT_SENDER;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    process.env.DEFAULT_SENDER = 'notify@staging.myrecruiter.ai';
+    const mod = await import('./index.mjs?sender-env-set');
+    assert.equal(mod.DEFAULT_SENDER, 'notify@staging.myrecruiter.ai');
+    assert.ok(!warnings.some((w) => w.includes('SENDER_ENV_MISSING')));
+  } finally {
+    console.warn = originalWarn;
+    if (original === undefined) delete process.env.DEFAULT_SENDER;
+    else process.env.DEFAULT_SENDER = original;
+  }
+});
+
+test('DEFAULT_SENDER: env missing → hardcoded fallback + loud warning', async () => {
+  const original = process.env.DEFAULT_SENDER;
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(' '));
+  try {
+    delete process.env.DEFAULT_SENDER;
+    const mod = await import('./index.mjs?sender-env-missing');
+    assert.equal(mod.DEFAULT_SENDER, 'notify@myrecruiter.ai');
+    assert.ok(warnings.some((w) => w.includes('SENDER_ENV_MISSING')));
+  } finally {
+    console.warn = originalWarn;
+    if (original === undefined) delete process.env.DEFAULT_SENDER;
+    else process.env.DEFAULT_SENDER = original;
+  }
+});

@@ -36,7 +36,11 @@ const REGION = process.env.AWS_REGION || 'us-east-1';
 const NOTIFY_SHARED_SECRET = process.env.NOTIFY_SHARED_SECRET;
 const ROUTES_BUCKET = process.env.ROUTES_BUCKET || 'myrecruiter-picasso';
 const ROUTES_KEY = process.env.ROUTES_KEY || 'notification-routes.json';
-const DEFAULT_SENDER = process.env.DEFAULT_SENDER || 'notify@myrecruiter.ai';
+// Exported for tests (sender env resolution).
+export const DEFAULT_SENDER = process.env.DEFAULT_SENDER || 'notify@myrecruiter.ai';
+if (!process.env.DEFAULT_SENDER) {
+  console.warn('SENDER_ENV_MISSING — using hardcoded fallback notify@myrecruiter.ai; set DEFAULT_SENDER');
+}
 const CONFIGURATION_SET = process.env.CONFIGURATION_SET || 'picasso-emails';
 const CACHE_TTL_MS = 5 * 60 * 1000;
 // Optional: when set, the hub can generate Clerk sign-in tokens per email recipient

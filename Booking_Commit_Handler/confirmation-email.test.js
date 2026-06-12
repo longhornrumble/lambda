@@ -489,3 +489,37 @@ describe('S4c behavioral pins + coverage', () => {
     expect(warns[0]).toContain(': error (using default copy)');
   });
 });
+
+describe('FROM_EMAIL sender env resolution', () => {
+  // Module-level read — jest.isolateModules re-evaluates the module so each
+  // test exercises the env state it sets up.
+  const ORIGINAL_SES_FROM_EMAIL = process.env.SES_FROM_EMAIL;
+
+  afterEach(() => {
+    if (ORIGINAL_SES_FROM_EMAIL === undefined) {
+      delete process.env.SES_FROM_EMAIL;
+    } else {
+      process.env.SES_FROM_EMAIL = ORIGINAL_SES_FROM_EMAIL;
+    }
+  });
+
+  it('uses SES_FROM_EMAIL when set, with no SENDER_ENV_MISSING warning', () => {
+    process.env.SES_FROM_EMAIL = 'notify@staging.myrecruiter.ai';
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    let mod;
+    jest.isolateModules(() => { mod = require('./confirmation-email'); });
+    expect(mod.FROM_EMAIL).toBe('notify@staging.myrecruiter.ai');
+    expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('SENDER_ENV_MISSING'));
+    warnSpy.mockRestore();
+  });
+
+  it('falls back to the legacy hardcoded sender with a loud warning when unset', () => {
+    delete process.env.SES_FROM_EMAIL;
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    let mod;
+    jest.isolateModules(() => { mod = require('./confirmation-email'); });
+    expect(mod.FROM_EMAIL).toBe('notify@myrecruiter.ai');
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('SENDER_ENV_MISSING'));
+    warnSpy.mockRestore();
+  });
+});
