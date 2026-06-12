@@ -319,6 +319,9 @@ function generateSlots({
 
 module.exports = {
   generateSlots,
+  // Shipped DST-correct civil-time resolver — consumed by the agent day-part bounds
+  // (agentTools.js after_time/before_time → date_window instants; 2026-06-12).
+  zonedWallTimeToUtc,
   // exported for unit coverage of the DST-critical helpers:
   _zoneOffsetMs: zoneOffsetMs,
   _zonedWallTimeToUtc: zonedWallTimeToUtc,
