@@ -43,6 +43,8 @@ on:
           - Attendance_Disposition_Handler
           - Attribution_Mint_Service
           - Attribution_Aggregator
+          - Attribution_Recap_Generator
+          - Attribution_Unsubscribe
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -77,8 +79,10 @@ jobs:
       calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
       reminder_scheduler: ${{ steps.filter.outputs.reminder_scheduler }}
       scheduled_message_sender: ${{ steps.filter.outputs.scheduled_message_sender }}
-      attribution_mint_service: ${{ steps.filter.outputs.attribution_mint_service }}
-      attribution_aggregator: ${{ steps.filter.outputs.attribution_aggregator }}
+      attribution_mint_service:      ${{ steps.filter.outputs.attribution_mint_service }}
+      attribution_aggregator:        ${{ steps.filter.outputs.attribution_aggregator }}
+      attribution_recap_generator:   ${{ steps.filter.outputs.attribution_recap_generator }}
+      attribution_unsubscribe:       ${{ steps.filter.outputs.attribution_unsubscribe }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -142,6 +146,10 @@ jobs:
               - 'Attribution_Mint_Service/**'
             attribution_aggregator:
               - 'Attribution_Aggregator/**'
+            attribution_recap_generator:
+              - 'Attribution_Recap_Generator/**'
+            attribution_unsubscribe:
+              - 'Attribution_Unsubscribe/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -178,7 +186,9 @@ jobs:
       needs.detect-changes.outputs.reminder_scheduler == 'true' ||
       needs.detect-changes.outputs.scheduled_message_sender == 'true' ||
       needs.detect-changes.outputs.attribution_mint_service == 'true' ||
-      needs.detect-changes.outputs.attribution_aggregator == 'true'
+      needs.detect-changes.outputs.attribution_aggregator == 'true' ||
+      needs.detect-changes.outputs.attribution_recap_generator == 'true' ||
+      needs.detect-changes.outputs.attribution_unsubscribe == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -721,6 +731,41 @@ jobs:
             # Empty Records list exercises cold-start + handler entry with no side effects.
             # Matches the Analytics_Event_Processor + picasso_session_archiver pattern.
             smoke_invoke_event: '{"Records":[]}'
+          - source_dir: Attribution_Recap_Generator
+            # Mission Intelligence Wave 2 -- Python 3.13 Lambda; monthly EventBridge schedule.
+            # Reads prior-month attribution-aggregates rows and dispatches recap emails via
+            # send_email. RECAP_SEND_ENABLED=false safety gate (Terraform-managed env var).
+            # boto3 is bundled in the Lambda runtime (no requirements-layer.txt needed).
+            # Function provisioned by Terraform in picasso#550; this entry deploys the real
+            # code over the placeholder. Env vars Terraform-managed (picasso infra/
+            # lambda-attribution-recap-generator-staging module).
+            # NOTE: do not merge this PR before picasso#550 applies.
+            staging_function: Attribution_Recap_Generator
+            handler: lambda_function.lambda_handler
+            runtime: python
+            include_globs: 'lambda_function.py __init__.py'
+            env_vars: ''
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Attribution_Unsubscribe
+            # Mission Intelligence Wave 2 WS-I -- Python 3.13 Lambda; public Function URL
+            # (AuthType=NONE; HMAC token is the auth layer -- RFC 8058 / CAN-SPAM).
+            # Validates one-click unsubscribe tokens and writes SUPPRESS#recap suppression
+            # rows to picasso-attribution-aggregates. Single-purpose write-one-row endpoint.
+            # boto3 from Lambda runtime; no requirements-layer.txt needed.
+            # Function provisioned by Terraform in picasso#553; this entry deploys real code
+            # over the placeholder. Env vars Terraform-managed (picasso infra/
+            # lambda-attribution-unsubscribe-staging module).
+            # NOTE: merge AFTER the Terraform PR (picasso#553) applies.
+            staging_function: Attribution_Unsubscribe
+            handler: lambda_function.lambda_handler
+            runtime: python
+            include_globs: 'lambda_function.py __init__.py'
+            env_vars: ''
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
 
     steps:
       - uses: actions/checkout@v4
