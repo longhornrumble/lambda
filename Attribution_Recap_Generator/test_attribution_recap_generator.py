@@ -2,24 +2,35 @@
 Tests for Attribution_Recap_Generator.
 
 Coverage per done-bar:
-1. Variant selection: all four variants (good_month / bad_month / small_tenant / first_month)
-2. Flag-off tenant is skipped (dashboard_attribution = False/absent)
-3. Recipients-absent tenant is skipped
-4. Idempotency: second run skipped (marker already present)
-5. Dry-run never invokes send_email Lambda
-6. Enabled path invokes send_email with the exact contract payload
-   (body key = JSON string, to/subject/html_body/text_body -- send_email/lambda_function.py:119-162)
-7. Render snapshot fixtures for all four variants:
-   - no '$' anywhere in HTML
-   - no per-person data (no email addresses, no session_ids in output)
-   - CTA link present (DASHBOARD_BASE_URL/attribution)
-   - unsubscribe + settings links present
-8. Old-shape aggregate row (missing fields) -> no crash (schema-tolerant reads)
-9. ATTRIBUTION_AGGREGATES_TABLE missing -> ValueError at handler start
+1.  Variant selection: all four variants
+2.  Flag-off tenant is skipped
+3.  Recipients-absent tenant is skipped
+4.  Idempotency: second run skipped
+5.  Dry-run never invokes send_email Lambda
+6.  Enabled path invokes send_email with exact contract payload
+7.  Render snapshot fixtures for all four variants (various assertions)
+8.  Old-shape aggregate row (missing fields) -> no crash
+9.  ATTRIBUTION_AGGREGATES_TABLE missing -> ValueError
+10. (WS-I) Token round-trip: valid token verifies; tampered byte -> 403
+11. (WS-I) Wrong-suffix payload -> 403; missing param -> 403
+12. (WS-I) Constant-time compare used (hmac.compare_digest)
+13. (WS-I) Idempotent double-unsubscribe (ConditionalCheckFailed treated as success)
+14. (WS-I) Suppression filter: mixed-case email matches; suppressed excluded; all-suppressed skips
+15. (WS-I) Per-recipient sends each carry a DIFFERENT token
+16. (WS-I) Postal address fail-closed: send blocked when RECAP_POSTAL_ADDRESS unset
+17. (WS-I) Dry-run renders [POSTAL ADDRESS NOT CONFIGURED] placeholder
+18. (WS-I) Secret-absent fail-closed; transient failure NOT cached
+19. (WS-I) No email/token in any logger.* call (static inspection)
 
 Run: pytest test_attribution_recap_generator.py -v
 """
+import ast
+import hashlib
+import hmac
+import base64
+import inspect
 import json
+import logging
 import os
 import pytest
 from datetime import datetime, timezone
@@ -34,6 +45,9 @@ os.environ.setdefault('TENANT_CONFIG_BUCKET', 'picasso-configs-test')
 os.environ.setdefault('SEND_EMAIL_FUNCTION_NAME', 'send_email')
 os.environ.setdefault('DASHBOARD_BASE_URL', 'https://app.myrecruiter.ai')
 os.environ.setdefault('RECAP_SEND_ENABLED', 'false')
+os.environ.setdefault('RECAP_POSTAL_ADDRESS', '123 Main St, Austin TX 78701')
+os.environ.setdefault('UNSUB_SECRET_NAME', 'picasso/unsub-signing-key')
+os.environ.setdefault('UNSUBSCRIBE_BASE_URL', 'https://app.myrecruiter.ai/unsubscribe')
 
 import lambda_function as recap  # noqa: E402
 from lambda_function import (
@@ -45,6 +59,10 @@ from lambda_function import (
     _build_superlatives,
     _extract_top_topics,
     _find_mvp_channel,
+    _build_unsub_token,
+    _b64url_nopad,
+    _fetch_suppressed_emails,
+    _filter_suppressed,
     CONFIDENCE_FLOOR,
     SMALL_TENANT_FLOOR,
     DEFAULT_TZ,
@@ -124,6 +142,12 @@ _TENANT_CONFIG_ENABLED = {
     'attribution_recap': {'recipients': ['admin@example.org']},
 }
 
+_TENANT_CONFIG_ENABLED_MULTI = {
+    'feature_flags': {'dashboard_attribution': True},
+    'organization_name': 'Test Org',
+    'attribution_recap': {'recipients': ['alice@example.org', 'bob@example.org']},
+}
+
 _TENANT_CONFIG_DISABLED = {
     'feature_flags': {'dashboard_attribution': False},
     'organization_name': 'Disabled Org',
@@ -138,6 +162,10 @@ _TENANT_CONFIG_NO_RECIPIENTS = {
 MONTH_STR = '2026-06'
 TENANT_ID = 'TEST12345'
 ORG_NAME = 'Test Org'
+
+_TEST_SIGNING_KEY = b'test-signing-key-for-unit-tests'
+_TEST_POSTAL = '123 Main St, Austin TX 78701'
+_TEST_UNSUB_BASE = 'https://app.myrecruiter.ai/unsubscribe'
 
 
 def _make_lambda_response(body_dict: dict, status_code: int = 200, function_error: str = None):
@@ -236,6 +264,7 @@ class TestFlagGate:
              patch.object(recap, '_recap_already_sent', return_value=False), \
              patch.object(recap, '_load_aggregate', return_value=_FIRST_MONTH_SUMMARY), \
              patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
              patch.object(recap, '_mark_recap_sent'):
             result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=True)
         assert result == 'dry_run'
@@ -274,6 +303,10 @@ class TestIdempotency:
              patch.object(recap, '_recap_already_sent', return_value=False), \
              patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
              patch.object(recap, '_load_channel_rows', return_value=_CHANNEL_ROWS), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
              patch.object(recap, '_mark_recap_sent') as mock_mark, \
              patch.object(recap, '_invoke_send_email') as mock_send:
             result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
@@ -287,6 +320,7 @@ class TestIdempotency:
              patch.object(recap, '_recap_already_sent', return_value=False), \
              patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
              patch.object(recap, '_load_channel_rows', return_value=_CHANNEL_ROWS), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
              patch.object(recap, '_mark_recap_sent') as mock_mark, \
              patch.object(recap, '_invoke_send_email') as mock_send:
             result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=True)
@@ -306,6 +340,7 @@ class TestDryRun:
              patch.object(recap, '_recap_already_sent', return_value=False), \
              patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
              patch.object(recap, '_load_channel_rows', return_value=_CHANNEL_ROWS), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
              patch.object(recap, '_mark_recap_sent'), \
              patch.object(recap, '_lambda_client') as mock_lambda_client:
             result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=True)
@@ -326,18 +361,13 @@ class TestDryRun:
 
 # ---------------------------------------------------------------------------
 # 6. Enabled path invokes send_email with exact contract payload
-# send_email/lambda_function.py:73,82-84,119-162:
-#   event.get('body', '{}') must be a JSON string containing to/subject/html_body
 # ---------------------------------------------------------------------------
 class TestEnabledPathSendEmailContract:
 
     def test_invoke_payload_matches_send_email_contract(self):
         """
-        send_email Lambda contract (send_email/lambda_function.py:119-162):
-          - event.get('body', '{}') is JSON-parsed
-          - required: 'to' (list), 'subject' (str), 'html_body' or 'text_body'
-        For Lambda-to-Lambda invocation the Payload must wrap these as:
-          {'body': json.dumps({'to': [...], 'subject': '...', 'html_body': '...', ...})}
+        Per-recipient send: each invoke must have 'to' as a single-element list,
+        and the body must be a JSON string (send_email contract).
         """
         mock_invoke_resp = _make_lambda_response({'success': True, 'message_id': 'msg123'})
 
@@ -345,6 +375,10 @@ class TestEnabledPathSendEmailContract:
              patch.object(recap, '_recap_already_sent', return_value=False), \
              patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
              patch.object(recap, '_load_channel_rows', return_value=_CHANNEL_ROWS), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
              patch.object(recap, '_mark_recap_sent'), \
              patch.object(recap, '_lambda_client') as mock_lc:
             mock_lc.invoke.return_value = mock_invoke_resp
@@ -357,39 +391,30 @@ class TestEnabledPathSendEmailContract:
         assert call_kwargs['FunctionName'] == 'send_email'
         assert call_kwargs['InvocationType'] == 'RequestResponse'
 
-        # Payload is bytes containing a dict with 'body' key (JSON string)
         raw_payload = call_kwargs['Payload']
         outer = json.loads(raw_payload.decode('utf-8') if isinstance(raw_payload, bytes) else raw_payload)
         assert 'body' in outer, 'Payload must have a body key (send_email contract)'
-
-        # body must be a JSON string (not a dict)
-        assert isinstance(outer['body'], str), 'body must be a JSON-encoded string (send_email/lambda_function.py:82-84)'
+        assert isinstance(outer['body'], str), 'body must be a JSON-encoded string'
 
         inner = json.loads(outer['body'])
         assert isinstance(inner.get('to'), list), 'to must be a list'
-        assert len(inner['to']) > 0, 'to must have at least one recipient'
-        assert isinstance(inner.get('subject'), str) and inner['subject'], 'subject must be a non-empty string'
-        assert inner.get('html_body') or inner.get('text_body'), 'html_body or text_body required'
+        assert len(inner['to']) == 1, 'per-recipient send: exactly one address per invoke'
+        assert isinstance(inner.get('subject'), str) and inner['subject']
+        assert inner.get('html_body') or inner.get('text_body')
 
-        # C8.10: no dollar signs in the payload
-        assert '$' not in inner.get('html_body', ''), 'html_body must not contain dollar signs (locked decision #5)'
+        assert '$' not in inner.get('html_body', ''), 'html_body must not contain dollar signs'
         assert '$' not in inner.get('text_body', ''), 'text_body must not contain dollar signs'
 
     def test_send_email_function_error_logged_not_raised(self):
-        """FunctionError from send_email -> logged but no exception raised."""
         mock_invoke_resp = _make_lambda_response({'errorMessage': 'SES error'}, function_error='Unhandled')
-
         with patch.object(recap, '_lambda_client') as mock_lc:
             mock_lc.invoke.return_value = mock_invoke_resp
-            # Should not raise
             recap._invoke_send_email(
                 {'to': ['x@y.com'], 'subject': 'test', 'html_body': '<p>hi</p>'},
                 TENANT_ID, MONTH_STR,
             )
 
     def test_send_email_missing_function_name_logs_error(self, caplog):
-        """SEND_EMAIL_FUNCTION_NAME not set -> logs error, no crash."""
-        import logging
         with patch.object(recap, 'SEND_EMAIL_FUNCTION_NAME', ''):
             with caplog.at_level(logging.ERROR):
                 recap._invoke_send_email(
@@ -410,128 +435,144 @@ _VARIANT_CASES = [
     ('first_month', _FIRST_MONTH_SUMMARY),
 ]
 
+_POSTAL = _TEST_POSTAL
+_UNSUB = 'https://app.myrecruiter.ai/unsubscribe?t=TESTTOKEN'
+
 
 class TestRenderSnapshots:
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_no_dollar_sign(self, variant, summary):
-        """No dollar signs anywhere in HTML (locked decision #5 / C7)."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        assert '$' not in html, f'Dollar sign found in {variant} HTML'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert '$' not in html
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_no_per_person_data(self, variant, summary):
-        """No session_ids, no email addresses in rendered HTML (C8 aggregates only)."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        # No raw session_id patterns (sess_...)
-        assert 'sess_' not in html, f'Session ID found in {variant} HTML'
-        # No @-sign except in our own domain references (footer links are to app URLs, not emails)
-        # The HTML contains no email addresses -- verify by checking for mailto: or raw address
-        assert 'mailto:' not in html.lower(), f'mailto link in {variant} HTML'
-        # No literal recipient addresses (the tenant ID is safe; org name is not an email)
-        assert 'admin@example.org' not in html, 'Recipient address leaked into HTML'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert 'sess_' not in html
+        assert 'mailto:' not in html.lower()
+        assert 'admin@example.org' not in html
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_cta_link_present(self, variant, summary):
-        """CTA link to attribution tab must be present."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        assert 'https://app.myrecruiter.ai/attribution' in html, f'CTA link missing in {variant} HTML'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert 'https://app.myrecruiter.ai/attribution' in html
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_unsubscribe_present(self, variant, summary):
-        """Unsubscribe link required (I3)."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        assert 'unsubscribe' in html.lower(), f'Unsubscribe missing in {variant} HTML'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert 'unsubscribe' in html.lower()
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_settings_present(self, variant, summary):
-        """Settings link required (I3)."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        assert 'settings' in html.lower(), f'Settings link missing in {variant} HTML'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert 'settings' in html.lower()
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_why_receiving_present(self, variant, summary):
-        """Footer must explain why they're receiving this (CAN-SPAM)."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        assert "receiving this" in html.lower(), f'"receiving this" missing in {variant} HTML'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert 'receiving this' in html.lower()
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_no_empty_superlative(self, variant, summary):
-        """Small tenant variant must not render empty superlatives (I2)."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        # Ensure no '&mdash;' immediately after a label with no value
-        # A simple check: the rendered HTML must be non-empty
-        assert len(html) > 500, f'{variant} HTML suspiciously short'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert len(html) > 500
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_html_is_valid_table_structure(self, variant, summary):
-        """Basic structural checks: DOCTYPE, body, table tags present."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
         assert '<!DOCTYPE html>' in html
         assert '<body' in html
         assert '<table' in html
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_month_label_in_html(self, variant, summary):
-        """Month label ('June 2026') must appear in rendered HTML."""
-        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        assert 'June 2026' in html, f'Month label missing in {variant} HTML'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert 'June 2026' in html
 
     @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
     def test_text_fallback_no_dollar_sign(self, variant, summary):
-        """Plain text fallback also has no dollar signs."""
-        text = _render_text_fallback(variant, summary, MONTH_STR, ORG_NAME)
-        assert '$' not in text, f'Dollar sign found in {variant} text fallback'
+        text = _render_text_fallback(variant, summary, MONTH_STR, ORG_NAME,
+                                     postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert '$' not in text
 
     def test_small_tenant_no_rate_comparison(self):
-        """Small tenant variant must not show rate comparisons (I2)."""
-        html = _render_email('small_tenant', _SMALL_SUMMARY, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        # No delta arrows in the small_tenant path
-        # The section_big_three for small_tenant omits delta HTML
-        # Verify the conversion rate section (Channel MVP) is not in small_tenant HTML
-        # (the spec says: fewer panels, no rates for small_tenant)
-        # We check that the MVP section is absent (variant == 'small_tenant' skips it)
-        assert 'Channel MVP' not in html, 'Channel MVP section must not appear in small_tenant HTML'
+        html = _render_email('small_tenant', _SMALL_SUMMARY, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert 'Channel MVP' not in html
 
     def test_first_month_no_delta(self):
-        """First-month variant must not show prior-month delta arrows."""
-        html = _render_email('first_month', _FIRST_MONTH_SUMMARY, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID)
-        # No delta arrows in first_month -- select_variant returns 'first_month' because
-        # prior_conversations is absent, so _pct_delta_str returns '' for first_month summary
-        # (prior_conversations is None -> '' delta). The HTML should not contain '▲' from
-        # summary data (there may be no prior to compare). Verify no delta label.
-        # The section_big_three with first_month variant still shows delta if prior data is
-        # in the summary row -- but _FIRST_MONTH_SUMMARY has no prior_conversations.
-        # So _pct_delta_str should return '' -> no arrow rendered.
-        assert '▲' not in html or '▼' not in html  # at most one direction absent
-        # The welcome-flavor title should be present
+        html = _render_email('first_month', _FIRST_MONTH_SUMMARY, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
+        assert '▲' not in html or '▼' not in html
         assert 'first' in html.lower() or 'welcome' in html.lower() or 'Welcome' in html
+
+    @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
+    def test_postal_address_in_footer(self, variant, summary):
+        """CAN-SPAM condition 1: postal address must appear in footer HTML."""
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address='456 Test Ave, Dallas TX 75201', unsub_url=_UNSUB)
+        assert '456 Test Ave, Dallas TX 75201' in html
+
+    @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
+    def test_postal_address_in_text_fallback(self, variant, summary):
+        """CAN-SPAM condition 1: postal address in plain text fallback."""
+        text = _render_text_fallback(variant, summary, MONTH_STR, ORG_NAME,
+                                     postal_address='456 Test Ave, Dallas TX 75201', unsub_url=_UNSUB)
+        assert '456 Test Ave, Dallas TX 75201' in text
+
+    @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
+    def test_tokenized_unsub_url_in_footer(self, variant, summary):
+        """CAN-SPAM condition 3: per-recipient tokenized URL must appear in footer."""
+        token_url = 'https://app.myrecruiter.ai/unsubscribe?t=MYTOKEN123'
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=token_url)
+        assert 'MYTOKEN123' in html
+
+    @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
+    def test_tokenized_unsub_url_in_text_fallback(self, variant, summary):
+        token_url = 'https://app.myrecruiter.ai/unsubscribe?t=MYTOKEN456'
+        text = _render_text_fallback(variant, summary, MONTH_STR, ORG_NAME,
+                                     postal_address=_POSTAL, unsub_url=token_url)
+        assert 'MYTOKEN456' in text
+
+    @pytest.mark.parametrize('variant,summary', _VARIANT_CASES)
+    def test_dry_run_placeholder_postal(self, variant, summary):
+        """Dry-run: [POSTAL ADDRESS NOT CONFIGURED] placeholder present when no postal."""
+        html = _render_email(variant, summary, _CHANNEL_ROWS, MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address='[POSTAL ADDRESS NOT CONFIGURED]', unsub_url=_UNSUB)
+        assert '[POSTAL ADDRESS NOT CONFIGURED]' in html
 
 
 # ---------------------------------------------------------------------------
-# 8. Old-shape aggregate row (missing new fields) -> no crash
+# 8. Old-shape aggregate row -> no crash
 # ---------------------------------------------------------------------------
 class TestSchemaToleranceOldRow:
 
     def test_empty_summary_row_no_crash(self):
-        """Empty/missing aggregate row -> treat as zero-month, no exception."""
-        # select_variant
         variant = _select_variant({}, MONTH_STR, TENANT_ID)
-        assert variant == 'first_month'  # no prior_conversations -> first_month
-
-        # render (zero-data first_month)
-        html = _render_email('first_month', {}, [], MONTH_STR, ORG_NAME, TENANT_ID)
+        assert variant == 'first_month'
+        html = _render_email('first_month', {}, [], MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
         assert '<!DOCTYPE html>' in html
 
     def test_partial_row_no_crash(self):
-        """Row missing conversation_minutes -> defaults to 0, no exception."""
-        row = {'conversations': 100, 'leads': 10}  # missing most fields
-        variant = _select_variant(row, MONTH_STR, TENANT_ID)  # first_month (no prior)
-        html = _render_email(variant, row, [], MONTH_STR, ORG_NAME, TENANT_ID)
+        row = {'conversations': 100, 'leads': 10}
+        variant = _select_variant(row, MONTH_STR, TENANT_ID)
+        html = _render_email(variant, row, [], MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
         assert '$' not in html
 
     def test_none_values_in_row_no_crash(self):
-        """None values for optional fields don't crash."""
         row = {
             'conversations': 100,
             'leads': 15,
@@ -543,23 +584,22 @@ class TestSchemaToleranceOldRow:
             'prior_leads': None,
         }
         variant = _select_variant(row, MONTH_STR, TENANT_ID)
-        html = _render_email(variant, row, [], MONTH_STR, ORG_NAME, TENANT_ID)
+        html = _render_email(variant, row, [], MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
         assert '<!DOCTYPE html>' in html
 
     def test_missing_channel_rows_no_crash(self):
-        """No channel rows -> MVP absent, topics absent, no crash."""
-        html = _render_email('good_month', _GOOD_SUMMARY, [], MONTH_STR, ORG_NAME, TENANT_ID)
+        html = _render_email('good_month', _GOOD_SUMMARY, [], MONTH_STR, ORG_NAME, TENANT_ID,
+                             postal_address=_POSTAL, unsub_url=_UNSUB)
         assert '<!DOCTYPE html>' in html
         assert '$' not in html
 
     def test_channel_row_missing_data_key(self):
-        """Channel row without 'data' key is tolerated."""
-        rows = [{'channel': 'website'}]  # no 'data' key
+        rows = [{'channel': 'website'}]
         topics = _extract_top_topics(rows)
         assert isinstance(topics, list)
-
         mvp = _find_mvp_channel(rows)
-        assert mvp is None  # conversations=0 < floor -> skipped
+        assert mvp is None
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +611,554 @@ class TestMissingTableEnv:
         with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', ''):
             with pytest.raises(ValueError, match='ATTRIBUTION_AGGREGATES_TABLE'):
                 recap.lambda_handler({}, None)
+
+
+# ---------------------------------------------------------------------------
+# 10. (WS-I) Token helpers: round-trip, tamper, wrong suffix
+# ---------------------------------------------------------------------------
+class TestTokenHelpers:
+
+    def test_token_round_trip_valid(self):
+        """Build token then validate it: must decode to (tenant_id, email_lower)."""
+        token = _build_unsub_token(TENANT_ID, 'User@Example.COM', _TEST_SIGNING_KEY)
+        # Verify token contains two base64url segments separated by '.'
+        parts = token.split('.')
+        assert len(parts) == 2
+
+        # Validate: decode payload and HMAC
+        payload_bytes = base64.urlsafe_b64decode(parts[0] + '=' * (4 - len(parts[0]) % 4) if len(parts[0]) % 4 else parts[0])
+        payload = payload_bytes.decode('utf-8')
+        assert payload == f'{TENANT_ID}|user@example.com|recap'
+
+        sig_bytes = base64.urlsafe_b64decode(parts[1] + '=' * (4 - len(parts[1]) % 4) if len(parts[1]) % 4 else parts[1])
+        import hashlib as _hl
+        import hmac as _hmac
+        expected = _hmac.new(_TEST_SIGNING_KEY, payload_bytes, _hl.sha256).digest()
+        assert hmac.compare_digest(expected, sig_bytes)
+
+    def test_token_normalises_email_lowercase(self):
+        t1 = _build_unsub_token(TENANT_ID, 'USER@EXAMPLE.COM', _TEST_SIGNING_KEY)
+        t2 = _build_unsub_token(TENANT_ID, 'user@example.com', _TEST_SIGNING_KEY)
+        assert t1 == t2
+
+    def test_build_unsub_token_format(self):
+        """Token must have exactly one '.' separating two non-empty segments."""
+        token = _build_unsub_token(TENANT_ID, 'a@b.com', _TEST_SIGNING_KEY)
+        parts = token.split('.')
+        assert len(parts) == 2
+        assert all(p for p in parts)
+
+    def test_token_no_padding(self):
+        """base64url segments must have no '=' padding."""
+        token = _build_unsub_token(TENANT_ID, 'a@b.com', _TEST_SIGNING_KEY)
+        assert '=' not in token
+
+
+# ---------------------------------------------------------------------------
+# 11-12. (WS-I) Token validation: tamper, wrong suffix, missing, constant-time
+# These tests live in the Unsubscribe Lambda but we test the token structure here
+# via _build_unsub_token so the two Lambdas stay in agreement.
+# ---------------------------------------------------------------------------
+class TestTokenValidationIntegrity:
+
+    def _decode_token(self, token):
+        """Decode token payload -> (tenant_id, email, suffix)."""
+        b64_payload = token.split('.')[0]
+        padded = b64_payload + '=' * (4 - len(b64_payload) % 4) if len(b64_payload) % 4 else b64_payload
+        payload = base64.urlsafe_b64decode(padded).decode('utf-8')
+        return payload.split('|')
+
+    def test_tampered_byte_invalidates(self):
+        """Flip one byte in the signature segment -> HMAC mismatch."""
+        from Attribution_Unsubscribe.lambda_function import _validate_token
+        token = _build_unsub_token(TENANT_ID, 'x@y.com', _TEST_SIGNING_KEY)
+        # Flip last char of sig segment
+        parts = token.rsplit('.', 1)
+        sig_chars = list(parts[1])
+        sig_chars[-1] = 'A' if sig_chars[-1] != 'A' else 'B'
+        tampered = parts[0] + '.' + ''.join(sig_chars)
+        assert _validate_token(tampered, _TEST_SIGNING_KEY) is None
+
+    def test_wrong_suffix_payload_invalid(self):
+        """Payload suffix must be 'recap'; any other value -> invalid."""
+        from Attribution_Unsubscribe.lambda_function import _validate_token
+        # Build a token with wrong suffix by constructing manually
+        import hashlib as _hl
+        payload = f'{TENANT_ID}|x@y.com|monthly'
+        payload_bytes = payload.encode('utf-8')
+        sig = hmac.new(_TEST_SIGNING_KEY, payload_bytes, _hl.sha256).digest()
+        token = _b64url_nopad(payload_bytes) + '.' + _b64url_nopad(sig)
+        assert _validate_token(token, _TEST_SIGNING_KEY) is None
+
+    def test_missing_dot_invalid(self):
+        from Attribution_Unsubscribe.lambda_function import _validate_token
+        assert _validate_token('nodottoken', _TEST_SIGNING_KEY) is None
+
+    def test_empty_token_invalid(self):
+        from Attribution_Unsubscribe.lambda_function import _validate_token
+        assert _validate_token('', _TEST_SIGNING_KEY) is None
+
+    def test_valid_token_returns_tuple(self):
+        from Attribution_Unsubscribe.lambda_function import _validate_token
+        token = _build_unsub_token(TENANT_ID, 'user@example.com', _TEST_SIGNING_KEY)
+        result = _validate_token(token, _TEST_SIGNING_KEY)
+        assert result is not None
+        assert result[0] == TENANT_ID
+        assert result[1] == 'user@example.com'
+
+    def test_constant_time_compare_used(self):
+        """_validate_token must use hmac.compare_digest (static inspect)."""
+        import Attribution_Unsubscribe.lambda_function as unsub_mod
+        src = inspect.getsource(unsub_mod._validate_token)
+        assert 'compare_digest' in src, 'hmac.compare_digest must be used in _validate_token'
+
+
+# ---------------------------------------------------------------------------
+# 13. (WS-I) Unsubscribe Lambda: idempotent double-unsubscribe
+# ---------------------------------------------------------------------------
+class TestUnsubscribeLambda:
+
+    def _make_event(self, token: str) -> dict:
+        return {'queryStringParameters': {'t': token}}
+
+    def test_valid_token_returns_200_html(self):
+        from Attribution_Unsubscribe import lambda_function as unsub
+        token = _build_unsub_token(TENANT_ID, 'alice@example.com', _TEST_SIGNING_KEY)
+        event = self._make_event(token)
+
+        mock_table = MagicMock()
+        mock_table.put_item.return_value = {}
+
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(unsub, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(unsub, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            resp = unsub.lambda_handler(event, None)
+
+        assert resp['statusCode'] == 200
+        assert 'text/html' in resp['headers']['Content-Type']
+        assert 'unsubscribed' in resp['body'].lower()
+
+    def test_idempotent_double_unsubscribe(self):
+        """ConditionalCheckFailedException on second request treated as success (200)."""
+        from Attribution_Unsubscribe import lambda_function as unsub
+        from botocore.exceptions import ClientError
+        token = _build_unsub_token(TENANT_ID, 'alice@example.com', _TEST_SIGNING_KEY)
+        event = self._make_event(token)
+
+        mock_table = MagicMock()
+        err = ClientError({'Error': {'Code': 'ConditionalCheckFailedException', 'Message': 'x'}}, 'PutItem')
+        mock_table.put_item.side_effect = err
+
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(unsub, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(unsub, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            resp = unsub.lambda_handler(event, None)
+
+        # Should still return 200 (idempotent)
+        assert resp['statusCode'] == 200
+
+    def test_missing_token_returns_403(self):
+        from Attribution_Unsubscribe import lambda_function as unsub
+        resp = unsub.lambda_handler({'queryStringParameters': {}}, None)
+        assert resp['statusCode'] == 403
+
+    def test_null_query_params_returns_403(self):
+        from Attribution_Unsubscribe import lambda_function as unsub
+        resp = unsub.lambda_handler({}, None)
+        assert resp['statusCode'] == 403
+
+    def test_tampered_token_returns_403(self):
+        from Attribution_Unsubscribe import lambda_function as unsub
+        token = _build_unsub_token(TENANT_ID, 'alice@example.com', _TEST_SIGNING_KEY)
+        parts = token.rsplit('.', 1)
+        sig_chars = list(parts[1])
+        sig_chars[0] = 'A' if sig_chars[0] != 'A' else 'B'
+        tampered = parts[0] + '.' + ''.join(sig_chars)
+        event = self._make_event(tampered)
+
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_SIGNING_KEY):
+            resp = unsub.lambda_handler(event, None)
+
+        assert resp['statusCode'] == 403
+
+    def test_wrong_suffix_returns_403(self):
+        from Attribution_Unsubscribe import lambda_function as unsub
+        import hashlib as _hl
+        payload = f'{TENANT_ID}|alice@example.com|newsletter'
+        payload_bytes = payload.encode('utf-8')
+        sig = hmac.new(_TEST_SIGNING_KEY, payload_bytes, _hl.sha256).digest()
+        token = _b64url_nopad(payload_bytes) + '.' + _b64url_nopad(sig)
+        event = self._make_event(token)
+
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_SIGNING_KEY):
+            resp = unsub.lambda_handler(event, None)
+
+        assert resp['statusCode'] == 403
+
+    def test_signing_key_unavailable_returns_403(self):
+        """If signing key can't be fetched, return 403 (no detail)."""
+        from Attribution_Unsubscribe import lambda_function as unsub
+        token = _build_unsub_token(TENANT_ID, 'a@b.com', _TEST_SIGNING_KEY)
+        with patch.object(unsub, '_get_signing_key', return_value=None):
+            resp = unsub.lambda_handler(self._make_event(token), None)
+        assert resp['statusCode'] == 403
+
+    def test_suppression_row_schema(self):
+        """Suppression row must use correct pk/sk and no TTL."""
+        from Attribution_Unsubscribe import lambda_function as unsub
+        token = _build_unsub_token(TENANT_ID, 'Alice@Example.COM', _TEST_SIGNING_KEY)
+        event = self._make_event(token)
+
+        mock_table = MagicMock()
+        put_calls = []
+
+        def capture_put(**kwargs):
+            put_calls.append(kwargs)
+            return {}
+
+        mock_table.put_item.side_effect = capture_put
+
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(unsub, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(unsub, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            unsub.lambda_handler(event, None)
+
+        assert len(put_calls) == 1
+        item = put_calls[0]['Item']
+        assert item['pk'] == f'TENANT#{TENANT_ID}'
+        assert item['sk'] == 'SUPPRESS#recap#alice@example.com'  # lowercased
+        assert item['source'] == 'unsubscribe_link'
+        assert 'created_at' in item
+        assert 'ttl' not in item, 'Suppression row must NOT have TTL (permanent)'
+
+    def test_403_body_has_no_detail(self):
+        """403 responses must not reveal token structure or error reason."""
+        from Attribution_Unsubscribe import lambda_function as unsub
+        resp = unsub.lambda_handler({'queryStringParameters': {'t': 'invalid'}}, None)
+        assert resp['statusCode'] == 403
+        assert resp['body'].strip().lower() in ('forbidden', 'forbidden\n')
+
+
+# ---------------------------------------------------------------------------
+# 14. (WS-I) Suppression filter: mixed-case, partial, all-suppressed
+# ---------------------------------------------------------------------------
+class TestSuppressionFilter:
+
+    def test_filter_suppressed_exact(self):
+        suppressed = {'alice@example.org', 'bob@example.org'}
+        result = _filter_suppressed(['alice@example.org', 'charlie@example.org'], suppressed)
+        assert result == ['charlie@example.org']
+
+    def test_filter_suppressed_case_insensitive(self):
+        """Input email case doesn't matter -- lowercased for comparison."""
+        suppressed = {'alice@example.org'}
+        result = _filter_suppressed(['ALICE@EXAMPLE.ORG', 'bob@example.org'], suppressed)
+        assert result == ['bob@example.org']
+
+    def test_filter_suppressed_all(self):
+        suppressed = {'alice@example.org', 'bob@example.org'}
+        result = _filter_suppressed(['alice@example.org', 'bob@example.org'], suppressed)
+        assert result == []
+
+    def test_filter_suppressed_none(self):
+        result = _filter_suppressed(['alice@example.org'], set())
+        assert result == ['alice@example.org']
+
+    def test_process_tenant_all_suppressed_returns_skip(self):
+        config = {
+            'feature_flags': {'dashboard_attribution': True},
+            'organization_name': 'Org',
+            'attribution_recap': {'recipients': ['admin@example.org']},
+        }
+        with patch.object(recap, '_get_tenant_config', return_value=config), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value={'admin@example.org'}):
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=True)
+        assert result == 'skip_all_suppressed'
+
+    def test_process_tenant_partial_suppression_sends_remaining(self):
+        """Partial suppression: remaining recipients still get the email."""
+        with patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED_MULTI), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value={'alice@example.org'}), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
+             patch.object(recap, '_mark_recap_sent'), \
+             patch.object(recap, '_invoke_send_email') as mock_send:
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
+
+        assert result == 'sent'
+        # Only bob remains after alice is suppressed
+        assert mock_send.call_count == 1
+        payload_sent = mock_send.call_args[0][0]
+        assert payload_sent['to'] == ['bob@example.org']
+
+    def test_suppression_wins_over_config_every_month(self):
+        """Even if recipient is in config, suppression wins."""
+        config = {
+            'feature_flags': {'dashboard_attribution': True},
+            'organization_name': 'Org',
+            'attribution_recap': {'recipients': ['victim@example.org']},
+        }
+        with patch.object(recap, '_get_tenant_config', return_value=config), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value={'victim@example.org'}), \
+             patch.object(recap, '_invoke_send_email') as mock_send:
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=True)
+
+        assert result == 'skip_all_suppressed'
+        mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# 15. (WS-I) Per-recipient sends carry DIFFERENT tokens
+# ---------------------------------------------------------------------------
+class TestPerRecipientTokens:
+
+    def test_per_recipient_different_tokens(self):
+        """Two recipients must receive different unsubscribe tokens."""
+        with patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED_MULTI), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
+             patch.object(recap, '_mark_recap_sent'), \
+             patch.object(recap, '_invoke_send_email') as mock_send:
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
+
+        assert result == 'sent'
+        assert mock_send.call_count == 2, 'Two recipients -> two send_email invokes'
+
+        # Extract unsubscribe URLs from html_body of each call
+        tokens = []
+        for call_args in mock_send.call_args_list:
+            payload = call_args[0][0]
+            html = payload['html_body']
+            # Find the ?t= value in the HTML
+            import re
+            matches = re.findall(r'\?t=([^"&\s]+)', html)
+            assert matches, 'Unsubscribe token missing from html_body'
+            tokens.append(matches[0])
+
+        assert len(tokens) == 2
+        assert tokens[0] != tokens[1], 'Per-recipient tokens must be different'
+
+    def test_one_invoke_per_recipient(self):
+        """N recipients -> N send_email invokes (one per recipient)."""
+        config = {
+            'feature_flags': {'dashboard_attribution': True},
+            'organization_name': 'Org',
+            'attribution_recap': {'recipients': ['a@t.com', 'b@t.com', 'c@t.com']},
+        }
+        with patch.object(recap, '_get_tenant_config', return_value=config), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
+             patch.object(recap, '_mark_recap_sent'), \
+             patch.object(recap, '_invoke_send_email') as mock_send:
+            recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
+
+        assert mock_send.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# 16. (WS-I) Postal address fail-closed
+# ---------------------------------------------------------------------------
+class TestPostalAddressFailClosed:
+
+    def test_send_blocked_when_postal_unset(self, caplog):
+        """When RECAP_POSTAL_ADDRESS is empty and RECAP_SEND_ENABLED=true, block send."""
+        with patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', ''), \
+             patch.object(recap, '_invoke_send_email') as mock_send, \
+             caplog.at_level(logging.ERROR):
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
+
+        assert result == 'skip_flag_off'
+        mock_send.assert_not_called()
+        assert any('recap-blocked-no-postal-address' in r.message for r in caplog.records)
+
+    def test_dry_run_postal_placeholder_rendered(self):
+        """Dry-run with empty postal address renders [POSTAL ADDRESS NOT CONFIGURED]."""
+        with patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', ''), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', ''), \
+             patch.object(recap, '_render_email', wraps=recap._render_email) as mock_render:
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=True)
+
+        assert result == 'dry_run'
+        # render_email should have been called with the placeholder
+        call_kwargs = mock_render.call_args.kwargs if mock_render.call_args.kwargs else {}
+        postal_arg = call_kwargs.get('postal_address') or mock_render.call_args[1].get('postal_address') or ''
+        # Either the kwarg or positional arg contains the placeholder
+        all_args = str(mock_render.call_args)
+        assert '[POSTAL ADDRESS NOT CONFIGURED]' in all_args
+
+
+# ---------------------------------------------------------------------------
+# 17. (WS-I) Secret-absent fail-closed; no caching of transient failure
+# ---------------------------------------------------------------------------
+class TestSecretFailClosed:
+
+    def test_send_blocked_when_unsub_secret_absent(self, caplog):
+        """When signing key unavailable and RECAP_SEND_ENABLED=true, block send."""
+        with patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=None), \
+             patch.object(recap, '_invoke_send_email') as mock_send, \
+             caplog.at_level(logging.ERROR):
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
+
+        assert result == 'skip_flag_off'
+        mock_send.assert_not_called()
+        assert any('recap-blocked-unsub-key-unavailable' in r.message for r in caplog.records)
+
+    def test_send_blocked_when_unsub_url_unset(self, caplog):
+        """When UNSUBSCRIBE_BASE_URL unset and RECAP_SEND_ENABLED=true, block send."""
+        with patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', ''), \
+             patch.object(recap, '_invoke_send_email') as mock_send, \
+             caplog.at_level(logging.ERROR):
+            result = recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
+
+        assert result == 'skip_flag_off'
+        mock_send.assert_not_called()
+        assert any('recap-blocked-no-unsub-url' in r.message for r in caplog.records)
+
+    def test_transient_fetch_failure_not_cached(self):
+        """
+        After a transient Secrets Manager failure, _get_unsub_signing_key must retry
+        (not cache the None result). We verify the _unsub_signing_key module variable
+        is still None after a failed fetch.
+        """
+        import Attribution_Recap_Generator.lambda_function as _recap_mod
+        from botocore.exceptions import ClientError
+
+        # Reset cached key
+        original_key = _recap_mod._unsub_signing_key
+        _recap_mod._unsub_signing_key = None
+
+        try:
+            err = ClientError({'Error': {'Code': 'ServiceUnavailableException', 'Message': 'x'}}, 'GetSecretValue')
+            with patch.object(_recap_mod, '_secretsmanager') as mock_sm:
+                mock_sm.get_secret_value.side_effect = err
+                result = _recap_mod._get_unsub_signing_key()
+
+            # After failure: None returned, not cached
+            assert result is None
+            assert _recap_mod._unsub_signing_key is None, 'Transient failure must NOT be cached'
+
+            # Second call: should retry (not return cached None)
+            with patch.object(_recap_mod, '_secretsmanager') as mock_sm2:
+                mock_sm2.get_secret_value.return_value = {'SecretString': 'newkey'}
+                result2 = _recap_mod._get_unsub_signing_key()
+            assert result2 == b'newkey'
+
+        finally:
+            _recap_mod._unsub_signing_key = original_key
+
+
+# ---------------------------------------------------------------------------
+# 18. (WS-I) No email/token in any log call (static inspection)
+# ---------------------------------------------------------------------------
+class TestPIILogHygiene:
+
+    def _find_log_calls(self, source: str):
+        """Parse AST and return list of logger.* call nodes."""
+        tree = ast.parse(source)
+        log_calls = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                    if func.value.id == 'logger' and func.attr in ('info', 'warning', 'error', 'debug', 'critical'):
+                        log_calls.append(node)
+        return log_calls
+
+    def _inside_email_log_id(self, root, target_node):
+        """Return True if target_node is an argument to _email_log_id() in root."""
+        for node in ast.walk(root):
+            if isinstance(node, ast.Call):
+                func = node.func
+                func_name = (func.id if isinstance(func, ast.Name)
+                             else (func.attr if isinstance(func, ast.Attribute) else ''))
+                if func_name == '_email_log_id':
+                    for call_arg in node.args:
+                        if isinstance(call_arg, ast.Name) and call_arg.id == target_node.id:
+                            return True
+        return False
+
+    def _call_has_suspect_arg(self, node):
+        """
+        Returns True if a log call's argument list contains a reference to
+        variables typically holding email addresses, tokens, or signing keys.
+        Excludes variables wrapped in _email_log_id() (those are safely hashed).
+        """
+        suspect = {'email', 'email_lower', 'token', 'signing_key', 'key_bytes',
+                   'payload', 'recipient_email', 'raw'}
+        for arg in node.args[1:]:  # skip format string (args[0])
+            for inner in ast.walk(arg):
+                if isinstance(inner, ast.Name) and inner.id in suspect:
+                    if self._inside_email_log_id(arg, inner):
+                        continue
+                    return True
+        return False
+
+    def test_recap_generator_no_pii_in_logs(self):
+        """No email address or token variable passed to logger.* in Attribution_Recap_Generator."""
+        import Attribution_Recap_Generator.lambda_function as _mod
+        src = inspect.getsource(_mod)
+        log_calls = self._find_log_calls(src)
+        violations = []
+        for node in log_calls:
+            if self._call_has_suspect_arg(node):
+                violations.append(f'line {node.lineno}')
+        assert not violations, f'PII variable(s) passed to logger in recap generator: {violations}'
+
+    def test_unsubscribe_no_pii_in_logs(self):
+        """No email address or token variable passed to logger.* in Attribution_Unsubscribe."""
+        import Attribution_Unsubscribe.lambda_function as _mod
+        src = inspect.getsource(_mod)
+        log_calls = self._find_log_calls(src)
+        violations = []
+        for node in log_calls:
+            if self._call_has_suspect_arg(node):
+                violations.append(f'line {node.lineno}')
+        assert not violations, f'PII variable(s) passed to logger in unsubscribe: {violations}'
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +1227,7 @@ class TestHelpers:
 
     def test_find_mvp_channel_below_floor_excluded(self):
         rows = [
-            {'channel': 'campaign', 'data': {'conversations': 10, 'leads': 5}},  # below floor
+            {'channel': 'campaign', 'data': {'conversations': 10, 'leads': 5}},
         ]
         mvp = _find_mvp_channel(rows)
         assert mvp is None
@@ -654,7 +1242,6 @@ class TestHelpers:
 class TestHandlerFlow:
 
     def test_handler_processes_flagged_tenants(self):
-        """Handler iterates tenants and processes flagged ones."""
         with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
              patch.object(recap, '_get_active_tenant_pairs', return_value=[('h1', 'T1'), ('h2', 'T2')]), \
              patch.object(recap, '_process_tenant', side_effect=['dry_run', 'skip_flag_off']) as mock_proc:
@@ -666,7 +1253,6 @@ class TestHandlerFlow:
         assert mock_proc.call_count == 2
 
     def test_handler_error_in_tenant_does_not_abort_others(self):
-        """Error in one tenant's processing doesn't abort the loop."""
         def side_effect(tenant_id, month_str, dry_run):
             if tenant_id == 'T1':
                 raise RuntimeError('boom')
@@ -689,3 +1275,11 @@ class TestHandlerFlow:
 
         assert result['sent'] == 1
         assert result['dry_run_mode'] is False
+
+    def test_handler_skip_all_suppressed_counted_as_skipped(self):
+        with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_get_active_tenant_pairs', return_value=[('h1', 'T1')]), \
+             patch.object(recap, '_process_tenant', return_value='skip_all_suppressed'):
+            result = recap.lambda_handler({}, None)
+
+        assert result['skipped'] == 1
