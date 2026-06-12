@@ -1283,3 +1283,206 @@ class TestHandlerFlow:
             result = recap.lambda_handler({}, None)
 
         assert result['skipped'] == 1
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: Marker write fail-closed (non-ConditionalCheck error -> raise)
+# ---------------------------------------------------------------------------
+class TestMarkerWriteFailClosed:
+
+    def test_provisioned_throughput_error_prevents_send(self):
+        """
+        ProvisionedThroughputExceededException on _mark_recap_sent must NOT fall through
+        to send_email.  The per-tenant try/except in lambda_handler absorbs the raise
+        and marks the tenant as errored.
+        """
+        from botocore.exceptions import ClientError
+
+        pte_err = ClientError(
+            {'Error': {'Code': 'ProvisionedThroughputExceededException', 'Message': 'x'}},
+            'PutItem',
+        )
+
+        with patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
+             patch.object(recap, '_invoke_send_email') as mock_send, \
+             patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_dynamodb') as mock_ddb:
+            # Configure _mark_recap_sent to throw a non-ConditionalCheck error
+            mock_table = MagicMock()
+            mock_table.put_item.side_effect = pte_err
+            mock_ddb.Table.return_value = mock_table
+
+            with pytest.raises(ClientError):
+                recap._process_tenant(TENANT_ID, MONTH_STR, dry_run=False)
+
+        # send_email must NOT have been invoked
+        mock_send.assert_not_called()
+
+    def test_non_conditional_check_error_propagates(self):
+        """Any non-ConditionalCheck ClientError from _mark_recap_sent must raise."""
+        from botocore.exceptions import ClientError
+        for error_code in ('ProvisionedThroughputExceededException', 'InternalServerError',
+                           'ServiceUnavailable'):
+            err = ClientError({'Error': {'Code': error_code, 'Message': 'x'}}, 'PutItem')
+            with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+                 patch.object(recap, '_dynamodb') as mock_ddb:
+                mock_table = MagicMock()
+                mock_table.put_item.side_effect = err
+                mock_ddb.Table.return_value = mock_table
+
+                with pytest.raises(ClientError):
+                    recap._mark_recap_sent(TENANT_ID, MONTH_STR)
+
+    def test_conditional_check_failed_is_not_raised(self):
+        """ConditionalCheckFailedException (race condition) must NOT raise -- it's success."""
+        from botocore.exceptions import ClientError
+        cce = ClientError({'Error': {'Code': 'ConditionalCheckFailedException', 'Message': 'x'}}, 'PutItem')
+        with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_dynamodb') as mock_ddb:
+            mock_table = MagicMock()
+            mock_table.put_item.side_effect = cce
+            mock_ddb.Table.return_value = mock_table
+
+            # Must not raise
+            recap._mark_recap_sent(TENANT_ID, MONTH_STR)
+
+    def test_handler_absorbs_marker_error_as_tenant_error(self):
+        """
+        When _mark_recap_sent raises, the per-tenant loop in lambda_handler must
+        catch it and count the tenant as an error (not propagate to the whole handler).
+        """
+        from botocore.exceptions import ClientError
+        pte_err = ClientError(
+            {'Error': {'Code': 'ProvisionedThroughputExceededException', 'Message': 'x'}},
+            'PutItem',
+        )
+
+        with patch.object(recap, 'RECAP_SEND_ENABLED', 'true'), \
+             patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_get_active_tenant_pairs', return_value=[('h1', TENANT_ID)]), \
+             patch.object(recap, '_get_tenant_config', return_value=_TENANT_CONFIG_ENABLED), \
+             patch.object(recap, '_recap_already_sent', return_value=False), \
+             patch.object(recap, '_load_aggregate', return_value=_GOOD_SUMMARY), \
+             patch.object(recap, '_load_channel_rows', return_value=[]), \
+             patch.object(recap, '_fetch_suppressed_emails', return_value=set()), \
+             patch.object(recap, '_get_unsub_signing_key', return_value=_TEST_SIGNING_KEY), \
+             patch.object(recap, 'UNSUBSCRIBE_BASE_URL', _TEST_UNSUB_BASE), \
+             patch.object(recap, 'RECAP_POSTAL_ADDRESS', _TEST_POSTAL), \
+             patch.object(recap, '_invoke_send_email') as mock_send, \
+             patch.object(recap, '_mark_recap_sent', side_effect=pte_err):
+            result = recap.lambda_handler({}, None)
+
+        assert result['errors'] == 1
+        assert result['sent'] == 0
+        mock_send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Paginated suppression query
+# ---------------------------------------------------------------------------
+class TestSuppressionQueryPagination:
+
+    def test_two_page_query_suppresses_both_pages(self):
+        """
+        When DynamoDB returns a LastEvaluatedKey on the first response,
+        emails from BOTH pages must be included in the suppression set.
+        """
+        page1_items = [
+            {'pk': f'TENANT#{TENANT_ID}', 'sk': 'SUPPRESS#recap#alice@example.org'},
+        ]
+        page2_items = [
+            {'pk': f'TENANT#{TENANT_ID}', 'sk': 'SUPPRESS#recap#bob@example.org'},
+        ]
+        call_count = [0]
+
+        def fake_query(**kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return {
+                    'Items': page1_items,
+                    'LastEvaluatedKey': {'pk': 'TENANT#TEST12345', 'sk': 'SUPPRESS#recap#alice@example.org'},
+                }
+            else:
+                return {'Items': page2_items}
+
+        mock_table = MagicMock()
+        mock_table.query.side_effect = fake_query
+
+        with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            result = _fetch_suppressed_emails(TENANT_ID)
+
+        assert call_count[0] == 2, 'Must have issued two queries'
+        assert 'alice@example.org' in result
+        assert 'bob@example.org' in result
+
+    def test_single_page_query_no_last_key(self):
+        """When no LastEvaluatedKey, only one query is issued."""
+        items = [
+            {'pk': f'TENANT#{TENANT_ID}', 'sk': 'SUPPRESS#recap#carol@example.org'},
+        ]
+        mock_table = MagicMock()
+        mock_table.query.return_value = {'Items': items}
+
+        with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            result = _fetch_suppressed_emails(TENANT_ID)
+
+        mock_table.query.assert_called_once()
+        assert 'carol@example.org' in result
+
+    def test_three_page_query_collects_all(self):
+        """More than two pages: all pages must be iterated."""
+        pages = [
+            ({'Items': [{'sk': 'SUPPRESS#recap#p1@x.com'}], 'LastEvaluatedKey': {'x': '1'}}),
+            ({'Items': [{'sk': 'SUPPRESS#recap#p2@x.com'}], 'LastEvaluatedKey': {'x': '2'}}),
+            ({'Items': [{'sk': 'SUPPRESS#recap#p3@x.com'}]}),
+        ]
+        call_count = [0]
+
+        def fake_query(**kwargs):
+            resp = pages[call_count[0]]
+            call_count[0] += 1
+            return resp
+
+        mock_table = MagicMock()
+        mock_table.query.side_effect = fake_query
+
+        with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            result = _fetch_suppressed_emails(TENANT_ID)
+
+        assert call_count[0] == 3
+        assert {'p1@x.com', 'p2@x.com', 'p3@x.com'} == result
+
+    def test_exclusive_start_key_passed_on_second_call(self):
+        """ExclusiveStartKey from page 1 must be forwarded to page 2 query."""
+        last_key = {'pk': 'TENANT#TEST12345', 'sk': 'SUPPRESS#recap#z@x.com'}
+        calls_received = []
+
+        def fake_query(**kwargs):
+            calls_received.append(dict(kwargs))
+            if len(calls_received) == 1:
+                return {'Items': [], 'LastEvaluatedKey': last_key}
+            return {'Items': []}
+
+        mock_table = MagicMock()
+        mock_table.query.side_effect = fake_query
+
+        with patch.object(recap, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(recap, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            _fetch_suppressed_emails(TENANT_ID)
+
+        assert len(calls_received) == 2
+        assert calls_received[1].get('ExclusiveStartKey') == last_key

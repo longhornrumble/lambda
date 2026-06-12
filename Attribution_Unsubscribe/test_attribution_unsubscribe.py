@@ -492,3 +492,118 @@ class TestValidateToken:
                  '.' +
                  base64.urlsafe_b64encode(sig).rstrip(b'=').decode('ascii'))
         assert _validate_token(token, _TEST_KEY) is None
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Token length cap (MAX_TOKEN_LEN = 1024)
+# ---------------------------------------------------------------------------
+class TestTokenLengthCap:
+
+    def test_oversized_token_returns_403(self):
+        """Token longer than MAX_TOKEN_LEN must be rejected with 403 before any decode."""
+        oversized = 'A' * (unsub.MAX_TOKEN_LEN + 1)
+        with patch.object(unsub, '_get_signing_key') as mock_key, \
+             patch.object(unsub, '_validate_token') as mock_validate:
+            resp = unsub.lambda_handler(_event(oversized), None)
+
+        assert resp['statusCode'] == 403
+        # Neither the signing key fetch nor the decode should be attempted
+        mock_key.assert_not_called()
+        mock_validate.assert_not_called()
+
+    def test_token_at_max_len_is_not_rejected_by_length_check(self):
+        """Token exactly MAX_TOKEN_LEN chars must pass the length gate."""
+        # It will still fail validation, but the length gate should not block it.
+        at_limit = 'A' * unsub.MAX_TOKEN_LEN
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_KEY):
+            resp = unsub.lambda_handler(_event(at_limit), None)
+        # Should fail with 403 due to bad token, not length
+        assert resp['statusCode'] == 403
+
+    def test_max_token_len_constant_is_1024(self):
+        assert unsub.MAX_TOKEN_LEN == 1024
+
+    def test_oversized_token_logs_length_not_content(self, caplog):
+        """Warning log for oversized token must include the length, not the token itself."""
+        oversized = 'X' * 2000
+        with caplog.at_level(logging.WARNING):
+            unsub.lambda_handler(_event(oversized), None)
+        # At least one warning record must mention the length
+        assert any(
+            '2000' in r.message or 'len=' in r.message or 'too long' in r.message
+            for r in caplog.records
+        ), f"Expected length warning, got: {[r.message for r in caplog.records]}"
+        # The token content itself must not appear in any log message
+        assert all('X' * 20 not in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Fix 4: Method routing (GET + POST allowed; others -> 403)
+# ---------------------------------------------------------------------------
+class TestMethodRouting:
+
+    def _event_with_method(self, method, token=None):
+        qs = {'t': token} if token else {}
+        return {
+            'requestContext': {'http': {'method': method}},
+            'queryStringParameters': qs,
+        }
+
+    def test_get_allowed(self):
+        """GET with valid token -> 200."""
+        token = _make_token(_TENANT_ID, _EMAIL, _TEST_KEY)
+        mock_table = MagicMock()
+        mock_table.put_item.return_value = {}
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_KEY), \
+             patch.object(unsub, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(unsub, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            resp = unsub.lambda_handler(self._event_with_method('GET', token), None)
+        assert resp['statusCode'] == 200
+
+    def test_post_allowed(self):
+        """POST (RFC 8058 one-click) with valid token -> 200."""
+        token = _make_token(_TENANT_ID, _EMAIL, _TEST_KEY)
+        mock_table = MagicMock()
+        mock_table.put_item.return_value = {}
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_KEY), \
+             patch.object(unsub, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(unsub, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            resp = unsub.lambda_handler(self._event_with_method('POST', token), None)
+        assert resp['statusCode'] == 200
+
+    def test_options_returns_403(self):
+        """OPTIONS -> 403 before any token processing."""
+        with patch.object(unsub, '_get_signing_key') as mock_key:
+            resp = unsub.lambda_handler(self._event_with_method('OPTIONS'), None)
+        assert resp['statusCode'] == 403
+        mock_key.assert_not_called()
+
+    def test_delete_returns_403(self):
+        """DELETE -> 403."""
+        resp = unsub.lambda_handler(self._event_with_method('DELETE'), None)
+        assert resp['statusCode'] == 403
+
+    def test_put_returns_403(self):
+        """PUT -> 403."""
+        resp = unsub.lambda_handler(self._event_with_method('PUT'), None)
+        assert resp['statusCode'] == 403
+
+    def test_unknown_method_returns_403(self):
+        """Arbitrary unknown method -> 403."""
+        resp = unsub.lambda_handler(self._event_with_method('PATCH'), None)
+        assert resp['statusCode'] == 403
+
+    def test_no_request_context_defaults_to_get(self):
+        """Missing requestContext defaults to GET (backward-compat with test events)."""
+        token = _make_token(_TENANT_ID, _EMAIL, _TEST_KEY)
+        mock_table = MagicMock()
+        mock_table.put_item.return_value = {}
+        with patch.object(unsub, '_get_signing_key', return_value=_TEST_KEY), \
+             patch.object(unsub, 'ATTRIBUTION_AGGREGATES_TABLE', 'test-table'), \
+             patch.object(unsub, '_dynamodb') as mock_ddb:
+            mock_ddb.Table.return_value = mock_table
+            # Standard event dict with no requestContext key
+            resp = unsub.lambda_handler({'queryStringParameters': {'t': token}}, None)
+        assert resp['statusCode'] == 200

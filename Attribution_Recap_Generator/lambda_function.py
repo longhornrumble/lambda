@@ -187,18 +187,28 @@ def _fetch_suppressed_emails(tenant_id: str) -> set:
     try:
         from boto3.dynamodb.conditions import Key
         table = _dynamodb.Table(ATTRIBUTION_AGGREGATES_TABLE)
-        resp = table.query(
-            KeyConditionExpression=(
+        suppressed = set()
+        prefix = 'SUPPRESS#recap#'
+        query_kwargs: dict = {
+            'KeyConditionExpression': (
                 Key('pk').eq(f'TENANT#{tenant_id}') &
                 Key('sk').begins_with('SUPPRESS#recap#')
             )
-        )
-        suppressed = set()
-        prefix = 'SUPPRESS#recap#'
-        for item in resp.get('Items', []):
-            sk = item.get('sk', '')
-            if sk.startswith(prefix):
-                suppressed.add(sk[len(prefix):])
+        }
+        # Paginate: a busy tenant could accumulate more than one 1-MB page of
+        # suppression rows; without pagination those on later pages are silently
+        # honored -- every recipient on a page beyond the first would still
+        # receive the email.
+        while True:
+            resp = table.query(**query_kwargs)
+            for item in resp.get('Items', []):
+                sk = item.get('sk', '')
+                if sk.startswith(prefix):
+                    suppressed.add(sk[len(prefix):])
+            last_key = resp.get('LastEvaluatedKey')
+            if not last_key:
+                break
+            query_kwargs['ExclusiveStartKey'] = last_key
         return suppressed
     except ClientError as exc:
         logger.error(
@@ -1174,6 +1184,11 @@ def _mark_recap_sent(tenant_id: str, month_str: str) -> None:
                 'Failed to write recap marker for tenant=%s month=%s: %s',
                 tenant_id[:8], month_str, exc,
             )
+            # Raise so the per-tenant try/except in lambda_handler absorbs it
+            # and marks this tenant as errored.  Fall-through here would send
+            # emails without a marker, guaranteeing a double-send on every
+            # EventBridge retry until the DynamoDB condition is restored.
+            raise
 
 
 # ---------------------------------------------------------------------------

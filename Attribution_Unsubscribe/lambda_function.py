@@ -47,6 +47,11 @@ logger.setLevel(logging.INFO)
 ATTRIBUTION_AGGREGATES_TABLE = os.environ.get('ATTRIBUTION_AGGREGATES_TABLE', '')
 UNSUB_SECRET_NAME = os.environ.get('UNSUB_SECRET_NAME', '')
 
+# Maximum token length accepted before any decode attempt.
+# A legitimate HMAC-SHA256 token over {tenant_id}|{email}|recap never exceeds ~300 chars;
+# 1024 guards against large-payload attacks (ReDoS via padding, memory exhaustion).
+MAX_TOKEN_LEN = 1024
+
 # ---------------------------------------------------------------------------
 # AWS clients
 # ---------------------------------------------------------------------------
@@ -235,17 +240,38 @@ def _record_suppression(tenant_id: str, email_lower: str) -> None:
 # ---------------------------------------------------------------------------
 def lambda_handler(event: dict, context) -> dict:
     """
-    GET handler for Lambda Function URL.
+    GET/POST handler for Lambda Function URL.
+    Accepts GET (browser link click) and POST (RFC 8058 one-click unsubscribe).
+    All other methods return 403 before any token processing.
     Extracts `t` query param, validates HMAC token, writes suppression row.
     Returns 200 HTML on success, 403 plain text on any invalid/missing token.
-    No other routes or actions.
     """
+    # Method gate: allow GET and POST (RFC 8058 one-click); warn and reject others.
+    method = (
+        (event.get('requestContext') or {})
+        .get('http', {})
+        .get('method', 'GET')
+        .upper()
+    )
+    if method not in ('GET', 'POST'):
+        logger.warning('Unsubscribe request: unexpected method=%s -- returning 403', method)
+        return _403()
+
     # Extract query params (Function URL places them under queryStringParameters)
     qs = event.get('queryStringParameters') or {}
     token = qs.get('t', '').strip()
 
     if not token:
         logger.warning('Unsubscribe request: missing token param')
+        return _403()
+
+    # Reject oversized tokens before any decode attempt.
+    token_len = len(token)
+    if token_len > MAX_TOKEN_LEN:
+        logger.warning(
+            'Unsubscribe request: token too long (len=%d) -- rejecting without decode',
+            token_len,
+        )
         return _403()
 
     # Fetch signing key
