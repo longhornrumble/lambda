@@ -107,7 +107,7 @@ function getSESFromEmail() {
   const email = process.env.SES_FROM_EMAIL;
   if (!email) {
     if (!sesEmailWarningLogged) {
-      console.warn('⚠️ SES_FROM_EMAIL not set - using fallback notify@myrecruiter.ai');
+      console.warn('⚠️ SENDER_ENV_MISSING — using hardcoded fallback notify@myrecruiter.ai; set SES_FROM_EMAIL');
       sesEmailWarningLogged = true;
     }
     return 'notify@myrecruiter.ai';
@@ -1874,5 +1874,6 @@ module.exports = {
   handleFormMode,
   validateFormField,
   submitForm,
+  getSESFromEmail,
   SmsRateLimitError
 };

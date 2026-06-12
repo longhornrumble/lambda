@@ -33,6 +33,9 @@ const ses = new SESClient(sdkConfig({ region: SES_REGION }));
 const ddb = new DynamoDBClient(sdkConfig({ region: SES_REGION }));
 
 const FROM_EMAIL = process.env.SES_FROM_EMAIL || 'notify@myrecruiter.ai';
+if (!process.env.SES_FROM_EMAIL) {
+  console.warn('SENDER_ENV_MISSING — using hardcoded fallback notify@myrecruiter.ai; set SES_FROM_EMAIL');
+}
 const CONFIG_SET = process.env.SES_CONFIGURATION_SET || 'picasso-emails';
 // §13.8 — token action endpoints live on the greenfield schedule.* host.
 const SCHEDULE_BASE_URL = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
@@ -371,6 +374,7 @@ async function sendConfirmationEmail(args, opts = {}) {
 }
 
 module.exports = {
+  FROM_EMAIL,
   sendConfirmationEmail,
   buildIcs,
   buildActionLinks,
