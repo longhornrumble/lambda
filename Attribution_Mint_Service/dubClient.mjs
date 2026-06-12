@@ -89,8 +89,20 @@ export async function dubMintLink(apiKey, { destinationUrl, entryPointId, tenant
   }
 
   if (!response.ok) {
-    // Log status only — never log the body (may contain key reflections or config data)
-    throw new DubError(`Dub POST /links returned HTTP ${response.status}`);
+    // Surface Dub's structured error code/message (no PII, no credentials in
+    // Dub error bodies) — debugging blind cost three deploy cycles 2026-06-12.
+    // Never log the raw body verbatim; extract the two known fields only.
+    let dubCode = '';
+    let dubMessage = '';
+    try {
+      const errBody = await response.json();
+      dubCode = errBody?.error?.code ?? '';
+      dubMessage = (errBody?.error?.message ?? '').slice(0, 200);
+    } catch { /* non-JSON body — status alone */ }
+    throw new DubError(
+      `Dub POST /links returned HTTP ${response.status}` +
+      (dubCode ? ` (${dubCode}: ${dubMessage})` : ''),
+    );
   }
 
   const data = await response.json();
