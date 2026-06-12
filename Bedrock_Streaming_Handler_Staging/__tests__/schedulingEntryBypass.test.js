@@ -42,9 +42,15 @@ jest.mock('../scheduling/schedulingFlow', () => ({
   runSchedulingTurn: jest.fn(async () => ({ handled: false })),
 }));
 // The seam under test: the bypass must call this with bedrock:null and end the stream.
-jest.mock('../scheduling/newBookingEntry', () => ({
-  runNewBookingEntry: jest.fn(),
-}));
+// EMAIL_SHAPE stays REAL — index.js gates the email-capture path on it.
+jest.mock('../scheduling/newBookingEntry', () => {
+  const actual = jest.requireActual('../scheduling/newBookingEntry');
+  return {
+    runNewBookingEntry: jest.fn(),
+    captureAttendeeEmail: jest.fn(),
+    EMAIL_SHAPE: actual.EMAIL_SHAPE,
+  };
+});
 
 global.awslambda = {
   streamifyResponse: jest.fn((handler) => async (event, responseStream, context) =>
@@ -54,7 +60,7 @@ global.awslambda = {
 
 const { loadConfig, retrieveKB } = require('../../shared/bedrock-core');
 const { enhanceResponse } = require('../response_enhancer');
-const { runNewBookingEntry } = require('../scheduling/newBookingEntry');
+const { runNewBookingEntry, captureAttendeeEmail } = require('../scheduling/newBookingEntry');
 
 const indexModule = require('../index');
 
@@ -121,21 +127,26 @@ function clickEvent(overrides = {}) {
   };
 }
 
+// File-scope resets: BOTH describe blocks below share these mocks — a describe-scoped
+// beforeEach left the second block with accumulated state (found the hard way).
+beforeEach(() => {
+  bedrockMock.reset();
+  loadConfig.mockReset();
+  retrieveKB.mockReset();
+  enhanceResponse.mockReset();
+  runNewBookingEntry.mockReset();
+  captureAttendeeEmail.mockReset();
+  captureAttendeeEmail.mockResolvedValue({ captured: false, reason: 'no_confirming_session' });
+
+  loadConfig.mockResolvedValue(schedulingConfig);
+  retrieveKB.mockResolvedValue('kb context');
+  enhanceResponse.mockResolvedValue({ message: '', ctaButtons: [], metadata: {} });
+  runNewBookingEntry.mockResolvedValue({ handled: true });
+
+  process.env.CONFIG_BUCKET = 'test-bucket';
+});
+
 describe('start_scheduling deterministic entry bypass', () => {
-  beforeEach(() => {
-    bedrockMock.reset();
-    loadConfig.mockReset();
-    retrieveKB.mockReset();
-    enhanceResponse.mockReset();
-    runNewBookingEntry.mockReset();
-
-    loadConfig.mockResolvedValue(schedulingConfig);
-    retrieveKB.mockResolvedValue('kb context');
-    enhanceResponse.mockResolvedValue({ message: '', ctaButtons: [], metadata: {} });
-    runNewBookingEntry.mockResolvedValue({ handled: true });
-
-    process.env.CONFIG_BUCKET = 'test-bucket';
-  });
 
   it('bypasses Bedrock entirely and runs the entry hook with bedrock:null', async () => {
     const responseStream = mockResponseStream();
@@ -215,5 +226,122 @@ describe('start_scheduling deterministic entry bypass', () => {
     expect(chunks).toContain('[DONE]');
     expect(responseStream.end).toHaveBeenCalled();
     expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(0);
+  });
+});
+
+describe('deterministic click router — select / confirm / email-capture turns', () => {
+  it('select_slot click routes deterministically; identity known → "lock it in" copy', async () => {
+    runNewBookingEntry.mockResolvedValue({ handled: true, state: 'confirming', identity: true });
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({
+        routing_metadata: { scheduling_action: 'select_slot', scheduling_slot_id: 's1', cta_triggered: false },
+        user_input: 'Fri, Jun 12 · 9:00 AM',
+      }),
+      responseStream,
+      {}
+    );
+    expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(0);
+    expect(runNewBookingEntry).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bedrock: null,
+        routingMetadata: expect.objectContaining({ scheduling_action: 'select_slot', scheduling_slot_id: 's1' }),
+      })
+    );
+    const chunks = responseStream.getChunks().join('');
+    expect(chunks).toContain('lock it in');
+    expect(chunks).not.toContain(ENTRY_COPY); // entry copy is the CTA turn's line, not select's
+    expect(chunks).toContain('[DONE]');
+  });
+
+  it('select_slot click without identity → email-ask copy', async () => {
+    runNewBookingEntry.mockResolvedValue({ handled: true, state: 'confirming', identity: false });
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({ routing_metadata: { scheduling_action: 'select_slot', scheduling_slot_id: 's1' } }),
+      responseStream,
+      {}
+    );
+    expect(responseStream.getChunks().join('')).toContain('best email');
+  });
+
+  it('select_slot rejected (stale/spoofed slot) → slot-gone copy', async () => {
+    runNewBookingEntry.mockResolvedValue({ handled: true, rejected: true, reason: 'unknown_slot' });
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({ routing_metadata: { scheduling_action: 'select_slot', scheduling_slot_id: 'zz' } }),
+      responseStream,
+      {}
+    );
+    expect(responseStream.getChunks().join('')).toContain("isn't available anymore");
+  });
+
+  it('confirm_book click executed → booked copy; no Bedrock', async () => {
+    runNewBookingEntry.mockResolvedValue({ handled: true, action: 'confirm_book', executed: true, state: 'booked' });
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({ routing_metadata: { scheduling_action: 'confirm_book' } }),
+      responseStream,
+      {}
+    );
+    expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(0);
+    expect(responseStream.getChunks().join('')).toContain('Booked!');
+  });
+
+  it('confirm_book click held at identity_required → email-ask copy, no crash', async () => {
+    runNewBookingEntry.mockResolvedValue({ handled: true, executed: false, rejected: true, reason: 'identity_required' });
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({ routing_metadata: { scheduling_action: 'confirm_book' } }),
+      responseStream,
+      {}
+    );
+    expect(responseStream.getChunks().join('')).toContain('best email');
+  });
+
+  it('bare email turn with a confirming session → captured, "Got it" copy, no Bedrock', async () => {
+    captureAttendeeEmail.mockResolvedValue({ captured: true, email: 'vol@example.com' });
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({ routing_metadata: {}, user_input: 'vol@example.com' }),
+      responseStream,
+      {}
+    );
+    expect(captureAttendeeEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'vol@example.com', sessionId: 'sess-bypass-1' })
+    );
+    expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(0);
+    const chunks = responseStream.getChunks().join('');
+    expect(chunks).toContain('Got it — vol@example.com');
+    expect(chunks).toContain('[DONE]');
+  });
+
+  it('bare email with NO in-flight session → falls through to normal chat (Bedrock runs)', async () => {
+    captureAttendeeEmail.mockResolvedValue({ captured: false, reason: 'no_confirming_session' });
+    bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(bedrockStream(['Sure!']));
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({ routing_metadata: {}, user_input: 'someone@example.com' }),
+      responseStream,
+      {}
+    );
+    expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(1);
+    expect(responseStream.getChunks().join('')).not.toContain('Got it —');
+  });
+
+  it('scheduling disabled: select_slot click falls through to normal chat', async () => {
+    loadConfig.mockResolvedValue(noSchedulingConfig);
+    bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(bedrockStream(['Hi']));
+    // Pollution guard: a prior test's post-stream tail can land a late send on the
+    // shared client mock — count from a clean history so this asserts THIS turn only.
+    bedrockMock.resetHistory();
+    const responseStream = mockResponseStream();
+    await indexModule.handler(
+      clickEvent({ routing_metadata: { scheduling_action: 'select_slot', scheduling_slot_id: 's1' } }),
+      responseStream,
+      {}
+    );
+    expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(1);
+    expect(runNewBookingEntry).not.toHaveBeenCalled();
   });
 });

@@ -661,18 +661,35 @@ async function runNewBookingTurn({
       });
     }
 
-    // The detector output is ADVISORY only — the C9 state machine (transition() below), NOT
-    // this prompt, is the primary defense against a fabricated/injected action: every action
-    // is gated through stateMachine.transition, so a spoofed `confirm_book` from the wrong
-    // state is rejected regardless of what the detector returns.
-    const detected = await detectNewBookingAction({
-      responseText,
-      conversationHistory,
-      session: { state },
-      config,
-      bedrock,
-      logger,
-    });
+    // §B16b amendment (deterministic pipeline): the widget's slot-chip / confirm-button
+    // clicks carry scheduling_action (+ scheduling_slot_id for select) in routing_metadata —
+    // a deterministic source consumed BEFORE the LLM detector, exactly like the §B16e
+    // day-selected signal above. The detector remains the fallback for typed text only.
+    // The §B14 boundary is UNCHANGED either way: every action below still gates through
+    // stateMachine.transition + persisted-state validation (a spoofed signal with a slotId
+    // not in persisted candidate_slots is rejected as unknown_slot; confirm_book from a
+    // non-confirming state throws IllegalStateTransition).
+    let detected;
+    if (deps.schedulingAction === 'select_slot' || deps.schedulingAction === 'confirm_book') {
+      detected = { action: deps.schedulingAction };
+      if (deps.schedulingAction === 'select_slot' && deps.schedulingSlotId != null) {
+        detected.slotId = String(deps.schedulingSlotId);
+      }
+      logger.info && logger.info(`[WS-NEWBOOK] deterministic widget action: ${detected.action}`);
+    } else {
+      // The detector output is ADVISORY only — the C9 state machine (transition() below), NOT
+      // this prompt, is the primary defense against a fabricated/injected action: every action
+      // is gated through stateMachine.transition, so a spoofed `confirm_book` from the wrong
+      // state is rejected regardless of what the detector returns.
+      detected = await detectNewBookingAction({
+        responseText,
+        conversationHistory,
+        session: { state },
+        config,
+        bedrock,
+        logger,
+      });
+    }
     const action = detected.action;
 
     try {
@@ -749,9 +766,23 @@ async function runNewBookingTurn({
             // carry the propose metadata forward so the commit turn can read it.
             proposal: prior && prior.proposal,
             rejected_slot_ids: prior && prior.rejected_slot_ids,
+            // §B16d amendment: a previously chat-captured email survives re-selection.
+            attendee_email: prior && prior.attendee_email,
           });
         }
-        return { handled: true, executed: false, action, state: 'confirming' };
+        // Deterministic pipeline: the confirm affordance is SERVER-driven. With identity
+        // already resolved, arm it now via `scheduling_confirm`; otherwise the caller asks
+        // for the email and captureAttendeeEmail re-arms it on the capture turn.
+        const attendeeEmail = ctxAttendeeEmail(qctx);
+        if (attendeeEmail && typeof write === 'function') {
+          write(`data: ${JSON.stringify({
+            type: 'scheduling_confirm',
+            session_id: sessionId,
+            slot: { slotId: chosen.slotId, label: chosen.label },
+            attendee_email: attendeeEmail,
+          })}\n\n`);
+        }
+        return { handled: true, executed: false, action, state: 'confirming', identity: !!attendeeEmail, selected_label: chosen.label };
       }
 
       // ── action === 'none' ──
