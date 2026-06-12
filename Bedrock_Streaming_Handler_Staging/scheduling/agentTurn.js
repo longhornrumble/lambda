@@ -81,6 +81,8 @@ const {
   AGENT_TOOL_DEFINITIONS,
   executeGetAvailableTimes,
   executeRequestBookingConfirmation,
+  DEFAULT_AGENT_TIME_ZONE,
+  timeZoneForQctx,
 } = require('./agentTools');
 const { checkSensitiveContext, userSideTranscript } = require('./sensitiveContext');
 // Shipped server-side qualifying-context resolver (appointment type / timezone) — the
@@ -95,7 +97,10 @@ const MAX_TOOL_ITERATIONS = 3;
 const MAX_HISTORY_MESSAGES = 12;
 
 // agent_turn_summary.prompt_version (§B17g) — bump when AGENT_NARRATION_RULES changes.
-const PROMPT_VERSION = 'b17e.v4';
+// v5 (2026-06-12): rule 16 — day-part bounds (after_time/before_time) for
+// morning/afternoon/evening asks (live defect: unbounded re-queries of a 9:00–17:00
+// day always return mornings → the model honestly mis-narrated afternoons as closed).
+const PROMPT_VERSION = 'b17e.v5';
 
 // §B17b overflow: templated warm-honest copy (verbatim) + the shipped async-escape SSE.
 const OVERFLOW_COPY = 'I ran into a snag — let me get someone to help.';
@@ -153,6 +158,11 @@ const AGENT_NARRATION_RULES = [
     'automatically. NEVER enumerate individual times in your text — summarize instead ' +
     "('Monday and Tuesday mornings are both open — tap a time below') and ask ONE " +
     'closing question.',
+  "16. For time-of-day requests (morning/afternoon/evening/'after 3'), pass " +
+    'after_time/before_time with the date. Afternoon = 12:00–17:00, evening = 17:00 ' +
+    'onward, morning = before 12:00. The tool returns the earliest openings within ' +
+    'whatever bounds you give — without bounds you only see the earliest times of the ' +
+    'day, so NEVER conclude a time-of-day is unavailable without a bounded query.',
 ].join('\n');
 
 // ─── §B17h kill-switch guard ───────────────────────────────────────────────────────────
@@ -211,8 +221,6 @@ function buildStateLine(sessionRow) {
 // FALSE "nothing Monday/Tuesday". Rule 14 above tells it to pass `date`; the today-line
 // gives it the anchor to compute one.
 
-const DEFAULT_AGENT_TIME_ZONE = 'America/Chicago';
-
 /**
  * Resolve the timezone the today-line is computed in: appointment-type timezone first
  * (qctx — prefers the integrator's deps.qualifyingContext, the same seam agentTools
@@ -221,6 +229,10 @@ const DEFAULT_AGENT_TIME_ZONE = 'America/Chicago';
  * to 'UTC' when nothing is configured — for DATE awareness that default is treated as
  * unresolved (UTC mis-states "today" for US evenings), so the platform home zone wins
  * instead. An appointment type EXPLICITLY configured to 'UTC' is honored.
+ *
+ * The precedence itself lives in agentTools.timeZoneForQctx (2026-06-12 daypart
+ * amendment) — ONE source of truth, so the model's date anchor and the
+ * after_time/before_time bound instants always resolve in the SAME zone.
  *
  * @param {object} params - { tenantConfig, deps }
  * @returns {string} IANA timezone
@@ -236,12 +248,7 @@ function resolveAgentTimeZone({ tenantConfig, deps } = {}) {
       qctx = null; // resolver failure must never kill the turn — default tz instead
     }
   }
-  const apptType = qctx && qctx.appointment_type;
-  const apptTz = apptType && (apptType.timezone || apptType.time_zone);
-  if (apptTz) return apptTz;
-  const userTz = qctx && (qctx.userTimeZone || qctx.user_time_zone);
-  if (userTz && userTz !== 'UTC') return userTz;
-  return DEFAULT_AGENT_TIME_ZONE;
+  return timeZoneForQctx(qctx);
 }
 
 /**
@@ -328,8 +335,9 @@ function emitAudit(deps, event) {
 }
 
 // agent_tool_call — built field-by-field from the §B17g allowlist; tool args are
-// reduced to: slot_id (opaque id), date (the YYYY-MM-DD arg), exclude_slot_ids
-// (opaque ids), email_present (boolean — NEVER the email).
+// reduced to: slot_id (opaque id), date (the YYYY-MM-DD arg), after_time/before_time
+// (the 'HH:MM' day-part bounds — non-PII civil times; 2026-06-12 amendment),
+// exclude_slot_ids (opaque ids), email_present (boolean — NEVER the email).
 function emitAgentToolCall(deps, { tenantId, sessionId, tool, outcome, latencyMs, iteration, input }) {
   const evt = {
     event_type: 'agent_tool_call',
@@ -343,6 +351,8 @@ function emitAgentToolCall(deps, { tenantId, sessionId, tool, outcome, latencyMs
   };
   if (input && typeof input.slot_id === 'string') evt.slot_id = input.slot_id;
   if (input && typeof input.date === 'string') evt.date = input.date;
+  if (input && typeof input.after_time === 'string') evt.after_time = input.after_time;
+  if (input && typeof input.before_time === 'string') evt.before_time = input.before_time;
   if (input && Array.isArray(input.exclude_slot_ids)) {
     evt.exclude_slot_ids = input.exclude_slot_ids.filter((v) => typeof v === 'string');
   }
