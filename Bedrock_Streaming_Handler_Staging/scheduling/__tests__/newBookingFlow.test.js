@@ -868,3 +868,140 @@ describe('runNewBookingTurn — pin tests (fix #10)', () => {
     expect(savedArg.state).toBe('proposing'); // did advance
   });
 });
+
+// ── §B16b amendment: deterministic widget actions (slot-chip / confirm clicks) ──────────
+// The widget's scheduling_action (+ scheduling_slot_id) signal is consumed BEFORE the LLM
+// detector — the detector model must never be invoked on a click turn, and every §B14
+// guard (transition + persisted-candidate validation) still applies to the signal.
+
+describe('runNewBookingTurn — deterministic widget actions (§B16b amendment)', () => {
+  test('select_slot click: detector NOT called; proposing → confirming; scheduling_confirm emitted when identity known', async () => {
+    const saveState = jest.fn();
+    const bedrock = { send: jest.fn() };
+    const writes = [];
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock,
+      write: (s) => writes.push(s),
+      deps: {
+        schedulingAction: 'select_slot',
+        schedulingSlotId: 's1',
+        loadState: async () => ({ state: 'proposing', candidate_slots: [SLOT], proposal: { poolSize: 2 } }),
+        qualifyingContext: QCTX,
+        saveState,
+      },
+    }));
+    expect(bedrock.send).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ handled: true, executed: false, action: 'select_slot', state: 'confirming', identity: true });
+    const confirmEvt = writes.find((w) => w.includes('"scheduling_confirm"'));
+    expect(confirmEvt).toBeDefined();
+    const parsed = JSON.parse(confirmEvt.replace(/^data: /, '').trim());
+    expect(parsed).toMatchObject({
+      type: 'scheduling_confirm',
+      session_id: 'sess-1',
+      slot: { slotId: 's1', label: SLOT.label },
+      attendee_email: 'vol@example.com',
+    });
+  });
+
+  test('select_slot click without identity: confirming + identity:false, NO scheduling_confirm yet', async () => {
+    const writes = [];
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: { send: jest.fn() },
+      write: (s) => writes.push(s),
+      deps: {
+        schedulingAction: 'select_slot',
+        schedulingSlotId: 's1',
+        loadState: async () => ({ state: 'proposing', candidate_slots: [SLOT] }),
+        qualifyingContext: QCTX_NO_EMAIL,
+        saveState: jest.fn(),
+      },
+    }));
+    expect(res).toMatchObject({ handled: true, state: 'confirming', identity: false });
+    expect(writes.find((w) => w.includes('"scheduling_confirm"'))).toBeUndefined();
+  });
+
+  test('spoofed select_slot signal with unknown slotId → rejected unknown_slot (persisted-state guard holds)', async () => {
+    const saveState = jest.fn();
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: { send: jest.fn() },
+      deps: {
+        schedulingAction: 'select_slot',
+        schedulingSlotId: 'not-a-candidate',
+        loadState: async () => ({ state: 'proposing', candidate_slots: [SLOT] }),
+        qualifyingContext: QCTX,
+        saveState,
+      },
+    }));
+    expect(res).toMatchObject({ handled: true, rejected: true, reason: 'unknown_slot' });
+    expect(saveState).not.toHaveBeenCalled();
+  });
+
+  test('confirm_book click from confirming with identity: commits deterministically (no detector)', async () => {
+    const bedrock = { send: jest.fn() };
+    const invokeBookingCommit = jest.fn().mockResolvedValue({
+      status: 'BOOKED', bookingId: 'bk-1', resourceId: 'maya@org.example',
+    });
+    const saveState = jest.fn();
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock,
+      write: jest.fn(),
+      deps: {
+        schedulingAction: 'confirm_book',
+        loadState: async () => ({ state: 'confirming', selected_slot: SLOT, proposal: { poolSize: 2 } }),
+        qualifyingContext: QCTX,
+        saveState,
+        invokeBookingCommit,
+      },
+    }));
+    expect(bedrock.send).not.toHaveBeenCalled();
+    expect(invokeBookingCommit).toHaveBeenCalledTimes(1);
+    expect(res).toMatchObject({ handled: true, action: 'confirm_book', executed: true, state: 'booked' });
+  });
+
+  test('confirm_book click without identity → identity_required, NO commit', async () => {
+    const invokeBookingCommit = jest.fn();
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: { send: jest.fn() },
+      deps: {
+        schedulingAction: 'confirm_book',
+        loadState: async () => ({ state: 'confirming', selected_slot: SLOT }),
+        qualifyingContext: QCTX_NO_EMAIL,
+        saveState: jest.fn(),
+        invokeBookingCommit,
+      },
+    }));
+    expect(res).toMatchObject({ handled: true, executed: false, rejected: true, reason: 'identity_required' });
+    expect(invokeBookingCommit).not.toHaveBeenCalled();
+  });
+
+  test('spoofed confirm_book click from proposing → IllegalStateTransition, NO commit', async () => {
+    const invokeBookingCommit = jest.fn();
+    const res = await runNewBookingTurn(baseTurn({
+      bedrock: { send: jest.fn() },
+      deps: {
+        schedulingAction: 'confirm_book',
+        loadState: async () => ({ state: 'proposing', candidate_slots: [SLOT] }),
+        qualifyingContext: QCTX,
+        invokeBookingCommit,
+      },
+    }));
+    expect(res).toMatchObject({ handled: true, rejected: true });
+    expect(res.reason).toMatch(/Illegal/i);
+    expect(invokeBookingCommit).not.toHaveBeenCalled();
+  });
+
+  test('select_slot carries a prior chat-captured attendee_email forward on saveState', async () => {
+    const saveState = jest.fn();
+    await runNewBookingTurn(baseTurn({
+      bedrock: { send: jest.fn() },
+      deps: {
+        schedulingAction: 'select_slot',
+        schedulingSlotId: 's1',
+        loadState: async () => ({ state: 'proposing', candidate_slots: [SLOT], attendee_email: 'kept@example.com' }),
+        qualifyingContext: QCTX_NO_EMAIL,
+        saveState,
+      },
+    }));
+    expect(saveState).toHaveBeenCalledWith(expect.objectContaining({ attendee_email: 'kept@example.com' }));
+  });
+});

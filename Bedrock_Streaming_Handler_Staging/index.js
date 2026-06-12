@@ -39,12 +39,19 @@ const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
 // WS-NEWBOOK (B-remainder §B16d): the in-chat NEW-booking entry-hook. No-op for normal chat +
 // the recovery loop; engages on the widget's scheduling_intent:'new_booking' signal or an
 // in-flight new-booking session row.
-const { runNewBookingEntry } = require('./scheduling/newBookingEntry');
-// Deterministic-entry copy (§B16d hardening): the start_scheduling click bypasses Bedrock,
-// so these templated lines are the ONLY assistant text on that turn.
+const { runNewBookingEntry, captureAttendeeEmail, EMAIL_SHAPE } = require('./scheduling/newBookingEntry');
+// Deterministic-pipeline copy: scheduling CLICK turns (entry / select / confirm) and the
+// email-capture turn bypass Bedrock, so these templated lines are the ONLY assistant text.
 const SCHEDULING_ENTRY_COPY = 'Happy to set that up — let me pull up some openings for you…';
 const SCHEDULING_ENTRY_FALLBACK_COPY =
   "I couldn't pull up available times just now. Please try again in a few minutes.";
+const SCHEDULING_EMAIL_ASK_COPY = "Great choice! What's the best email for the calendar invite?";
+const SCHEDULING_CONFIRM_READY_COPY = 'Perfect — tap "Yes, book it" and I\'ll lock it in.';
+const SCHEDULING_SLOT_GONE_COPY =
+  'That time isn\'t available anymore — tap another slot, or say "more times".';
+const SCHEDULING_BOOKED_COPY = 'Booked! Your calendar invite is on its way.';
+const SCHEDULING_EMAIL_GOT_COPY = (email) =>
+  `Got it — ${email}. Tap "Yes, book it" to confirm your time.`;
 const { buildSchedulingDeps } = require('./scheduling/schedulingStateStore');
 const { corsHeaders } = require('./cors-helper');
 
@@ -468,34 +475,25 @@ const streamingHandler = async (event, responseStream, context) => {
       }
     }
 
-    // start_scheduling CTA click — a DETERMINISTIC route, not a chat turn (mirrors the
-    // show_showcase bypass above). The click carries zero ambiguity, and streaming a KB
-    // answer here co-mingles legacy KB scheduling copy with the live booking flow and
-    // narrates outcomes the state machine never produced (QA 2026-06-12, P0-2). Emit one
-    // templated line, then run the §B16d entry hook with `bedrock: null` — its action
-    // detector is fail-closed to {action:'none'} without a client, so the qualifying
-    // session is created and propose → scheduling_slots fires with NO model call anywhere.
-    // Scheduling disabled → fall through to normal chat (unchanged behavior, fail-open
-    // to plain conversation like every other CTA).
-    if (routingMetadata.scheduling_intent === 'new_booking' && isSchedulingEnabled(config)) {
-      console.log('📅 start_scheduling click detected — bypassing Bedrock for deterministic scheduling entry');
-      try {
-        write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_ENTRY_COPY, session_id: sessionId })}\n\n`);
-        const entry = await runNewBookingEntry({
-          responseText: '',
-          conversationHistory,
-          tenantId: config?.tenant_id,
-          sessionId,
-          config,
-          bedrock: null, // deterministic entry — never invoke the detector model
-          write,
-          routingMetadata,
-          deps: { ...schedulingDeps, ...newBookingDep },
-        });
-        if (!entry || entry.handled !== true) {
-          // Never leave the click in dead air (propose seam down, entry error, etc.)
-          write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_ENTRY_FALLBACK_COPY, session_id: sessionId })}\n\n`);
-        }
+    // Scheduling CLICK turns — DETERMINISTIC routes, not chat turns (mirrors the
+    // show_showcase bypass above). Clicks carry zero ambiguity, and streaming a KB
+    // answer co-mingles legacy KB scheduling copy with the live booking flow and
+    // narrates outcomes the state machine never produced (QA 2026-06-12, P0-2).
+    //   • entry  — scheduling_intent:'new_booking' (start_scheduling CTA)
+    //   • select — scheduling_action:'select_slot' + scheduling_slot_id (slot chip)
+    //   • confirm— scheduling_action:'confirm_book' (confirm button)
+    // Each runs the §B16d entry hook with `bedrock: null` — the action detector is
+    // fail-closed without a client, and the widget signal is consumed deterministically
+    // by the flow (§B16b amendment) — so NO model call happens anywhere on a click turn.
+    // Scheduling disabled → fall through to normal chat (unchanged behavior).
+    const widgetSchedulingAction =
+      routingMetadata.scheduling_action === 'select_slot' || routingMetadata.scheduling_action === 'confirm_book'
+        ? routingMetadata.scheduling_action
+        : null;
+    const isSchedulingEntryClick = routingMetadata.scheduling_intent === 'new_booking';
+    if ((isSchedulingEntryClick || widgetSchedulingAction) && isSchedulingEnabled(config)) {
+      console.log(`📅 scheduling click turn (${widgetSchedulingAction || 'new_booking entry'}) — bypassing Bedrock for deterministic handling`);
+      const endSchedulingTurn = () => {
         write('data: [DONE]\n\n');
         if (heartbeatInterval) {
           clearInterval(heartbeatInterval);
@@ -503,10 +501,70 @@ const streamingHandler = async (event, responseStream, context) => {
         }
         streamEnded = true;
         responseStream.end();
+      };
+      try {
+        if (isSchedulingEntryClick && !widgetSchedulingAction) {
+          write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_ENTRY_COPY, session_id: sessionId })}\n\n`);
+        }
+        const entry = await runNewBookingEntry({
+          responseText: '',
+          conversationHistory,
+          tenantId: config?.tenant_id,
+          sessionId,
+          config,
+          bedrock: null, // deterministic turn — never invoke the detector model
+          write,
+          routingMetadata,
+          deps: { ...schedulingDeps, ...newBookingDep },
+        });
+        // Outcome copy — the flow has already emitted its structured events
+        // (scheduling_slots / scheduling_confirm / scheduling_booked / notice);
+        // this is the human-readable line that accompanies them.
+        let copy = null;
+        if (widgetSchedulingAction === 'select_slot') {
+          if (entry?.state === 'confirming' && entry?.identity) copy = SCHEDULING_CONFIRM_READY_COPY;
+          else if (entry?.state === 'confirming') copy = SCHEDULING_EMAIL_ASK_COPY;
+          else copy = SCHEDULING_SLOT_GONE_COPY; // unknown_slot / illegal transition / stale click
+        } else if (widgetSchedulingAction === 'confirm_book') {
+          if (entry?.executed) copy = SCHEDULING_BOOKED_COPY;
+          else if (entry?.fallback === 'email') copy = null; // flow emitted the §9.3 notice
+          else if (entry?.reason === 'identity_required') copy = SCHEDULING_EMAIL_ASK_COPY;
+          else if (entry?.reason === 'slot_unavailable') copy = SCHEDULING_SLOT_GONE_COPY;
+          else copy = SCHEDULING_ENTRY_FALLBACK_COPY;
+        } else if (!entry || entry.handled !== true) {
+          // Entry click: never leave it in dead air (propose seam down, entry error, etc.)
+          copy = SCHEDULING_ENTRY_FALLBACK_COPY;
+        }
+        if (copy) {
+          write(`data: ${JSON.stringify({ type: 'text', content: copy, session_id: sessionId })}\n\n`);
+        }
+        endSchedulingTurn();
         return;
       } catch (error) {
-        console.error('Scheduling entry bypass error:', error);
+        console.error('Scheduling click turn error:', error);
         write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_ENTRY_FALLBACK_COPY, session_id: sessionId })}\n\n`);
+        endSchedulingTurn();
+        return;
+      }
+    }
+
+    // Deterministic email capture (§B16d amendment): an in-flight booking holding at
+    // `confirming` without identity asked the user for their email. A bare email-shaped
+    // message is that answer — capture it without a model call (the KB has nothing to
+    // say to an email address). Cheap regex gates the state read; any non-capture
+    // outcome (no in-flight session, wrong state) falls through to normal chat.
+    // §B14 holds: capture NEVER commits — the user still taps the (re-armed) confirm button.
+    if (isSchedulingEnabled(config) && typeof userInput === 'string' && EMAIL_SHAPE.test(userInput.trim())) {
+      const cap = await captureAttendeeEmail({
+        tenantId: config?.tenant_id,
+        sessionId,
+        email: userInput.trim(),
+        deps: schedulingDeps,
+        write,
+      });
+      if (cap.captured) {
+        console.log('📅 attendee email captured for confirming session — bypassing Bedrock');
+        write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_EMAIL_GOT_COPY(cap.email), session_id: sessionId })}\n\n`);
         write('data: [DONE]\n\n');
         if (heartbeatInterval) {
           clearInterval(heartbeatInterval);

@@ -59,7 +59,7 @@ function buildSchedulingDeps({ sessionTable, bookingTable, region, client } = {}
   // C9 state row write. PUTs the plain-<sessionId> row — never touches the
   // `binding#<sessionId>` row, so the §B10 binding is preserved. Guards `state`
   // (DDB rejects a null/undefined attribute, audit S-2).
-  async function saveState({ tenantId, sessionId, state, candidate_slots, selected_slot, proposal, rejected_slot_ids } = {}) {
+  async function saveState({ tenantId, sessionId, state, candidate_slots, selected_slot, proposal, rejected_slot_ids, attendee_email } = {}) {
     if (!tenantId || !sessionId || !state) return;
     const item = { tenantId, session_id: sessionId, state, updated_at: new Date().toISOString() };
     if (candidate_slots !== undefined) item.candidate_slots = candidate_slots;
@@ -69,6 +69,9 @@ function buildSchedulingDeps({ sessionTable, bookingTable, region, client } = {}
     // accumulated rejected slot ids so the "more times" self-loop re-proposes fresh times.
     if (proposal !== undefined) item.proposal = proposal;
     if (rejected_slot_ids !== undefined) item.rejected_slot_ids = rejected_slot_ids;
+    // §B16d amendment (deterministic pipeline): chat-captured attendee email rides the
+    // session row so the commit's identity gate can pass without a form submission.
+    if (attendee_email !== undefined) item.attendee_email = attendee_email;
     try {
       await ddb.send(new PutCommand({ TableName: sessionTable, Item: item }));
     } catch (err) {

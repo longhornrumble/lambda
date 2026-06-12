@@ -183,7 +183,18 @@ async function runNewBookingEntry({
     // so the commit can complete. Injectable for tests; defaults to the form-injection read.
     // Non-fatal → null → the flow holds at `confirming` (identity_required), never breaks chat.
     const sourceAttendee = deps.getSessionAttendee || resolveSessionAttendee;
-    const attendee = await sourceAttendee({ tenantId, sessionId });
+    let attendee = await sourceAttendee({ tenantId, sessionId });
+
+    // §B16d amendment (deterministic pipeline): a chat-captured email persisted on the
+    // session row (captureAttendeeEmail below) is the fallback identity source when no
+    // same-session form submission carries one. Shape-revalidated on read — a stored
+    // value must never bypass the commit's email contract.
+    if (!attendee && prior && typeof prior.attendee_email === 'string') {
+      const storedEmail = prior.attendee_email.trim();
+      if (storedEmail && storedEmail.length <= 254 && EMAIL_SHAPE.test(storedEmail)) {
+        attendee = { email: storedEmail };
+      }
+    }
 
     const qualifyingContext = resolveQualifyingContext({ config, routingMetadata, attendee });
 
@@ -197,8 +208,16 @@ async function runNewBookingEntry({
       write,
       // §B16e: surface the widget's deterministic day-picker signal to the flow
       // (rides routing_metadata like scheduling_intent; the flow validates it
-      // against the offered strip before acting).
-      deps: { ...deps, qualifyingContext, schedulingDaySelected: routingMetadata.scheduling_day_selected },
+      // against the offered strip before acting). §B16b amendment: the slot-chip /
+      // confirm-button clicks ride the same seam (scheduling_action + scheduling_slot_id)
+      // so the flow can act deterministically instead of via the LLM detector.
+      deps: {
+        ...deps,
+        qualifyingContext,
+        schedulingDaySelected: routingMetadata.scheduling_day_selected,
+        schedulingAction: routingMetadata.scheduling_action,
+        schedulingSlotId: routingMetadata.scheduling_slot_id,
+      },
     });
   } catch (err) {
     console.error(`[WS-NEWBOOK] entry-hook failed (non-fatal): error_name=${(err && err.name) || 'unknown'}`);
@@ -206,4 +225,60 @@ async function runNewBookingEntry({
   }
 }
 
-module.exports = { runNewBookingEntry, resolveQualifyingContext, resolveSessionAttendee, IN_FLIGHT_STATES };
+/**
+ * §B16d amendment (deterministic pipeline): capture an attendee email TYPED in chat for an
+ * in-flight new-booking session holding at `confirming`. Deterministic — the caller has
+ * already shape-tested the message as a bare email; this re-validates, requires a
+ * confirming session WITH a selected slot, persists the email on the session row, and
+ * re-arms the widget's confirm affordance via a `scheduling_confirm` SSE.
+ *
+ * NEVER commits (§B14: free text never commits) — the user must still tap the confirm
+ * button, whose click rides scheduling_action:'confirm_book'.
+ *
+ * @param {object} params - { tenantId, sessionId, email, deps: {loadState, saveState}, write }
+ * @returns {Promise<{captured: boolean, email?: string, reason?: string}>}
+ */
+async function captureAttendeeEmail({ tenantId, sessionId, email, deps = {}, write } = {}) {
+  try {
+    if (!tenantId || !sessionId || !deps.loadState || !deps.saveState) {
+      return { captured: false, reason: 'unwired' };
+    }
+    const trimmed = typeof email === 'string' ? email.trim() : '';
+    if (!trimmed || trimmed.length > 254 || !EMAIL_SHAPE.test(trimmed)) {
+      return { captured: false, reason: 'invalid_email' };
+    }
+    const prior = await deps.loadState({ tenantId, sessionId });
+    if (!prior || prior.state !== 'confirming') {
+      return { captured: false, reason: 'no_confirming_session' };
+    }
+    const selected = prior.selected_slot;
+    if (!selected || !selected.slotId) {
+      return { captured: false, reason: 'no_slot_selected' };
+    }
+    await deps.saveState({
+      tenantId,
+      sessionId,
+      state: 'confirming',
+      candidate_slots: prior.candidate_slots,
+      selected_slot: prior.selected_slot,
+      proposal: prior.proposal,
+      rejected_slot_ids: prior.rejected_slot_ids,
+      attendee_email: trimmed,
+    });
+    if (typeof write === 'function') {
+      const fromCandidates = (prior.candidate_slots || []).find((s) => s && s.slotId === selected.slotId);
+      write(`data: ${JSON.stringify({
+        type: 'scheduling_confirm',
+        session_id: sessionId,
+        slot: { slotId: selected.slotId, label: (fromCandidates && fromCandidates.label) || selected.label },
+        attendee_email: trimmed,
+      })}\n\n`);
+    }
+    return { captured: true, email: trimmed };
+  } catch (err) {
+    console.error(`[WS-NEWBOOK] captureAttendeeEmail failed (non-fatal): error_name=${(err && err.name) || 'unknown'}`);
+    return { captured: false, reason: 'error' };
+  }
+}
+
+module.exports = { runNewBookingEntry, resolveQualifyingContext, resolveSessionAttendee, captureAttendeeEmail, EMAIL_SHAPE, IN_FLIGHT_STATES };

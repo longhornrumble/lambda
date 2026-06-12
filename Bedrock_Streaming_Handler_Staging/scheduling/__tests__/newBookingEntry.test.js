@@ -322,3 +322,122 @@ describe('runNewBookingEntry — attendee wiring into qualifyingContext', () => 
     errSpy.mockRestore();
   });
 });
+
+// ── §B16d amendment: chat-captured attendee email (deterministic pipeline) ──────────────
+
+const { captureAttendeeEmail, EMAIL_SHAPE } = require('../newBookingEntry');
+
+describe('runNewBookingEntry — session-row attendee_email fallback', () => {
+  const base = {
+    responseText: 'hi', conversationHistory: [], tenantId: 'T1', sessionId: 'S1',
+    config: { feature_flags: { scheduling_enabled: true }, scheduling: { appointment_types: { apt1: {} } } },
+    bedrock: {}, write: jest.fn(),
+  };
+
+  test('no form attendee + valid prior.attendee_email → qctx.attendee from the session row', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'confirming', attendee_email: 'typed@example.com' });
+    const getSessionAttendee = jest.fn().mockResolvedValue(null);
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState, getSessionAttendee } });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toEqual({ email: 'typed@example.com' });
+  });
+
+  test('form attendee WINS over the session-row email', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'confirming', attendee_email: 'typed@example.com' });
+    const getSessionAttendee = jest.fn().mockResolvedValue({ email: 'form@example.com' });
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState, getSessionAttendee } });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toEqual({ email: 'form@example.com' });
+  });
+
+  test('malformed stored email is rejected on read (never reaches the commit contract)', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'confirming', attendee_email: '<bad@x.com>' });
+    const getSessionAttendee = jest.fn().mockResolvedValue(null);
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState, getSessionAttendee } });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.qualifyingContext.attendee).toBeUndefined();
+  });
+
+  test('widget action signals are threaded into flow deps', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'proposing' });
+    await runNewBookingEntry({
+      ...base,
+      routingMetadata: { scheduling_action: 'select_slot', scheduling_slot_id: 's9' },
+      deps: { loadState, getSessionAttendee: jest.fn().mockResolvedValue(null) },
+    });
+    const flowDeps = runNewBookingTurn.mock.calls[0][0].deps;
+    expect(flowDeps.schedulingAction).toBe('select_slot');
+    expect(flowDeps.schedulingSlotId).toBe('s9');
+  });
+});
+
+describe('captureAttendeeEmail (§B16d amendment) — deterministic, never commits', () => {
+  const PRIOR = Object.freeze({
+    state: 'confirming',
+    selected_slot: { slotId: 's1', start: '2026-06-10T19:00:00Z', end: '2026-06-10T19:30:00Z' },
+    candidate_slots: [{ slotId: 's1', label: 'Wed, Jun 10 · 2:00 PM' }],
+    proposal: { poolSize: 2 },
+    rejected_slot_ids: ['s0'],
+  });
+
+  test('valid capture: persists email preserving ALL prior fields + emits scheduling_confirm', async () => {
+    const saveState = jest.fn();
+    const writes = [];
+    const res = await captureAttendeeEmail({
+      tenantId: 'T1', sessionId: 'S1', email: ' vol@example.com ',
+      deps: { loadState: jest.fn().mockResolvedValue(PRIOR), saveState },
+      write: (s) => writes.push(s),
+    });
+    expect(res).toEqual({ captured: true, email: 'vol@example.com' });
+    expect(saveState).toHaveBeenCalledWith({
+      tenantId: 'T1', sessionId: 'S1', state: 'confirming',
+      candidate_slots: PRIOR.candidate_slots,
+      selected_slot: PRIOR.selected_slot,
+      proposal: PRIOR.proposal,
+      rejected_slot_ids: PRIOR.rejected_slot_ids,
+      attendee_email: 'vol@example.com',
+    });
+    const evt = JSON.parse(writes[0].replace(/^data: /, '').trim());
+    expect(evt).toMatchObject({
+      type: 'scheduling_confirm', session_id: 'S1',
+      slot: { slotId: 's1', label: 'Wed, Jun 10 · 2:00 PM' },
+      attendee_email: 'vol@example.com',
+    });
+  });
+
+  test('invalid email shape → not captured, nothing persisted', async () => {
+    const saveState = jest.fn();
+    const res = await captureAttendeeEmail({
+      tenantId: 'T1', sessionId: 'S1', email: 'not-an-email',
+      deps: { loadState: jest.fn(), saveState },
+    });
+    expect(res).toMatchObject({ captured: false, reason: 'invalid_email' });
+    expect(saveState).not.toHaveBeenCalled();
+  });
+
+  test('no session / wrong state / no selected slot → not captured', async () => {
+    const cases = [
+      [null, 'no_confirming_session'],
+      [{ state: 'proposing' }, 'no_confirming_session'],
+      [{ state: 'confirming' }, 'no_slot_selected'],
+    ];
+    for (const [prior, reason] of cases) {
+      const res = await captureAttendeeEmail({
+        tenantId: 'T1', sessionId: 'S1', email: 'a@b.com',
+        deps: { loadState: jest.fn().mockResolvedValue(prior), saveState: jest.fn() },
+      });
+      expect(res).toMatchObject({ captured: false, reason });
+    }
+  });
+
+  test('loadState throw → fail-soft not captured', async () => {
+    const res = await captureAttendeeEmail({
+      tenantId: 'T1', sessionId: 'S1', email: 'a@b.com',
+      deps: { loadState: jest.fn().mockRejectedValue(new Error('ddb')), saveState: jest.fn() },
+    });
+    expect(res).toMatchObject({ captured: false, reason: 'error' });
+  });
+
+  test('EMAIL_SHAPE is exported and strict (angle brackets / trailing dot rejected)', () => {
+    expect(EMAIL_SHAPE.test('plus+tag@sub.domain.org')).toBe(true);
+    expect(EMAIL_SHAPE.test('<a@b.com>')).toBe(false);
+    expect(EMAIL_SHAPE.test('a@b.com.')).toBe(false);
+  });
+});
