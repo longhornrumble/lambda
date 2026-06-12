@@ -23,6 +23,18 @@
  *     Verify init-token → probe the stored refresh_token: success → connected; invalid_grant →
  *     stamp the secret revoked + report disconnected/bookable:false; 5xx/transient → stale_connected.
  *
+ *   POST /connection/disconnect   body { init:<initToken> }
+ *     §E11b user-initiated disconnect. METHOD-ENFORCED (POST only -- body-carried token). Identity
+ *     is claims-sourced only (token, not query/body). Steps (contract-ordered):
+ *       1. state.verify(init, typ:'init')
+ *       2. Best-effort Google revoke: oauth.revokeToken() -- failure logged WARN, never blocks.
+ *       3. secrets.markDisconnected() -- the shipped stamp (status:'revoked' + disconnected_at).
+ *       4. Best-effort async-invoke Calendar_Watch_Offboarder -- mirrors callback's Onboarder.
+ *     Idempotent: already-revoked or missing secret → 200 { status:'disconnected', watch:'none' }.
+ *     NO jti burn (replay = re-disconnect = idempotent + harmless; token is server-held only).
+ *     Generic errors only -- never leaks the secret path, URL, or failure detail.
+ *     Response: 200 { status:'disconnected', watch:'stopped'|'pending'|'none' }.
+ *
  * SLOT-POISONING DEFENSE: tenant_id/coordinator_id/coordinator_email are read ONLY from the
  * signed init/state token, NEVER from the query string — so a caller cannot *forge* a consent
  * flow into another coordinator's secret slot. RESIDUAL (flagged §E0 / Beta-blocker): the init
@@ -70,6 +82,7 @@ const ENV = process.env.ENVIRONMENT || 'staging';
 const OAUTH_REDIRECT_URI = process.env.OAUTH_REDIRECT_URI || '';
 const DASHBOARD_RETURN_URL = process.env.DASHBOARD_RETURN_URL || '';
 const ONBOARDER_FUNCTION_NAME = process.env.ONBOARDER_FUNCTION_NAME || `Calendar_Watch_Onboarder-${ENV}`;
+const OFFBOARDER_FUNCTION_NAME = process.env.OFFBOARDER_FUNCTION_NAME || `Calendar_Watch_Offboarder-${ENV}`;
 const STATE_TTL_SECONDS = (() => {
   const v = Number(process.env.STATE_TTL_SECONDS || 600);
   if (!Number.isFinite(v) || v <= 0) throw new Error(`Invalid STATE_TTL_SECONDS: ${process.env.STATE_TTL_SECONDS}`);
@@ -210,7 +223,7 @@ async function handleConnect(event) {
   const enabled = await isSchedulingEnabledForTenant(claims.tenant_id);
   if (!enabled) {
     log('connect_scheduling_disabled', { tenant_id: claims.tenant_id });
-    return page(403, 'Scheduling unavailable', '<p>Online scheduling isn’t enabled for this organization.</p>');
+    return page(403, 'Scheduling unavailable', '<p>Online scheduling isn&apos;t enabled for this organization.</p>');
   }
 
   let app;
@@ -318,7 +331,7 @@ async function handleCallback(event) {
   if (q.error) {
     const known = KNOWN_OAUTH_ERRORS.has(String(q.error)) ? String(q.error) : 'unknown';
     log('callback_user_declined', { tenant_id: claims.tenant_id, error: known });
-    return page(200, 'Calendar not connected', '<p>You didn’t finish connecting your calendar. You can return to the dashboard and try again anytime.</p>');
+    return page(200, 'Calendar not connected', '<p>You didn&apos;t finish connecting your calendar. You can return to the dashboard and try again anytime.</p>');
   }
   if (!q.code) {
     log('callback_missing_code', { tenant_id: claims.tenant_id });
@@ -355,7 +368,7 @@ async function handleCallback(event) {
   if (!tokens.refresh_token) {
     // prompt=consent should guarantee one; if missing, do NOT write a useless secret.
     warn('callback_no_refresh_token', { tenant_id: claims.tenant_id });
-    return page(400, 'Couldn’t finish connecting', '<p>We didn’t receive the access we need. Please return to the dashboard and connect again.</p>');
+    return page(400, "Couldn't finish connecting", "<p>We didn't receive the access we need. Please return to the dashboard and connect again.</p>");
   }
 
   // Granted-scope validation (integrator directive #5 / Security N-1): the user can grant a SUBSET
@@ -366,7 +379,7 @@ async function handleCallback(event) {
   const missing = oauth.SCOPES.filter((s) => !grantedScopes.includes(s));
   if (missing.length > 0) {
     warn('callback_insufficient_scope', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id), granted_count: grantedScopes.length });
-    return page(403, 'Couldn’t finish connecting', '<p>We need access to your calendar’s events and free/busy times to schedule. Please return to the dashboard and connect again, accepting all the requested permissions.</p>');
+    return page(403, "Couldn't finish connecting", "<p>We need access to your calendar's events and free/busy times to schedule. Please return to the dashboard and connect again, accepting all the requested permissions.</p>");
   }
 
   const nowIso = new Date().toISOString();
@@ -468,11 +481,136 @@ async function handleStatus(event) {
   }
 }
 
+// ─── fire Offboarder (best-effort async -- §E11b) ──────────────────────────────────────
+// Async (InvocationType:'Event') fire-and-forget. The SDK returns 202 on successful dispatch
+// and throws on any SDK/network error -- it never returns FunctionError on an Event invocation
+// (FunctionError only appears on RequestResponse). So: successful dispatch → ok:true (the
+// disconnect route reports watch:'pending' = dispatched, not confirmed); SDK throw → ok:false
+// (watch:'none' = offboard not dispatched; watch channel cleaned on next expiry/sweep).
+// A failure MUST NOT block or alter the disconnect response -- the stamp is already written.
+async function fireOffboarder({ tenantId, coordinatorId }) {
+  try {
+    await lambda.send(
+      new InvokeCommand({
+        FunctionName: OFFBOARDER_FUNCTION_NAME,
+        InvocationType: 'Event', // async -- 202 on dispatch; never blocks; never FunctionError
+        Payload: Buffer.from(
+          JSON.stringify({ tenant_id: tenantId, coordinator_id: coordinatorId })
+        ),
+      })
+    );
+    return { ok: true };
+  } catch (err) {
+    warn('offboarder_invoke_failed', { tenant_id: tenantId, coordinator_id_hash: coordHash(coordinatorId), name: err && err.name });
+    return { ok: false };
+  }
+}
+
+// ─── route: POST /connection/disconnect (§E11b) ───────────────────────────────────────
+// Body-carried init token (never query-string -- see §E11b contract). Idempotent. Generic
+// errors only -- no secret-path, URL, or failure-detail leak.
+async function handleDisconnect(event) {
+  // Parse JSON body -- tolerate null/empty/invalid (return 400 if init absent/invalid).
+  let body;
+  try {
+    body = JSON.parse((event && event.body) || '{}');
+  } catch (_) {
+    body = {};
+  }
+  const initToken = body && body.init;
+
+  // Step 1: verify the init token (claims-sourced identity -- never body fields).
+  let claims;
+  try {
+    claims = await state.verify(initToken, { expectedType: 'init' });
+  } catch (err) {
+    log('disconnect_init_rejected', { code: err && err.code });
+    return json(400, { error: 'invalid_request' });
+  }
+
+  // §E11b cross-purpose replay defense: reject tokens that lack purpose:'disconnect'.
+  // ADA mints disconnect tokens with this claim. A leaked connect/status URL token (which
+  // has no 'purpose' claim) is structurally invalid here -- prevents token cross-use.
+  // /connect and /connection/status remain unchanged (tokens without 'purpose' still work there).
+  if (claims.purpose !== 'disconnect') {
+    log('disconnect_wrong_purpose', { tenant_id: claims.tenant_id, coordinator_id_hash: coordHash(claims.coordinator_id) });
+    return json(400, { error: 'invalid_request' });
+  }
+
+  const { tenant_id: tenantId, coordinator_id: coordinatorId } = claims;
+
+  // Step 2: best-effort Google revocation. Failure is WARN-logged, never blocks disconnect.
+  let secret;
+  try {
+    secret = await secrets.readCoordinator({ tenantId, coordinatorId });
+  } catch (readErr) {
+    // Secrets Manager unavailable -- we can't read the refresh_token to revoke it. secret=null
+    // falls through to the idempotent early-return below (watch:'none', no markDisconnected call).
+    // This is correct: an SM outage produces an idempotent 200 {watch:'none'} with NO stamp --
+    // we cannot confirm the current state, so we do NOT write a stamp that might be wrong.
+    warn('disconnect_secret_read_failed', { tenant_id: tenantId, coordinator_id_hash: coordHash(coordinatorId), name: readErr && readErr.name });
+    secret = null;
+  }
+
+  // Idempotency: if already disconnected (no secret, no refresh_token, or status=revoked),
+  // skip the Google call and return success immediately with watch:'none'.
+  if (!secret || !secret.refresh_token || secret.status === 'revoked') {
+    log('disconnect_already_disconnected', { tenant_id: tenantId, coordinator_id_hash: coordHash(coordinatorId) });
+    return json(200, { status: 'disconnected', watch: 'none' });
+  }
+
+  // Best-effort Google revoke.
+  try {
+    await oauth.revokeToken({ refreshToken: secret.refresh_token });
+    log('disconnect_google_revoked', { tenant_id: tenantId, coordinator_id_hash: coordHash(coordinatorId) });
+  } catch (revokeErr) {
+    // Non-blocking -- log and continue.
+    warn('disconnect_google_revoke_failed', { tenant_id: tenantId, coordinator_id_hash: coordHash(coordinatorId), name: revokeErr && revokeErr.name });
+  }
+
+  // Step 3: stamp the secret (the authoritative disconnect signal).
+  try {
+    await secrets.markDisconnected({ tenantId, coordinatorId, nowIso: new Date().toISOString() });
+  } catch (stampErr) {
+    // Secrets Manager write failure -- the stamp didn't land; report a generic error but
+    // do NOT leak the secret name or path.
+    warn('disconnect_mark_failed', { tenant_id: tenantId, coordinator_id_hash: coordHash(coordinatorId), name: stampErr && stampErr.name });
+    return json(500, { error: 'internal' });
+  }
+
+  // Step 4: best-effort async Offboarder invoke (mirrors callback's Onboarder).
+  // InvocationType:'Event' -- dispatch is fire-and-forget. ok:true = async dispatch accepted
+  // (watch:'pending' = cleanup dispatched, not confirmed); ok:false = SDK throw (watch:'none').
+  // The §E11b enum is: stopped (watch stopped, confirmed) | pending (dispatched) | none (not dispatched).
+  // With async invoke we can only confirm dispatch, not completion -- so 'pending' is correct.
+  const offboard = await fireOffboarder({ tenantId, coordinatorId });
+  log('disconnect_complete', { tenant_id: tenantId, coordinator_id_hash: coordHash(coordinatorId), offboard_ok: offboard.ok });
+
+  return json(200, {
+    status: 'disconnected',
+    watch: offboard.ok ? 'pending' : 'none',
+  });
+}
+
 // ─── handler ───────────────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
   const path = getPath(event);
-  // All three routes are GET (browser navigation + a status fetch). Reject other methods.
   const method = ((event && event.requestContext && event.requestContext.http && event.requestContext.http.method) || 'GET').toUpperCase();
+
+  // /connection/disconnect is POST-only (body-carried token). All other routes are GET.
+  if (path === '/connection/disconnect') {
+    if (method !== 'POST') {
+      return { statusCode: 405, headers: { allow: 'POST', 'cache-control': 'no-store' }, body: '' };
+    }
+    try {
+      return await handleDisconnect(event);
+    } catch (err) {
+      warn('unhandled_error', { path, name: err && err.name });
+      return json(500, { error: 'internal' });
+    }
+  }
+
+  // All other routes are GET.
   if (method !== 'GET') {
     return { statusCode: 405, headers: { allow: 'GET', 'cache-control': 'no-store' }, body: '' };
   }
@@ -481,7 +619,7 @@ exports.handler = async (event) => {
     if (path === '/oauth/callback') return await handleCallback(event);
     if (path === '/connection/status') return await handleStatus(event);
     log('unknown_path', { path });
-    return page(404, 'Not found', '<p>This page doesn’t exist.</p>');
+    return page(404, 'Not found', "<p>This page doesn't exist.</p>");
   } catch (err) {
     // Last-resort guard — never leak a stack/detail to the browser.
     warn('unhandled_error', { path, name: err && err.name });
@@ -499,10 +637,13 @@ exports._internal = {
   genericFailure,
   coordHash,
   fireOnboarder,
+  fireOffboarder,
   handleConnect,
   handleCallback,
   handleStatus,
+  handleDisconnect,
   STATE_TTL_SECONDS,
   ONBOARDER_FUNCTION_NAME,
+  OFFBOARDER_FUNCTION_NAME,
   burnJti,
 };

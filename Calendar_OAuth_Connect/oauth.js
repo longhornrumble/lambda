@@ -4,12 +4,14 @@
  * oauth.js — thin wrapper over google-auth-library's OAuth2Client for the consent flow.
  *
  * Reuses the SAME library the shipped Calendar_Watch_Onboarder/oauth-client.js uses (which is
- * a token READER); this is the complementary token WRITER side. Three operations:
+ * a token READER); this is the complementary token WRITER side. Four operations:
  *   • buildAuthUrl  — the Google consent redirect (access_type=offline + prompt=consent so a
  *                     refresh_token is always returned; scope-minimized per D2).
  *   • exchangeCode  — authorization_code → tokens (must include a refresh_token).
  *   • probeRefresh  — refresh_token → access_token, used by /connection/status to detect
  *                     revocation (an invalid_grant throw classifies as permanently disconnected).
+ *   • revokeToken   — POST to Google's revocation endpoint (§E11b). Best-effort: caller MUST
+ *                     treat a network/4xx failure as non-fatal; it logs and continues.
  *
  * SCOPE MINIMIZATION (D2): calendar.events (insert/list/watch/get/delete — C8 + B5 + listener)
  * + calendar.freebusy (availability.js freeBusy.query). NOT the full auth/calendar scope. This
@@ -85,9 +87,34 @@ async function probeRefresh({ clientId, clientSecret, refreshToken }) {
   await withTimeout(client.getAccessToken(), 'getAccessToken');
 }
 
+// Google's token-revocation endpoint (RFC 7009 / Google identity docs).
+// Accepts the refresh_token as a form-encoded `token` parameter.
+const GOOGLE_REVOKE_URL = 'https://oauth2.googleapis.com/revoke';
+
+/**
+ * Revoke a Google OAuth refresh_token at Google's revocation endpoint (§E11b).
+ *
+ * Best-effort contract: the caller MUST treat a rejected promise as non-fatal.
+ * Any network error, 4xx, or 5xx is surfaced as a thrown Error so the caller can
+ * log it and continue — it MUST NOT block the disconnect.
+ *
+ * PII: the token itself is never logged; only the http_status on failure.
+ *
+ * @param {object} args - { refreshToken }
+ * @returns {Promise<void>} resolves on HTTP 200; throws otherwise.
+ */
+async function revokeToken({ refreshToken }) {
+  // Use the google-auth-library OAuth2Client to call the revocation endpoint.
+  // The library posts `token=<value>` as application/x-www-form-urlencoded.
+  const client = new OAuth2Client();
+  await withTimeout(client.revokeToken(refreshToken), 'revokeToken');
+}
+
 module.exports = {
   SCOPES,
   buildAuthUrl,
   exchangeCode,
   probeRefresh,
+  revokeToken,
+  GOOGLE_REVOKE_URL,
 };

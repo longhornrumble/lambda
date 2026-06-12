@@ -188,7 +188,84 @@ alone does not remove the PII — the id is the email.)
 
 ---
 
-## 6. Deploy
+## 6. §E11b: POST /connection/disconnect (WS-T3-DISC-BE; LOCKED 2026-06-12)
+
+**New route added by this PR.** The disconnect flow is the §E11 inverse.
+
+### 6a. New environment variable
+
+| Var | Value (staging) | Notes |
+|---|---|---|
+| `OFFBOARDER_FUNCTION_NAME` | `Calendar_Watch_Offboarder-staging` | async-invoked after the disconnect stamp; default = `Calendar_Watch_Offboarder-${ENVIRONMENT}` |
+
+### 6b. Additional IAM grant (INTEGRATOR wires)
+
+The existing `Calendar_OAuth_Connect-exec-staging` role needs one new statement:
+
+```json
+{
+  "Sid": "FireOffboarderOnDisconnect",
+  "Effect": "Allow",
+  "Action": "lambda:InvokeFunction",
+  "Resource": "arn:aws:lambda:us-east-1:525409062831:function:Calendar_Watch_Offboarder-staging"
+}
+```
+
+This is the **only new IAM change** for the disconnect route -- all Secrets Manager access is
+covered by the existing per-coordinator read/write statements (markDisconnected reads + stamps
+the same secret path as the connect flow).
+
+### 6c. CloudFront behavior (INTEGRATOR wires)
+
+The three existing behaviors on the D3 distribution are GET-method-set (GET, HEAD, OPTIONS only).
+The `/connection/disconnect` route requires **POST in allowed_methods**.
+
+Add an ordered CloudFront behavior **before the catch-all** (or convert to a specific path-pattern):
+
+```
+Path pattern : /connection/disconnect
+Origin       : Calendar_OAuth_Connect Function URL (same as /connect + /connection/status)
+Allowed HTTP methods: GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE
+  (CloudFront requires the full set to include POST)
+Cache policy : CachingDisabled
+```
+
+**INERT until this behavior lands**: the route is correctly implemented and the code can
+tolerate the CloudFront behavior being missing (requests will get a 403/404 from CloudFront
+until the behavior is wired). Safe to ship the Lambda code first, wire CloudFront after.
+
+### 6d. `watch` field semantics (integrator + dashboard FE note)
+
+The `watch` field in the 200 response encodes the offboard-cleanup state:
+
+| Value | Meaning |
+|---|---|
+| `pending` | Offboarder async dispatch accepted (202). Cleanup is in-progress; the stamp is authoritative. **Dashboard FE should treat this as success-with-cleanup-in-progress.** |
+| `none` | Offboarder SDK threw (throttle/network error), OR the coordinator was already disconnected. Watch channel cleaned on next expiry or manual sweep. |
+
+`watch:'stopped'` is NOT returned by this route -- the Offboarder is invoked with `InvocationType:'Event'` (async, fire-and-forget). An async invoke returns 202 on dispatch acceptance; it cannot confirm execution. `pending` is the honest value.
+
+### 6e. Revoke-succeeded-but-stamp-failed window
+
+If Google revoke succeeds but `markDisconnected` throws, the route returns 500 (the stamp is authoritative -- the caller retries). The coordinator's Google token IS revoked at this point, but the local secret still shows `connected`. This self-heals on the next `/connection/status` probe: `invalid_grant` triggers `markDisconnected` via the status route's permanent-revocation path. The `disconnect_mark_failed` event in CloudWatch Logs warrants a manual status check if it persists -- alarm on it before Beta.
+
+### 6f. Analytics_Dashboard_API (ADA) side
+
+The ADA handler `handle_scheduling_connection_disconnect` is also shipped in this PR. It:
+1. Verifies Clerk auth (existing ADA Clerk-auth middleware -- no new auth surface)
+2. Feature-gates on `dashboard_scheduling` (same as `connection/init`)
+3. Mints an init token with `purpose:'disconnect'` (same `_sign_oauth_state` helper; the `/connection/disconnect` route rejects tokens without this claim)
+4. POSTs body-carried `{ init: <token> }` to `${OAUTH_FUNCTION_URL}/connection/disconnect`
+5. Relays `{ status, watch }` to the caller
+
+No new env vars or IAM changes needed for ADA beyond the existing `OAUTH_FUNCTION_URL` and
+`OAUTH_STATE_SIGNING_SECRET_NAME` (already wired by the §E0 init mint -- picasso#468/471).
+
+**Beta note -- per-coordinator disconnect rate limiting:** v1 has no application-level rate limit on disconnect. A malicious or buggy caller can drive repeated disconnect-reconnect cycles per coordinator. Before Beta, consider a short per-coordinator cooldown (e.g. 60s TTL in DynamoDB or ElastiCache) or rely on the init-token single-use enforcement (§5) as a natural throttle.
+
+---
+
+## 7. Deploy
 
 ```bash
 cd Calendar_OAuth_Connect
