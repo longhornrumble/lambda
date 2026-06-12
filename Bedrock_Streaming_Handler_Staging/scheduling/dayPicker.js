@@ -215,6 +215,9 @@ module.exports = {
   dateWindowForDay,
   emitDayPicker,
   emitPickerEscapeNotice,
+  // "today" as a civil YYYY-MM-DD in a timezone — consumed by the agent day-part
+  // bounds (agentTools.js: after_time/before_time without a date apply to TODAY).
+  localDateString,
   // exported for tests:
   _formatDayLabel: formatDayLabel,
 };

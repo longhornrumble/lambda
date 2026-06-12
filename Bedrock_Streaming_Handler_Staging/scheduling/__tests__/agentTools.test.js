@@ -446,6 +446,218 @@ describe('executeGetAvailableTimes', () => {
       );
     });
   });
+
+  // ── day-part bounds (after_time/before_time — live defect 2026-06-12) ────────────────
+  describe('day-part bounds (after_time/before_time → tz-resolved date_window instants)', () => {
+    test("CT afternoon: date + after 12:00 + before 17:00 → 17:00Z–22:00Z (June, CDT = UTC-5)", async () => {
+      const args = tool1Args({ input: { date: '2026-06-19', after_time: '12:00', before_time: '17:00' } });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-06-19T17:00:00.000Z', end: '2026-06-19T22:00:00.000Z' },
+        })
+      );
+    });
+
+    test('appointment-type timezone wins over the qctx user timezone (today-line precedence)', async () => {
+      const args = tool1Args({
+        input: { date: '2026-06-19', after_time: '12:00' },
+        deps: {
+          invokeProposal: jest.fn().mockResolvedValue(PROPOSE_OK),
+          saveState: jest.fn().mockResolvedValue(undefined),
+          qualifyingContext: {
+            ...QCTX,
+            appointment_type: { ...QCTX.appointment_type, timezone: 'America/New_York' },
+          },
+          logger: quietLogger,
+        },
+      });
+      await executeGetAvailableTimes(args);
+      // EDT = UTC-4; implicit end widens to the civil-day end IN THE BOUNDS TZ
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-06-19T16:00:00.000Z', end: '2026-06-20T04:00:00.000Z' },
+        })
+      );
+    });
+
+    test('after-only: implicit end = next-day civil midnight in the bounds tz (evenings not clipped by the UTC-day end)', async () => {
+      const args = tool1Args({ input: { date: '2026-06-19', after_time: '17:00' } });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-06-19T22:00:00.000Z', end: '2026-06-20T05:00:00.000Z' },
+        })
+      );
+    });
+
+    test('before-only: implicit start = the civil-day start in the bounds tz', async () => {
+      const args = tool1Args({ input: { date: '2026-06-19', before_time: '12:00' } });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-06-19T05:00:00.000Z', end: '2026-06-19T17:00:00.000Z' },
+        })
+      );
+    });
+
+    test('DST fall-back day (2026-11-01, Chicago): afternoon 12:00–17:00 = 18:00Z–23:00Z (CST = UTC-6 after the 2am change)', async () => {
+      const args = tool1Args({ input: { date: '2026-11-01', after_time: '12:00', before_time: '17:00' } });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-11-01T18:00:00.000Z', end: '2026-11-01T23:00:00.000Z' },
+        })
+      );
+    });
+
+    test('DST spring-forward day (2027-03-14, Chicago): after 12:00 = 17:00Z (CDT); the nonexistent 02:30 → invalid_time', async () => {
+      const ok = tool1Args({ input: { date: '2027-03-14', after_time: '12:00' } });
+      await executeGetAvailableTimes(ok);
+      expect(ok.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2027-03-14T17:00:00.000Z', end: '2027-03-15T05:00:00.000Z' },
+        })
+      );
+      // 02:30 does not exist on the spring-forward day → structured invalid_time, no lookup
+      const gap = tool1Args({ input: { date: '2027-03-14', after_time: '02:30' } });
+      const result = await executeGetAvailableTimes(gap);
+      expect(result.error).toBe('invalid_time');
+      expect(typeof result.note).toBe('string');
+      expect(gap.deps.invokeProposal).not.toHaveBeenCalled();
+    });
+
+    test('DST-at-midnight zone (America/Santiago, DST starts 2026-09-06 00:00): implicit start edge keeps the conservative UTC edge', async () => {
+      // Chile's spring-forward happens AT midnight — 2026-09-06 00:00 does not exist
+      // (clocks jump 00:00 → 01:00). The implicit start edge must fall back to the
+      // shipped UTC-day edge instead of failing; the explicit 12:00 bound resolves
+      // post-transition (CLST = UTC-3) → 15:00Z.
+      const args = tool1Args({
+        input: { date: '2026-09-06', before_time: '12:00' },
+        deps: {
+          invokeProposal: jest.fn().mockResolvedValue(PROPOSE_OK),
+          saveState: jest.fn().mockResolvedValue(undefined),
+          qualifyingContext: {
+            ...QCTX,
+            appointment_type: { ...QCTX.appointment_type, timezone: 'America/Santiago' },
+          },
+          logger: quietLogger,
+        },
+      });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-09-06T00:00:00.000Z', end: '2026-09-06T15:00:00.000Z' },
+        })
+      );
+    });
+
+    test('invalid HH:MM shapes → invalid_time, no propose invoke, nothing persisted', async () => {
+      for (const bad of ['noon', '25:00', '24:00', '12:60', '12:5', '1230', '12:00pm', '', 9]) {
+        const args = tool1Args({ input: { date: '2026-06-19', after_time: bad } });
+        const result = await executeGetAvailableTimes(args);
+        expect(result).toEqual(expect.objectContaining({ error: 'invalid_time' }));
+        expect(args.deps.invokeProposal).not.toHaveBeenCalled();
+        expect(args.deps.saveState).not.toHaveBeenCalled();
+        const before = tool1Args({ input: { date: '2026-06-19', before_time: bad } });
+        expect((await executeGetAvailableTimes(before)).error).toBe('invalid_time');
+        expect(before.deps.invokeProposal).not.toHaveBeenCalled();
+      }
+    });
+
+    test('inverted bounds (after ≥ before) → invalid_time, never a guaranteed-empty lookup', async () => {
+      for (const input of [
+        { date: '2026-06-19', after_time: '17:00', before_time: '12:00' },
+        { date: '2026-06-19', after_time: '12:00', before_time: '12:00' },
+      ]) {
+        const args = tool1Args({ input });
+        const result = await executeGetAvailableTimes(args);
+        expect(result.error).toBe('invalid_time');
+        expect(args.deps.invokeProposal).not.toHaveBeenCalled();
+      }
+    });
+
+    test('bounds without a date apply to TODAY in the bounds tz (deps.nowMs clock)', async () => {
+      // 2026-06-19T15:00:00Z = 10:00 AM CDT, Friday June 19 — today is 2026-06-19
+      const args = tool1Args({ input: { after_time: '12:00' } });
+      args.deps.nowMs = Date.parse('2026-06-19T15:00:00Z');
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-06-19T17:00:00.000Z', end: '2026-06-20T05:00:00.000Z' },
+        })
+      );
+    });
+
+    test("TODAY resolves as the CIVIL date in the bounds tz, not UTC (late Chicago evening = next day UTC)", async () => {
+      // 2026-06-20T03:00:00Z is still Friday June 19, 10:00 PM in America/Chicago
+      const args = tool1Args({ input: { before_time: '12:00' } });
+      args.deps.nowMs = Date.parse('2026-06-20T03:00:00Z');
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-06-19T05:00:00.000Z', end: '2026-06-19T17:00:00.000Z' },
+        })
+      );
+    });
+
+    test('garbage deps.nowMs (non-finite) falls back to the real clock — never throws (mirrors the agentTurn guard)', async () => {
+      const args = tool1Args({ input: { after_time: '12:00' } });
+      args.deps.nowMs = 'not-a-clock';
+      const result = await executeGetAvailableTimes(args);
+      expect(result.error).toBeUndefined(); // lookup proceeded on the real clock
+      const dw = args.deps.invokeProposal.mock.calls[0][0].date_window;
+      expect(Number.isNaN(Date.parse(dw.start))).toBe(false);
+      expect(Number.isNaN(Date.parse(dw.end))).toBe(false);
+      expect(Date.parse(dw.start)).toBeLessThan(Date.parse(dw.end));
+    });
+
+    test('date WITHOUT bounds keeps the shipped §B16e full-UTC-day mapping (byte-identical)', async () => {
+      const args = tool1Args({ input: { date: '2026-06-19' } });
+      await executeGetAvailableTimes(args);
+      expect(args.deps.invokeProposal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          date_window: { start: '2026-06-19T00:00:00.000Z', end: '2026-06-20T00:00:00.000Z' },
+        })
+      );
+    });
+
+    test('F6 union across a morning call + bounded afternoon call: earliest-first, deduped, capped at 10', async () => {
+      // 8 morning slots persisted by THIS turn's earlier (unbounded) call…
+      const morning = Array.from({ length: 8 }, (_, i) => ({
+        slotId: `am${i}`,
+        start: `2026-06-19T1${i}:00:00Z`,
+        end: `2026-06-19T1${i}:30:00Z`,
+        label: `Fri · morning ${i}`,
+      }));
+      // …then the bounded afternoon call returns 7 slots, one duplicating am7 → 15 raw,
+      // 14 after dedupe, capped at 10.
+      const afternoon = [
+        { ...morning[7] }, // duplicate slotId — first occurrence must win
+        ...Array.from({ length: 6 }, (_, i) => ({
+          slotId: `pm${i}`,
+          start: `2026-06-19T${18 + i}:00:00Z`,
+          end: `2026-06-19T${18 + i}:30:00Z`,
+          label: `Fri · afternoon ${i}`,
+        })),
+      ];
+      const turnCandidates = { slots: morning };
+      const args = tool1Args({
+        input: { date: '2026-06-19', after_time: '12:00' },
+        session: { state: 'proposing', session_id: 'sess-1', candidate_slots: morning },
+        turnCandidates,
+      });
+      args.deps.invokeProposal = jest.fn().mockResolvedValue({ outcome: 'ok', slots: afternoon, poolSize: 2 });
+      await executeGetAvailableTimes(args);
+
+      const saved = args.deps.saveState.mock.calls[0][0].candidate_slots;
+      expect(saved).toHaveLength(10);
+      expect(saved.slice(0, 8)).toEqual(morning); // earliest-first: prior call's slots lead
+      expect(saved.map((s) => s.slotId).filter((id) => id === 'am7')).toHaveLength(1); // deduped
+      expect(saved.slice(8).map((s) => s.slotId)).toEqual(['pm0', 'pm1']); // first fresh afternoon slots fill the cap
+      expect(turnCandidates.slots).toHaveLength(10);
+    });
+  });
 });
 
 // ── TOOL 2: executeRequestBookingConfirmation ─────────────────────────────────────────
