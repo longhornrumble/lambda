@@ -195,7 +195,10 @@ async function runNewBookingEntry({
       config,
       bedrock,
       write,
-      deps: { ...deps, qualifyingContext },
+      // §B16e: surface the widget's deterministic day-picker signal to the flow
+      // (rides routing_metadata like scheduling_intent; the flow validates it
+      // against the offered strip before acting).
+      deps: { ...deps, qualifyingContext, schedulingDaySelected: routingMetadata.scheduling_day_selected },
     });
   } catch (err) {
     console.error(`[WS-NEWBOOK] entry-hook failed (non-fatal): error_name=${(err && err.name) || 'unknown'}`);

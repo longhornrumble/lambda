@@ -117,6 +117,24 @@ describe('runNewBookingEntry — engage / bootstrap / no-op', () => {
     expect(res.handled).toBe(true);
   });
 
+  test('§B16e: scheduling_day_selected rides routing_metadata into deps.schedulingDaySelected (in-flight turn)', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'proposing' });
+    const res = await runNewBookingEntry({
+      ...base,
+      routingMetadata: { scheduling_day_selected: '2026-06-20' },
+      deps: { loadState },
+    });
+    expect(runNewBookingTurn).toHaveBeenCalledTimes(1);
+    expect(runNewBookingTurn.mock.calls[0][0].deps.schedulingDaySelected).toBe('2026-06-20');
+    expect(res.handled).toBe(true);
+  });
+
+  test('§B16e: absent signal → deps.schedulingDaySelected undefined (schema discipline)', async () => {
+    const loadState = jest.fn().mockResolvedValue({ state: 'proposing' });
+    await runNewBookingEntry({ ...base, routingMetadata: {}, deps: { loadState } });
+    expect(runNewBookingTurn.mock.calls[0][0].deps.schedulingDaySelected).toBeUndefined();
+  });
+
   test('new_booking signal BUT a session is already in flight → does NOT reset (no qualifying write)', async () => {
     const loadState = jest.fn().mockResolvedValue({ state: 'proposing' });
     const saveState = jest.fn();
