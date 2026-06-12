@@ -494,6 +494,10 @@ def lambda_handler(event, context):
         # identity from auth). Returns the connect + status URLs the E16 calendar UI drives.
         elif path.endswith('/scheduling/connection/init') and method == 'GET':
             return handle_scheduling_connection_init(tenant_id, user_email)
+        # §E11b user-initiated calendar disconnect (any authenticated staff; SELF-ONLY).
+        # ADA mints an init token and POSTs it body-carried to the OAuth Lambda.
+        elif path.endswith('/scheduling/connection/disconnect') and method == 'POST':
+            return handle_scheduling_connection_disconnect(tenant_id, user_email)
         # Forms endpoints (more specific - check second)
         elif path.endswith('/forms/summary'):
             return handle_form_summary(tenant_id, params)
@@ -4971,6 +4975,90 @@ def cors_response(status_code: int, body: Dict[str, Any]) -> Dict[str, Any]:
         },
         'body': json.dumps(body)
     }
+
+
+# --- G3 / E11b: scheduling OAuth DISCONNECT (SELF-ONLY; §E11b) --------------- #
+# ADA Clerk-authed entry for user-initiated calendar disconnect. Resolves caller
+# identity identically to the §E0 init mint (SELF-ONLY: coordinator = caller's own
+# lower-cased email, tenant from org, never client-supplied -- anti-slot-poisoning).
+# ADA mints a short-lived init token and POSTs it body-carried to the OAuth Lambda
+# (${OAUTH_FUNCTION_URL}/connection/disconnect). The token NEVER appears in any URL
+# or log line (G3 hygiene, mirroring the init mint's rules).
+#
+# Generic errors only: no secret-path, OAUTH_FUNCTION_URL, or failure detail leak
+# (mirror §E0 mint's G3 hygiene discipline). Upstream 4xx/5xx is relayed as-is;
+# network/timeout failures produce a generic 503.
+#
+_OAUTH_DISCONNECT_TIMEOUT_SECONDS = 10
+
+
+def handle_scheduling_connection_disconnect(tenant_id: str, user_email: Optional[str]) -> Dict[str, Any]:
+    """
+    POST /scheduling/connection/disconnect (E11b; any authenticated staff; SELF-ONLY).
+
+    Mints an init token for the caller's own identity, then POSTs it body-carried to
+    OAUTH_FUNCTION_URL/connection/disconnect. Relays { status, watch } on success.
+
+    Security: identity is never client-supplied; token is body-carried (never in URL
+    or logs); generic errors (no secret-path/URL leak).
+    """
+    email = (user_email or '').strip()
+    if not email or email.lower() == 'unknown':
+        return cors_response(400, {'error': 'no verified caller identity'})
+    if not tenant_id or not str(tenant_id).strip():
+        return cors_response(400, {'error': 'no verified tenant'})
+
+    # Feature gate: same as init mint -- fail-closed for tenants without scheduling.
+    access_error = validate_feature_access(tenant_id, 'dashboard_scheduling', _request_user_role)
+    if access_error:
+        return access_error
+
+    base = OAUTH_FUNCTION_URL.rstrip('/')
+    if not base:
+        return cors_response(503, {'error': 'calendar disconnect not configured'})
+
+    coordinator_id = email.lower()
+    try:
+        token = _sign_oauth_state('init', {
+            'tenant_id': tenant_id,
+            'coordinator_id': coordinator_id,
+            'coordinator_email': email,
+        }, _OAUTH_STATE_TTL_SECONDS)
+    except Exception:
+        # Secrets Manager failure or misconfigured signing key -- generic 503, no leak.
+        logger.exception('[scheduling/connection/disconnect] init-token mint failed')
+        return cors_response(503, {'error': 'calendar disconnect unavailable'})
+
+    # Server-side POST: token is body-carried, NEVER in the URL or logs.
+    disconnect_url = f'{base}/connection/disconnect'
+    body_bytes = json.dumps({'init': token}).encode('utf-8')
+    req = urllib.request.Request(
+        disconnect_url,
+        data=body_bytes,
+        headers={'Content-Type': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_OAUTH_DISCONNECT_TIMEOUT_SECONDS) as resp:
+            raw = resp.read()
+            upstream = json.loads(raw.decode('utf-8')) if raw else {}
+            return cors_response(200, {
+                'status': upstream.get('status', 'disconnected'),
+                'watch': upstream.get('watch', 'none'),
+            })
+    except urllib.error.HTTPError as e:
+        # Relay the status code (4xx/5xx from the OAuth Lambda), but with a generic
+        # body -- never leak the OAuth Function URL or upstream error detail.
+        status = e.code if e.code in (400, 403, 429, 500, 502, 503) else 502
+        if status >= 500:
+            logger.warning('[scheduling/connection/disconnect] upstream %s', e.code)
+        else:
+            logger.info('[scheduling/connection/disconnect] upstream 4xx %s', e.code)
+        return cors_response(status, {'error': 'disconnect_failed'})
+    except Exception:
+        # Network error, timeout, or unexpected failure -- generic 503, no URL leak.
+        logger.exception('[scheduling/connection/disconnect] upstream call failed')
+        return cors_response(503, {'error': 'calendar disconnect unavailable'})
 
 
 # =============================================================================
