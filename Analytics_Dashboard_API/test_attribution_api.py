@@ -33,12 +33,21 @@ import pytest
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(__file__))
 
-# Stub heavy deps that aren't available in the test env
+# Stub heavy deps that aren't available in the test env.
+# IMPORTANT: only stub a name if it genuinely cannot be imported — unconditional
+# stubs inserted at collection time shadow real same-dir modules (e.g.
+# tenant_registry_ops) for every subsequent test file collected by pytest,
+# causing "module has no attribute …" failures in unrelated test files.
+import importlib
 import types
 
 for _stub in ("jwt", "tenant_registry_ops"):
     if _stub not in sys.modules:
-        sys.modules[_stub] = types.ModuleType(_stub)
+        try:
+            importlib.import_module(_stub)
+            # Real module imported successfully — do nothing; let it win.
+        except ImportError:
+            sys.modules[_stub] = types.ModuleType(_stub)
 
 
 # Pre-set env vars before any module-level reads.
