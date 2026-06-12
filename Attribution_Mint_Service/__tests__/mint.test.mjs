@@ -834,6 +834,18 @@ describe('dubClient — Retry-After NaN guard (item 6)', () => {
 // ============================================================
 
 describe('mintEntryPoint — Dub POST body assertions (item 7)', () => {
+  it('appends ?workspaceId= to the Dub URL when DUB_WORKSPACE_ID is set', async () => {
+    process.env.DUB_WORKSPACE_ID = 'ws_TEST123';
+    try {
+      const result = await mintEntryPoint(makeValidBody());
+      expect(result.ok).toBe(true);
+      expect(globalThis.fetch.mock.calls[0][0])
+        .toBe('https://api.dub.co/links?workspaceId=ws_TEST123');
+    } finally {
+      delete process.env.DUB_WORKSPACE_ID;
+    }
+  });
+
   it('sends correct externalId, domain, tenantId, and url with ?ep= (no tagNames)', async () => {
     const result = await mintEntryPoint(makeValidBody());
     expect(result.ok).toBe(true);
