@@ -150,9 +150,10 @@ APPOINTMENT_TYPE_TABLE = os.environ.get('APPOINTMENT_TYPE_TABLE', 'picasso-appoi
 ROUTING_POLICY_TABLE = os.environ.get('ROUTING_POLICY_TABLE', 'picasso-routing-policy')
 
 # Attribution (WS-D) — C5 aggregates, C3 registry, C4b mint proxy
-# AGGREGATES_TABLE shared with existing aggregator reads (default unchanged).
+# C5 re-home (2026-06-12): new env var + new table; legacy AGGREGATES_TABLE/
+# picasso-dashboard-aggregates are dead — using them yields silent all-zero responses.
 # ENTRY_POINTS_TABLE and MINT_FUNCTION_NAME are new; integrator glue must set them.
-AGGREGATES_TABLE = os.environ.get('AGGREGATES_TABLE', 'picasso-dashboard-aggregates')
+AGGREGATES_TABLE = os.environ.get('ATTRIBUTION_AGGREGATES_TABLE', 'picasso-attribution-aggregates')
 ENTRY_POINTS_TABLE = os.environ.get('ENTRY_POINTS_TABLE', '')
 MINT_FUNCTION_NAME = os.environ.get('MINT_FUNCTION_NAME', '')
 

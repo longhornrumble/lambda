@@ -16,9 +16,9 @@ All routes:
   - Never log full payloads at info level — IDs and counts only (C8.10)
 
 Env vars (declare in Lambda config; integrator glue adds grants):
-  AGGREGATES_TABLE    — picasso-dashboard-aggregates (C5 rows)
-  ENTRY_POINTS_TABLE  — picasso-entry-points-{env} (C3 registry)
-  MINT_FUNCTION_NAME  — WS-B's mint Lambda (C4b proxy)
+  ATTRIBUTION_AGGREGATES_TABLE — picasso-attribution-aggregates (C5 rows, NEW table per C5 re-home)
+  ENTRY_POINTS_TABLE           — picasso-entry-points (C3 registry)
+  MINT_FUNCTION_NAME           — WS-B's mint Lambda (C4b proxy)
 
 Cite: FROZEN_CONTRACTS.md C4b, C5, C6, C7, C8
 """
@@ -31,6 +31,7 @@ import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
 import boto3
@@ -50,7 +51,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Env vars — read at module import (Lambda lifetime cache)
 # ---------------------------------------------------------------------------
-AGGREGATES_TABLE = os.environ.get("AGGREGATES_TABLE", "picasso-dashboard-aggregates")
+# C5 re-home (2026-06-12): new table + new env var; legacy AGGREGATES_TABLE/
+# picasso-dashboard-aggregates are dead — using them yields silent all-zero responses.
+AGGREGATES_TABLE = os.environ.get("ATTRIBUTION_AGGREGATES_TABLE", "picasso-attribution-aggregates")
 ENTRY_POINTS_TABLE = os.environ.get("ENTRY_POINTS_TABLE", "")
 MINT_FUNCTION_NAME = os.environ.get("MINT_FUNCTION_NAME", "")
 
@@ -83,16 +86,33 @@ def _current_month_tenant_local(config: dict[str, Any]) -> str:
     return datetime.now(tz).strftime("%Y-%m")
 
 
+def _next_month(month: str) -> str:
+    """Return the YYYY-MM of the month after the given YYYY-MM string."""
+    year, mon = int(month[:4]), int(month[5:7])
+    if mon == 12:
+        return f"{year + 1}-01"
+    return f"{year}-{mon + 1:02d}"
+
+
 def _validate_month(month_param: Optional[str], config: dict[str, Any]) -> tuple[str, Optional[dict]]:
     """
     Validate and normalise the ?month= parameter.
     Returns (month_str, None) on success or (None, error_response) on failure.
     error_response is a pre-built dict suitable for cors_response(400, ...).
+    Rejects months more than 1 calendar month in the future (Fix 7 — month sanity ceiling).
     """
     if not month_param:
         return _current_month_tenant_local(config), None
     if not _MONTH_RE.match(month_param):
         return "", {"error": "Invalid month parameter", "message": "month must be YYYY-MM"}
+    # Ceiling: reject months more than 1 calendar month ahead of current tenant-local month
+    current = _current_month_tenant_local(config)
+    ceiling = _next_month(current)
+    if month_param > ceiling:
+        return "", {
+            "error": "month out of range",
+            "message": f"month may not be more than 1 calendar month in the future (ceiling: {ceiling})",
+        }
     return month_param, None
 
 
@@ -126,15 +146,16 @@ def _deserialize_item(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _get_agg_item(tenant_id: str, sk: str) -> Optional[dict[str, Any]]:
     """
-    Fetch a single C5 aggregate row by PK=TENANT#{tenant_id} SK=METRIC#{sk}.
+    Fetch a single C5 aggregate row by pk=TENANT#{tenant_id} sk=METRIC#{sk}.
+    C5 key attributes are lowercase pk/sk (matches session-events convention).
     Returns a schema-tolerant deserialized dict or None if not found.
     """
     try:
         resp = _dynamodb.get_item(
             TableName=AGGREGATES_TABLE,
             Key={
-                "PK": {"S": f"TENANT#{tenant_id}"},
-                "SK": {"S": f"METRIC#{sk}"},
+                "pk": {"S": f"TENANT#{tenant_id}"},
+                "sk": {"S": f"METRIC#{sk}"},
             },
         )
     except ClientError as e:
@@ -149,13 +170,14 @@ def _get_agg_item(tenant_id: str, sk: str) -> Optional[dict[str, Any]]:
 
 def _query_agg_prefix(tenant_id: str, sk_prefix: str) -> list[dict[str, Any]]:
     """
-    Query C5 rows by PK=TENANT#{tenant_id} SK begins_with sk_prefix.
+    Query C5 rows by pk=TENANT#{tenant_id} sk begins_with sk_prefix.
+    C5 key attributes are lowercase pk/sk (matches session-events convention).
     Returns a list of deserialized dicts (may be empty).
     """
     results: list[dict[str, Any]] = []
     kwargs: dict[str, Any] = dict(
         TableName=AGGREGATES_TABLE,
-        KeyConditionExpression="PK = :pk AND begins_with(SK, :sk_prefix)",
+        KeyConditionExpression="pk = :pk AND begins_with(sk, :sk_prefix)",
         ExpressionAttributeValues={
             ":pk": {"S": f"TENANT#{tenant_id}"},
             ":sk_prefix": {"S": f"METRIC#{sk_prefix}"},
@@ -280,6 +302,32 @@ _CAMPAIGN_RE = re.compile(r"^[^@]{1,128}$")
 _PLACEMENT_RE = re.compile(r"^[^@]{1,128}$")
 _URL_RE = re.compile(r"^https://[^/\s]+")
 _EP_ID_RE = re.compile(r"^ep_[0-9A-Za-z]{8,64}$")
+_SUFFIX_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_SUFFIX_MAX = 190
+
+
+def _validate_target_url(url: str) -> Optional[str]:
+    """
+    Validate target.url per C8.15:
+    - must be https://
+    - no userinfo (@ in netloc)
+    - query params: every key must start with utm_ ('ep' is appended by the service, never client-supplied)
+    Returns an error string or None on success.
+    """
+    if not url or not _URL_RE.match(url):
+        return "target.url must be an https:// URL"
+    parsed = urlparse(url)
+    if parsed.username or (parsed.netloc and "@" in parsed.netloc):
+        return "target.url must not contain userinfo"
+    if parsed.query:
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        bad_keys = [k for k in qs if not k.startswith("utm_")]
+        if bad_keys:
+            return (
+                f"target.url query parameters must start with utm_; "
+                f"rejected: {', '.join(sorted(bad_keys))}"
+            )
+    return None
 
 
 def _validate_mint_body(body: dict[str, Any]) -> Optional[str]:
@@ -287,6 +335,7 @@ def _validate_mint_body(body: dict[str, Any]) -> Optional[str]:
     Validate the POST /attribution/entry-points request body per C4b.
     Returns an error message string on failure, or None on success.
     C8.13: length caps, reject @; C8.14: no person fields accepted.
+    C8.15: target.url query-param restriction (only utm_* allowed).
     """
     required = ("label", "channel", "campaign", "placement", "target")
     for f in required:
@@ -315,14 +364,20 @@ def _validate_mint_body(body: dict[str, Any]) -> Optional[str]:
     target_type = target.get("type", "")
     if target_type not in ("standalone_chat", "site_url"):
         return "target.type must be standalone_chat or site_url"
-    url = target.get("url", "")
-    if not url or not _URL_RE.match(url):
-        return "target.url must be an https:// URL"
-    # C8.15: no userinfo, no mailto/javascript
-    if "@" in url.split("://", 1)[-1].split("/")[0]:
-        return "target.url must not contain userinfo"
+    url_err = _validate_target_url(target.get("url", ""))
+    if url_err:
+        return url_err
 
-    # Optional suffix: no validation beyond presence
+    # Optional suffix: when present must be <=190 chars and match safe charset
+    suffix = body.get("suffix")
+    if suffix is not None:
+        if not isinstance(suffix, str) or len(suffix) == 0:
+            return "suffix must be a non-empty string when provided"
+        if len(suffix) > _SUFFIX_MAX:
+            return f"suffix must be at most {_SUFFIX_MAX} characters"
+        if not _SUFFIX_RE.match(suffix):
+            return "suffix may only contain letters, digits, dots, underscores, and hyphens"
+
     return None
 
 
@@ -363,12 +418,16 @@ def handle_attribution_summary(
     if val_err:
         return cors_response_fn(400, dict(tenant_id=tenant_id, month=month_param or "", source="validation", **val_err))
 
-    # C5: fetch summary row
-    summary_row = _get_agg_item(tenant_id, f"attribution_summary#{month}") or {}
-    prior = _get_agg_item(tenant_id, f"attribution_summary#{_prior_month(month)}") or {}
-
-    # C5: fetch all channel rows for this month
-    channel_rows_raw = _query_agg_prefix(tenant_id, f"attribution_channel#{month}#")
+    # C5: fetch summary row — wrap DDB calls so operation details never leak to callers (Fix 6)
+    try:
+        summary_row = _get_agg_item(tenant_id, f"attribution_summary#{month}") or {}
+        prior = _get_agg_item(tenant_id, f"attribution_summary#{_prior_month(month)}") or {}
+        channel_rows_raw = _query_agg_prefix(tenant_id, f"attribution_channel#{month}#")
+    except ClientError:
+        return cors_response_fn(502, {
+            "tenant_id": tenant_id, "month": month, "source": "dynamodb",
+            "error": "Upstream data unavailable",
+        })
 
     # ---- ecosystem ----
     total_convs = int(summary_row.get("conversations", 0))
@@ -496,17 +555,22 @@ def handle_attribution_channel(
     if val_err:
         return cors_response_fn(400, dict(tenant_id=tenant_id, month=month_param or "", source="validation", **val_err))
 
-    # C5: channel row
-    ch_row = _get_agg_item(tenant_id, f"attribution_channel#{month}#{channel}") or {}
+    # C5: channel row — wrap DDB calls so operation details never leak to callers (Fix 6)
+    try:
+        ch_row = _get_agg_item(tenant_id, f"attribution_channel#{month}#{channel}") or {}
+        ep_rows = _query_agg_prefix(tenant_id, f"attribution_entrypoint#{month}#")
+        registry_records = _query_entry_points_registry(tenant_id)
+    except ClientError:
+        return cors_response_fn(502, {
+            "tenant_id": tenant_id, "month": month, "source": "dynamodb",
+            "error": "Upstream data unavailable",
+        })
 
-    # C5: entry-point rows for this channel/month
-    ep_rows = _query_agg_prefix(tenant_id, f"attribution_entrypoint#{month}#")
     # Filter to this channel (ep rows hold denormalised channel from registry)
     # For website-channel, ep rows are not applicable; include all for others
     ch_ep_rows = [r for r in ep_rows if r.get("channel", "") == channel]
 
     # C3 registry: get created_at and short_link for each entry point
-    registry_records = _query_entry_points_registry(tenant_id)
     registry_map = {r.get("entry_point_id", ""): r for r in registry_records if r.get("channel") == channel}
 
     # Requested month's start (for is_new check)
@@ -514,7 +578,7 @@ def handle_attribution_channel(
 
     entry_points_out = []
     for ep in ch_ep_rows:
-        ep_id = ep.get("entry_point_id") or ep.get("SK", "").split("#")[-1]
+        ep_id = ep.get("entry_point_id") or ep.get("sk", "").split("#")[-1]
         ep_c = int(ep.get("conversations", 0))
         ep_l = int(ep.get("leads", 0))
         ep_rate = _rate_pct(ep_l, ep_c)
@@ -552,17 +616,24 @@ def handle_attribution_channel(
         key=lambda x: -x["clicks"],
     )
 
-    # 6-month trend
-    trend_out = []
-    for i in range(5, -1, -1):
-        m = month
-        for _ in range(i):
-            m = _prior_month(m)
-        t_row = _get_agg_item(tenant_id, f"attribution_channel#{m}#{channel}") or {}
-        trend_out.append({
-            "month": m,
-            "conversations": int(t_row.get("conversations", 0)),
-            "leads": int(t_row.get("leads", 0)),
+    # 6-month trend + website comparison row — also wrapped to prevent DDB detail leakage
+    try:
+        trend_out = []
+        for i in range(5, -1, -1):
+            m = month
+            for _ in range(i):
+                m = _prior_month(m)
+            t_row = _get_agg_item(tenant_id, f"attribution_channel#{m}#{channel}") or {}
+            trend_out.append({
+                "month": m,
+                "conversations": int(t_row.get("conversations", 0)),
+                "leads": int(t_row.get("leads", 0)),
+            })
+        website_row = _get_agg_item(tenant_id, f"attribution_channel#{month}#website") or {}
+    except ClientError:
+        return cors_response_fn(502, {
+            "tenant_id": tenant_id, "month": month, "source": "dynamodb",
+            "error": "Upstream data unavailable",
         })
 
     # channel funnel
@@ -581,8 +652,6 @@ def handle_attribution_channel(
     else:
         reached = 0
 
-    # website row for suggested_move comparison
-    website_row = _get_agg_item(tenant_id, f"attribution_channel#{month}#website") or {}
     w_c = int(website_row.get("conversations", 0))
     w_l = int(website_row.get("leads", 0))
 
@@ -680,7 +749,11 @@ def handle_attribution_mint(
             "error": "Validation failed", "message": val_err,
         })
 
-    # Build mint payload (C4b) — inject tenant_id from JWT
+    # Build mint payload (C4b) — inject tenant_id from JWT.
+    # target is allow-listed to {type, url} only — never forward the verbatim
+    # client dict (prevents mass-assignment via extra keys).
+    client_target = body["target"]
+    safe_target = {"type": client_target["type"], "url": client_target["url"]}
     mint_payload = {
         "action": "mint",
         "tenant_id": tenant_id,
@@ -688,7 +761,7 @@ def handle_attribution_mint(
         "channel": body["channel"],
         "campaign": body["campaign"],
         "placement": body["placement"],
-        "target": body["target"],
+        "target": safe_target,
     }
     if body.get("suffix"):
         mint_payload["suffix"] = body["suffix"]

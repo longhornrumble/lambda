@@ -8,9 +8,15 @@ Coverage:
 - Old-shape C5 row (missing new attributes) -> no crash (contract/fixture test, REQUIRED)
 - Empty tenant (no aggregate rows) -> graceful empty response
 - Month param: malformed -> 400; absent -> current month
+- Month param: more than 1 calendar month in the future -> 400 (Fix 7 month ceiling)
 - Mint proxy: success (201), SUFFIX_TAKEN (409), DUB_ERROR (502),
               VALIDATION (400), CONFLICT (409), MINT_FUNCTION_NAME unset (503)
 - Rule pack pure-function tests: best-rate, worth_a_look, too_early, no_data
+- target allow-list: extra keys on target not forwarded to mint (Fix 3)
+- suffix validation: too long, bad charset, ok value (Fix 4)
+- target.url query-param restriction: non-utm_ params rejected (Fix 5)
+- DDB ClientError in handle_attribution_summary -> 502 no detail (Fix 6)
+- DDB ClientError in handle_attribution_channel -> 502 no detail (Fix 6)
 
 Cite: FROZEN_CONTRACTS.md C5, C6, C7, C8
 """
@@ -35,8 +41,9 @@ for _stub in ("jwt", "tenant_registry_ops"):
         sys.modules[_stub] = types.ModuleType(_stub)
 
 
-# Pre-set env vars before any module-level reads
-os.environ.setdefault("AGGREGATES_TABLE", "picasso-dashboard-aggregates-test")
+# Pre-set env vars before any module-level reads.
+# Fix 1: use ATTRIBUTION_AGGREGATES_TABLE (C5 re-home); old AGGREGATES_TABLE is dead.
+os.environ.setdefault("ATTRIBUTION_AGGREGATES_TABLE", "picasso-attribution-aggregates-test")
 os.environ.setdefault("ENTRY_POINTS_TABLE", "picasso-entry-points-test")
 os.environ["MINT_FUNCTION_NAME"] = "mint-function-test"
 
@@ -88,10 +95,12 @@ def _summary_row(
     self_booked_pct=None,
     median_first_response_minutes=None,
 ):
-    """Build a C5 attribution_summary aggregate dict (deserialized form)."""
+    """Build a C5 attribution_summary aggregate dict (deserialized form).
+    Uses lowercase pk/sk per C5 key convention (Fix 2).
+    """
     row = {
-        "PK": f"TENANT#{tenant_id}",
-        "SK": f"METRIC#attribution_summary#{month}",
+        "pk": f"TENANT#{tenant_id}",
+        "sk": f"METRIC#attribution_summary#{month}",
         "conversations": conversations,
         "engaged": engaged,
         "applications": applications,
@@ -119,10 +128,12 @@ def _channel_row(
     resource_clicks=None,
     reach=500,
 ):
-    """Build a C5 attribution_channel aggregate dict (deserialized form)."""
+    """Build a C5 attribution_channel aggregate dict (deserialized form).
+    Uses lowercase pk/sk per C5 key convention (Fix 2).
+    """
     return {
-        "PK": f"TENANT#{tenant_id}",
-        "SK": f"METRIC#attribution_channel#{month}#{channel}",
+        "pk": f"TENANT#{tenant_id}",
+        "sk": f"METRIC#attribution_channel#{month}#{channel}",
         "channel": channel,
         "conversations": conversations,
         "engaged": engaged,
@@ -138,10 +149,11 @@ def _old_shape_summary_row():
     """
     Old-shape C5 row: missing ALL new attribution attributes.
     Contract/fixture test: readers must not crash.  Cite: FROZEN_CONTRACTS C5, Schema Discipline.
+    Uses lowercase pk/sk per C5 key convention (Fix 2).
     """
     return {
-        "PK": "TENANT#T1",
-        "SK": "METRIC#attribution_summary#2025-01",
+        "pk": "TENANT#T1",
+        "sk": "METRIC#attribution_summary#2025-01",
         # Intentionally absent: conversations, engaged, applications, leads,
         # after_hours_conversations, conversation_minutes, reach_page_views_sessions,
         # self_booked_pct, median_first_response_minutes
@@ -149,10 +161,12 @@ def _old_shape_summary_row():
 
 
 def _old_shape_channel_row():
-    """Old-shape C5 channel row: missing all new fields."""
+    """Old-shape C5 channel row: missing all new fields.
+    Uses lowercase pk/sk per C5 key convention (Fix 2).
+    """
     return {
-        "PK": "TENANT#T1",
-        "SK": "METRIC#attribution_channel#2025-01#website",
+        "pk": "TENANT#T1",
+        "sk": "METRIC#attribution_channel#2025-01#website",
         "channel": "website",
         # Intentionally absent: conversations, leads, reach, topic_counts, resource_clicks
     }
@@ -680,6 +694,232 @@ class TestMintEndpoint:
         assert resp["statusCode"] == 201
         body = json.loads(resp["body"])
         assert body.get("tenant_id") == "T1"  # from JWT, not client
+
+    # Fix 3: target allow-list
+    def test_extra_target_keys_not_forwarded(self):
+        """Fix 3: extra keys in target dict must not be forwarded to WS-B (mass-assignment guard)."""
+        import unittest.mock
+        body_with_extra = dict(self._VALID_BODY)
+        body_with_extra["target"] = {
+            "type": "standalone_chat",
+            "url": "https://chat.myrecruiter.ai",
+            "extra_key": "evil_value",
+            "admin": True,
+        }
+        captured = {}
+        original_invoke = attribution_api._invoke_mint
+
+        def capture_payload(payload):
+            captured["payload"] = payload
+            return 201, {
+                "ok": True,
+                "entry_point": {
+                    "entry_point_id": "ep_01HZABC12345678901234567",
+                    "short_link": "https://myrctr.link/t",
+                    "qr_url": "https://api.dub.co/qr?url=https://myrctr.link/t&size=1000&level=H",
+                    "destination_url": "https://chat.myrecruiter.ai?ep=ep_01HZABC12345678901234567",
+                    "dub_link_id": "d1",
+                    "created_at": "2026-06-01T00:00:00Z",
+                },
+            }
+
+        with unittest.mock.patch.object(attribution_api, "_invoke_mint", side_effect=capture_payload):
+            resp = attribution_api.handle_attribution_mint(
+                "T1", {"body": json.dumps(body_with_extra)},
+                _cors, "super_admin", _feat_ok,
+            )
+        assert resp["statusCode"] == 201
+        forwarded_target = captured["payload"]["target"]
+        assert set(forwarded_target.keys()) == {"type", "url"}, (
+            f"target forwarded unexpected keys: {set(forwarded_target.keys()) - {'type','url'}}"
+        )
+
+    # Fix 4: suffix validation
+    def test_suffix_too_long_returns_400(self):
+        """Fix 4: suffix > 190 chars must be rejected with 400."""
+        bad_body = dict(self._VALID_BODY)
+        bad_body["suffix"] = "a" * 191
+        resp = self._run(body_dict=bad_body)
+        assert resp["statusCode"] == 400
+        body = json.loads(resp["body"])
+        assert "suffix" in body.get("message", "").lower()
+
+    def test_suffix_bad_charset_returns_400(self):
+        """Fix 4: suffix with disallowed chars must be rejected with 400."""
+        bad_body = dict(self._VALID_BODY)
+        bad_body["suffix"] = "bad suffix!"  # space + ! not allowed
+        resp = self._run(body_dict=bad_body)
+        assert resp["statusCode"] == 400
+
+    def test_suffix_valid_accepted(self):
+        """Fix 4: valid suffix (letters, digits, dots, underscores, hyphens) passes."""
+        body_with_suffix = dict(self._VALID_BODY)
+        body_with_suffix["suffix"] = "gala-tents_2026.v2"
+        resp = self._run(body_dict=body_with_suffix)
+        assert resp["statusCode"] == 201
+
+    def test_suffix_at_190_chars_accepted(self):
+        """Fix 4: suffix exactly 190 chars is accepted."""
+        body_with_suffix = dict(self._VALID_BODY)
+        body_with_suffix["suffix"] = "a" * 190
+        resp = self._run(body_dict=body_with_suffix)
+        assert resp["statusCode"] == 201
+
+    # Fix 5: target.url query-param restriction
+    def test_target_url_with_non_utm_param_rejected(self):
+        """Fix 5 / C8.15: target.url with a non-utm_ query param must be rejected."""
+        bad_body = dict(self._VALID_BODY)
+        bad_body["target"] = {"type": "site_url", "url": "https://example.com?email=user@test.com"}
+        resp = self._run(body_dict=bad_body)
+        assert resp["statusCode"] == 400
+        body = json.loads(resp["body"])
+        assert "utm_" in body.get("message", "").lower() or "query" in body.get("message", "").lower()
+
+    def test_target_url_with_utm_param_accepted(self):
+        """Fix 5: target.url with only utm_ params is accepted."""
+        body_with_utm = dict(self._VALID_BODY)
+        body_with_utm["target"] = {
+            "type": "site_url",
+            "url": "https://example.com?utm_source=qr&utm_campaign=gala",
+        }
+        resp = self._run(body_dict=body_with_utm)
+        assert resp["statusCode"] == 201
+
+    def test_target_url_with_ep_param_rejected(self):
+        """Fix 5: ep= param is appended by the service, never client-supplied — must be rejected."""
+        bad_body = dict(self._VALID_BODY)
+        bad_body["target"] = {"type": "site_url", "url": "https://example.com?ep=ep_ABCDEFGH12345678"}
+        resp = self._run(body_dict=bad_body)
+        assert resp["statusCode"] == 400
+
+
+# ---------------------------------------------------------------------------
+# Fix 6: DDB ClientError -> clean 502 (no operation detail leak)
+# ---------------------------------------------------------------------------
+
+class TestDDBErrorHandling:
+    """Fix 6: DDB ClientErrors in handle_attribution_summary and handle_attribution_channel
+    must yield clean 502 responses without leaking DDB operation details."""
+
+    def test_summary_ddb_error_returns_502_no_detail(self):
+        """ClientError in _get_agg_item during summary handler -> 502, no str(e) in body."""
+        from botocore.exceptions import ClientError as BotoClientError
+        err = BotoClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "too much"}},
+            "GetItem",
+        )
+        with patch.object(attribution_api, "_get_agg_item", side_effect=err):
+            resp = attribution_api.handle_attribution_summary(
+                "T1", {"month": "2026-05"}, _CONFIG_CHICAGO, _cors, "super_admin", _feat_ok,
+            )
+        assert resp["statusCode"] == 502
+        body = json.loads(resp["body"])
+        # Must NOT echo DDB error message or operation name
+        body_str = json.dumps(body)
+        assert "ProvisionedThroughputExceededException" not in body_str
+        assert "GetItem" not in body_str
+        assert "too much" not in body_str
+        # Must have the standard error key
+        assert "error" in body
+
+    def test_channel_ddb_error_returns_502_no_detail(self):
+        """ClientError in _get_agg_item during channel handler -> 502, no str(e) in body."""
+        from botocore.exceptions import ClientError as BotoClientError
+        err = BotoClientError(
+            {"Error": {"Code": "ProvisionedThroughputExceededException", "Message": "too much"}},
+            "GetItem",
+        )
+        with patch.object(attribution_api, "_get_agg_item", side_effect=err):
+            resp = attribution_api.handle_attribution_channel(
+                "T1", "website", {"month": "2026-05"}, _CONFIG_CHICAGO,
+                _cors, "super_admin", _feat_ok,
+            )
+        assert resp["statusCode"] == 502
+        body = json.loads(resp["body"])
+        body_str = json.dumps(body)
+        assert "ProvisionedThroughputExceededException" not in body_str
+        assert "GetItem" not in body_str
+        assert "error" in body
+
+    def test_summary_query_ddb_error_returns_502(self):
+        """ClientError in _query_agg_prefix during summary handler -> 502."""
+        from botocore.exceptions import ClientError as BotoClientError
+        err = BotoClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "table not found"}},
+            "Query",
+        )
+        with (
+            patch.object(attribution_api, "_get_agg_item") as mock_get,
+            patch.object(attribution_api, "_query_agg_prefix", side_effect=err),
+        ):
+            mock_get.return_value = None
+            resp = attribution_api.handle_attribution_summary(
+                "T1", {"month": "2026-05"}, _CONFIG_CHICAGO, _cors, "super_admin", _feat_ok,
+            )
+        assert resp["statusCode"] == 502
+        body = json.loads(resp["body"])
+        assert "ResourceNotFoundException" not in json.dumps(body)
+
+
+# ---------------------------------------------------------------------------
+# Fix 7: Month sanity ceiling
+# ---------------------------------------------------------------------------
+
+class TestMonthCeiling:
+    """Fix 7: months more than 1 calendar month in the future are rejected with 400."""
+
+    def _run_summary(self, month: str):
+        """Run summary handler with given month param; no DDB calls needed."""
+        with (
+            patch.object(attribution_api, "_get_agg_item", return_value=None),
+            patch.object(attribution_api, "_query_agg_prefix", return_value=[]),
+        ):
+            return attribution_api.handle_attribution_summary(
+                "T1", {"month": month}, _CONFIG_CHICAGO, _cors, "super_admin", _feat_ok,
+            )
+
+    def test_far_future_month_rejected(self):
+        """A month 2 years in the future must be rejected."""
+        resp = self._run_summary("2099-01")
+        assert resp["statusCode"] == 400
+        body = json.loads(resp["body"])
+        assert "range" in body.get("error", "").lower() or "future" in body.get("message", "").lower()
+
+    def test_far_future_channel_rejected(self):
+        """Channel endpoint: far-future month rejected."""
+        with (
+            patch.object(attribution_api, "_get_agg_item", return_value=None),
+            patch.object(attribution_api, "_query_agg_prefix", return_value=[]),
+            patch.object(attribution_api, "_query_entry_points_registry", return_value=[]),
+        ):
+            resp = attribution_api.handle_attribution_channel(
+                "T1", "website", {"month": "2099-12"}, _CONFIG_CHICAGO,
+                _cors, "super_admin", _feat_ok,
+            )
+        assert resp["statusCode"] == 400
+
+    def test_current_month_accepted(self):
+        """Current month must always be accepted."""
+        from attribution_api import _current_month_tenant_local
+        current = _current_month_tenant_local(_CONFIG_CHICAGO)
+        resp = self._run_summary(current)
+        assert resp["statusCode"] == 200
+
+    def test_next_month_accepted(self):
+        """One month in the future (the ceiling) must be accepted."""
+        from attribution_api import _current_month_tenant_local, _next_month
+        current = _current_month_tenant_local(_CONFIG_CHICAGO)
+        ceiling = _next_month(current)
+        resp = self._run_summary(ceiling)
+        assert resp["statusCode"] == 200
+
+    def test_two_months_ahead_rejected(self):
+        """Two months in the future must be rejected."""
+        from attribution_api import _current_month_tenant_local, _next_month
+        current = _current_month_tenant_local(_CONFIG_CHICAGO)
+        two_ahead = _next_month(_next_month(current))
+        resp = self._run_summary(two_ahead)
+        assert resp["statusCode"] == 400
 
 
 # ---------------------------------------------------------------------------
