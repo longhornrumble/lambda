@@ -448,8 +448,12 @@ async function executeGetAvailableTimes({
   if (turnCandidates) turnCandidates.slots = persistedSlots;
 
   // Emit the SHIPPED scheduling_slots SSE → existing widget chips (unchanged contract).
+  // §B18b: forward context when the propose result carries it (ADDITIVE; omit when absent —
+  // old-shape tolerant per CLAUDE.md schema discipline).
   if (typeof write === 'function') {
-    write(`data: ${JSON.stringify({ type: 'scheduling_slots', slots, session_id: sessionId })}\n\n`);
+    const sseEvent = { type: 'scheduling_slots', slots, session_id: sessionId };
+    if (res.context != null) sseEvent.context = res.context;
+    write(`data: ${JSON.stringify(sseEvent)}\n\n`);
   }
 
   // F5 (eval A2/A3): when a re-lookup returns the SAME times the session already had,

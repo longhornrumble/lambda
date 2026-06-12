@@ -100,7 +100,9 @@ const MAX_HISTORY_MESSAGES = 12;
 // v5 (2026-06-12): rule 16 — day-part bounds (after_time/before_time) for
 // morning/afternoon/evening asks (live defect: unbounded re-queries of a 9:00–17:00
 // day always return mornings → the model honestly mis-narrated afternoons as closed).
-const PROMPT_VERSION = 'b17e.v5';
+// v6 (2026-06-12): rule 17 — §B17e rule-12 narration rule — no model-authored closing
+// question when presenting scheduling_slots chips (the FE renders refinement microcopy).
+const PROMPT_VERSION = 'b17e.v6';
 
 // §B17b overflow: templated warm-honest copy (verbatim) + the shipped async-escape SSE.
 const OVERFLOW_COPY = 'I ran into a snag — let me get someone to help.';
@@ -163,6 +165,12 @@ const AGENT_NARRATION_RULES = [
     'onward, morning = before 12:00. The tool returns the earliest openings within ' +
     'whatever bounds you give — without bounds you only see the earliest times of the ' +
     'day, so NEVER conclude a time-of-day is unavailable without a bounded query.',
+  // §B17e rule 12 — narration rule for offer presentation turns (LOCKED 2026-06-12).
+  '17. When presenting times (scheduling_slots chips are rendered), do NOT author a ' +
+    'trailing closing question ("Which works best for you?", "Does one of these work?", ' +
+    'or any variant). The interface renders refinement microcopy below the chips — a ' +
+    'model-authored closing question duplicates it and makes the UI feel broken. Summarize ' +
+    'the offer in one sentence ("Here are some times that work") and stop.',
 ].join('\n');
 
 // ─── §B17h kill-switch guard ───────────────────────────────────────────────────────────

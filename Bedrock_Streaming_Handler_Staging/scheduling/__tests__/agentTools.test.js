@@ -841,3 +841,28 @@ describe('NO TOOL BOOKS (§B17b/§B17c)', () => {
     expect(commitSpy).not.toHaveBeenCalled();
   });
 });
+
+// ─── §B18b context forwarding: executeGetAvailableTimes old-shape fixture ────────────
+
+describe('executeGetAvailableTimes — §B18b context forwarding (old-shape fixture)', () => {
+  test('propose result WITH context → scheduling_slots SSE carries context', async () => {
+    const proposeWithCtx = jest.fn().mockResolvedValue({
+      ...PROPOSE_OK,
+      context: { duration_minutes: 30, conference_type: 'google_meet', conference_label: 'Google Meet', tz_label: 'Central Time' },
+    });
+    const args = tool1Args({ deps: { invokeProposal: proposeWithCtx } });
+    await executeGetAvailableTimes(args);
+    const slotEvents = frames(args.write).filter((f) => f.type === 'scheduling_slots');
+    expect(slotEvents.length).toBeGreaterThan(0);
+    expect(slotEvents[0].context).toEqual({ duration_minutes: 30, conference_type: 'google_meet', conference_label: 'Google Meet', tz_label: 'Central Time' });
+  });
+
+  test('propose result WITHOUT context (old shape) → no context key on SSE, no crash', async () => {
+    // PROPOSE_OK has no context field — old shape
+    const args = tool1Args();
+    await executeGetAvailableTimes(args);
+    const slotEvents = frames(args.write).filter((f) => f.type === 'scheduling_slots');
+    expect(slotEvents.length).toBeGreaterThan(0);
+    expect(slotEvents[0]).not.toHaveProperty('context');
+  });
+});

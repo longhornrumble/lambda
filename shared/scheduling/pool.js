@@ -183,9 +183,116 @@ function isConditionalCheckFailed(err) {
 
 // ─── select (§10.2 steps 1-5 + slot generation) ─────────────────────────────────────
 
+// §B18a: CANDIDATE_CAP for diverse-3 sampling — passed to generateSlots as maxSlots
+// when sampling mode is active. slots.js is NOT modified; pool just passes the wider cap.
+const CANDIDATE_CAP = 48;
+
+// §B18a daypart boundaries in wall-clock minutes from midnight.
+// morning < 720 (12:00), midday 720–899 (12:00–14:59), afternoon >= 900 (15:00).
+function daypartOf(isoStart, userTimeZone) {
+  // Parse the hour+minute in the user's timezone from an ISO8601 UTC instant.
+  // We use Intl to avoid timezone math. Falls back to UTC on any failure (never throws).
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: userTimeZone,
+      hour: 'numeric',
+      minute: 'numeric',
+      hour12: false,
+    }).formatToParts(new Date(isoStart));
+    const h = parseInt(parts.find((p) => p.type === 'hour').value, 10);
+    const m = parseInt(parts.find((p) => p.type === 'minute').value, 10);
+    const wallMins = h * 60 + m;
+    if (wallMins < 720) return 'morning';
+    if (wallMins < 900) return 'midday';
+    return 'afternoon';
+  } catch {
+    return 'morning'; // safe fallback — only affects presentation diversity
+  }
+}
+
+// §B18a pick rules:
+//   pick-1: earliest overall.
+//   pick-2: different daypart from pick-1, preferring same day; fall back to next day.
+//   pick-3: third daypart (distinct from both picks 1+2), same-day pref then day-spread.
+//   Output sorted chronologically.
+//   ≤count candidates → return all.
+function sampleDaypartDiverse(merged, count, userTimeZone) {
+  if (merged.length <= count) return [...merged];
+
+  const withDaypart = merged.map((m) => ({ ...m, _daypart: daypartOf(m.start, userTimeZone) }));
+
+  const picks = [];
+  const usedDayparts = new Set();
+  const usedStarts = new Set();
+
+  // pick-1: earliest overall
+  const p1 = withDaypart[0];
+  picks.push(p1);
+  usedDayparts.add(p1._daypart);
+  usedStarts.add(p1.start);
+  const p1Day = p1.start.slice(0, 10);
+
+  // pick-2: different daypart, same day first then any day
+  let p2 = null;
+  // same-day preference
+  for (const c of withDaypart) {
+    if (usedStarts.has(c.start)) continue;
+    if (!usedDayparts.has(c._daypart) && c.start.slice(0, 10) === p1Day) {
+      p2 = c; break;
+    }
+  }
+  // day-spread fallback
+  if (!p2) {
+    for (const c of withDaypart) {
+      if (usedStarts.has(c.start)) continue;
+      if (!usedDayparts.has(c._daypart)) { p2 = c; break; }
+    }
+  }
+  // last resort: any different slot (daypart exhausted)
+  if (!p2) {
+    for (const c of withDaypart) {
+      if (!usedStarts.has(c.start)) { p2 = c; break; }
+    }
+  }
+  if (!p2) return picks.map(({ _daypart: _, ...rest }) => rest);
+  picks.push(p2);
+  usedDayparts.add(p2._daypart);
+  usedStarts.add(p2.start);
+
+  if (count < 3) return picks.map(({ _daypart: _, ...rest }) => rest).sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+
+  // pick-3: third daypart distinct from picks 1+2; same-day pref then day-spread
+  let p3 = null;
+  for (const c of withDaypart) {
+    if (usedStarts.has(c.start)) continue;
+    if (!usedDayparts.has(c._daypart) && c.start.slice(0, 10) === p1Day) {
+      p3 = c; break;
+    }
+  }
+  if (!p3) {
+    for (const c of withDaypart) {
+      if (usedStarts.has(c.start)) continue;
+      if (!usedDayparts.has(c._daypart)) { p3 = c; break; }
+    }
+  }
+  if (!p3) {
+    for (const c of withDaypart) {
+      if (!usedStarts.has(c.start)) { p3 = c; break; }
+    }
+  }
+  if (!p3) return picks.map(({ _daypart: _, ...rest }) => rest).sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+  picks.push(p3);
+
+  // Sort chronologically; strip the _daypart annotation.
+  return picks
+    .map(({ _daypart: _, ...rest }) => rest)
+    .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+}
+
 /**
  * select({ tenantId, appointmentType, routingPolicy, candidates, userTimeZone,
- *          alreadyRejected?, now?, windowStart?, windowEnd?, dateWindow?, maxSlots? })
+ *          alreadyRejected?, now?, windowStart?, windowEnd?, dateWindow?, maxSlots?,
+ *          sampling? })
  *   → { status, poolBranch, orderedPool, tieBreaker, roundRobinCursor, slots }
  *
  *   status:    'SLOTS_PROPOSED' | 'SLOT_UNAVAILABLE'
@@ -197,6 +304,11 @@ function isConditionalCheckFailed(err) {
  *   picked day. Absent → unchanged behavior. Forwarded to each generateSlots call so
  *   the day-filter is not silently discarded (fix: was in the destructure but not
  *   passed to C7, making the whole day-filter a production no-op).
+ *
+ *   §B18a: optional sampling: { mode: 'daypart-diverse', count: 3 }
+ *   Absent → behavior byte-identical to today (earliest-first slice at maxSlots).
+ *   Present → generateSlots called with CANDIDATE_CAP=48; after merge+alreadyRejected
+ *   filter, diverse-3 sampling applied. Per-chip shape unchanged.
  */
 async function select({
   tenantId,
@@ -210,6 +322,7 @@ async function select({
   windowEnd,
   dateWindow,
   maxSlots = DEFAULT_MAX_SLOTS,
+  sampling,
 }) {
   if (!tenantId) throw new Error('tenantId is required');
   if (!userTimeZone) throw new Error('userTimeZone is required');
@@ -275,6 +388,11 @@ async function select({
   }
   const poolBranch = ordered.length === 1 ? 'single' : 'multiple';
 
+  // §B18a: when sampling is active, generate a wider candidate set so diversity
+  // sampling has enough material. slots.js is NOT modified — pool passes the wider cap.
+  const isDiverse = sampling && sampling.mode === 'daypart-diverse';
+  const generationCap = isDiverse ? CANDIDATE_CAP : maxSlots;
+
   // Per-resource slot generation (§B3: call generateSlots once per candidate
   // resource, supplying resourceId), merged into generic time chips.
   //
@@ -292,7 +410,7 @@ async function select({
       resourceId,
       now,
       searchDays,
-      maxSlots,
+      maxSlots: generationCap,
       // §B16e: forward the day-picker constraint so generateSlots filters to the
       // selected day. When absent (undefined) generateSlots ignores it (no-op).
       dateWindow,
@@ -313,14 +431,21 @@ async function select({
   }
 
   // Re-offer dedup (§10.2): drop times the volunteer already rejected, by the pool's
-  // own `slot#${start}` chip id. Then earliest-first, capped at maxSlots.
+  // own `slot#${start}` chip id. Then earliest-first.
   // candidateResourceIds preserves the tie-broken `ordered` priority (who C8 locks
   // against first for that time).
   const rejected = new Set(Array.isArray(alreadyRejected) ? alreadyRejected : []);
   const merged = [...byStart.values()]
     .filter((m) => !rejected.has(`slot#${m.start}`))
     .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
-  const chips = merged.slice(0, maxSlots).map((m) => ({
+
+  // §B18a: apply diverse-3 sampling AFTER merge+alreadyRejected filter.
+  // Default path (no sampling): earliest-first slice at maxSlots — byte-identical regression.
+  const selected = isDiverse
+    ? sampleDaypartDiverse(merged, sampling.count, userTimeZone)
+    : merged.slice(0, maxSlots);
+
+  const chips = selected.map((m) => ({
     slotId: `slot#${m.start}`,
     start: m.start,
     end: m.end,
