@@ -389,7 +389,11 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
       message: 'Thank you! Your application has been submitted successfully. You will receive a confirmation email shortly.',
       submissionId: submissionId,
       priority: priority,
-      fulfillment: fulfillmentResult
+      fulfillment: fulfillmentResult,
+      // D3 (WS-TRACKD-BE) INTERNAL seam field — the canonical applicant contact for the
+      // post-form scheduling offer. index.js strips this off the response BEFORE the SSE
+      // write, so the widget wire frame is unchanged (never echoed back to the client).
+      applicant_contact: applicantContact || null
     };
 
   } catch (error) {

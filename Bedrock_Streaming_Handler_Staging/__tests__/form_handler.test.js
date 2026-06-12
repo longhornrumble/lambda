@@ -1164,6 +1164,24 @@ describe('Form Handler - Integration', () => {
     });
   });
 
+  it('threads the canonical applicant contact onto form_complete (D3 internal seam)', async () => {
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+
+    const result = await handleFormMode(
+      { form_mode: true, action: 'submit_form', form_id: 'volunteer_apply', form_data: mockFormData },
+      mockTenantConfig
+    );
+
+    // index.js strips applicant_contact before the SSE write; it must carry the
+    // extractor's canonical email so the post-form scheduling offer can pre-fill it
+    // (a silent field rename here would orphan the glue's call site).
+    expect(result.applicant_contact).toEqual(
+      expect.objectContaining({ email: 'john.doe@example.com' })
+    );
+  });
+
   it('should pass session_id and conversation_id through handleFormMode', async () => {
     sesMock.on(SendEmailCommand).resolves({ MessageId: 'test-id' });
     dynamoMock.on(PutCommand).resolves({});

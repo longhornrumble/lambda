@@ -34,8 +34,18 @@ const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock
 const { injectFormContext } = require('./scheduling/formInjection');
 // WS-CONVO (B3 keystone): in-chat reschedule/cancel. Pre-turn binding hook +
 // post-stream §B14 structured-action boundary. No-op for non-scheduling sessions.
-const { injectSchedulingContext, isSchedulingEnabled } = require('./scheduling/bindingContext');
+const {
+  injectSchedulingContext,
+  isSchedulingEnabled,
+  resolveNewBookingSessionRow,
+  NEW_BOOKING_IN_FLIGHT_STATES,
+} = require('./scheduling/bindingContext');
 const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
+// WS-AG-CORE (§B17): the bounded agent tool loop + its §B17h kill-switch guard. The
+// integrator wires the §B17a routing branch below; the module owns the turn itself.
+const { agentTurn, isAgentTurnEnabled } = require('./scheduling/agentTurn');
+// WS-TRACKD-BE (D3): post-form scheduling offer — wired at the form-completion seam.
+const { postFormOffer } = require('./scheduling/postFormOffer');
 // WS-NEWBOOK (B-remainder §B16d): the in-chat NEW-booking entry-hook. No-op for normal chat +
 // the recovery loop; engages on the widget's scheduling_intent:'new_booking' signal or an
 // in-flight new-booking session row.
@@ -405,8 +415,52 @@ const streamingHandler = async (event, responseStream, context) => {
       try {
         const formResponse = await handleFormMode(body, config, context.awsRequestId);
 
+        // D3 (WS-TRACKD-BE): applicant_contact is an INTERNAL seam field from
+        // form_handler — strip it before the wire write so the widget frame shape is
+        // unchanged (the user's own contact data is never echoed back).
+        const { applicant_contact: formContact, ...wireFormResponse } = formResponse;
+
         // Send the form response as a single SSE event
-        write(`data: ${JSON.stringify(formResponse)}\n\n`);
+        write(`data: ${JSON.stringify(wireFormResponse)}\n\n`);
+
+        // D3 (design-doc Appendix-A row D3): post-form scheduling offer — AFTER a
+        // successful FINAL submission only, for scheduling-enabled tenants.
+        // STRICT call-site guard (clobber-guard layer 1): offer ONLY when loadState
+        // returns NO session row at all (null) — stricter than the module's own
+        // layer-2 guard (this also covers recovery-state rows like 'rescheduling' /
+        // 'canceling'). Non-fatal: any throw → err.name log, the form response above
+        // already went out and [DONE] still follows.
+        if (
+          formResponse.type === 'form_complete' &&
+          formContact?.email &&
+          isSchedulingEnabled(config)
+        ) {
+          try {
+            const existingRow = await schedulingDeps.loadState({
+              tenantId: config?.tenant_id,
+              sessionId,
+            });
+            if (existingRow == null) {
+              const { offerText } = await postFormOffer({
+                tenantConfig: config,
+                sessionId,
+                attendee: formContact,
+                deps: {
+                  ...schedulingDeps,
+                  ...newBookingDep,
+                  loadState: schedulingDeps.loadState,
+                  emitSse: (evt) => write(`data: ${JSON.stringify(evt)}\n\n`),
+                },
+              });
+              if (offerText) {
+                write(`data: ${JSON.stringify({ type: 'text', content: offerText, session_id: sessionId })}\n\n`);
+              }
+            }
+          } catch (err) {
+            console.error(`[WS-TRACKD] post-form offer call site failed (non-fatal): error_name=${(err && err.name) || 'unknown'}`);
+          }
+        }
+
         write('data: [DONE]\n\n');
 
         // Clear heartbeat and end stream
@@ -576,6 +630,51 @@ const streamingHandler = async (event, responseStream, context) => {
       }
     }
 
+    // §B17a — agent-turn routing branch (increment 1; integrator glue). Sits AFTER the
+    // deterministic click router and the email-capture block (clicks and bare-email
+    // capture turns NEVER reach the agent — §B16b/§B16d semantics untouched) and BEFORE
+    // the legacy chat path. Engages only when ALL hold:
+    //   • §B17h kill switches pass (env AGENTIC_SCHEDULING_DISABLED first, then
+    //     feature_flags.scheduling_enabled, then feature_flags.AGENTIC_SCHEDULING)
+    //   • a typed-text turn (no scheduling click metadata; form_mode turns returned above)
+    //   • an in-flight NEW-booking session row exists (qualifying | proposing | confirming)
+    //     — ONE loadState read via the existing seam (fail-soft: error/null → normal chat)
+    // Flag off or no session row → fall through unchanged (§B17h: flag-off tenants are
+    // byte-identical to the pre-agent baseline; the flag check gates the state read).
+    if (
+      isAgentTurnEnabled({ tenantConfig: config }) &&
+      !isSchedulingEntryClick &&
+      !widgetSchedulingAction
+    ) {
+      const agentSessionRow = await resolveNewBookingSessionRow({
+        tenantId: config?.tenant_id,
+        sessionId,
+        deps: { loadState: schedulingDeps.loadState },
+      });
+      if (agentSessionRow && NEW_BOOKING_IN_FLIGHT_STATES.includes(agentSessionRow.state)) {
+        console.log(`🤖 §B17a agent turn engaged (session state: ${agentSessionRow.state})`);
+        await agentTurn({
+          event: { userText: userInput, conversationHistory, sessionId },
+          context,
+          sessionRow: agentSessionRow,
+          tenantConfig: config,
+          deps: { ...schedulingDeps, ...newBookingDep, bedrock },
+          streamWriter: write,
+        });
+        // End the stream exactly like the deterministic click router does. agentTurn
+        // never throws (all failures degrade to honest copy on the stream), so the
+        // connection is never left dead.
+        write('data: [DONE]\n\n');
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = null;
+        }
+        streamEnded = true;
+        responseStream.end();
+        return;
+      }
+    }
+
     // Sanitize user input to prevent prompt injection
     const sanitizedInput = sanitizeUserInput(userInput);
 
@@ -633,9 +732,16 @@ const streamingHandler = async (event, responseStream, context) => {
     // governs this session (WS-D4 redemption). No-op (prompt unchanged) for normal chat.
     // Feature-gated: scheduling is OFF unless feature_flags.scheduling_enabled (like Forms);
     // when disabled, skip the binding read entirely so the path is fully dormant.
+    // Track-D fix 1 (§B17d): deps.loadState activates the in-flight new-booking state
+    // line for the AGENTIC_SCHEDULING-off path — the legacy model stops claiming "no
+    // scheduling access" mid-booking. No row → prompt byte-identical (no-regression).
     const schedulingEnabled = isSchedulingEnabled(config);
     const prompt = schedulingEnabled
-      ? await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId })
+      ? await injectSchedulingContext(formPrompt, {
+          tenantId: config?.tenant_id,
+          sessionId,
+          deps: { loadState: schedulingDeps.loadState },
+        })
       : formPrompt;
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
