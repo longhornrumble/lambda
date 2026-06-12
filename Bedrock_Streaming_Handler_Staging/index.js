@@ -658,7 +658,9 @@ const streamingHandler = async (event, responseStream, context) => {
           context,
           sessionRow: agentSessionRow,
           tenantConfig: config,
-          deps: { ...schedulingDeps, ...newBookingDep, bedrock },
+          // retrieveKB: F2 (eval A4) — the agent turn retrieves KB context for the
+          // user text via the same shared seam the legacy path uses (fail-soft inside).
+          deps: { ...schedulingDeps, ...newBookingDep, bedrock, retrieveKB },
           streamWriter: write,
         });
         // End the stream exactly like the deterministic click router does. agentTurn

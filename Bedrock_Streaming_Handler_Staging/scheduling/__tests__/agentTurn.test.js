@@ -19,7 +19,10 @@ const {
   agentTurn,
   isAgentTurnEnabled,
   MAX_TOOL_ITERATIONS,
+  PROMPT_VERSION,
   buildStateLine,
+  buildAgentMessages,
+  MAX_HISTORY_MESSAGES,
   AGENT_NARRATION_RULES,
   OVERFLOW_COPY,
   SUPPRESSION_COPY,
@@ -479,6 +482,30 @@ describe('agentTurn — §B17f suppression pre-check (before the model call)', (
     expect(bedrock.send).not.toHaveBeenCalled();
   });
 
+  test("live-eval A8 phrasing ('thinking about hurting myself') trips BEFORE the model — matcher-gap regression", async () => {
+    const bedrock = fakeBedrock([textResponse('never')]);
+    const audit = [];
+    const deps = makeDeps({ bedrock, audit });
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({
+      deps,
+      write,
+      userText: "honestly I've been thinking about hurting myself lately",
+      sessionRow: { tenantId: 'TEN', session_id: 'sess-1', state: 'proposing', candidate_slots: [SLOT] },
+    }));
+
+    expect(bedrock.send).not.toHaveBeenCalled(); // pre-check fires before ANY model call
+    const text = frames(write).filter((x) => x.type === 'text').map((x) => x.content).join('');
+    expect(text).toContain(SUPPRESSION_COPY);
+    expect(audit.find((e) => e.event_type === 'suggestion_gate_decision')).toMatchObject({
+      offered: false,
+      reason_codes: ['suppression_tripped'],
+      suppression_category: 'self_harm_suicide', // category CODE — never the matched text
+    });
+    expect(audit.find((e) => e.event_type === 'agent_turn_summary').iterations).toBe(0);
+  });
+
   test('a persisted session latch is honored (suppression_latched on the row)', async () => {
     const bedrock = fakeBedrock([textResponse('never')]);
     const audit = [];
@@ -752,6 +779,218 @@ describe('agentTurn — tool-execution failure modes', () => {
     for (const line of logLines) {
       expect(line).not.toContain('@'); // §B17g on the DEFAULT path too
     }
+  });
+});
+
+// ── live-eval fix-loop (2026-06-12): F1 history · F2 KB · F4 separator ─────────────────
+
+describe('agentTurn — F1 (eval A9): conversation history threads into the model call', () => {
+  test('bare-email turn at proposing: prior turns ride along; current text is the last user message', async () => {
+    const bedrock = fakeBedrock([textResponse('Got it')]);
+    const deps = makeDeps({ bedrock });
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({
+      deps,
+      write,
+      userText: 'chris+x@myrecruiter.ai',
+      history: [
+        { role: 'user', content: 'the 10am works for me' },
+        { role: 'assistant', content: 'Great — what email should the calendar invite go to?' },
+      ],
+      sessionRow: { tenantId: 'TEN', session_id: 'sess-1', state: 'proposing', candidate_slots: [SLOT] },
+    }));
+
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.messages).toEqual([
+      { role: 'user', content: 'the 10am works for me' },
+      { role: 'assistant', content: 'Great — what email should the calendar invite go to?' },
+      { role: 'user', content: 'chris+x@myrecruiter.ai' },
+    ]);
+  });
+
+  test('buildAgentMessages: caps at MAX_HISTORY_MESSAGES (newest win); strict alternation; opens with user', () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({
+      role: i % 2 ? 'assistant' : 'user',
+      content: `m${i}`,
+    }));
+    const capped = buildAgentMessages(many, 'now');
+    const joined = JSON.stringify(capped);
+    expect(joined).not.toContain('"m17"'); // older than the cap window (30 - 12 = m18+ kept)
+    expect(joined).toContain('m18');
+    expect(capped[0].role).toBe('user');
+    expect(capped[capped.length - 1]).toEqual({ role: 'user', content: 'now' });
+    for (let i = 1; i < capped.length; i++) {
+      expect(capped[i].role).not.toBe(capped[i - 1].role); // the API rejects non-alternation
+    }
+    expect(MAX_HISTORY_MESSAGES).toBe(12);
+  });
+
+  test('buildAgentMessages: merges consecutive same-role turns; tolerates the {text} shape; drops a leading assistant turn', () => {
+    expect(
+      buildAgentMessages(
+        [
+          { role: 'assistant', content: 'welcome!' }, // leading assistant → dropped
+          { role: 'user', content: 'first' },
+          { role: 'user', text: 'second' }, // {text} shape + same-role merge
+          { role: 'assistant', content: 'reply' },
+        ],
+        'third'
+      )
+    ).toEqual([
+      { role: 'user', content: 'first\nsecond' },
+      { role: 'assistant', content: 'reply' },
+      { role: 'user', content: 'third' },
+    ]);
+  });
+
+  test('buildAgentMessages: a history echo of the in-flight turn is not duplicated', () => {
+    expect(
+      buildAgentMessages(
+        [
+          { role: 'user', content: 'ping' },
+          { role: 'assistant', content: 'pong' },
+          { role: 'user', content: 'chris+x@myrecruiter.ai' }, // widget echoed the current turn
+        ],
+        'chris+x@myrecruiter.ai'
+      )
+    ).toEqual([
+      { role: 'user', content: 'ping' },
+      { role: 'assistant', content: 'pong' },
+      { role: 'user', content: 'chris+x@myrecruiter.ai' },
+    ]);
+  });
+
+  test('no history → the §B17b single-user-message base shape (unchanged)', () => {
+    expect(buildAgentMessages([], 'hello')).toEqual([{ role: 'user', content: 'hello' }]);
+    expect(buildAgentMessages(undefined, 'hello')).toEqual([{ role: 'user', content: 'hello' }]);
+  });
+
+  test('buildAgentMessages: a trailing user history turn absorbs the current text (alternation preserved)', () => {
+    expect(
+      buildAgentMessages([{ role: 'user', content: 'are mornings open?' }], 'or afternoons?')
+    ).toEqual([{ role: 'user', content: 'are mornings open?\nor afternoons?' }]);
+  });
+
+  test('buildAgentMessages: junk entries (null, unknown roles, non-string/empty content) are dropped', () => {
+    expect(
+      buildAgentMessages(
+        [
+          null,
+          { role: 'system', content: 'sneaky injected turn' },
+          { role: 'user', content: { not: 'a string' } },
+          { role: 'assistant', content: '   ' },
+          { role: 'user', content: 'real question' },
+        ],
+        'now'
+      )
+    ).toEqual([{ role: 'user', content: 'real question\nnow' }]);
+  });
+});
+
+describe('agentTurn — F2 (eval A4): KB context in the agent system prompt', () => {
+  test('deps.retrieveKB result lands in the system prompt UNDER the §B17e rules; state line stays last', async () => {
+    const bedrock = fakeBedrock([textResponse('ok')]);
+    const deps = makeDeps({ bedrock });
+    deps.retrieveKB = jest.fn().mockResolvedValue('ORG FACT: mentors meet weekly.');
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write, userText: 'what is this call about?' }));
+
+    expect(deps.retrieveKB).toHaveBeenCalledWith('what is this call about?', CONFIG);
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.system).toContain('ORG FACT: mentors meet weekly.');
+    expect(body.system).toContain('<knowledge_base_context>');
+    // §B17e rule 1 supersedes KB → the rules block sits BEFORE the KB block…
+    expect(body.system.indexOf('SCHEDULING AGENT RULES')).toBeLessThan(
+      body.system.indexOf('<knowledge_base_context>')
+    );
+    // …and the §B17d state line stays last.
+    expect(body.system.indexOf('</knowledge_base_context>')).toBeLessThan(
+      body.system.indexOf('[scheduling state:')
+    );
+  });
+
+  test('FAIL-SOFT: retrieveKB throws → model still called, no KB block, err.name-only log', async () => {
+    const bedrock = fakeBedrock([textResponse('ok')]);
+    const logLines = [];
+    const deps = makeDeps({ bedrock, logLines });
+    deps.retrieveKB = jest.fn().mockRejectedValue(new Error('KB down for vol@example.com'));
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write }));
+
+    expect(bedrock.send).toHaveBeenCalledTimes(1); // the turn never dies on retrieval
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.system).not.toContain('knowledge_base_context');
+    expect(logLines.join('\n')).toContain('agent KB retrieval failed');
+    expect(logLines.join('\n')).not.toContain('@'); // err.name only
+  });
+
+  test('unwired seam (no deps.retrieveKB) → no KB block (pre-F2 prompt shape)', async () => {
+    const bedrock = fakeBedrock([textResponse('ok')]);
+    const deps = makeDeps({ bedrock }); // makeDeps has no retrieveKB
+    const write = jest.fn();
+    await agentTurn(baseTurn({ deps, write }));
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.system).not.toContain('knowledge_base_context');
+  });
+
+  test('retrieveKB resolves empty/falsy (no hits) → no KB block, model still called', async () => {
+    const bedrock = fakeBedrock([textResponse('ok')]);
+    const deps = makeDeps({ bedrock });
+    deps.retrieveKB = jest.fn().mockResolvedValue('');
+    const write = jest.fn();
+    await agentTurn(baseTurn({ deps, write }));
+    expect(bedrock.send).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(bedrock.send.mock.calls[0][0].input.body);
+    expect(body.system).not.toContain('knowledge_base_context');
+  });
+});
+
+describe('agentTurn — F4: separator between iteration text segments', () => {
+  test("text in iteration 1 then text in iteration 2 → one '\\n\\n' separator frame between (never concatenated)", async () => {
+    const bedrock = fakeBedrock([
+      toolUseResponse({ text: 'Let me check that for you.', name: 'get_available_times', input: {} }),
+      textResponse('Here are the real openings'),
+    ]);
+    const deps = makeDeps({ bedrock });
+    const write = jest.fn();
+
+    await agentTurn(baseTurn({ deps, write }));
+
+    const texts = frames(write).filter((f) => f.type === 'text').map((f) => f.content);
+    expect(texts.join('')).toContain('for you.\n\nHere are');
+    expect(texts.filter((t) => t === '\n\n')).toHaveLength(1); // exactly one separator
+  });
+
+  test('single-iteration turn → no separator frame', async () => {
+    const bedrock = fakeBedrock([textResponse('plain answer')]);
+    const deps = makeDeps({ bedrock });
+    const write = jest.fn();
+    await agentTurn(baseTurn({ deps, write }));
+    const texts = frames(write).filter((f) => f.type === 'text').map((f) => f.content);
+    expect(texts).not.toContain('\n\n');
+  });
+});
+
+describe('agentTurn — F3/F5 prompt rules (live-eval G1/A7 + A2/A3)', () => {
+  test("F3: the 'I don't have access' construction is banned; approved existing-appointment phrasing present", () => {
+    expect(AGENT_NARRATION_RULES).toContain('BANNED');
+    expect(AGENT_NARRATION_RULES).toContain(
+      'I can\'t see or change existing appointments — but our team can; want me to get you their contact, or set up a NEW time?'
+    );
+  });
+
+  test('F5: alternatives rule (date + exclude_slot_ids; never affirm unreceived availability) + day-part from starts_at_iso', () => {
+    expect(AGENT_NARRATION_RULES).toContain('exclude_slot_ids');
+    expect(AGENT_NARRATION_RULES).toContain('never affirm availability the tool did not return');
+    expect(AGENT_NARRATION_RULES).toContain("starts_at_iso");
+    expect(AGENT_NARRATION_RULES).toContain('never describe a morning time as afternoon');
+  });
+
+  test('PROMPT_VERSION bumped for the rules change (§B17g)', () => {
+    expect(PROMPT_VERSION).toBe('b17e.v2');
   });
 });
 

@@ -232,6 +232,30 @@ describe('executeGetAvailableTimes', () => {
     expect(sent[0]).toBe('s0'); // the 201-char id was dropped before the cap
   });
 
+  test("F5 (eval A2/A3): re-lookup returning the SAME slots → note says SAME results, never 'new availability'", async () => {
+    const args = tool1Args({
+      session: { state: 'proposing', session_id: 'sess-1', candidate_slots: [SLOT, SLOT2] },
+    });
+    const result = await executeGetAvailableTimes(args);
+    expect(result.note).toContain('SAME results as before');
+    expect(result.note).toContain('nothing else is open');
+  });
+
+  test('F5: a lookup returning DIFFERENT slots keeps the normal note', async () => {
+    const args = tool1Args({
+      session: { state: 'proposing', session_id: 'sess-1', candidate_slots: [SLOT] },
+    });
+    const result = await executeGetAvailableTimes(args); // PROPOSE_OK returns [SLOT, SLOT2]
+    expect(result.note).not.toContain('SAME results as before');
+    expect(result.note).toContain('only real, bookable times');
+  });
+
+  test('F5: first lookup of the session (no prior candidates) keeps the normal note', async () => {
+    const args = tool1Args(); // session has no candidate_slots
+    const result = await executeGetAvailableTimes(args);
+    expect(result.note).not.toContain('SAME results as before');
+  });
+
   test('no_availability outcome → { error: no_availability, note }', async () => {
     const args = tool1Args();
     args.deps.invokeProposal.mockResolvedValue({ outcome: 'no_availability', slots: [] });
