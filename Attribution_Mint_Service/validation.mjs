@@ -1,5 +1,5 @@
 /**
- * Input validation for the mint action.
+ * Input validation for the mint and repoint actions.
  * Returns null if valid, or a { code, message } error object.
  *
  * Enforces C8 PII taxonomy guardrails:
@@ -155,6 +155,45 @@ export function validateMintRequest(body) {
     tenant_id,
     metric: 'attribution.destination.unverified',
   });
+
+  return null;
+}
+
+// entry_point_id format: ep_ + 8..64 alphanumeric chars
+const ENTRY_POINT_ID_RE = /^ep_[0-9A-Za-z]{8,64}$/;
+
+/**
+ * Validate the repoint request body.
+ * @param {object} body
+ * @returns {{ code: string, message: string }|null} null = valid
+ */
+export function validateRepointRequest(body) {
+  if (!body || typeof body !== 'object') {
+    return { code: 'VALIDATION', message: 'Request body must be an object' };
+  }
+
+  const { tenant_id, entry_point_id, target } = body;
+
+  if (!tenant_id || typeof tenant_id !== 'string' || !tenant_id.trim()) {
+    return { code: 'VALIDATION', message: 'tenant_id is required' };
+  }
+  if (tenant_id.length > MAX_TENANT_ID_LEN) {
+    return { code: 'VALIDATION', message: `tenant_id must be ${MAX_TENANT_ID_LEN} characters or fewer (got ${tenant_id.length})` };
+  }
+
+  if (!entry_point_id || typeof entry_point_id !== 'string') {
+    return { code: 'VALIDATION', message: 'entry_point_id is required' };
+  }
+  if (!ENTRY_POINT_ID_RE.test(entry_point_id)) {
+    return { code: 'VALIDATION', message: 'entry_point_id must match ^ep_[0-9A-Za-z]{8,64}$' };
+  }
+
+  if (!target || typeof target !== 'object') {
+    return { code: 'VALIDATION', message: 'target is required' };
+  }
+
+  const urlErr = validateDestinationUrl(target.url);
+  if (urlErr) return { code: 'VALIDATION', message: urlErr };
 
   return null;
 }
