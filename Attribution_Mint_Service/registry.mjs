@@ -14,6 +14,7 @@ import {
   DynamoDBDocumentClient,
   PutCommand,
   GetCommand,
+  UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import { ConditionalCheckFailedException } from '@aws-sdk/client-dynamodb';
 
@@ -76,6 +77,29 @@ export async function getEntryPoint(tenantId, entryPointId) {
     Key: { tenant_id: tenantId, entry_point_id: entryPointId },
   }));
   return result.Item ?? null;
+}
+
+/**
+ * Update the destination_url of an existing entry-point registry record.
+ * No condition needed — caller (repointEntryPoint) confirmed existence via getEntryPoint.
+ * Does NOT touch short_link / dub_key / qr — the printed QR is unchanged.
+ *
+ * @param {string} tenantId
+ * @param {string} entryPointId
+ * @param {string} destinationUrl - New destination URL (already has ?ep= appended)
+ * @returns {Promise<void>}
+ */
+export async function updateDestination(tenantId, entryPointId, destinationUrl) {
+  const tableName = process.env.ENTRY_POINTS_TABLE;
+  if (!tableName) throw new Error('ENTRY_POINTS_TABLE env var is not set');
+
+  const client = getDocClient();
+  await client.send(new UpdateCommand({
+    TableName: tableName,
+    Key: { tenant_id: tenantId, entry_point_id: entryPointId },
+    UpdateExpression: 'SET destination_url = :url',
+    ExpressionAttributeValues: { ':url': destinationUrl },
+  }));
 }
 
 // Re-export so callers don't need a separate aws-sdk import

@@ -121,6 +121,62 @@ export async function dubMintLink(apiKey, { destinationUrl, entryPointId, tenant
 }
 
 /**
+ * Repoint an existing Dub link to a new destination URL via PATCH /links/ext_{entryPointId}.
+ *
+ * @param {string} apiKey - Dub API key (from Secrets Manager, never logged)
+ * @param {string} entryPointId - ep_ id used as Dub externalId (ext_ prefix added here)
+ * @param {string} newUrl - New destination URL (already has ?ep= appended by caller)
+ * @returns {Promise<void>}
+ * @throws {DubRateLimitError|DubError}
+ */
+export async function dubRepointLink(apiKey, entryPointId, newUrl) {
+  const response = await fetch(`${DUB_API_BASE}/links/ext_${entryPointId}${wsQuery()}`, {
+    method: 'PATCH',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ url: newUrl }),
+  });
+
+  if (response.status === 429) {
+    const raw = parseInt(response.headers.get('Retry-After') ?? '', 10);
+    const retryAfter = Number.isFinite(raw) && raw > 0
+      ? Math.min(raw, MAX_RETRY_WAIT_MS / 1000)
+      : 1;
+    throw new DubRateLimitError(retryAfter);
+  }
+
+  if (response.status === 404) {
+    let dubCode = '';
+    let dubMessage = '';
+    try {
+      const errBody = await response.json();
+      dubCode = errBody?.error?.code ?? '';
+      dubMessage = (errBody?.error?.message ?? '').slice(0, 200);
+    } catch { /* non-JSON body — status alone */ }
+    throw new DubError(
+      `Dub PATCH /links/ext_${entryPointId} returned HTTP 404` +
+      (dubCode ? ` (${dubCode}: ${dubMessage})` : ''),
+    );
+  }
+
+  if (!response.ok) {
+    let dubCode = '';
+    let dubMessage = '';
+    try {
+      const errBody = await response.json();
+      dubCode = errBody?.error?.code ?? '';
+      dubMessage = (errBody?.error?.message ?? '').slice(0, 200);
+    } catch { /* non-JSON body — status alone */ }
+    throw new DubError(
+      `Dub PATCH /links/ext_${entryPointId} returned HTTP ${response.status}` +
+      (dubCode ? ` (${dubCode}: ${dubMessage})` : ''),
+    );
+  }
+}
+
+/**
  * Delete a Dub link by its internal id (best-effort cleanup after registry failure).
  * Errors are swallowed; the caller logs them as warnings.
  *

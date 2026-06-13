@@ -4,7 +4,7 @@
  * All external surfaces (fetch, DynamoDB, Secrets Manager) are mocked.
  * No live AWS or Dub calls.
  *
- * Coverage targets:
+ * Coverage targets (mint):
  *  - Happy mint (no suffix, with suffix)
  *  - SUFFIX_TAKEN (Dub 409 on custom key)
  *  - CONFLICT (Dub 409 on externalId, no registry row)
@@ -17,6 +17,15 @@
  *    non-https destination, disallowed query params, label >128
  *  - Secret absent/empty → DUB_ERROR "not configured" (no crash)
  *  - 429 with Retry-After honored once then surfaced
+ *
+ * Coverage targets (repoint):
+ *  - Happy repoint: PATCH to /links/ext_{id} with wsQuery honored; body.url has ?ep=; UpdateItem called; short_link/qr unchanged
+ *  - NOT_FOUND when getEntryPoint returns null
+ *  - Validation failures: bad entry_point_id format, non-https target.url, disallowed query param, mailto
+ *  - Dub 404 → DUB_ERROR with surfaced detail
+ *  - Dub 5xx → DUB_ERROR
+ *  - Dub 429 → retry then surface
+ *  - Secret absent → DUB_ERROR
  */
 
 import { jest, describe, it, expect, beforeEach, afterEach } from '@jest/globals';
@@ -33,8 +42,8 @@ import { setDocClient } from '../registry.mjs';
 import { setSmClient } from '../secrets.mjs';
 
 // Import the units under test
-import { mintEntryPoint, handler } from '../index.mjs';
-import { validateMintRequest, validateDestinationUrl } from '../validation.mjs';
+import { mintEntryPoint, repointEntryPoint, handler } from '../index.mjs';
+import { validateMintRequest, validateRepointRequest, validateDestinationUrl } from '../validation.mjs';
 import { generateULID } from '../ulid.mjs';
 import { buildQrUrl } from '../dubClient.mjs';
 
@@ -62,8 +71,8 @@ function makeValidBody(overrides = {}) {
   };
 }
 
-/** Create a mock DynamoDB DocumentClient that succeeds on both put and get */
-function makeDdbMock({ putThrows = null, getResult = null } = {}) {
+/** Create a mock DynamoDB DocumentClient that succeeds on put/get/update */
+function makeDdbMock({ putThrows = null, getResult = null, updateThrows = null } = {}) {
   return {
     send: jest.fn(async (command) => {
       const name = command.constructor?.name ?? '';
@@ -73,6 +82,10 @@ function makeDdbMock({ putThrows = null, getResult = null } = {}) {
       }
       if (name === 'GetCommand') {
         return { Item: getResult };
+      }
+      if (name === 'UpdateCommand') {
+        if (updateThrows) throw updateThrows;
+        return {};
       }
       // Item 13: throw on unrecognized commands rather than silently falling through.
       throw new Error(`Unexpected DynamoDB command in test mock: ${name || JSON.stringify(command)}`);
@@ -909,5 +922,399 @@ describe('validateMintRequest — empty-string suffix (item 9)', () => {
     const body = makeValidBody();
     delete body.suffix;
     expect(validateMintRequest(body)).toBeNull();
+  });
+});
+
+// ============================================================
+// validateRepointRequest
+// ============================================================
+
+function makeValidRepointBody(overrides = {}) {
+  return {
+    action: 'repoint',
+    tenant_id: 'TENANT123',
+    entry_point_id: 'ep_ABCD1234',
+    target: { url: 'https://example.org/new-landing' },
+    ...overrides,
+  };
+}
+
+describe('validateRepointRequest', () => {
+  it('returns null for a valid request', () => {
+    expect(validateRepointRequest(makeValidRepointBody())).toBeNull();
+  });
+
+  it('rejects missing entry_point_id', () => {
+    const err = validateRepointRequest(makeValidRepointBody({ entry_point_id: '' }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/entry_point_id/);
+  });
+
+  it('rejects entry_point_id without ep_ prefix', () => {
+    const err = validateRepointRequest(makeValidRepointBody({ entry_point_id: 'ABCD1234' }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/entry_point_id/);
+  });
+
+  it('rejects entry_point_id with fewer than 8 chars after ep_', () => {
+    const err = validateRepointRequest(makeValidRepointBody({ entry_point_id: 'ep_ABC' }));
+    expect(err?.code).toBe('VALIDATION');
+  });
+
+  it('accepts entry_point_id with exactly 8 chars after ep_', () => {
+    expect(validateRepointRequest(makeValidRepointBody({ entry_point_id: 'ep_ABCD1234' }))).toBeNull();
+  });
+
+  it('rejects non-https target.url', () => {
+    const err = validateRepointRequest(makeValidRepointBody({
+      target: { url: 'http://example.org/new' },
+    }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/https/);
+  });
+
+  it('rejects mailto: target.url', () => {
+    const err = validateRepointRequest(makeValidRepointBody({
+      target: { url: 'mailto:user@example.org' },
+    }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/Forbidden/);
+  });
+
+  it('rejects disallowed query param in target.url', () => {
+    const err = validateRepointRequest(makeValidRepointBody({
+      target: { url: 'https://example.org/new?tracking=123' },
+    }));
+    expect(err?.code).toBe('VALIDATION');
+    expect(err?.message).toMatch(/Disallowed/);
+  });
+
+  it('accepts utm_ query params in target.url', () => {
+    expect(validateRepointRequest(makeValidRepointBody({
+      target: { url: 'https://example.org/new?utm_source=print' },
+    }))).toBeNull();
+  });
+});
+
+// ============================================================
+// repointEntryPoint — happy path
+// ============================================================
+
+describe('repointEntryPoint — happy path', () => {
+  const existingRow = {
+    tenant_id: 'TENANT123',
+    entry_point_id: 'ep_ABCD1234',
+    dub_short_link: 'https://myrctr.link/gala-tents',
+    dub_link_id: 'dub_link_001',
+    dub_key: 'gala-tents',
+    destination_url: 'https://example.org/old?ep=ep_ABCD1234',
+  };
+
+  beforeEach(() => {
+    setDocClient(makeDdbMock({ getResult: existingRow }));
+    // Dub PATCH succeeds
+    globalThis.fetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({}),
+    });
+  });
+
+  it('returns ok:true with updated destination_url and unchanged short_link/qr', async () => {
+    const result = await repointEntryPoint(makeValidRepointBody());
+
+    expect(result.ok).toBe(true);
+    expect(result.entry_point.entry_point_id).toBe('ep_ABCD1234');
+    expect(result.entry_point.short_link).toBe('https://myrctr.link/gala-tents');
+    expect(result.entry_point.qr_url).toMatch(/api\.dub\.co\/qr/);
+    expect(result.entry_point.destination_url).toMatch(/\?ep=ep_ABCD1234$/);
+    expect(result.entry_point.destination_url).toContain('new-landing');
+    expect(result.entry_point.dub_link_id).toBe('dub_link_001');
+    expect(result.entry_point.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    // short_link must be unchanged from registry (not regenerated)
+    expect(result.entry_point.short_link).toBe(existingRow.dub_short_link);
+  });
+
+  it('sends PATCH to /links/ext_{id} (not POST)', async () => {
+    await repointEntryPoint(makeValidRepointBody());
+
+    const fetchCall = globalThis.fetch.mock.calls[0];
+    expect(fetchCall[0]).toContain('/links/ext_ep_ABCD1234');
+    expect(fetchCall[1].method).toBe('PATCH');
+  });
+
+  it('body.url contains ?ep=entry_point_id (re-appended, not caller-supplied)', async () => {
+    await repointEntryPoint(makeValidRepointBody());
+
+    const fetchCall = globalThis.fetch.mock.calls[0];
+    const sentBody = JSON.parse(fetchCall[1].body);
+    expect(sentBody.url).toContain('?ep=ep_ABCD1234');
+    expect(sentBody.url).toContain('new-landing');
+  });
+
+  it('appends ?workspaceId= to PATCH URL when DUB_WORKSPACE_ID is set', async () => {
+    process.env.DUB_WORKSPACE_ID = 'ws_REPOINT';
+    try {
+      await repointEntryPoint(makeValidRepointBody());
+      const fetchCall = globalThis.fetch.mock.calls[0];
+      expect(fetchCall[0]).toContain('?workspaceId=ws_REPOINT');
+    } finally {
+      delete process.env.DUB_WORKSPACE_ID;
+    }
+  });
+
+  it('calls registry UpdateItem with new destination_url', async () => {
+    const ddbMock = makeDdbMock({ getResult: existingRow });
+    setDocClient(ddbMock);
+
+    await repointEntryPoint(makeValidRepointBody());
+
+    const updateCalls = ddbMock.send.mock.calls.filter(
+      ([cmd]) => cmd.constructor?.name === 'UpdateCommand'
+    );
+    expect(updateCalls).toHaveLength(1);
+    const updateInput = updateCalls[0][0].input;
+    expect(updateInput.ExpressionAttributeValues[':url']).toContain('?ep=ep_ABCD1234');
+  });
+});
+
+// ============================================================
+// repointEntryPoint — registry update fails after Dub PATCH succeeds
+// ============================================================
+
+describe('repointEntryPoint — registry update failure after Dub PATCH success', () => {
+  const existingRow = {
+    tenant_id: 'TENANT123',
+    entry_point_id: 'ep_ABCD1234',
+    dub_short_link: 'https://myrctr.link/gala-tents',
+    dub_link_id: 'dub_link_001',
+    destination_url: 'https://example.org/old?ep=ep_ABCD1234',
+  };
+
+  it('returns DUB_ERROR with "retry to sync" message when registry UpdateItem fails after Dub PATCH succeeds', async () => {
+    const updateErr = new Error('ProvisionedThroughputExceededException');
+    updateErr.name = 'ProvisionedThroughputExceededException';
+    setDocClient(makeDdbMock({ getResult: existingRow, updateThrows: updateErr }));
+
+    globalThis.fetch.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({}),
+    });
+
+    const result = await repointEntryPoint(makeValidRepointBody());
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('DUB_ERROR');
+    expect(result.error.message).toMatch(/retry to sync/);
+  });
+});
+
+// ============================================================
+// repointEntryPoint — NOT_FOUND
+// ============================================================
+
+describe('repointEntryPoint — NOT_FOUND', () => {
+  it('returns NOT_FOUND when getEntryPoint returns null', async () => {
+    setDocClient(makeDdbMock({ getResult: null }));
+
+    const result = await repointEntryPoint(makeValidRepointBody());
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('NOT_FOUND');
+    expect(result.error.message).toMatch(/entry point not found/);
+    // Dub should NOT have been called
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================
+// repointEntryPoint — Dub error paths
+// ============================================================
+
+describe('repointEntryPoint — Dub 404', () => {
+  const existingRow = {
+    tenant_id: 'TENANT123',
+    entry_point_id: 'ep_ABCD1234',
+    dub_short_link: 'https://myrctr.link/gala-tents',
+    dub_link_id: 'dub_link_001',
+    destination_url: 'https://example.org/old?ep=ep_ABCD1234',
+  };
+
+  it('returns DUB_ERROR when Dub returns 404', async () => {
+    setDocClient(makeDdbMock({ getResult: existingRow }));
+    globalThis.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      headers: { get: () => null },
+      json: async () => ({ error: { code: 'not_found', message: 'Link not found' } }),
+    });
+
+    const result = await repointEntryPoint(makeValidRepointBody());
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('DUB_ERROR');
+    expect(result.error.message).toMatch(/404/);
+  });
+});
+
+describe('repointEntryPoint — Dub 5xx', () => {
+  const existingRow = {
+    tenant_id: 'TENANT123',
+    entry_point_id: 'ep_ABCD1234',
+    dub_short_link: 'https://myrctr.link/gala-tents',
+    dub_link_id: 'dub_link_001',
+    destination_url: 'https://example.org/old?ep=ep_ABCD1234',
+  };
+
+  it('returns DUB_ERROR with surfaced detail on Dub 500', async () => {
+    setDocClient(makeDdbMock({ getResult: existingRow }));
+    globalThis.fetch.mockResolvedValueOnce({
+      ok: false,
+      status: 500,
+      headers: { get: () => null },
+      json: async () => ({ error: { code: 'server_error', message: 'Internal error' } }),
+    });
+
+    const result = await repointEntryPoint(makeValidRepointBody());
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('DUB_ERROR');
+    expect(result.error.message).toMatch(/500/);
+  });
+});
+
+describe('repointEntryPoint — Dub 429 retry', () => {
+  const existingRow = {
+    tenant_id: 'TENANT123',
+    entry_point_id: 'ep_ABCD1234',
+    dub_short_link: 'https://myrctr.link/gala-tents',
+    dub_link_id: 'dub_link_001',
+    destination_url: 'https://example.org/old?ep=ep_ABCD1234',
+  };
+
+  it('retries once on 429 and succeeds', async () => {
+    jest.useFakeTimers();
+    setDocClient(makeDdbMock({ getResult: existingRow }));
+
+    globalThis.fetch
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: { get: (h) => h === 'Retry-After' ? '1' : null },
+        json: async () => ({}),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        json: async () => ({}),
+      });
+
+    const promise = repointEntryPoint(makeValidRepointBody());
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result.ok).toBe(true);
+    expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+  }, 10000);
+
+  it('returns DUB_ERROR after retry also fails with 429', async () => {
+    jest.useFakeTimers();
+    setDocClient(makeDdbMock({ getResult: existingRow }));
+
+    globalThis.fetch
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: { get: (h) => h === 'Retry-After' ? '1' : null },
+        json: async () => ({}),
+      })
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        headers: { get: (h) => h === 'Retry-After' ? '1' : null },
+        json: async () => ({}),
+      });
+
+    const promise = repointEntryPoint(makeValidRepointBody());
+    await jest.runAllTimersAsync();
+    const result = await promise;
+
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('DUB_ERROR');
+    expect(result.error.message).toMatch(/rate limit/i);
+  }, 10000);
+});
+
+// ============================================================
+// repointEntryPoint — secret absent
+// ============================================================
+
+describe('repointEntryPoint — secret absent', () => {
+  it('returns DUB_ERROR gracefully when DUB_SECRET_NAME not set', async () => {
+    delete process.env.DUB_SECRET_NAME;
+    setSmClient(null);
+
+    const result = await repointEntryPoint(makeValidRepointBody());
+    expect(result.ok).toBe(false);
+    expect(result.error.code).toBe('DUB_ERROR');
+    expect(result.error.message).toMatch(/not configured/);
+    // getEntryPoint should NOT have been called (exits before DDB)
+    // — and since DUB_SECRET_NAME is absent, fetch definitely not called
+    expect(globalThis.fetch).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================
+// handler — repoint dispatch
+// ============================================================
+
+describe('handler — repoint dispatch', () => {
+  const existingRow = {
+    tenant_id: 'TENANT123',
+    entry_point_id: 'ep_ABCD1234',
+    dub_short_link: 'https://myrctr.link/gala-tents',
+    dub_link_id: 'dub_link_001',
+    destination_url: 'https://example.org/old?ep=ep_ABCD1234',
+  };
+
+  beforeEach(() => {
+    setDocClient(makeDdbMock({ getResult: existingRow }));
+    globalThis.fetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      json: async () => ({}),
+    });
+  });
+
+  it('returns 200 on successful repoint', async () => {
+    const response = await handler(makeValidRepointBody());
+    expect(response.statusCode).toBe(200);
+    const body = JSON.parse(response.body);
+    expect(body.ok).toBe(true);
+    expect(body.entry_point.short_link).toBe('https://myrctr.link/gala-tents');
+  });
+
+  it('returns 400 for repoint validation error (bad entry_point_id)', async () => {
+    const response = await handler(makeValidRepointBody({ entry_point_id: 'bad-id' }));
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.error.code).toBe('VALIDATION');
+  });
+
+  it('returns 404 for NOT_FOUND', async () => {
+    setDocClient(makeDdbMock({ getResult: null }));
+    const response = await handler(makeValidRepointBody());
+    expect(response.statusCode).toBe(404);
+    const body = JSON.parse(response.body);
+    expect(body.error.code).toBe('NOT_FOUND');
+  });
+
+  it('returns 400 for unknown action (repoint path not triggered for "list")', async () => {
+    const response = await handler({ action: 'list' });
+    expect(response.statusCode).toBe(400);
+    const body = JSON.parse(response.body);
+    expect(body.error.code).toBe('VALIDATION');
+    expect(body.error.message).toBe('Unknown action');
   });
 });
