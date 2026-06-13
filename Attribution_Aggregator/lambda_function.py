@@ -328,6 +328,17 @@ def _compute_session_metrics(sid: str, events: List[Dict], tz: ZoneInfo) -> Dict
     is_after_hours = False
     first_user_message_ts: Optional[datetime] = None
     message_timestamps: List[datetime] = []
+    # C7 WS-K: interaction_timestamps collects timestamps of all real interaction
+    # events for staff-hours computation.  MESSAGE_SENT/USER_MESSAGE are defined
+    # in Picasso's eventConstants.js but never emitted by the live widget; the
+    # actual signals are CONVERSATION_STARTED, CTA_CLICKED, ACTION_CHIP_CLICKED,
+    # LINK_CLICKED, FORM_* and SCHEDULING_*.  We feed ALL of these into
+    # _compute_active_seconds (which applies the C7 5-min idle cap and 1-min floor),
+    # producing a "wall-clock time the visitor was actively interacting on our
+    # surface".  If a real MESSAGE_SENT ts ever appears it is included too (the
+    # set union is the right measure).  PAGE_VIEW sessions are keyed pv_ and
+    # separated upstream -- no pv_ events reach this function.  FROZEN_CONTRACTS C7.
+    interaction_timestamps: List[datetime] = []
     topic_counts: Dict[str, int] = defaultdict(int)
     resource_clicks: Dict[str, int] = defaultdict(int)
     attribution: Optional[Dict] = None
@@ -352,7 +363,11 @@ def _compute_session_metrics(sid: str, events: List[Dict], tz: ZoneInfo) -> Dict
             except (ValueError, TypeError):
                 pass
 
-        # C1.1 / C7 -- CONVERSATION_STARTED carries attribution + entry_point_id
+        # C1.1 / C7 -- CONVERSATION_STARTED carries attribution + entry_point_id.
+        # WS-K fix: CONVERSATION_STARTED ts IS the first-user-message time per C7
+        # (it is emitted on the user's first message; MESSAGE_SENT is never emitted
+        # by the live widget).  Capture ts as first_user_message_ts here; also
+        # accept a real MESSAGE_SENT ts below (taking the earliest -- future-proof).
         if event_type == 'CONVERSATION_STARTED':
             ep_raw = ev.get('entry_point_id') or payload.get('entry_point_id')
             if ep_raw and EP_ID_PATTERN.match(str(ep_raw)):
@@ -365,14 +380,22 @@ def _compute_session_metrics(sid: str, events: List[Dict], tz: ZoneInfo) -> Dict
                     )
                 except (json.JSONDecodeError, TypeError):
                     attribution = {}
+            # C7 WS-K: drive after-hours off CONVERSATION_STARTED ts (FROZEN_CONTRACTS C7)
+            if ts:
+                if first_user_message_ts is None or ts < first_user_message_ts:
+                    first_user_message_ts = ts
+                interaction_timestamps.append(ts)
 
         # C7 -- user message tracking (proxy: MESSAGE_SENT by user)
+        # WS-K: MESSAGE_SENT is never emitted live, but honour it if present --
+        # take earliest ts for after-hours; include ts in interaction_timestamps.
         if event_type in ('MESSAGE_SENT', 'USER_MESSAGE'):
             user_message_count += 1
             if ts:
-                if first_user_message_ts is None:
+                if first_user_message_ts is None or ts < first_user_message_ts:
                     first_user_message_ts = ts
-                message_timestamps.append(ts)
+                interaction_timestamps.append(ts)
+                message_timestamps.append(ts)  # kept for backward compat
 
             # C5 topics: categorize first user message
             text = payload.get('text', '') or payload.get('message', '') or ''
@@ -380,17 +403,31 @@ def _compute_session_metrics(sid: str, events: List[Dict], tz: ZoneInfo) -> Dict
                 topic = categorize_question(text)
                 topic_counts[topic] += 1
 
-        # C7 -- engaged events
+        # C7 -- engaged events; also collect ts for interaction_timestamps (WS-K)
         if event_type in ENGAGED_EVENT_TYPES:
             has_engaged_event = True
+            if ts:
+                interaction_timestamps.append(ts)
 
-        # C7 -- application started / lead delivered
+        # C7 -- application started / lead delivered; collect interaction ts (WS-K)
         if event_type == 'FORM_STARTED':
             has_application = True
+            if ts:
+                interaction_timestamps.append(ts)
         if event_type == 'FORM_COMPLETED':
             has_lead = True
+            if ts:
+                interaction_timestamps.append(ts)
+
+        # C7/C5 -- SCHEDULING_* and ACTION_CHIP_CLICKED: interaction ts (WS-K)
+        if event_type in ('ACTION_CHIP_CLICKED', 'SCHEDULING_TYPED_REFINEMENT',
+                          'SCHEDULING_CONFIRMED', 'SCHEDULING_STARTED',
+                          'SCHEDULING_CANCELLED', 'SCHEDULING_ABANDONED'):
+            if ts:
+                interaction_timestamps.append(ts)
 
         # C1.2 -- LINK_CLICKED resource tracking (C5 resource_clicks)
+        # Note: LINK_CLICKED is also in ENGAGED_EVENT_TYPES; ts already added above.
         if event_type == 'LINK_CLICKED':
             has_engaged_event = True
             url = payload.get('url', '')
@@ -404,8 +441,12 @@ def _compute_session_metrics(sid: str, events: List[Dict], tz: ZoneInfo) -> Dict
     # C7 -- engaged: >=1 engaged event OR >=2 user messages
     is_engaged = has_engaged_event or user_message_count >= ENGAGED_MIN_USER_MESSAGES
 
-    # C7 -- staff-hours: sum consecutive message gaps, cap each at 5 min, floor 1 min
-    active_seconds = _compute_active_seconds(message_timestamps)
+    # C7 WS-K: staff-hours driven off interaction_timestamps (all real interaction
+    # signals -- see comment at variable declaration above).  Sort ascending so
+    # consecutive-gap math is correct regardless of DDB return order.
+    # FROZEN_CONTRACTS C7: 5-min idle cap, 1-min floor, /40 work-weeks unchanged.
+    interaction_timestamps_sorted = sorted(set(interaction_timestamps))
+    active_seconds = _compute_active_seconds(interaction_timestamps_sorted)
 
     # C2 -- provenance resolution (registry lookup deferred to channel/ep aggregation)
     # Store raw data here; _resolve_provenance called at build time

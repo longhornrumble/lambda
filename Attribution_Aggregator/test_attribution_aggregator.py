@@ -1011,5 +1011,221 @@ class TestLambdaHandlerSmoke:
         assert result['successful'] == 0
 
 
+# ---------------------------------------------------------------------------
+# WS-K fix: after-hours driven off CONVERSATION_STARTED
+# ---------------------------------------------------------------------------
+class TestAfterHoursFromConversationStarted:
+    """
+    WS-K fix 1: after_hours must be True when CONVERSATION_STARTED is after-hours,
+    even when no MESSAGE_SENT event exists.
+    FROZEN_CONTRACTS C7 (implementation refinement).
+    """
+
+    def test_after_hours_session_via_conversation_started(self):
+        """
+        CONVERSATION_STARTED at 2026-06-13T02:32:00Z = 21:32 Fri CDT (UTC-5 in June).
+        Weekday Fri is business day, but 21:32 > 17:00 -> after_hours = True.
+        """
+        evs = [
+            _ddb_event(
+                event_type='CONVERSATION_STARTED',
+                step=1,
+                ts='2026-06-13T02:32:00Z',  # 21:32 CDT Friday (UTC-5)
+            )
+        ]
+        sm = _compute_session_metrics('sess_after', evs, _TZ_CHICAGO)
+        assert sm['is_after_hours'] is True, (
+            'Session starting at 21:32 CDT Friday must be after_hours=True'
+        )
+
+    def test_during_hours_session_via_conversation_started(self):
+        """
+        CONVERSATION_STARTED at 2026-06-12T15:00:00Z = 10:00 Fri CDT -> business hours.
+        """
+        evs = [
+            _ddb_event(
+                event_type='CONVERSATION_STARTED',
+                step=1,
+                ts='2026-06-12T15:00:00Z',  # 10:00 CDT Friday
+            )
+        ]
+        sm = _compute_session_metrics('sess_during', evs, _TZ_CHICAGO)
+        assert sm['is_after_hours'] is False, (
+            'Session starting at 10:00 CDT Friday must be after_hours=False'
+        )
+
+    def test_conversation_started_without_timestamp_does_not_crash(self):
+        """CONVERSATION_STARTED with no timestamp -> no crash, is_after_hours=False."""
+        evs = [
+            {
+                'pk': 'SESSION#sess_nots',
+                'sk': 'STEP#001',
+                'session_id': 'sess_nots',
+                'step_number': 1,
+                'event_type': 'CONVERSATION_STARTED',
+                'ttl': 9999999999,
+            }
+        ]
+        sm = _compute_session_metrics('sess_nots', evs, _TZ_CHICAGO)
+        assert sm['is_after_hours'] is False
+
+    def test_old_shape_with_message_sent_still_works(self):
+        """
+        Old-shape session with a real MESSAGE_SENT uses earliest ts for after-hours.
+        If MESSAGE_SENT arrives before CONVERSATION_STARTED ts, MESSAGE_SENT ts wins.
+        """
+        # MESSAGE_SENT at 21:00 CDT (after hours), CONVERSATION_STARTED at 21:05
+        evs = [
+            _ddb_event(
+                event_type='MESSAGE_SENT',
+                step=1,
+                ts='2026-06-13T02:00:00Z',  # 21:00 CDT Friday
+            ),
+            _ddb_event(
+                event_type='CONVERSATION_STARTED',
+                step=2,
+                ts='2026-06-13T02:05:00Z',  # 21:05 CDT Friday
+            ),
+        ]
+        sm = _compute_session_metrics('sess_msg_first', evs, _TZ_CHICAGO)
+        assert sm['is_after_hours'] is True
+
+    def test_message_sent_earlier_than_conversation_started_wins(self):
+        """
+        MESSAGE_SENT ts earlier than CONVERSATION_STARTED ts -> MESSAGE_SENT is taken.
+        Both are after hours here so the result is still True.
+        """
+        # CONVERSATION_STARTED at step 1 (22:00), MESSAGE_SENT at step 0 (21:30 - earlier)
+        evs = [
+            _ddb_event(
+                event_type='CONVERSATION_STARTED',
+                step=2,
+                ts='2026-06-13T03:00:00Z',  # 22:00 CDT Friday
+            ),
+            _ddb_event(
+                event_type='MESSAGE_SENT',
+                step=1,
+                ts='2026-06-13T02:30:00Z',  # 21:30 CDT Friday -- earlier
+            ),
+        ]
+        sm = _compute_session_metrics('sess_cs_later', evs, _TZ_CHICAGO)
+        # earliest ts = 21:30 CDT Friday -> still after hours
+        assert sm['is_after_hours'] is True
+
+
+# ---------------------------------------------------------------------------
+# WS-K fix: active_seconds computed from interaction event stream
+# ---------------------------------------------------------------------------
+class TestActiveSecondsFromInteractionStream:
+    """
+    WS-K fix 2: active_seconds / conversation_minutes driven off all real
+    interaction events (CONVERSATION_STARTED, CTA_CLICKED, ACTION_CHIP_CLICKED,
+    LINK_CLICKED, FORM_*, SCHEDULING_*), not just MESSAGE_SENT.
+    FROZEN_CONTRACTS C7 (implementation refinement -- C7 assumed MESSAGE_SENT existed).
+    """
+
+    def _make_events(self, event_pairs):
+        """Helper: list of (event_type, ts_str) -> DDB event list."""
+        return [
+            _ddb_event(event_type=et, step=i + 1, ts=ts)
+            for i, (et, ts) in enumerate(event_pairs)
+        ]
+
+    def test_single_conversation_started_gives_floor(self):
+        """Single CONVERSATION_STARTED -> 1 interaction event -> 60s floor."""
+        evs = self._make_events([('CONVERSATION_STARTED', '2026-06-12T15:00:00Z')])
+        sm = _compute_session_metrics('sess_single', evs, _TZ_CHICAGO)
+        assert sm['active_seconds'] == MIN_CONVERSATION_SECONDS  # 60
+
+    def test_zero_events_gives_zero(self):
+        """No events -> 0 active seconds (no floor -- no events)."""
+        sm = _compute_session_metrics('sess_empty', [], _TZ_CHICAGO)
+        assert sm['active_seconds'] == 0
+
+    def test_events_at_0s_90s_20min_applies_5min_cap(self):
+        """
+        Three events: 0s, +90s, +20min.
+        Gaps: 90s (kept) + 1200s (capped to 300s) = 390s.
+        """
+        base_ts = datetime(2026, 6, 12, 15, 0, 0, tzinfo=ZoneInfo('UTC'))
+        t0 = base_ts.isoformat().replace('+00:00', 'Z')
+        t1 = (base_ts + timedelta(seconds=90)).isoformat().replace('+00:00', 'Z')
+        t2 = (base_ts + timedelta(minutes=20)).isoformat().replace('+00:00', 'Z')
+
+        evs = self._make_events([
+            ('CONVERSATION_STARTED', t0),
+            ('CTA_CLICKED', t1),
+            ('ACTION_CHIP_CLICKED', t2),
+        ])
+        sm = _compute_session_metrics('sess_3ev', evs, _TZ_CHICAGO)
+        assert sm['active_seconds'] == 390, (
+            f'Expected 390s (90 + 300 capped), got {sm["active_seconds"]}'
+        )
+
+    def test_single_event_floors_to_60s(self):
+        """Single interaction event -> 60s (1-min floor)."""
+        evs = self._make_events([('CTA_CLICKED', '2026-06-12T15:00:00Z')])
+        sm = _compute_session_metrics('sess_1ev', evs, _TZ_CHICAGO)
+        assert sm['active_seconds'] == MIN_CONVERSATION_SECONDS
+
+    def test_realistic_session_conversation_minutes_nonzero(self):
+        """
+        Realistic session: CONVERSATION_STARTED + CTA_CLICKED + ACTION_CHIP_CLICKED
+        + 2x SCHEDULING_TYPED_REFINEMENT spanning ~90s total.
+        conversation_minutes must be > 0 (was structurally 0 before fix).
+        Also tests after_hours (21:32 CDT Friday -> True).
+        """
+        base_utc = datetime(2026, 6, 13, 2, 32, 0, tzinfo=ZoneInfo('UTC'))  # 21:32 CDT Fri
+
+        def fmt(dt):
+            return dt.isoformat().replace('+00:00', 'Z')
+
+        evs = self._make_events([
+            ('CONVERSATION_STARTED',         fmt(base_utc)),
+            ('CTA_CLICKED',                  fmt(base_utc + timedelta(seconds=20))),
+            ('ACTION_CHIP_CLICKED',          fmt(base_utc + timedelta(seconds=45))),
+            ('SCHEDULING_TYPED_REFINEMENT',  fmt(base_utc + timedelta(seconds=70))),
+            ('SCHEDULING_TYPED_REFINEMENT',  fmt(base_utc + timedelta(seconds=90))),
+        ])
+        sm = _compute_session_metrics('sess_realistic', evs, _TZ_CHICAGO)
+        assert sm['is_after_hours'] is True, 'Must be after_hours at 21:32 CDT Friday'
+        assert sm['active_seconds'] > 0, 'active_seconds must be > 0 after WS-K fix'
+        assert sm['active_seconds'] == 90, (
+            f'Expected 90s (sum of 20+25+25+20 gaps), got {sm["active_seconds"]}'
+        )
+        # Build a summary to verify conversation_minutes is non-zero
+        session_metrics = {'sess_realistic': sm}
+        summary = _build_summary(['sess_realistic'], session_metrics, 0)
+        assert summary['conversation_minutes'] > 0, (
+            'conversation_minutes must be > 0 after WS-K fix'
+        )
+        assert summary['after_hours_conversations'] == 1
+
+    def test_no_message_sent_active_seconds_still_nonzero(self):
+        """
+        Session with only CONVERSATION_STARTED + SCHEDULING_TYPED_REFINEMENT
+        (no MESSAGE_SENT) -> active_seconds > 0.  Before the fix this was 0.
+        """
+        evs = self._make_events([
+            ('CONVERSATION_STARTED',        '2026-06-12T15:00:00Z'),
+            ('SCHEDULING_TYPED_REFINEMENT', '2026-06-12T15:01:30Z'),  # +90s
+        ])
+        sm = _compute_session_metrics('sess_sched', evs, _TZ_CHICAGO)
+        assert sm['active_seconds'] == 90
+
+    def test_duplicate_timestamps_deduped_via_set(self):
+        """
+        Two events at the same timestamp (e.g. CONVERSATION_STARTED fires simultaneously
+        with CTA_CLICKED at step 1) -> deduped, treated as single event, floors to 60s.
+        """
+        evs = self._make_events([
+            ('CONVERSATION_STARTED', '2026-06-12T15:00:00Z'),
+            ('CTA_CLICKED',          '2026-06-12T15:00:00Z'),
+        ])
+        sm = _compute_session_metrics('sess_dup', evs, _TZ_CHICAGO)
+        # After dedup: 1 unique ts -> floor 60s
+        assert sm['active_seconds'] == MIN_CONVERSATION_SECONDS
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
