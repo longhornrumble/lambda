@@ -35,6 +35,9 @@
 
 const { computeReminderTiers } = require('./cadence');
 
+// G1: SCHEDULE_BASE_URL mirrors confirmation-email.js's constant (same env var source).
+const SCHEDULE_BASE_URL = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
+
 // ─── field access (forward-compatible reads — snake_case OR camelCase) ─────────────────
 
 function pick(obj, ...keys) {
@@ -43,6 +46,19 @@ function pick(obj, ...keys) {
     if (obj[k] !== undefined && obj[k] !== null && obj[k] !== '') return obj[k];
   }
   return undefined;
+}
+
+// G1: locale-aware "when" label (mirrors index.js formatWhen — shared discipline §9.3).
+function formatWhenLabel(startAt, timeZone) {
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      weekday: 'short', month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+      timeZone: timeZone || 'UTC',
+    }).format(new Date(startAt));
+  } catch (_) {
+    return startAt || '';
+  }
 }
 
 // ─── name / id derivation (deterministic + idempotent) ────────────────────────────────
@@ -102,6 +118,9 @@ function readBooking(booking) {
       pick(booking, 'organization_name', 'organizationName', 'org_name') || 'us',
     isSynthetic: pick(booking, 'is_synthetic', 'isSynthetic') === true,
     existingState: pick(booking, 'reminder_schedule_state', 'reminderScheduleState'),
+    // G1 additive: forward-compatible (undefined on old rows → action block skipped).
+    joinUrl: pick(booking, 'join_url', 'joinUrl'),
+    cancellationWindowHours: pick(booking, 'cancellation_window_hours', 'cancellationWindowHours'),
   };
 }
 
@@ -126,10 +145,13 @@ function reminderBody({ b, tier }) {
   return `Reminder: your ${b.appointmentTypeName} with ${b.organizationName} is coming up ${lead}.`;
 }
 
-function buildReminderRow({ b, tier, fireAtMs, tenantPrefsSnap, config }) {
+function buildReminderRow({ b, tier, fireAtMs, tenantPrefsSnap, config, rescheduleUrl, cancelUrl, joinUrl, whenLabel }) {
   const messageId = reminderMessageId(b.bookingId, tier);
   const body = reminderBody({ b, tier });
-  return {
+  // G1: bake action-link fields onto the row (only when non-empty — forward-compatible).
+  // The consumer (Scheduled_Message_Sender) appends the rendered action block OUTSIDE
+  // the editable body at fire time; old-shape rows lacking these fields → no block emitted.
+  const row = {
     pk: messagePk(b.tenantId),
     sk: messageSk(b.startAt, messageId),
     tenant_id: b.tenantId,
@@ -159,6 +181,13 @@ function buildReminderRow({ b, tier, fireAtMs, tenantPrefsSnap, config }) {
     // harmless when TTL is off. 7d after fire.
     ttl: Math.floor(fireAtMs / 1000) + 7 * 24 * 60 * 60,
   };
+  // G1: bake action-link fields only when non-empty (forward-compatible — consumer
+  // skips the action block when these are absent, no empty lines emitted).
+  if (rescheduleUrl) row.reschedule_url = rescheduleUrl;
+  if (cancelUrl) row.cancel_url = cancelUrl;
+  if (joinUrl) row.join_url = joinUrl;
+  if (whenLabel) row.when_label = whenLabel;
+  return row;
 }
 
 function buildAttendanceRow({ b, fireAtMs, tenantPrefsSnap, config }) {
@@ -286,11 +315,12 @@ async function writeScheduleState(deps, table, tenantId, bookingId, state) {
  * @param {object} args.booking       - the persisted Booking (snake_case or camelCase)
  * @param {object} [args.tenantPrefs] - tenant config slice ({ notificationPrefs, sms_quiet_hours })
  *        used to snapshot the fire-time §E3 gate inputs into each row.
+ * @param {object} [args.signOpts]    - G1: passed through to tokens.sign (test key injection).
  * @param {object} [deps]             - injected { ddb, scheduler, now, logger, config }
  * @returns {Promise<{ tenantId, bookingId, reminders: {tier,scheduleName,sk}[],
  *          attendance: {scheduleName,sk}, tiers: string[] }>} the persisted reminder_schedule_state.
  */
-async function scheduleReminders({ booking, tenantPrefs } = {}, deps = buildDefaultDeps()) {
+async function scheduleReminders({ booking, tenantPrefs, signOpts } = {}, deps = buildDefaultDeps()) {
   const b = readBooking(booking);
   if (!b.tenantId) throw new Error('scheduleReminders requires booking.tenant_id');
   if (!b.bookingId) throw new Error('scheduleReminders requires booking.booking_id');
@@ -306,6 +336,36 @@ async function scheduleReminders({ booking, tenantPrefs } = {}, deps = buildDefa
   const tenantPrefsSnap = snapshotTenantPrefs(tenantPrefs);
   const tiers = computeReminderTiers({ startAt: b.startAt, nowMs, synthetic });
 
+  // G1: mint cancel + reschedule tokens ONCE (shared across all reminder rows for this
+  // booking). FAIL-SOFT: if signing fails for any reason (missing key, reconciler path
+  // lacking the grant), set urls to '' and continue — reminders still schedule without links.
+  let rescheduleUrl = '';
+  let cancelUrl = '';
+  let whenLabel = '';
+  try {
+    const { sign } = require('../shared/scheduling/tokens');
+    const baseClaims = {
+      tenant_id: b.tenantId,
+      booking_id: b.bookingId,
+      start_at: b.startAt,
+      cancellation_window_hours: b.cancellationWindowHours || 0,
+    };
+    const [cancelToken, rescheduleToken] = await Promise.all([
+      sign('cancel', baseClaims, signOpts),
+      sign('reschedule', baseClaims, signOpts),
+    ]);
+    cancelUrl = `${SCHEDULE_BASE_URL}/cancel?t=${encodeURIComponent(cancelToken)}`;
+    rescheduleUrl = `${SCHEDULE_BASE_URL}/reschedule?t=${encodeURIComponent(rescheduleToken)}`;
+    whenLabel = formatWhenLabel(b.startAt, b.timezone);
+  } catch (mintErr) {
+    log.warn(JSON.stringify({
+      event: 'reminder_link_mint_failed',
+      booking_id: b.bookingId,
+      error: mintErr.message || String(mintErr),
+    }));
+    // Links stay '' — reminders schedule without action block (fail-soft).
+  }
+
   const state = {
     tenantId: b.tenantId,
     bookingId: b.bookingId,
@@ -318,7 +378,11 @@ async function scheduleReminders({ booking, tenantPrefs } = {}, deps = buildDefa
 
   // 1. Reminder rows + schedules.
   for (const { tier, fireAtMs } of tiers) {
-    const row = buildReminderRow({ b, tier, fireAtMs, tenantPrefsSnap, config: cfg });
+    const row = buildReminderRow({
+      b, tier, fireAtMs, tenantPrefsSnap, config: cfg,
+      // G1: pass minted urls ('' when minting failed → fields omitted from row).
+      rescheduleUrl, cancelUrl, joinUrl: b.joinUrl || '', whenLabel,
+    });
     await putRow(deps, cfg.scheduledMessagesTable, row);
     const name = reminderScheduleName(tier, b.bookingId);
     await deps.scheduler.createSchedule(

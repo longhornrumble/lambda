@@ -693,3 +693,175 @@ test('attendance (coordinator) email gets NO unsubscribe line; attendee reminder
   }
 });
 
+// ─── G1: buildActionBlock unit tests ──────────────────────────────────────────────────────
+
+import { buildActionBlock } from './index.mjs';
+
+test('G1/buildActionBlock: old-shape row (no link fields) → all formats are empty string', () => {
+  const block = buildActionBlock({});
+  assert.equal(block.text, '');
+  assert.equal(block.html, '');
+  assert.equal(block.sms, '');
+});
+
+test('G1/buildActionBlock: row with only when_label → text/html produced, sms empty', () => {
+  const block = buildActionBlock({ when_label: 'Tomorrow at 2:00 PM CDT' });
+  assert.match(block.text, /When: Tomorrow at 2:00 PM CDT/);
+  assert.match(block.html, /When: Tomorrow at 2:00 PM CDT/);
+  assert.equal(block.sms, ''); // sms block only carries URLs
+});
+
+test('G1/buildActionBlock: join_url appears in all three formats', () => {
+  const block = buildActionBlock({ join_url: 'https://meet.google.com/abc' });
+  assert.match(block.text, /Join: https:\/\/meet\.google\.com\/abc/);
+  assert.match(block.html, /href="https:\/\/meet\.google\.com\/abc"/);
+  assert.match(block.sms, /Join: https:\/\/meet\.google\.com\/abc/);
+});
+
+test('G1/buildActionBlock: reschedule + cancel URLs both appear in all formats', () => {
+  const block = buildActionBlock({
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=abc',
+    cancel_url: 'https://schedule.myrecruiter.ai/cancel?t=def',
+  });
+  assert.match(block.text, /Reschedule:.*reschedule\?t=abc/);
+  assert.match(block.text, /Cancel:.*cancel\?t=def/);
+  assert.match(block.html, /href="https:\/\/schedule\.myrecruiter\.ai\/reschedule\?t=abc"/);
+  assert.match(block.html, /href="https:\/\/schedule\.myrecruiter\.ai\/cancel\?t=def"/);
+  assert.match(block.sms, /Reschedule:.*reschedule\?t=abc/);
+  assert.match(block.sms, /Cancel:.*cancel\?t=def/);
+});
+
+test('G1/buildActionBlock: HTML content is escaped (XSS guard)', () => {
+  const block = buildActionBlock({ when_label: '<script>alert(1)</script>' });
+  assert.ok(!block.html.includes('<script>'));
+  assert.match(block.html, /&lt;script&gt;/);
+});
+
+test('G1/buildActionBlock: text format starts with double newline separator', () => {
+  const block = buildActionBlock({ join_url: 'https://meet.example.com/x' });
+  assert.ok(block.text.startsWith('\n\n'));
+});
+
+test('G1/buildActionBlock: html format starts with single newline separator', () => {
+  const block = buildActionBlock({ when_label: 'Friday at 3 PM' });
+  assert.ok(block.html.startsWith('\n'));
+});
+
+// ─── G1: integration — action block appended in email/SMS send paths ──────────────────────
+
+test('G1 email: enriched attendee reminder → action block in text AND html, STOP is last', async () => {
+  const message = reminderRow({
+    when_label: 'Tomorrow at 2:00 PM CDT',
+    join_url: 'https://meet.google.com/abc',
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=tok1',
+    cancel_url: 'https://schedule.myrecruiter.ai/cancel?t=tok2',
+  });
+  const { deps, lambdaCalls } = makeDeps({ message });
+  await dispatch(EVENT(message), deps);
+  const email = parseEmail(lambdaCalls);
+  // Action block present before STOP
+  assert.match(email.text_body, /When: Tomorrow at 2:00 PM CDT/);
+  assert.match(email.text_body, /Join: https:\/\/meet\.google\.com\/abc/);
+  assert.match(email.text_body, /Reschedule:.*tok1/);
+  assert.match(email.text_body, /Cancel:.*tok2/);
+  // STOP is last in text
+  assert.ok(email.text_body.endsWith(STOP_LINE_TEXT));
+  // HTML version also carries the block
+  assert.match(email.html_body, /Join the meeting/);
+  // STOP last in html
+  assert.ok(email.html_body.endsWith(STOP_LINE_HTML));
+});
+
+test('G1 email: STOP appears exactly once even when action block is present', async () => {
+  const message = reminderRow({
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=tok',
+    cancel_url: 'https://schedule.myrecruiter.ai/cancel?t=tok',
+  });
+  const { deps, lambdaCalls } = makeDeps({ message });
+  await dispatch(EVENT(message), deps);
+  const { text_body, html_body } = parseEmail(lambdaCalls);
+  // STOP must not be duplicated — appears exactly once each
+  const textMatches = [...text_body.matchAll(/reply STOP/gi)];
+  const htmlMatches = [...html_body.matchAll(/reply STOP/gi)];
+  assert.equal(textMatches.length, 1);
+  assert.equal(htmlMatches.length, 1);
+});
+
+test('G1 email: old-shape row (no link fields) → no action block, STOP still appended', async () => {
+  const message = reminderRow(); // no when_label / join_url / reschedule_url / cancel_url
+  const { deps, lambdaCalls } = makeDeps({ message });
+  await dispatch(EVENT(message), deps);
+  const { text_body, html_body } = parseEmail(lambdaCalls);
+  // No action-block content
+  assert.ok(!text_body.includes('Reschedule:'));
+  assert.ok(!text_body.includes('Cancel:'));
+  // STOP is still there (not broken by old-shape path)
+  assert.ok(text_body.includes('reply STOP'));
+  assert.ok(html_body.includes('reply STOP'));
+});
+
+test('G1 email: attendance (coordinator) check row gets no action block', async () => {
+  const message = reminderRow({
+    attendance_check: true,
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=tok',
+    cancel_url: 'https://schedule.myrecruiter.ai/cancel?t=tok',
+  });
+  const { deps, lambdaCalls } = makeDeps({ message });
+  await dispatch(EVENT(message), deps);
+  const { text_body, html_body } = parseEmail(lambdaCalls);
+  // Coordinator prompts never carry action links or STOP
+  assert.ok(!text_body.includes('Reschedule:'));
+  assert.ok(!text_body.includes('reply STOP'));
+  assert.ok(!html_body.includes('reply STOP'));
+});
+
+test('G1 SMS: enriched attendee reminder → action URLs in body, STOP is last', async () => {
+  const message = reminderRow({
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=tok1',
+    cancel_url: 'https://schedule.myrecruiter.ai/cancel?t=tok2',
+    join_url: 'https://meet.google.com/abc',
+  });
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  await dispatch(EVENT(message), deps);
+  const { body } = parseSms(lambdaCalls);
+  assert.match(body, /Reschedule:.*tok1/);
+  assert.match(body, /Cancel:.*tok2/);
+  assert.match(body, /Join: https:\/\/meet\.google\.com\/abc/);
+  assert.ok(body.endsWith(SMS_STOP_FOOTER));
+});
+
+test('G1 SMS: old-shape row (no link fields) → only STOP footer, no extra whitespace', async () => {
+  const message = reminderRow(); // no action-link fields
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  await dispatch(EVENT(message), deps);
+  const { body } = parseSms(lambdaCalls);
+  assert.ok(!body.includes('Reschedule:'));
+  assert.ok(!body.includes('Cancel:'));
+  assert.ok(body.endsWith(SMS_STOP_FOOTER));
+});
+
+test('G1 SMS: attendance check row gets no action links in SMS body', async () => {
+  const message = reminderRow({
+    attendance_check: true,
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=tok',
+  });
+  const { deps, lambdaCalls } = makeDeps({ message, selectChannels: bothChannels });
+  await dispatch(EVENT(message), deps);
+  const { body } = parseSms(lambdaCalls);
+  assert.ok(!body.includes('Reschedule:'));
+});
+
+test('G1: forward-compat read — old-shape row (no link fields) never crashes dispatch', async () => {
+  // Simulates a row that was committed before G1: no when_label, no join_url, etc.
+  const message = reminderRow({
+    // explicitly undefined (not set) — simulates old DDB row
+  });
+  delete message.when_label;
+  delete message.join_url;
+  delete message.reschedule_url;
+  delete message.cancel_url;
+  const { deps, ddbCalls } = makeDeps({ message });
+  const res = await dispatch(EVENT(message), deps);
+  assert.equal(res.success, true);
+  assert.equal(lastStatus(ddbCalls), 'sent');
+});

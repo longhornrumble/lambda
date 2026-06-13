@@ -118,6 +118,30 @@ describe('buildEventBody — §5.7 PII boundary + ownership tag', () => {
     expect(body.summary).not.toMatch(/[\r\n]/);
     expect(body.summary).toContain('Bcc: evil@x'); // collapsed to one line, not a header
   });
+
+  // ── G2: agenda ────────────────────────────────────────────────────────────────────────
+  it('G2: agenda present → prepended to description BEFORE attendee/link lines', () => {
+    const body = ce.buildEventBody({ ...base, conference: {}, agenda: 'Discuss onboarding steps.' });
+    expect(body.description).toMatch(/^Discuss onboarding steps\./);
+    expect(body.description).toContain('Attendee:');
+    expect(body.description.indexOf('Discuss')).toBeLessThan(body.description.indexOf('Attendee:'));
+  });
+
+  it('G2: agenda absent → description byte-identical to pre-G2 (no empty leading line)', () => {
+    const withAgenda = ce.buildEventBody({ ...base, conference: {} });
+    const withoutAgenda = ce.buildEventBody({ ...base, conference: {}, agenda: undefined });
+    // Both should produce the exact same description.
+    expect(withAgenda.description).toBe(withoutAgenda.description);
+    // Confirm it does NOT start with a newline/blank.
+    expect(withAgenda.description).not.toMatch(/^\n/);
+  });
+
+  it('G2: agenda with control chars is cleaned before appearing in description', () => {
+    const body = ce.buildEventBody({ ...base, conference: {}, agenda: 'Step 1\nStep 2\x01' });
+    // Control chars should be collapsed
+    expect(body.description).not.toMatch(/\x01/);
+    expect(body.description).toMatch(/Step 1/);
+  });
 });
 
 describe('insertEvent', () => {

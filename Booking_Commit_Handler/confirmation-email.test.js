@@ -490,6 +490,81 @@ describe('S4c behavioral pins + coverage', () => {
   });
 });
 
+// ── G2: agenda flows into .ics DESCRIPTION ────────────────────────────────────────────
+
+describe('G2 — agenda in .ics DESCRIPTION (sendConfirmationEmail)', () => {
+  it('agenda present → ics DESCRIPTION carries agenda then manage-booking line', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-g2-1' });
+    await email.sendConfirmationEmail({
+      ...ARGS,
+      agenda: 'Discuss onboarding steps.',
+    }, { loadTemplateOverride: async () => null });
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    // The .ics attachment is base64 — find and decode it.
+    const b64Match = raw.match(/\r\n\r\n([A-Za-z0-9+/=\r\n]+)\r\n--/);
+    // Decode last base64 attachment (the .ics is the last part)
+    const icsAttachments = [];
+    const partRe = /Content-Type: text\/calendar[\s\S]+?\r\n\r\n([A-Za-z0-9+\/=\r\n]+)/g;
+    let match;
+    while ((match = partRe.exec(raw)) !== null) { icsAttachments.push(match[1]); }
+    const icsContent = Buffer.from(icsAttachments[0].replace(/\r\n/g, ''), 'base64').toString('utf8');
+    expect(icsContent).toContain('Discuss onboarding steps');
+    expect(icsContent).toContain('Manage this booking');
+    // Agenda must come BEFORE the manage line in the DESCRIPTION
+    expect(icsContent.indexOf('Discuss')).toBeLessThan(icsContent.indexOf('Manage'));
+  });
+
+  it('agenda absent → .ics DESCRIPTION byte-identical to pre-G2 (only manage-booking line)', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-g2-2' });
+    await email.sendConfirmationEmail({ ...ARGS }, { loadTemplateOverride: async () => null });
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    const partRe = /Content-Type: text\/calendar[\s\S]+?\r\n\r\n([A-Za-z0-9+\/=\r\n]+)/g;
+    const matches = [];
+    let m;
+    while ((m = partRe.exec(raw)) !== null) { matches.push(m[1]); }
+    const icsContent = Buffer.from(matches[0].replace(/\r\n/g, ''), 'base64').toString('utf8');
+    // Must still have the manage-booking line but NOT an extra empty agenda line
+    expect(icsContent).toContain('DESCRIPTION:Manage this booking');
+    expect(icsContent).not.toMatch(/DESCRIPTION:\n/); // no leading blank
+  });
+
+  it('agenda without deepLink → ics DESCRIPTION is just the agenda (no manage line appended)', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-g2-3' });
+    await email.sendConfirmationEmail({
+      ...ARGS,
+      deepLink: '',
+      agenda: 'Team intro.',
+    }, { loadTemplateOverride: async () => null });
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    const partRe = /Content-Type: text\/calendar[\s\S]+?\r\n\r\n([A-Za-z0-9+\/=\r\n]+)/g;
+    const matches = [];
+    let m2;
+    while ((m2 = partRe.exec(raw)) !== null) { matches.push(m2[1]); }
+    const icsContent = Buffer.from(matches[0].replace(/\r\n/g, ''), 'base64').toString('utf8');
+    expect(icsContent).toContain('Team intro');
+    expect(icsContent).not.toContain('Manage');
+  });
+});
+
+// ── G3: orgName resolution (index.js threaded orgName) ────────────────────────────────
+// buildBodies already tests org fallback; this confirms the sendConfirmationEmail
+// receives the resolved orgName. Resolution itself is tested in index.test.js.
+describe('G3 — orgName flows into confirmation email sign-off', () => {
+  it('orgName "Austin Angels" appears in the text sign-off', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-g3-1' });
+    await email.sendConfirmationEmail({ ...ARGS, orgName: 'Austin Angels' }, { loadTemplateOverride: async () => null });
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    expect(raw).toContain('Austin Angels');
+  });
+
+  it('orgName empty → text body uses "the team" literal fallback', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-g3-2' });
+    await email.sendConfirmationEmail({ ...ARGS, orgName: '' }, { loadTemplateOverride: async () => null });
+    const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
+    expect(raw).toContain('the team');
+  });
+});
+
 describe('FROM_EMAIL sender env resolution', () => {
   // Module-level read — jest.isolateModules re-evaluates the module so each
   // test exercises the env state it sets up.

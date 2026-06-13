@@ -287,7 +287,8 @@ ${joinUrl ? `<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>` : ''}
  *     tenantId, bookingId, attendeeEmail, attendeeFirstName,
  *     appointmentTypeName, orgName, coordinatorEmail,
  *     start, end, whenLabel, joinUrl, deepLink,
- *     startAt, cancellationWindowHours
+ *     startAt, cancellationWindowHours,
+ *     agenda?,               // G2: optional plain-text from AppointmentType.agenda
  *   }
  *   (callers may still pass coordinatorName — accepted but unused since §E14 S4c: the
  *   editable body's ADA vocabulary has no {{coordinator}} var; coordinatorEmail is
@@ -305,6 +306,7 @@ async function sendConfirmationEmail(args, opts = {}) {
     appointmentTypeName, orgName, coordinatorEmail,
     start, end, whenLabel, joinUrl, deepLink,
     startAt, cancellationWindowHours,
+    agenda,
   } = args;
 
   if (!attendeeEmail) throw new Error('attendeeEmail is required for the confirmation email');
@@ -326,10 +328,17 @@ async function sendConfirmationEmail(args, opts = {}) {
   ]);
 
   const summary = `${appointmentTypeName || 'Appointment'}${attendeeFirstName ? ` — ${attendeeFirstName}` : ''}`;
+  // G2: compose .ics DESCRIPTION = agenda (when present) + the existing "Manage this
+  // booking" line, joined by \n. escapeIcsText in buildIcs handles RFC 5545 escaping.
+  // Absent agenda → today's behavior (only the "Manage" line, or empty).
+  const icsManageLine = deepLink ? `Manage this booking: ${deepLink}` : '';
+  const icsDescription = agenda
+    ? [String(agenda), ...(icsManageLine ? [icsManageLine] : [])].join('\n')
+    : icsManageLine;
   const ics = buildIcs({
     bookingId,
     summary,
-    description: deepLink ? `Manage this booking: ${deepLink}` : '',
+    description: icsDescription,
     location: joinUrl || '',
     start,
     end,

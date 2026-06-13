@@ -135,7 +135,9 @@ function reminderTenantPrefs(config) {
 // The plain-object booking view scheduleReminders.readBooking consumes (snake_case). NOT
 // the marshalled DDB bookingItem — readBooking expects plain string values, so a {S:...}
 // AttributeValue map would silently mis-parse (start_at → NaN fire times).
-function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail }) {
+// G1: include join_url and cancellation_window_hours so scheduler.js can bake them into
+// the reminder rows (reschedule/cancel/join links + whenLabel).
+function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail, joinUrl }) {
   const a = ctx.attendee || {};
   return {
     tenant_id: tenantId,
@@ -150,6 +152,9 @@ function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail }
     appointment_type_name: ctx.appointmentTypeName,
     organization_name: ctx.orgName,
     is_synthetic: ctx.isSynthetic === true,
+    // G1 additive fields (forward-compatible — old rows lacking them work fine):
+    join_url: joinUrl || '',
+    cancellation_window_hours: ctx.cancellationWindowHours || 0,
   };
 }
 
@@ -158,7 +163,8 @@ function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail }
 // back a committed booking (mirrors the email step's "fail forward, alert" discipline). The
 // org SMS pref is read from the tenant config here, post-commit — NOT on the latency-sensitive
 // pre-commit path; the in-chat reschedule path re-binds via the event-passed org flag instead.
-async function scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail }) {
+// G1: joinUrl is passed in so scheduler.js can bake the join_url field into reminder rows.
+async function scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail, joinUrl }) {
   // Inert-and-QUIET until S6 wires the EventBridge Scheduler IaC: with no scheduler target
   // configured, every CreateSchedule would throw + alert on EVERY booking (alert-channel
   // noise). Skip silently when the scheduler env is absent — activates the instant S6 sets
@@ -178,10 +184,14 @@ async function scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorE
     } catch (cfgErr) {
       warn('reminder_config_load_failed', { booking_id: bookingId, error: cfgErr.message });
     }
-    await scheduleReminders({
-      booking: buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail }),
-      tenantPrefs: reminderTenantPrefs(tenantConfig),
-    });
+    await scheduleReminders(
+      {
+        booking: buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail, joinUrl }),
+        tenantPrefs: reminderTenantPrefs(tenantConfig),
+        // G1: thread signOpts (test seam for token signing key) into scheduler.js.
+        signOpts: ctx.signOpts,
+      },
+    );
   } catch (err) {
     warn('reminder_schedule_failed', { booking_id: bookingId, error: err.message });
     await alertAdmin('Scheduling: reminder scheduling failed (booking valid)', {
@@ -297,6 +307,7 @@ async function commitAgainstResource({
       start: ctx.start, end: ctx.end, timezone: ctx.timezone,
       deepLink,
       conference,
+      agenda: ctx.agenda, // G2: optional; absent → desc byte-identical to pre-G2
     });
     // The calendar to write into is the coordinator's REAL calendar (the OAuth
     // secret's coordinator_email), not the secret-path key coordinatorId — which can
@@ -394,6 +405,7 @@ async function commitAgainstResource({
         joinUrl, deepLink,
         startAt: ctx.start,
         cancellationWindowHours: ctx.cancellationWindowHours,
+        agenda: ctx.agenda, // G2: optional; absent → .ics description byte-identical to pre-G2
       }, { signOpts: ctx.signOpts });
       const elapsed = Date.now() - startedAt;
       if (elapsed > CONFIRMATION_SLA_MS) {
@@ -416,7 +428,8 @@ async function commitAgainstResource({
     // inside the commit's compensating try/catch, so wrap it too — a future edit that adds a
     // throw path can NEVER turn a committed booking into a rollback (structural isolation).
     try {
-      await scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail: calendarId });
+      // G1: pass joinUrl so scheduler.js can bake it into reminder rows for action links.
+      await scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail: calendarId, joinUrl });
     } catch (remErr) {
       warn('reminder_schedule_unexpected', { booking_id: bookingId, error: remErr.message });
     }
@@ -613,6 +626,35 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
     return { status: 'ALREADY_CONFIRMED', bookingId, booking: existing };
   }
 
+  // G3: resolve orgName from event → tenant config → ''. Load config only when the
+  // caller did NOT pass org_name (surgical — no extra S3 read on the common path).
+  // Fail-safe: any config-load error → {} → '' (downstream shows the literal default).
+  let resolvedOrgName = event.org_name || '';
+  if (!resolvedOrgName) {
+    try {
+      const _loadConfig = injected.loadTenantConfig || featureGate.loadTenantConfig;
+      const _tenantCfg = await _loadConfig(tenantId);
+      resolvedOrgName = (_tenantCfg && (_tenantCfg.organization_name || _tenantCfg.chat_title)) || '';
+    } catch (_) {
+      // fail-safe: config unreadable → orgName stays ''.
+    }
+  }
+
+  // G2: resolve agenda from the event's appointment_type first. If absent, best-effort
+  // load the appointment-type row from DynamoDB (the IAM grant exists; BCH already reads
+  // this table on the propose route). Fail-safe: any error or missing agenda → undefined.
+  let resolvedAgenda = appt.agenda || undefined;
+  if (resolvedAgenda === undefined && appt.id) {
+    try {
+      const _getApptType = injected.getAppointmentType ||
+        require('../shared/scheduling/candidate-resolver').defaultGetAppointmentType;
+      const _apptRow = await _getApptType({ tenantId, appointmentTypeId: appt.id });
+      resolvedAgenda = (_apptRow && _apptRow.agenda) || undefined;
+    } catch (_) {
+      // fail-safe: agenda stays undefined.
+    }
+  }
+
   // shared context threaded through the attempt loop.
   const ctx = {
     sessionId: event.session_id,
@@ -625,7 +667,8 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
     conferenceType,
     coordinatorEmails: event.coordinator_emails || {},
     coordinatorName: event.coordinator_name || '',
-    orgName: event.org_name || '',
+    orgName: resolvedOrgName,
+    agenda: resolvedAgenda,
     deepLinkBase: event.deep_link_base || '',
     tieBreaker: event.tie_breaker,
     roundRobinCursor: event.round_robin_cursor || null,
@@ -707,4 +750,6 @@ exports._test = {
   safeReleaseLock,
   safeRevertRR,
   validate,
+  buildReminderBookingView,
+  scheduleBookingReminders,
 };
