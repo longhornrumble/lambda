@@ -43,6 +43,12 @@ def dsar(monkeypatch):
     mock_ddb_resource = MagicMock()
     mock_sts = MagicMock()
     mock_s3 = MagicMock()
+    # F0: Secrets Manager (per-coordinator Google OAuth) + EventBridge Scheduler
+    # (reminder/attendance schedule cleanup) clients are instantiated at module
+    # level — the router MUST return mocks for them or the import-time
+    # boto3.client() calls raise AssertionError and break every test.
+    mock_sm = MagicMock()
+    mock_scheduler = MagicMock()
     mock_sts.get_caller_identity.return_value = {"Account": "525409062831"}
     # D2: default form-submissions key schema = staging composite
     # (tenant_id HASH, submission_id RANGE), consumed by
@@ -66,6 +72,10 @@ def dsar(monkeypatch):
             return mock_sts
         if name == "s3":
             return mock_s3
+        if name == "secretsmanager":
+            return mock_sm
+        if name == "scheduler":
+            return mock_scheduler
         # Any other client name surfaces as an explicit AssertionError so a
         # future code addition surfaces here instead of leaking real-AWS calls.
         raise AssertionError(f"unexpected boto3.client({name!r})")
@@ -78,6 +88,11 @@ def dsar(monkeypatch):
         mod.ddb = mock_ddb_resource
         mod.sts = mock_sts
         mod.s3 = mock_s3
+        # F0: scheduling walkers reach Secrets Manager + EventBridge Scheduler.
+        # Attached to mod so F0 tests configure them via mod.sm / mod.scheduler
+        # (the yield tuple arity is unchanged so existing unpacks keep working).
+        mod.sm = mock_sm
+        mod.scheduler = mock_scheduler
         yield mod, mock_ddb_resource, mock_sts
 
 
@@ -93,6 +108,35 @@ def _valid_event(**overrides):
     }
     base.update(overrides)
     return base
+
+
+# F0: the email-path dispatcher now also walks the scheduling identity graph
+# (booking / scheduled-messages / scheduling-session). Dispatcher + handler
+# tests that don't exercise scheduling need those Table() calls to resolve to a
+# zero-row mock instead of AssertionError-ing the route. This helper returns an
+# empty table (no rows, no item) so the scheduling walkers cleanly report
+# no_bookings / no_sessions.
+_F0_SCHEDULING_TABLES = (
+    "picasso-booking-staging",
+    "picasso-conversation-scheduling-session-staging",
+    "picasso-scheduled-messages",
+)
+
+
+def _empty_scheduling_table():
+    t = MagicMock()
+    t.query.return_value = {"Items": []}
+    t.get_item.return_value = {}
+    return t
+
+
+def _route_unknown_table(name):
+    """Fallback for dict-literal Table routers: zero-row mock for the F0
+    scheduling tables, AssertionError for anything genuinely unexpected (keeps
+    the leak guard)."""
+    if name in _F0_SCHEDULING_TABLES:
+        return _empty_scheduling_table()
+    raise AssertionError(f"unexpected DDB Table call: {name}")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1835,6 +1879,8 @@ def _stub_psid_tables(mock_ddb, *, rm_items=None, se_items=None):
             return rm_table
         if name == "picasso-session-events":
             return se_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
     mock_ddb.Table.side_effect = route
@@ -2493,6 +2539,8 @@ def _stub_dispatch(mock_ddb, *, fs_items=None, fs_error=False,
             return rm_table
         if name == "picasso-session-events":
             return se_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
     mock_ddb.Table.side_effect = route
@@ -2944,7 +2992,7 @@ def test_dispatcher_recent_messages_partial_error_taint_on_failed_session_ids(ds
             "picasso-notification-events": ne_table,
             "picasso-recent-messages": rm_table,
             "picasso-session-events": se_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     _r, followups, _exp, walker_results = mod._walk_mfs_surfaces(
@@ -2998,7 +3046,7 @@ def test_dispatcher_recent_messages_truncation_taints_completed_to_errored(dsar)
             "picasso-notification-events": ne_table,
             "picasso-recent-messages": rm_table,
             "picasso-session-events": se_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     _r, followups, _exp, walker_results = mod._walk_mfs_surfaces(
@@ -3051,7 +3099,7 @@ def test_dispatcher_recent_messages_combined_failures_and_truncation_taint(dsar)
             "picasso-notification-events": ne_table,
             "picasso-recent-messages": rm_table,
             "picasso-session-events": se_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     _r, followups, _exp, walker_results = mod._walk_mfs_surfaces(
@@ -3111,7 +3159,7 @@ def test_dispatcher_notification_events_combined_failures_and_truncation_taint(d
             "picasso-notification-events": ne_table,
             "picasso-recent-messages": rm_table,
             "picasso-session-events": se_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     _r, _f, _exp, walker_results = mod._walk_mfs_surfaces(
@@ -3203,6 +3251,8 @@ def _stub_handler_tables(mock_ddb, *, subject_found, fs_items=None,
             return se_table
         if name == "picasso-session-summaries":
             return ss_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
     mock_ddb.Table.side_effect = route
@@ -3226,13 +3276,14 @@ def test_handler_happy_path_access_exports_form_submission_rows(dsar):
     assert resp["rows_touched"]["form-submissions"] == 2
     assert "form-submissions" in resp["exported_rows"]
     assert len(resp["exported_rows"]["form-submissions"]) == 2
-    # Audit rows: request_received + 7 surface_walked
+    # Audit rows: request_received + 11 surface_walked
     # (form-submissions, notification-sends, notification-events,
     # recent-messages, session-events, archive [M2 Sprint C],
-    # fulfillment [M2 Sprint D]) + closed = 9. Deferred surfaces (2) suppressed.
-    assert audit_table.put_item.call_count == 9
+    # fulfillment [M2 Sprint D], + F0 booking, calendar, scheduled-messages,
+    # scheduling-session) + closed = 13. Deferred surfaces suppressed.
+    assert audit_table.put_item.call_count == 13
     fs_table.delete_item.assert_not_called()  # access never deletes
-    assert len(resp["audit_row_pks"]) == 9
+    assert len(resp["audit_row_pks"]) == 13
 
 
 def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
@@ -3250,8 +3301,9 @@ def test_handler_delete_dry_run_counts_but_does_not_delete(dsar):
     assert any("dry_run=true" in f and "1 row(s) would be deleted" in f
                for f in resp["manual_followups"])
     fs_table.delete_item.assert_not_called()
-    # request_received + 7 surface_walked (M2 Sprint D added fulfillment) + closed = 9
-    assert audit_table.put_item.call_count == 9
+    # request_received + 11 surface_walked (M2 Sprint D added fulfillment; F0
+    # added booking/calendar/scheduled-messages/scheduling-session) + closed = 13
+    assert audit_table.put_item.call_count == 13
 
 
 def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
@@ -3266,9 +3318,11 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
     assert "not found in pii-subject-index" in resp["manual_followups"][0]
     assert resp["exported_rows"] == {}
     # Audit rows: request_received + 8 surface_walked (all skipped_no_subject;
-    # M2 Sprint D added fulfillment; F-DSAR31 added session-summaries) + closed.
-    # Deferred surfaces (1: audit-read-only) still suppressed → 10 total.
-    assert audit_table.put_item.call_count == 10
+    # M2 Sprint D added fulfillment; F-DSAR31 added session-summaries) + the 4
+    # F0 scheduling surfaces (which RUN even with no subject — email-keyed,
+    # operator decision B — and report completed against the empty stub tables)
+    # + closed. Deferred surfaces (1: audit-read-only) still suppressed → 14.
+    assert audit_table.put_item.call_count == 14
     event_types = [c.kwargs["Item"]["event_type"] for c in audit_table.put_item.call_args_list]
     assert event_types == [
         "request_received",
@@ -3284,12 +3338,22 @@ def test_handler_subject_not_found_returns_partial_with_extra_followup(dsar):
         "surface_walked:fulfillment",
         # F-DSAR31: session-summaries skipped (no pii_subject_id resolved).
         "surface_walked:session-summaries",
+        # F0: scheduling surfaces are email-keyed (operator decision B) → they
+        # run even when the subject-index didn't resolve, reaching the
+        # scheduling-only (F-DSAR4) class. Empty stub tables → completed/0.
+        "surface_walked:booking",
+        "surface_walked:calendar",
+        "surface_walked:scheduled-messages",
+        "surface_walked:scheduling-session",
         "closed",
     ]
+    # Indices 1-8 are the MFS surfaces, all skipped_no_subject. The 4 scheduling
+    # surfaces (indices 9-12) are completed (they ran), NOT skipped.
     for i in (1, 2, 3, 4, 5, 6, 7, 8):
         skipped_event = audit_table.put_item.call_args_list[i].kwargs["Item"]
         assert skipped_event["status"] == "skipped_no_subject"
-    # No walker actually queried — all skipped
+    # No MFS walker actually queried — all skipped (the scheduling walkers query
+    # the separate scheduling tables, not these).
     fs_table.query.assert_not_called()
     ns_table.query.assert_not_called()
     ne_table.query.assert_not_called()
@@ -3352,6 +3416,12 @@ def test_handler_writes_surface_walked_audit_event_for_form_submissions(dsar):
         # M2 Sprint D: per-tenant S3 fulfillment walker chained off form-
         # submissions matched rows (email path only).
         "surface_walked:fulfillment",
+        # F0: scheduling identity-graph surfaces (session-summaries is deferred
+        # here — no tenant_hash — so it is suppressed and not in this list).
+        "surface_walked:booking",
+        "surface_walked:calendar",
+        "surface_walked:scheduled-messages",
+        "surface_walked:scheduling-session",
         "closed",
     ]
 
@@ -3375,6 +3445,10 @@ def test_handler_does_not_emit_surface_walked_for_deferred_surfaces(dsar):
         "surface_walked:session-events",  # audit fix #1
         "surface_walked:archive",  # M2 Sprint C
         "surface_walked:fulfillment",  # M2 Sprint D
+        "surface_walked:booking",  # F0
+        "surface_walked:calendar",  # F0
+        "surface_walked:scheduled-messages",  # F0
+        "surface_walked:scheduling-session",  # F0
     }
     extraneous_surface_walked = [
         call.kwargs["Item"]["event_type"]
@@ -3417,7 +3491,7 @@ def test_handler_close_status_partial_error_when_walker_errors(dsar):
             "picasso-form-submissions-staging": fs_table,
             "picasso-notification-sends": ns_table,
             "picasso-notification-events": ne_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     resp = mod.lambda_handler(
@@ -3467,7 +3541,7 @@ def test_handler_returns_failed_on_audit_collision_at_request_received(dsar):
             "picasso-form-submissions-staging": fs_table,
             "picasso-notification-sends": ns_table,
             "picasso-notification-events": ne_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     resp = mod.lambda_handler(_valid_event(), context=None)
@@ -3490,30 +3564,18 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (9 audit attempts post M2 Sprint D — fulfillment):
-    #   1: request_received                    → succeed
-    #   2: surface_walked:form-submissions     → CCFE (taints walker_results)
-    #   3: surface_walked:notification-sends   → succeed
-    #   4: surface_walked:notification-events  → succeed
-    #   5: surface_walked:recent-messages      → succeed
-    #   6: surface_walked:session-events       → succeed (audit fix #1)
-    #   7: surface_walked:archive              → succeed (M2 Sprint C)
-    #   8: surface_walked:fulfillment          → succeed (M2 Sprint D)
-    #   9: closed                              → succeed
-    audit_table.put_item.side_effect = [
-        None,
-        ClientError(
+    # PutItem sequence (13 audit attempts: request_received + 11 surface_walked
+    # [M2 + F0 booking/calendar/scheduled-messages/scheduling-session] + closed).
+    # Index 1 (surface_walked:form-submissions) raises CCFE → taints
+    # walker_results → close_status flips to partial_error; every other write
+    # succeeds and the run still completes through the closed event.
+    audit_table.put_item.side_effect = (
+        [None]  # request_received
+        + [ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException", "Message": "..."}},
-            "PutItem",
-        ),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ]
+            "PutItem")]  # surface_walked:form-submissions → CCFE
+        + [None] * 11  # remaining 10 surface_walked + closed
+    )
     subject_table = MagicMock()
     subject_table.get_item.return_value = {
         "Item": {"tenant_id": "TEN123", "normalized_email": "test@x.co",
@@ -3539,7 +3601,7 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
             "picasso-notification-events": ne_table,
             "picasso-recent-messages": rm_table,
             "picasso-session-events": se_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     resp = mod.lambda_handler(_valid_event(request_type="access"), context=None)
@@ -3547,9 +3609,9 @@ def test_handler_surface_walked_audit_collision_taints_close_status(dsar):
     # Close status reflects the audit-collision taint on the walker
     assert resp["status"] == "partial_error"
     # closed event was still written (recoverable failure path)
-    # Count: 1 request_received + 7 surface_walked (incl. archive M2 Sprint C
-    # + fulfillment M2 Sprint D) + 1 closed = 9
-    assert audit_table.put_item.call_count == 9
+    # Count: 1 request_received + 11 surface_walked (M2 + F0 scheduling) + 1
+    # closed = 13
+    assert audit_table.put_item.call_count == 13
     close_item = audit_table.put_item.call_args_list[-1].kwargs["Item"]
     assert close_item["event_type"] == "closed"
     assert close_item["status"] == "partial_error"
@@ -3562,30 +3624,16 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     from botocore.exceptions import ClientError
     mod, mock_ddb, _ = dsar
     audit_table = MagicMock()
-    # PutItem sequence (9 attempts post M2 Sprint D — fulfillment):
-    #   1: request_received                    → succeed
-    #   2: surface_walked:form-submissions     → succeed
-    #   3: surface_walked:notification-sends   → succeed
-    #   4: surface_walked:notification-events  → succeed
-    #   5: surface_walked:recent-messages      → succeed
-    #   6: surface_walked:session-events       → succeed (audit fix #1)
-    #   7: surface_walked:archive              → succeed (M2 Sprint C)
-    #   8: surface_walked:fulfillment          → succeed (M2 Sprint D)
-    #   9: closed                              → CCFE → return failed
-    audit_table.put_item.side_effect = [
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        ClientError(
+    # PutItem sequence (13 attempts: request_received + 11 surface_walked
+    # [M2 + F0 booking/calendar/scheduled-messages/scheduling-session] + closed).
+    # The final write (closed) raises CCFE → handler returns failed but still
+    # surfaces the walker artifacts that completed before it.
+    audit_table.put_item.side_effect = (
+        [None] * 12  # request_received + 11 surface_walked → all succeed
+        + [ClientError(
             {"Error": {"Code": "ConditionalCheckFailedException", "Message": "..."}},
-            "PutItem",
-        ),
-    ]
+            "PutItem")]  # closed → CCFE → return failed
+    )
     subject_table = MagicMock()
     subject_table.get_item.return_value = {
         "Item": {"tenant_id": "TEN123", "normalized_email": "test@x.co",
@@ -3611,7 +3659,7 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
             "picasso-notification-events": ne_table,
             "picasso-recent-messages": rm_table,
             "picasso-session-events": se_table,
-        }[name]
+        }.get(name) or _route_unknown_table(name)
     mock_ddb.Table.side_effect = route
 
     resp = mod.lambda_handler(_valid_event(request_type="access"), context=None)
@@ -3622,10 +3670,9 @@ def test_handler_returns_failed_on_audit_collision_at_closed_event(dsar):
     # needs visibility into what completed before the closed event failed.
     assert resp["pii_subject_id"] == "subj_opaque"
     assert resp["rows_touched"]["form-submissions"] == 1
-    # audit_row_pks lists the 8 successful events (no closed entry):
-    # request_received + 7 surface_walked (incl. archive M2 Sprint C
-    # + fulfillment M2 Sprint D)
-    assert len(resp["audit_row_pks"]) == 8
+    # audit_row_pks lists the 12 successful events (no closed entry):
+    # request_received + 11 surface_walked (M2 + F0 scheduling)
+    assert len(resp["audit_row_pks"]) == 12
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3767,6 +3814,8 @@ def test_e2_subject_resolution_client_error_writes_audit_and_returns_failed(dsar
             return subject_table
         if name == "picasso-pii-dsar-audit":
             return audit_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
     mock_ddb.Table.side_effect = route
 
@@ -3810,6 +3859,8 @@ def test_e2_subject_resolution_client_error_does_not_leak_email_in_response(dsar
             return subject_table
         if name == "picasso-pii-dsar-audit":
             return audit_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
     mock_ddb.Table.side_effect = route
 
@@ -3853,6 +3904,8 @@ def test_e2_subject_resolution_client_error_survives_audit_collision_on_failure_
             return subject_table
         if name == "picasso-pii-dsar-audit":
             return audit_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
     mock_ddb.Table.side_effect = route
 
@@ -3889,6 +3942,8 @@ def _stub_psid_handler_tables(mock_ddb, *, page_ids=("p1",), rm_items=None, se_i
             return rm_table
         if name == "picasso-session-events":
             return se_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
 
     mock_ddb.Table.side_effect = route
@@ -3977,6 +4032,8 @@ def test_handler_psid_path_subject_resolution_clienterror_returns_failed_with_au
             return cm_table
         if name == "picasso-pii-dsar-audit":
             return audit_table
+        if name in _F0_SCHEDULING_TABLES:
+            return _empty_scheduling_table()
         raise AssertionError(f"unexpected DDB Table call: {name}")
     mock_ddb.Table.side_effect = route
 
@@ -4302,3 +4359,873 @@ def test_handler_session_summaries_skipped_when_tenant_hash_absent(dsar):
     )
     assert resp["rows_touched"]["session-summaries"] == 0
     assert any("session-summaries: skipped" in f for f in resp["manual_followups"])
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# F0 — scheduling identity-graph walkers (booking / scheduled-messages /
+# scheduling-session) + Google Calendar deletion + EventBridge sweep.
+# ═══════════════════════════════════════════════════════════════════════════
+def _booking_row(booking_id="booking#abc123", attendee_email="subject@x.co",
+                 session_id="sess_1", external_event_id="evt_1",
+                 resource_id="coord@x.co", coordinator_email="coord@x.co",
+                 item_type="booking", **extra):
+    base = {
+        "tenantId": "TEN123",
+        "booking_id": booking_id,
+        "attendee_email": attendee_email,
+        "session_id": session_id,
+        "external_event_id": external_event_id,
+        "resource_id": resource_id,
+        "coordinator_email": coordinator_email,
+        "item_type": item_type,
+        "status": "booked",
+    }
+    base.update(extra)
+    return base
+
+
+def _sched_msg_row(appointment_id="booking#abc123", pk="TENANT#TEN123",
+                   sk="SCHEDULED#2026-06-11T21:00:00.000Z#booking#abc123#t24h",
+                   **extra):
+    base = {
+        "appointment_id": appointment_id, "pk": pk, "sk": sk,
+        "recipient_email": "subject@x.co", "moment": "reminder",
+    }
+    base.update(extra)
+    return base
+
+
+# ── _walk_booking ──────────────────────────────────────────────────────────
+def test_walk_booking_access_exports_only_attendee_matches(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [
+        _booking_row(booking_id="booking#1", attendee_email="subject@x.co",
+                     session_id="s1"),
+        _booking_row(booking_id="booking#2", attendee_email="other@x.co"),
+    ]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_booking("TEN123", "subject@x.co", "access", dry_run=True)
+    assert result["rows_found"] == 1
+    assert result["action"] == "exported"
+    assert result["booking_ids"] == ["booking#1"]
+    assert result["session_ids"] == ["s1"]
+    table.delete_item.assert_not_called()
+
+
+def test_walk_booking_matches_email_case_insensitively(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_booking_row(attendee_email="Subject@X.CO")]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_booking("TEN123", "subject@x.co", "access", dry_run=True)
+    assert result["rows_found"] == 1
+
+
+def test_walk_booking_carves_out_coordinator_email(dsar):
+    """Coordinator carve-out: a booking where the subject is the COORDINATOR
+    (not the attendee) must NOT be matched/deleted (staff PII, different
+    controller relationship)."""
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [
+        _booking_row(attendee_email="someone@x.co", coordinator_email="subject@x.co"),
+    ]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=False)
+    assert result["rows_found"] == 0
+    assert result["action"] == "no_bookings"
+    table.delete_item.assert_not_called()
+
+
+def test_walk_booking_query_uses_tenant_key_and_item_type_filter(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": []}
+    mock_ddb.Table.return_value = table
+    mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=True)
+    kwargs = table.query.call_args.kwargs
+    assert "KeyConditionExpression" in kwargs
+    assert "FilterExpression" in kwargs  # item_type == 'booking'
+    assert "IndexName" not in kwargs  # tenant-partition Query, no attendee GSI
+
+
+def test_walk_booking_dry_run_counts_no_calendar_no_delete(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_booking_row(external_event_id="evt1")]}
+    mock_ddb.Table.return_value = table
+    with patch.object(mod, "_delete_booking_calendar_events") as cal:
+        result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=True)
+    assert result["action"] == "dry_run_count"
+    assert result["calendar_events_pending"] == 1
+    cal.assert_not_called()
+    table.delete_item.assert_not_called()
+
+
+def test_walk_booking_delete_real_calendar_first_then_row(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_booking_row(booking_id="booking#1")]}
+    mock_ddb.Table.return_value = table
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 1, "events_already_gone": 0}, None)) as cal:
+        result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=False)
+    assert result["action"] == "deleted"
+    assert result["rows_deleted"] == 1
+    assert result["calendar_failed"] == 0
+    assert result["calendar_events_deleted"] == 1
+    cal.assert_called_once()
+    table.delete_item.assert_called_once_with(
+        Key={"tenantId": "TEN123", "booking_id": "booking#1"})
+
+
+def test_walk_booking_delete_real_keeps_row_when_calendar_fails(dsar):
+    """Advisory B1: a calendar event that can't be confirmed deleted → the
+    booking row is KEPT (so the event id is recoverable), counted in
+    calendar_failed; never a silent calendar residue."""
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_booking_row(booking_id="booking#1")]}
+    mock_ddb.Table.return_value = table
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(False, {"events_deleted": 0, "events_already_gone": 0}, "oauth_unresolved")):
+        result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=False)
+    assert result["action"] == "deleted"
+    assert result["rows_deleted"] == 0
+    assert result["calendar_failed"] == 1
+    table.delete_item.assert_not_called()  # row KEPT
+
+
+def test_walk_booking_paginates_through_last_evaluated_key(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.side_effect = [
+        {"Items": [_booking_row(booking_id="booking#1")], "LastEvaluatedKey": {"k": 1}},
+        {"Items": [_booking_row(booking_id="booking#2")]},
+    ]
+    mock_ddb.Table.return_value = table
+    result = mod._walk_booking("TEN123", "subject@x.co", "access", dry_run=True)
+    assert result["rows_found"] == 2
+    assert table.query.call_count == 2
+
+
+def test_walk_booking_query_error_returns_error(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.side_effect = ClientError(
+        {"Error": {"Code": "InternalServerError"}}, "Query")
+    mock_ddb.Table.return_value = table
+    result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=False)
+    assert result["error"] == "query_failed"
+    assert result["rows_found"] == 0
+
+
+def test_walk_booking_skips_corrupted_row_missing_booking_id(dsar):
+    mod, mock_ddb, _ = dsar
+    good = _booking_row(booking_id="booking#1")
+    bad = _booking_row(booking_id="booking#2")
+    bad.pop("booking_id")
+    table = MagicMock()
+    table.query.return_value = {"Items": [good, bad]}
+    mock_ddb.Table.return_value = table
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 1, "events_already_gone": 0}, None)):
+        result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=False)
+    # the corrupted row (no booking_id) is dropped client-side: booking_ids only
+    # collects present ids, and the delete loop skips the missing-key row.
+    assert result["rows_skipped_corrupted"] == 1
+    assert result["rows_deleted"] == 1
+
+
+# ── _walk_scheduled_messages ────────────────────────────────────────────────
+def test_walk_scheduled_messages_no_bookings_empty_input(dsar):
+    mod, _, _ = dsar
+    result = mod._walk_scheduled_messages("TEN123", [], "delete", dry_run=False)
+    assert result["action"] == "no_bookings"
+    assert result["rows_found"] == 0
+
+
+def test_walk_scheduled_messages_queries_by_appointment_gsi(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": []}
+    mock_ddb.Table.return_value = table
+    mod._walk_scheduled_messages("TEN123", ["booking#1"], "delete", dry_run=True)
+    assert table.query.call_args.kwargs["IndexName"] == "by-appointment"
+
+
+def test_walk_scheduled_messages_delete_real_deletes_and_sweeps_schedules(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [
+        _sched_msg_row(pk="TENANT#TEN123", sk="SCHEDULED#x#booking#1#t24h"),
+    ]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_scheduled_messages("TEN123", ["booking#1"], "delete", dry_run=False)
+    assert result["action"] == "deleted"
+    assert result["rows_deleted"] == 1
+    table.delete_item.assert_called_once_with(
+        Key={"pk": "TENANT#TEN123", "sk": "SCHEDULED#x#booking#1#t24h"})
+    # EventBridge sweep: 4 reminder tiers + attendance = 5 names, right group.
+    assert mod.scheduler.delete_schedule.call_count == 5
+    names = {c.kwargs["Name"] for c in mod.scheduler.delete_schedule.call_args_list}
+    assert "sched-attendance-booking-1" in names
+    assert "sched-reminder-t24h-booking-1" in names
+    for c in mod.scheduler.delete_schedule.call_args_list:
+        assert c.kwargs["GroupName"] == "picasso-scheduling-reminders-staging"
+    assert result["schedules_deleted"] == 5
+
+
+def test_walk_scheduled_messages_dry_run_no_delete_no_sweep(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_sched_msg_row()]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_scheduled_messages("TEN123", ["booking#1"], "delete", dry_run=True)
+    assert result["action"] == "dry_run_count"
+    assert result["rows_found"] == 1
+    table.delete_item.assert_not_called()
+    mod.scheduler.delete_schedule.assert_not_called()
+
+
+def test_walk_scheduled_messages_query_error_continues_other_bookings(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.side_effect = [
+        ClientError({"Error": {"Code": "InternalServerError"}}, "Query"),
+        {"Items": [_sched_msg_row(appointment_id="booking#2", sk="SCHEDULED#x#booking#2#t1h")]},
+    ]
+    mock_ddb.Table.return_value = table
+    result = mod._walk_scheduled_messages(
+        "TEN123", ["booking#1", "booking#2"], "delete", dry_run=False)
+    assert result["rows_found"] == 1  # booking#2's row survived the booking#1 error
+    assert result["query_failed_count"] == 1
+
+
+# ── _walk_conversation_scheduling_session ───────────────────────────────────
+def test_walk_scheduling_session_no_sessions_empty(dsar):
+    mod, _, _ = dsar
+    result = mod._walk_conversation_scheduling_session("TEN123", [], "delete", dry_run=False)
+    assert result["action"] == "no_sessions"
+
+
+def test_walk_scheduling_session_deletes_both_state_and_binding(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.get_item.side_effect = lambda Key: {
+        "Item": {"tenantId": "TEN123", "session_id": Key["session_id"]}
+    }
+    mock_ddb.Table.return_value = table
+    result = mod._walk_conversation_scheduling_session(
+        "TEN123", ["sess_1"], "delete", dry_run=False)
+    assert result["rows_found"] == 2  # state + binding both present
+    assert result["rows_deleted"] == 2
+    deleted_sks = {c.kwargs["Key"]["session_id"] for c in table.delete_item.call_args_list}
+    assert deleted_sks == {"sess_1", "binding#sess_1"}
+
+
+def test_walk_scheduling_session_dedupes_session_ids(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.get_item.return_value = {}
+    mock_ddb.Table.return_value = table
+    mod._walk_conversation_scheduling_session(
+        "TEN123", ["s1", "s1", "s2"], "delete", dry_run=True)
+    # 2 unique session_ids × (state + binding) = 4 get_item calls
+    assert table.get_item.call_count == 4
+
+
+def test_walk_scheduling_session_state_with_no_binding(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.get_item.side_effect = lambda Key: (
+        {"Item": {"tenantId": "TEN123", "session_id": "sess_1", "state": "x"}}
+        if Key["session_id"] == "sess_1" else {}
+    )
+    mock_ddb.Table.return_value = table
+    result = mod._walk_conversation_scheduling_session(
+        "TEN123", ["sess_1"], "delete", dry_run=False)
+    assert result["rows_found"] == 1
+    assert result["rows_deleted"] == 1
+    table.delete_item.assert_called_once_with(
+        Key={"tenantId": "TEN123", "session_id": "sess_1"})
+
+
+# ── Calendar + schedule low-level helpers ───────────────────────────────────
+def test_safe_schedule_name_sanitizes_hash(dsar):
+    mod, _, _ = dsar
+    assert mod._safe_schedule_name("booking#abc123") == "booking-abc123"
+
+
+def test_google_events_delete_success(dsar):
+    mod, _, _ = dsar
+    with patch.object(mod.urllib.request, "urlopen", return_value=MagicMock()):
+        assert mod._google_events_delete("tok", "cal@x.co", "evt1") == "deleted"
+
+
+def test_google_events_delete_404_410_idempotent(dsar):
+    mod, _, _ = dsar
+    for code in (404, 410):
+        err = mod.urllib.error.HTTPError("u", code, "gone", {}, None)
+        with patch.object(mod.urllib.request, "urlopen", side_effect=err):
+            assert mod._google_events_delete("tok", "cal@x.co", "evt1") == "already_gone"
+
+
+def test_google_events_delete_other_http_error_raises(dsar):
+    mod, _, _ = dsar
+    err = mod.urllib.error.HTTPError("u", 500, "boom", {}, None)
+    with patch.object(mod.urllib.request, "urlopen", side_effect=err):
+        with pytest.raises(mod.urllib.error.HTTPError):
+            mod._google_events_delete("tok", "cal@x.co", "evt1")
+
+
+def test_refresh_google_access_token_posts_to_google(dsar):
+    mod, _, _ = dsar
+    fake_resp = MagicMock()
+    fake_resp.read.return_value = b'{"access_token": "ya29.tok"}'
+    cm = MagicMock()
+    cm.__enter__.return_value = fake_resp
+    cm.__exit__.return_value = False
+    with patch.object(mod.urllib.request, "urlopen", return_value=cm) as uo:
+        tok = mod._refresh_google_access_token(
+            {"client_id": "c", "client_secret": "s", "refresh_token": "r"})
+    assert tok == "ya29.tok"
+    req = uo.call_args.args[0]
+    assert req.full_url == mod.GOOGLE_TOKEN_ENDPOINT
+    assert req.method == "POST"
+
+
+def test_delete_booking_calendar_events_no_event_id_is_ok(dsar):
+    mod, _, _ = dsar
+    booking = _booking_row()
+    booking.pop("external_event_id")
+    ok, outcome, err = mod._delete_booking_calendar_events("TEN123", booking, {})
+    assert ok is True
+    assert outcome.get("no_event") is True
+    assert err is None
+
+
+def test_delete_booking_calendar_events_missing_resource_id_fails(dsar):
+    mod, _, _ = dsar
+    booking = _booking_row(external_event_id="evt1")
+    booking.pop("resource_id")
+    ok, _outcome, err = mod._delete_booking_calendar_events("TEN123", booking, {})
+    assert ok is False
+    assert err == "missing_resource_id"
+
+
+def test_delete_booking_calendar_events_secret_missing_keeps_row(dsar):
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.side_effect = ClientError(
+        {"Error": {"Code": "ResourceNotFoundException"}}, "GetSecretValue")
+    ok, _outcome, err = mod._delete_booking_calendar_events(
+        "TEN123", _booking_row(external_event_id="evt1", resource_id="coord@x.co"), {})
+    assert ok is False
+    assert err == "oauth_unresolved"
+
+
+def test_delete_booking_calendar_events_happy_resolves_calendar_from_secret(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = {"SecretString": json.dumps({
+        "client_id": "c", "client_secret": "s", "refresh_token": "r",
+        "coordinator_email": "real-calendar@x.co"})}
+    with patch.object(mod, "_refresh_google_access_token", return_value="tok"), \
+         patch.object(mod, "_google_events_delete", return_value="deleted") as ged:
+        ok, outcome, err = mod._delete_booking_calendar_events(
+            "TEN123",
+            _booking_row(external_event_id="evt1", resource_id="coord@x.co"), {})
+    assert ok is True
+    assert outcome["events_deleted"] == 1
+    assert err is None
+    # calendarId resolved from the secret's coordinator_email (the real calendar)
+    assert ged.call_args.args[1] == "real-calendar@x.co"
+
+
+def test_delete_booking_calendar_events_deletes_both_event_ids(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = {"SecretString": json.dumps({
+        "client_id": "c", "client_secret": "s", "refresh_token": "r",
+        "coordinator_email": "cal@x.co"})}
+    with patch.object(mod, "_refresh_google_access_token", return_value="tok"), \
+         patch.object(mod, "_google_events_delete", return_value="deleted") as ged:
+        ok, outcome, _err = mod._delete_booking_calendar_events(
+            "TEN123",
+            _booking_row(external_event_id="evt1", rescheduled_old_event_id="evt2",
+                         resource_id="coord@x.co"), {})
+    assert ok is True
+    assert outcome["events_deleted"] == 2
+    deleted_event_ids = {c.args[2] for c in ged.call_args_list}
+    assert deleted_event_ids == {"evt1", "evt2"}
+
+
+def test_delete_booking_schedules_sweeps_all_tiers_and_attendance(dsar):
+    mod, _, _ = dsar
+    deleted, failed = mod._delete_booking_schedules("booking#abc")
+    assert deleted == 5
+    assert failed == 0
+    names = {c.kwargs["Name"] for c in mod.scheduler.delete_schedule.call_args_list}
+    assert names == {
+        "sched-reminder-t24h-booking-abc", "sched-reminder-t4h-booking-abc",
+        "sched-reminder-t1h-booking-abc", "sched-reminder-t15m-booking-abc",
+        "sched-attendance-booking-abc",
+    }
+
+
+def test_delete_booking_schedules_resource_not_found_idempotent(dsar):
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    mod.scheduler.delete_schedule.side_effect = ClientError(
+        {"Error": {"Code": "ResourceNotFoundException"}}, "DeleteSchedule")
+    deleted, failed = mod._delete_booking_schedules("booking#abc")
+    assert deleted == 0  # all already-gone (idempotent), nothing counted
+    assert failed == 0
+
+
+# ── orchestrator + dispatcher integration ───────────────────────────────────
+def _scheduling_route(booking_items, *, ss_get=None, sm_items=None):
+    """Build a Table side_effect router for the scheduling orchestrator: booking
+    table returns booking_items; scheduled-messages + scheduling-session default
+    to empty unless overridden."""
+    booking_table = MagicMock()
+    booking_table.query.return_value = {"Items": booking_items}
+    sm_table = MagicMock()
+    sm_table.query.return_value = {"Items": sm_items or []}
+    ss_table = MagicMock()
+    ss_table.get_item.side_effect = ss_get or (lambda Key: {})
+
+    def route(name):
+        if name == "picasso-booking-staging":
+            return booking_table
+        if name == "picasso-scheduled-messages":
+            return sm_table
+        if name == "picasso-conversation-scheduling-session-staging":
+            return ss_table
+        return _route_unknown_table(name)
+    return route, booking_table, sm_table, ss_table
+
+
+def test_apply_scheduling_wires_all_four_surfaces(dsar):
+    mod, mock_ddb, _ = dsar
+    route, _b, _s, _ss = _scheduling_route([_booking_row(booking_id="booking#1")])
+    mock_ddb.Table.side_effect = route
+    rows_touched, followups, exported, wr = {}, [], {}, {}
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 1, "events_already_gone": 0}, None)):
+        mod._apply_scheduling_walker_results(
+            "TEN123", "subject@x.co", [], "delete", False,
+            rows_touched, followups, exported, wr)
+    assert {"booking", "calendar", "scheduled-messages",
+            "scheduling-session"}.issubset(wr.keys())
+    assert wr["booking"]["status"] == "completed"
+    assert wr["booking"]["rows_deleted"] == 1
+    assert wr["calendar"]["rows_deleted"] == 1
+    assert rows_touched["booking"] == 1
+
+
+def test_apply_scheduling_calendar_fail_taints_booking_and_calendar(dsar):
+    mod, mock_ddb, _ = dsar
+    route, _b, _s, _ss = _scheduling_route([_booking_row(booking_id="booking#1")])
+    mock_ddb.Table.side_effect = route
+    rows_touched, followups, exported, wr = {}, [], {}, {}
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(False, {"events_deleted": 0, "events_already_gone": 0}, "oauth_unresolved")):
+        mod._apply_scheduling_walker_results(
+            "TEN123", "subject@x.co", [], "delete", False,
+            rows_touched, followups, exported, wr)
+    assert wr["booking"]["status"] == "errored"
+    assert wr["booking"]["error"] == "calendar_delete_unconfirmed"
+    assert wr["calendar"]["status"] == "errored"
+    assert any("could NOT be confirmed deleted" in f for f in followups)
+
+
+def test_apply_scheduling_unions_prior_and_booking_session_ids(dsar):
+    """The scheduling-session chain queries BOTH the form-submissions
+    session_ids (prior) AND the booking's own session_ids."""
+    mod, mock_ddb, _ = dsar
+    route, _b, _s, ss_table = _scheduling_route(
+        [_booking_row(booking_id="booking#1", session_id="sess_booking")])
+    mock_ddb.Table.side_effect = route
+    rows_touched, followups, exported, wr = {}, [], {}, {}
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 0, "events_already_gone": 0, "no_event": True}, None)):
+        mod._apply_scheduling_walker_results(
+            "TEN123", "subject@x.co", ["sess_form"], "delete", False,
+            rows_touched, followups, exported, wr)
+    queried = {c.kwargs["Key"]["session_id"] for c in ss_table.get_item.call_args_list}
+    assert {"sess_form", "binding#sess_form",
+            "sess_booking", "binding#sess_booking"}.issubset(queried)
+
+
+def test_dispatcher_none_branch_deletes_scheduling_only_subject(dsar):
+    """Operator decision B / F-DSAR4: a subject with a booking but NO subject-
+    index entry (scheduling-only) is STILL hard-deleted — the scheduling
+    surfaces run email-keyed even though pii_subject_id is None, while the MFS
+    surfaces stay skipped_no_subject."""
+    mod, mock_ddb, _ = dsar
+    route, _b, _s, _ss = _scheduling_route(
+        [_booking_row(booking_id="booking#1", attendee_email="subject@x.co")])
+    mock_ddb.Table.side_effect = route
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 1, "events_already_gone": 0}, None)):
+        rows_touched, followups, exported, wr = mod._walk_mfs_surfaces(
+            pii_subject_id=None, tenant_id="TEN123",
+            normalized_email="subject@x.co", request_type="delete", dry_run=False)
+    assert wr["booking"]["status"] == "completed"
+    assert wr["booking"]["rows_deleted"] == 1
+    assert rows_touched["booking"] == 1
+    # MFS surfaces remain skipped (subject did not resolve)
+    assert wr["form-submissions"]["status"] == "skipped_no_subject"
+
+
+# ── F0 failure-path coverage (adversarial review gaps 1-17) ─────────────────
+def _valid_secret(**over):
+    base = {"client_id": "c", "client_secret": "s", "refresh_token": "r",
+            "coordinator_email": "cal@x.co"}
+    base.update(over)
+    return {"SecretString": json.dumps(base)}
+
+
+# GAP 1 — token endpoint returns 2xx but body lacks access_token → KeyError
+def test_refresh_google_access_token_missing_key_raises(dsar):
+    mod, _, _ = dsar
+    fake = MagicMock(); fake.read.return_value = b"{}"
+    cm = MagicMock(); cm.__enter__.return_value = fake; cm.__exit__.return_value = False
+    with patch.object(mod.urllib.request, "urlopen", return_value=cm):
+        with pytest.raises(KeyError):
+            mod._refresh_google_access_token({"client_id": "c", "client_secret": "s", "refresh_token": "r"})
+
+
+# GAP 1b — empty access_token also raises (N1)
+def test_refresh_google_access_token_empty_token_raises(dsar):
+    mod, _, _ = dsar
+    fake = MagicMock(); fake.read.return_value = b'{"access_token": ""}'
+    cm = MagicMock(); cm.__enter__.return_value = fake; cm.__exit__.return_value = False
+    with patch.object(mod.urllib.request, "urlopen", return_value=cm):
+        with pytest.raises(KeyError):
+            mod._refresh_google_access_token({"client_id": "c", "client_secret": "s", "refresh_token": "r"})
+
+
+# GAP 2 — non-2xx HTTPError on token refresh → _delete_booking_calendar_events ok=False
+def test_calendar_events_token_refresh_http_error_keeps_row(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = _valid_secret()
+    err = mod.urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+    with patch.object(mod.urllib.request, "urlopen", side_effect=err):
+        ok, _o, errcode = mod._delete_booking_calendar_events(
+            "TEN123", _booking_row(external_event_id="evt1", resource_id="coord@x.co"), {})
+    assert ok is False
+    assert errcode == "oauth_unresolved"
+
+
+# GAP 3 — malformed JSON secret → ok=False
+def test_calendar_events_malformed_secret_json_keeps_row(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = {"SecretString": "NOT-JSON"}
+    ok, _o, errcode = mod._delete_booking_calendar_events(
+        "TEN123", _booking_row(external_event_id="evt1", resource_id="coord@x.co"), {})
+    assert ok is False
+    assert errcode == "oauth_unresolved"
+
+
+# GAP 4 — secret exists but has no SecretString (binary secret) → ValueError → ok=False
+def test_load_secret_missing_secretstring_raises(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = {}
+    with pytest.raises(ValueError):
+        mod._load_scheduling_oauth_secret("TEN123", "coord@x.co")
+
+
+def test_calendar_events_missing_secretstring_keeps_row(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = {}
+    ok, _o, errcode = mod._delete_booking_calendar_events(
+        "TEN123", _booking_row(external_event_id="evt1", resource_id="coord@x.co"), {})
+    assert ok is False
+    assert errcode == "oauth_unresolved"
+
+
+# GAP 5 — secret missing a required field → ok=False
+def test_calendar_events_secret_missing_field_keeps_row(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = {"SecretString": json.dumps(
+        {"client_id": "c", "client_secret": "s"})}  # no refresh_token
+    ok, _o, errcode = mod._delete_booking_calendar_events(
+        "TEN123", _booking_row(external_event_id="evt1", resource_id="coord@x.co"), {})
+    assert ok is False
+    assert errcode == "oauth_unresolved"
+
+
+# GAP 6 — URLError on the SECOND event delete (rescheduled) → ok=False, deleted=1
+def test_calendar_events_second_event_urlerror_keeps_row(dsar):
+    mod, _, _ = dsar
+    mod.sm.get_secret_value.return_value = _valid_secret()
+    with patch.object(mod, "_refresh_google_access_token", return_value="tok"), \
+         patch.object(mod, "_google_events_delete",
+                      side_effect=["deleted", mod.urllib.error.URLError("timeout")]):
+        ok, outcome, errcode = mod._delete_booking_calendar_events(
+            "TEN123",
+            _booking_row(external_event_id="evt1", rescheduled_old_event_id="evt2",
+                         resource_id="coord@x.co"), {})
+    assert ok is False
+    assert outcome["events_deleted"] == 1
+    assert errcode == "calendar_delete_failed"
+
+
+# GAP 7 — token_cache reuse: two bookings on the same coordinator → ONE secret read
+def test_walk_booking_reuses_token_cache_for_same_coordinator(dsar):
+    mod, mock_ddb, _ = dsar
+    mod.sm.get_secret_value.return_value = _valid_secret()
+    table = MagicMock()
+    table.query.return_value = {"Items": [
+        _booking_row(booking_id="booking#1", resource_id="coord@x.co", external_event_id="e1"),
+        _booking_row(booking_id="booking#2", resource_id="coord@x.co", external_event_id="e2"),
+    ]}
+    mock_ddb.Table.return_value = table
+    with patch.object(mod, "_refresh_google_access_token", return_value="tok"), \
+         patch.object(mod, "_google_events_delete", return_value="deleted"):
+        result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=False)
+    assert result["rows_deleted"] == 2
+    assert mod.sm.get_secret_value.call_count == 1  # cached across both bookings
+
+
+# GAP 8 — booking DeleteItem ClientError after calendar success → rows_delete_failed + taint
+def test_walk_booking_delete_item_failure_counts_and_taints(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_booking_row(booking_id="booking#1")]}
+    table.delete_item.side_effect = ClientError(
+        {"Error": {"Code": "ProvisionedThroughputExceededException"}}, "DeleteItem")
+    mock_ddb.Table.return_value = table
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 1, "events_already_gone": 0}, None)):
+        result = mod._walk_booking("TEN123", "subject@x.co", "delete", dry_run=False)
+    assert result["rows_deleted"] == 0
+    assert result["rows_delete_failed"] == 1
+    # dispatcher taints to errored
+    rows_touched, followups, exported, wr = {}, [], {}, {}
+    route, _b, _s, _ss = _scheduling_route([_booking_row(booking_id="booking#1")])
+    # reuse the route but make booking delete fail
+    bt = MagicMock()
+    bt.query.return_value = {"Items": [_booking_row(booking_id="booking#1")]}
+    bt.delete_item.side_effect = ClientError({"Error": {"Code": "Throttling"}}, "DeleteItem")
+    empty = MagicMock(); empty.query.return_value = {"Items": []}; empty.get_item.return_value = {}
+    mock_ddb.Table.side_effect = lambda n: bt if n == "picasso-booking-staging" else empty
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 1, "events_already_gone": 0}, None)):
+        mod._apply_scheduling_walker_results("TEN123", "subject@x.co", [], "delete", False,
+                                             rows_touched, followups, exported, wr)
+    assert wr["booking"]["status"] == "errored"
+    assert wr["booking"]["error"] == "rows_delete_failed"
+
+
+# GAP 9 — scheduled-messages pagination across LastEvaluatedKey
+def test_walk_scheduled_messages_paginates(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.side_effect = [
+        {"Items": [_sched_msg_row(sk="SCHEDULED#x#booking#1#t24h")], "LastEvaluatedKey": {"k": 1}},
+        {"Items": [_sched_msg_row(sk="SCHEDULED#x#booking#1#t1h")]},
+    ]
+    mock_ddb.Table.return_value = table
+    result = mod._walk_scheduled_messages("TEN123", ["booking#1"], "delete", dry_run=False)
+    assert result["rows_found"] == 2
+    assert result["rows_deleted"] == 2
+
+
+# GAP 10 — scheduled-messages access path
+def test_walk_scheduled_messages_access_exports(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_sched_msg_row()]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_scheduled_messages("TEN123", ["booking#abc123"], "access", dry_run=True)
+    assert result["action"] == "exported"
+    assert len(result["exported_rows"]) == 1
+    table.delete_item.assert_not_called()
+
+
+# GAP 11 — non-ResourceNotFound schedule delete failure → schedules_failed + taint
+def test_delete_booking_schedules_non_rnf_error_counts_failed(dsar):
+    from botocore.exceptions import ClientError
+    mod, _, _ = dsar
+    mod.scheduler.delete_schedule.side_effect = ClientError(
+        {"Error": {"Code": "InternalServerError"}}, "DeleteSchedule")
+    deleted, failed = mod._delete_booking_schedules("booking#abc")
+    assert deleted == 0
+    assert failed == 5
+
+
+def test_apply_scheduling_schedules_failed_taints(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    route, _b, sm_table, _ss = _scheduling_route(
+        [_booking_row(booking_id="booking#1")],
+        sm_items=[_sched_msg_row(sk="SCHEDULED#x#booking#1#t24h")])
+    mock_ddb.Table.side_effect = route
+    mod.scheduler.delete_schedule.side_effect = ClientError(
+        {"Error": {"Code": "InternalServerError"}}, "DeleteSchedule")
+    rows_touched, followups, exported, wr = {}, [], {}, {}
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(True, {"events_deleted": 0, "events_already_gone": 0, "no_event": True}, None)):
+        mod._apply_scheduling_walker_results("TEN123", "subject@x.co", [], "delete", False,
+                                             rows_touched, followups, exported, wr)
+    assert wr["scheduled-messages"]["status"] == "errored"
+    assert any("schedule delete" in f.lower() for f in followups)
+
+
+# GAP 12 — scheduling-session truncation cap
+def test_walk_scheduling_session_truncates_at_cap(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.get_item.return_value = {}
+    mock_ddb.Table.return_value = table
+    sids = [f"s{i}" for i in range(mod.MAX_SESSION_IDS_PER_INVOCATION + 5)]
+    result = mod._walk_conversation_scheduling_session("TEN123", sids, "delete", dry_run=True)
+    assert result["truncated_session_id_count"] == 5
+    # capped count × 2 (state + binding) get_item calls
+    assert table.get_item.call_count == mod.MAX_SESSION_IDS_PER_INVOCATION * 2
+
+
+# GAP 13 — scheduling-session get_item ClientError mid-loop → get_failed + continues
+def test_walk_scheduling_session_get_failure_continues_and_taints(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    # first get_item (state row) errors; second (binding) succeeds
+    table.get_item.side_effect = [
+        ClientError({"Error": {"Code": "Throttling"}}, "GetItem"),
+        {"Item": {"tenantId": "TEN123", "session_id": "binding#sess_1"}},
+    ]
+    mock_ddb.Table.return_value = table
+    result = mod._walk_conversation_scheduling_session("TEN123", ["sess_1"], "delete", dry_run=False)
+    assert result["get_failed"] == 1
+    assert result["rows_deleted"] == 1  # the binding row still processed
+    # dispatcher taints
+    rows_touched, followups, exported, wr = {}, [], {}, {}
+    bt = MagicMock(); bt.query.return_value = {"Items": []}
+    sst = MagicMock()
+    sst.get_item.side_effect = [ClientError({"Error": {"Code": "Throttling"}}, "GetItem"), {}]
+    empty = MagicMock(); empty.query.return_value = {"Items": []}
+    def route(n):
+        if n == "picasso-conversation-scheduling-session-staging": return sst
+        if n == "picasso-booking-staging": return bt
+        return empty
+    mock_ddb.Table.side_effect = route
+    mod._apply_scheduling_walker_results("TEN123", "subject@x.co", ["sess_1"], "delete", False,
+                                         rows_touched, followups, exported, wr)
+    assert wr["scheduling-session"]["status"] == "errored"
+
+
+# GAP 14 — scheduling-session access path
+def test_walk_scheduling_session_access_exports(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.get_item.side_effect = lambda Key: (
+        {"Item": {"tenantId": "TEN123", "session_id": Key["session_id"], "state": "booked"}}
+        if Key["session_id"] == "sess_1" else {})
+    mock_ddb.Table.return_value = table
+    result = mod._walk_conversation_scheduling_session("TEN123", ["sess_1"], "access", dry_run=True)
+    assert result["action"] == "exported"
+    assert len(result["exported_rows"]) == 1
+    table.delete_item.assert_not_called()
+
+
+# GAP 15 — scheduled-messages corrupted row (missing pk/sk) → skipped_corrupted
+def test_walk_scheduled_messages_skips_corrupted_row(dsar):
+    mod, mock_ddb, _ = dsar
+    good = _sched_msg_row(sk="SCHEDULED#x#booking#1#t24h")
+    bad = _sched_msg_row(sk="SCHEDULED#x#booking#1#t1h"); bad.pop("pk")
+    table = MagicMock()
+    table.query.return_value = {"Items": [good, bad]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_scheduled_messages("TEN123", ["booking#1"], "delete", dry_run=False)
+    assert result["rows_skipped_corrupted"] == 1
+    assert result["rows_deleted"] == 1
+
+
+# GAP 16 — end-to-end handler: delete-real scheduling calendar fail → partial_error
+def test_handler_delete_real_scheduling_calendar_fail_partial_error(dsar):
+    mod, mock_ddb, _ = dsar
+    _stub_handler_tables(mock_ddb, subject_found=True, fs_items=[])
+    base_route = mock_ddb.Table.side_effect
+    booking_table = MagicMock()
+    booking_table.query.return_value = {"Items": [_booking_row(booking_id="booking#1")]}
+
+    def route(name):
+        if name == "picasso-booking-staging":
+            return booking_table
+        return base_route(name)
+    mock_ddb.Table.side_effect = route
+    with patch.object(mod, "_delete_booking_calendar_events",
+                      return_value=(False, {"events_deleted": 0, "events_already_gone": 0}, "oauth_unresolved")):
+        resp = mod.lambda_handler(
+            _valid_event(subject_identifier="subject@x.co",
+                         request_type="delete", dry_run=False), context=None)
+    assert resp["status"] == "partial_error"
+    assert resp["rows_touched"]["booking"] == 1
+    assert resp["rows_touched"]["calendar"] == 0  # calendar delete was unconfirmed
+
+
+# GAP 17 — _compute_close_status sees calendar_delete_unconfirmed
+def test_compute_close_status_calendar_unconfirmed_is_partial_error(dsar):
+    mod, _, _ = dsar
+    wr = {
+        "form-submissions": {"status": "completed"},
+        "booking": {"status": "errored", "error": "calendar_delete_unconfirmed"},
+        "calendar": {"status": "errored", "error": "calendar_delete_unconfirmed"},
+    }
+    assert mod._compute_close_status(wr) == "partial_error"
+
+
+# Security B2 — path-traversal in coordinator_id is rejected (keep-row)
+def test_oauth_secret_path_rejects_traversal(dsar):
+    mod, _, _ = dsar
+    with pytest.raises(ValueError):
+        mod._scheduling_oauth_secret_path("TEN123", "../otherTenant/coord")
+    # a normal email coordinator id is accepted
+    assert mod._scheduling_oauth_secret_path("TEN123", "coord@x.co").endswith("/TEN123/coord@x.co")
+
+
+def test_calendar_events_unsafe_coordinator_keeps_row(dsar):
+    mod, _, _ = dsar
+    ok, _o, errcode = mod._delete_booking_calendar_events(
+        "TEN123", _booking_row(external_event_id="evt1", resource_id="../evil"), {})
+    assert ok is False
+    assert errcode == "oauth_unresolved"
+
+
+# SR4 — booking access export strips coordinator/internal fields
+def test_walk_booking_access_export_strips_coordinator_fields(dsar):
+    mod, mock_ddb, _ = dsar
+    table = MagicMock()
+    table.query.return_value = {"Items": [_booking_row(
+        booking_id="booking#1", attendee_email="subject@x.co",
+        coordinator_email="staff@x.co")]}
+    mock_ddb.Table.return_value = table
+    result = mod._walk_booking("TEN123", "subject@x.co", "access", dry_run=True)
+    row = result["exported_rows"][0]
+    assert "coordinator_email" not in row
+    assert "resource_id" not in row
+    assert "external_event_id" not in row
+    assert row["attendee_email"] == "subject@x.co"  # subject-facing field kept
+
+
+# SR6 — calendar surface reports not_attempted when the booking query failed
+def test_apply_scheduling_booking_query_error_calendar_not_attempted(dsar):
+    from botocore.exceptions import ClientError
+    mod, mock_ddb, _ = dsar
+    bt = MagicMock()
+    bt.query.side_effect = ClientError({"Error": {"Code": "InternalServerError"}}, "Query")
+    empty = MagicMock(); empty.query.return_value = {"Items": []}; empty.get_item.return_value = {}
+    mock_ddb.Table.side_effect = lambda n: bt if n == "picasso-booking-staging" else empty
+    rows_touched, followups, exported, wr = {}, [], {}, {}
+    mod._apply_scheduling_walker_results("TEN123", "subject@x.co", [], "delete", False,
+                                         rows_touched, followups, exported, wr)
+    assert wr["booking"]["status"] == "errored"
+    assert wr["calendar"]["status"] == "errored"
+    assert wr["calendar"]["action"] == "not_attempted"

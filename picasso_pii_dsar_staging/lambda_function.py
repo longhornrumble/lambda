@@ -129,10 +129,15 @@ import json
 import logging
 import os
 import re
+import ssl
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
+from botocore.config import Config
 from botocore.exceptions import ClientError
 
 logger = logging.getLogger()
@@ -176,6 +181,43 @@ GSI_CHANNEL_MAPPINGS_TENANT_INDEX = "TenantIndex"
 # control; walker must enumerate versions on delete to fully erase.
 S3_ARCHIVE_BUCKET = "picasso-archive-staging"
 S3_ARCHIVE_KEY_PREFIX = "sessions/"
+
+# ── F0: scheduling identity-graph surfaces ─────────────────────────────────
+# Scheduling v1 (Booking_Commit_Handler + Reminder_Scheduler + the Calendar_*
+# Lambdas) writes PII to three DynamoDB tables AND a real Google Calendar
+# event that the conversation-side DSAR walkers above never touched. These
+# names are the live staging tables (verified 2026-06-13); they are hardcoded
+# like the other staging-only surfaces (this Lambda is account-pinned via
+# EXPECTED_ACCOUNT). A future prod cutover would env-override them the way
+# FORM_SUBMISSIONS_TABLE does (D2).
+TABLE_BOOKING = "picasso-booking-staging"
+TABLE_SCHEDULING_SESSION = "picasso-conversation-scheduling-session-staging"
+TABLE_SCHEDULED_MESSAGES = "picasso-scheduled-messages"
+GSI_SCHEDULED_MESSAGES_BY_APPOINTMENT = "by-appointment"
+
+# EventBridge Scheduler group the reminder/attendance schedules live in.
+# VERIFIED LIVE (2026-06-13): staging acct 525 uses
+# `picasso-scheduling-reminders-staging` (NOT the `picasso-scheduling` test
+# default the F0 briefing cited — pre-flight caught the drift). Env-overridable
+# so a prod cutover can repoint without a code change.
+SCHEDULER_GROUP_NAME = os.environ.get(
+    "SCHEDULER_GROUP_NAME", "picasso-scheduling-reminders-staging")
+# Per-coordinator Google OAuth secret path prefix (mirrors
+# Booking_Commit_Handler/oauth-client.js buildSecretPath). The full path
+# `picasso/scheduling/oauth/{tenantId}/{coordinatorId}` encodes a coordinator
+# email — NEVER log it (cross-tenant existence oracle).
+SCHEDULING_OAUTH_SECRET_PREFIX = "picasso/scheduling/oauth"
+# Reminder tiers the deterministic EventBridge schedule-name sweep covers
+# (superset of what any one tenant enables; delete is idempotent so sweeping a
+# tier that doesn't exist is a harmless ResourceNotFound). Mirrors the
+# Reminder_Scheduler/scheduler.js no-bookkeeping sweep list.
+REMINDER_SCHEDULE_TIERS = ("t24h", "t4h", "t1h", "t15m")
+# Google Calendar deletion (stdlib urllib — no google-auth dependency, so no
+# zip/include_globs change). Idempotent: 404/410 == already gone.
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_CALENDAR_EVENT_URL = (
+    "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events/{event_id}")
+GOOGLE_HTTP_TIMEOUT_S = 10
 
 # Bound the chained notification-events GSI walk so a single DSAR cannot
 # exhaust the 60s Lambda timeout (Security advisor Finding 3, 2026-05-21).
@@ -250,6 +292,24 @@ sts = boto3.client("sts")
 # M2 Sprint C: S3 client for the ARCHIVE_BUCKET walker. Eager region from the
 # Lambda runtime (AWS_DEFAULT_REGION); no explicit region kwarg.
 s3 = boto3.client("s3")
+# F0: Secrets Manager (per-coordinator Google OAuth) + EventBridge Scheduler
+# (reminder/attendance schedule cleanup). Region inherited from the runtime.
+# Bounded timeouts (Security C2) so a degraded dependency can't consume the
+# whole Lambda budget and leave the DDB walk un-run / un-audited.
+_F0_CLIENT_CONFIG = Config(connect_timeout=5, read_timeout=10,
+                           retries={"max_attempts": 2})
+sm = boto3.client("secretsmanager", config=_F0_CLIENT_CONFIG)
+scheduler = boto3.client("scheduler", config=_F0_CLIENT_CONFIG)
+# Explicit TLS-verifying context for the Google credential exchange + calendar
+# delete (Security B3). urllib already verifies by default; pinning the context
+# makes the intent auditable and prevents a future maintainer from silently
+# disabling verification on a connection that carries client_secret/refresh_token.
+_TLS_CONTEXT = ssl.create_default_context()
+# Safe charset for the {tenant_id}/{coordinator_id} segments of the Secrets
+# Manager OAuth path (Security B2). Blocks `/`, `..`, and any separator that
+# could traverse to a different tenant's secret. Emails (coordinator ids) use
+# @ . _ % + - ; tenant ids are alphanumeric.
+_SECRET_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9._%+@-]+$")
 
 # Audit fix #10: MFA-Delete posture cache. The archive walker assumes
 # MFA-Delete is disabled — under MFA-Delete=enabled, every
@@ -975,6 +1035,799 @@ def _walk_session_summaries(pii_subject_id, tenant_hash, request_type, dry_run):
         "rows_delete_failed": delete_failed,
         "rows_skipped_corrupted": skipped_corrupted,
     }
+
+
+# ── F0: scheduling identity-graph walkers ──────────────────────────────────
+# F0 (the unwaivable gate on scheduling v1's prod flag-flip, F1). The
+# conversation-side walkers above do NOT reach scheduling's data surfaces
+# (bookings, scheduling-session bindings, reminder/attendance messages) NOR
+# the real Google Calendar event they create. These three walkers + the
+# Google-Calendar deletion action close that gap so a person's ENTIRE
+# scheduling footprint is hard-deletable with an auditor confirming zero
+# residue.
+#
+# DESIGN (advisory-corrected — pii-data-lifecycle + privacy-data-governance,
+# 2026-06-13; F0_SCHEDULING_IDENTITY_DELETION_BRIEFING.md §11). The chain keys
+# by booking_id + session_id, NOT per-table email match: scheduling-session
+# state rows carry NO attendee_email (verified live), and the scheduled-
+# messages attendance row's recipient is the COORDINATOR — an email match
+# would miss both. Order matters: the calendar event is deleted BEFORE the
+# booking row (once the row is gone the external_event_id needed to retry is
+# gone). Operator decision B (2026-06-13): subject discovery walks booking by
+# attendee_email independent of pii_subject_id, so a scheduling-only subject
+# (a booking but no form, hence no subject-index entry: the F-DSAR4 class) IS
+# reachable. No scheduling writer stamps pii_subject_id (verified).
+def _exc_label(exc):
+    """Safe, PII-free error label for logging. ClientError → AWS error code;
+    anything else → the exception class name. Never includes a message (which
+    could carry a secret path / email)."""
+    if isinstance(exc, ClientError):
+        return exc.response.get("Error", {}).get("Code", "ClientError")
+    return type(exc).__name__
+
+
+def _scheduling_oauth_secret_path(tenant_id, coordinator_id):
+    """Secrets Manager path for a coordinator's Google OAuth credentials.
+    Mirrors Booking_Commit_Handler/oauth-client.js:buildSecretPath.
+
+    Security B2: both segments are validated against a safe charset before the
+    path is built — `coordinator_id` comes off a booking row's `resource_id`,
+    so a poisoned value containing `/` or `..` could otherwise traverse to a
+    DIFFERENT tenant's OAuth secret (the IAM grant is a `…/oauth/*` wildcard).
+    Raises ValueError on an unsafe segment (caller treats as keep-row B1)."""
+    for segment in (tenant_id, coordinator_id):
+        if not segment or not _SECRET_PATH_SEGMENT_RE.match(str(segment)):
+            raise ValueError("unsafe segment for OAuth secret path")
+    return f"{SCHEDULING_OAUTH_SECRET_PREFIX}/{tenant_id}/{coordinator_id}"
+
+
+def _safe_schedule_name(booking_id):
+    """EventBridge Scheduler names allow [0-9a-zA-Z-_.] only. VERBATIM port of
+    Reminder_Scheduler/scheduler.js:safeName — booking#<hex> → booking-<hex>."""
+    return re.sub(r"[^0-9a-zA-Z]", "-", str(booking_id))
+
+
+def _load_scheduling_oauth_secret(tenant_id, coordinator_id):
+    """GetSecretValue + validate one coordinator's OAuth secret.
+
+    Returns the parsed dict. Raises ClientError (incl. ResourceNotFound when
+    the coordinator_id doesn't resolve to a stored secret — advisory B1's
+    silent-skip trap) or ValueError (malformed / missing required field).
+    Callers MUST treat any raise as "calendar event NOT deleted" and leave the
+    booking row in place. NEVER log the secret path or contents."""
+    resp = sm.get_secret_value(
+        SecretId=_scheduling_oauth_secret_path(tenant_id, coordinator_id))
+    secret_string = resp.get("SecretString")
+    if not secret_string:
+        raise ValueError("oauth secret has no SecretString")
+    secret = json.loads(secret_string)
+    for required in ("client_id", "client_secret", "refresh_token"):
+        if not secret.get(required):
+            raise ValueError(f"oauth secret missing required field: {required}")
+    return secret
+
+
+def _refresh_google_access_token(secret):
+    """Exchange the stored refresh_token for a short-lived access_token at
+    Google's token endpoint. stdlib urllib only (no google-auth dependency).
+    Raises urllib.error.* on transport/non-2xx; KeyError if the response lacks
+    access_token."""
+    data = urllib.parse.urlencode({
+        "client_id": secret["client_id"],
+        "client_secret": secret["client_secret"],
+        "refresh_token": secret["refresh_token"],
+        "grant_type": "refresh_token",
+    }).encode("utf-8")
+    req = urllib.request.Request(GOOGLE_TOKEN_ENDPOINT, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    with urllib.request.urlopen(
+            req, timeout=GOOGLE_HTTP_TIMEOUT_S, context=_TLS_CONTEXT) as resp:
+        body = json.loads(resp.read().decode("utf-8", errors="replace"))
+    token = body["access_token"]
+    if not token:
+        # N1: an empty/null access_token would send a bare `Bearer ` and 401 —
+        # surface it as the same keep-row failure as a missing key.
+        raise KeyError("access_token empty in Google token response")
+    return token
+
+
+def _google_events_delete(access_token, calendar_id, event_id):
+    """DELETE one Google Calendar event. Idempotent: 404/410 → 'already_gone'.
+    Returns 'deleted' on 2xx. Raises on any other failure (caller treats a
+    raise as non-idempotent failure → keep the booking row, taint). Mirrors
+    Booking_Commit_Handler/calendar-events.js:deleteEvent."""
+    url = GOOGLE_CALENDAR_EVENT_URL.format(
+        calendar_id=urllib.parse.quote(str(calendar_id), safe=""),
+        event_id=urllib.parse.quote(str(event_id), safe=""),
+    )
+    req = urllib.request.Request(url, method="DELETE")
+    req.add_header("Authorization", f"Bearer {access_token}")
+    try:
+        urllib.request.urlopen(
+            req, timeout=GOOGLE_HTTP_TIMEOUT_S, context=_TLS_CONTEXT)
+        return "deleted"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (404, 410):
+            return "already_gone"
+        raise
+
+
+def _resolve_coordinator_calendar(tenant_id, coordinator_id, token_cache):
+    """Return (access_token, calendar_id_from_secret|None) for a coordinator,
+    cached per (tenant_id, coordinator_id) within the invocation (multiple
+    bookings on the same coordinator reuse one token). Raises on unresolved
+    secret / refresh failure — caller treats as the keep-row case.
+
+    Security B1: the cache key is the (tenant_id, coordinator_id) PAIR, not
+    coordinator_id alone — a structural guarantee that a token minted for
+    tenant A's coordinator can never be reused for tenant B even if a future
+    caller batches multiple tenants into one invocation."""
+    cache_key = (tenant_id, coordinator_id)
+    cached = token_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    secret = _load_scheduling_oauth_secret(tenant_id, coordinator_id)
+    token = _refresh_google_access_token(secret)
+    calendar_id = (secret.get("coordinator_email") or "").strip() or None
+    token_cache[cache_key] = (token, calendar_id)
+    return token, calendar_id
+
+
+def _delete_booking_calendar_events(tenant_id, booking, token_cache):
+    """Delete the Google Calendar event(s) for one booking BEFORE its row.
+
+    Resolves coordinator_id = booking.resource_id (v1 identity convention —
+    the booking row stores resource_id, not the secret-path coordinatorId;
+    advisory B1). calendar_id = secret.coordinator_email or the row's
+    coordinator_email or coordinator_id. Deletes BOTH external_event_id and
+    rescheduled_old_event_id (a 2nd live event left by a pending reschedule).
+
+    Returns (ok: bool, outcome: dict, error: str|None). ok=False means at
+    least one event could NOT be confirmed deleted (secret unresolved, token
+    refresh failed, or a non-idempotent HTTP error) → the caller MUST keep the
+    booking row and taint (never silent calendar residue). 'already_gone'
+    counts as ok. No event ids on the row → ok with no_event=True."""
+    event_ids = [
+        e for e in (booking.get("external_event_id"),
+                    booking.get("rescheduled_old_event_id")) if e
+    ]
+    if not event_ids:
+        return True, {"events_deleted": 0, "events_already_gone": 0,
+                      "no_event": True}, None
+    coordinator_id = booking.get("resource_id")
+    if not coordinator_id:
+        return False, {"events_deleted": 0, "events_already_gone": 0}, \
+            "missing_resource_id"
+    try:
+        token, cal_from_secret = _resolve_coordinator_calendar(
+            tenant_id, coordinator_id, token_cache)
+    except (ClientError, ValueError, urllib.error.URLError, OSError, KeyError) as exc:
+        # B1: secret unresolved / refresh failed → do NOT delete the row. Log
+        # the error CLASS only (never the secret path / coordinator email).
+        logger.error("booking_calendar_oauth_failed: err=%s", _exc_label(exc))
+        return False, {"events_deleted": 0, "events_already_gone": 0}, \
+            "oauth_unresolved"
+    calendar_id = cal_from_secret or booking.get("coordinator_email") or coordinator_id
+    deleted = 0
+    already_gone = 0
+    for event_id in event_ids:
+        try:
+            outcome = _google_events_delete(token, calendar_id, event_id)
+        except (urllib.error.URLError, OSError) as exc:
+            logger.error("booking_calendar_delete_failed: err=%s", _exc_label(exc))
+            return False, {"events_deleted": deleted,
+                           "events_already_gone": already_gone}, \
+                "calendar_delete_failed"
+        if outcome == "deleted":
+            deleted += 1
+        else:
+            already_gone += 1
+    return True, {"events_deleted": deleted, "events_already_gone": already_gone}, None
+
+
+def _delete_booking_schedules(booking_id):
+    """Idempotent sweep of a booking's EventBridge reminder+attendance
+    schedules by deterministic name (advisory B4 — a named schedule carrying
+    the booking_id is residue even after the DDB row is gone / TTL'd). Returns
+    (deleted, failed). ResourceNotFound → already gone (neither counter).
+    Mirrors the Reminder_Scheduler/scheduler.js no-bookkeeping sweep."""
+    safe = _safe_schedule_name(booking_id)
+    names = [f"sched-reminder-{tier}-{safe}" for tier in REMINDER_SCHEDULE_TIERS]
+    names.append(f"sched-attendance-{safe}")
+    deleted = 0
+    failed = 0
+    for name in names:
+        try:
+            scheduler.delete_schedule(Name=name, GroupName=SCHEDULER_GROUP_NAME)
+            deleted += 1
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code")
+            if code == "ResourceNotFoundException":
+                continue
+            failed += 1
+            logger.error("booking_schedule_delete_failed: code=%s", code)
+    return deleted, failed
+
+
+# Booking-row fields that are coordinator/staff PII or internal operational
+# state — stripped from an access-type DSAR export so the SUBJECT's data export
+# does not over-disclose the coordinator's email/calendar identifiers (SR4).
+# A denylist (not an allowlist) so new subject-facing fields are auto-included.
+_BOOKING_EXPORT_DENYLIST = frozenset({
+    "coordinator_email", "resource_id", "external_event_id",
+    "rescheduled_old_event_id", "idempotency_key", "last_calendar_mutation_at",
+    "reminder_schedule_state", "channel_details",
+})
+
+
+def _project_booking_row(row):
+    """Drop coordinator/internal fields from a booking row for access export."""
+    return {k: v for k, v in row.items() if k not in _BOOKING_EXPORT_DENYLIST}
+
+
+def _walk_booking(tenant_id, normalized_email, request_type, dry_run):
+    """Walk picasso-booking-staging for one subject by attendee_email (F0).
+
+    Email-keyed (operator decision B) — NO pii_subject_id needed, so a
+    scheduling-only subject (the F-DSAR4 class) is reachable. Tenant-partition
+    Query (PK=tenantId; there is NO attendee_email GSI — verified live) +
+    server-side FilterExpression item_type=='booking' (excludes slot_lock /
+    coordinator_degraded items), paginated on LastEvaluatedKey (F-DSAR30
+    truncation lesson). The attendee_email match is done CLIENT-SIDE with
+    case-insensitive normalization (`.strip().lower()` both sides) so a casing
+    variance cannot cause a deletion miss (= residue = F0 fail).
+
+    Coordinator carve-out: matches `attendee_email` ONLY; a row's
+    coordinator_email (staff PII) is captured solely to route the calendar
+    delete and is never a match/delete key — bookings where the subject is the
+    coordinator are NOT deleted.
+
+    Deletion order (delete-real): per booking, delete the Google Calendar
+    event(s) FIRST; ONLY on success DeleteItem the booking row. On calendar
+    failure (unresolved coordinator secret / non-idempotent HTTP error) the row
+    is KEPT (so the external_event_id is recoverable) and counted in
+    calendar_failed — the dispatcher taints the DSAR partial_error so the
+    operator finishes manually (advisory B1: never silent calendar residue).
+    booking_ids + session_ids are captured for ALL matched bookings (incl.
+    calendar-failed ones) so the chained scheduled-messages + scheduling-session
+    walkers still clean those surfaces; only the booking ROW is kept on failure.
+
+    request_type: "access" → exported_rows; "delete"+dry_run → count (no
+    calendar calls / no DeleteItem); "delete"+real → calendar-delete-first then
+    DeleteItem.
+    """
+    table = ddb.Table(TABLE_BOOKING)
+    subject = _normalize_email(normalized_email)
+    matched = []
+    last_evaluated_key = None
+    while True:
+        kwargs = {
+            "KeyConditionExpression": Key("tenantId").eq(tenant_id),
+            "FilterExpression": Attr("item_type").eq("booking"),
+        }
+        if last_evaluated_key:
+            kwargs["ExclusiveStartKey"] = last_evaluated_key
+        try:
+            resp = table.query(**kwargs)
+        except ClientError as exc:
+            logger.error(
+                "booking_query_failed: code=%s",
+                exc.response.get("Error", {}).get("Code"),
+            )
+            return {"rows_found": 0, "session_ids": [], "booking_ids": [],
+                    "error": "query_failed"}
+        for row in resp.get("Items", []):
+            if _normalize_email(row.get("attendee_email") or "") == subject:
+                matched.append(row)
+        last_evaluated_key = resp.get("LastEvaluatedKey")
+        if not last_evaluated_key:
+            break
+
+    rows_found = len(matched)
+    session_ids = [sid for sid in (r.get("session_id") for r in matched) if sid]
+    booking_ids = [bid for bid in (r.get("booking_id") for r in matched) if bid]
+
+    if rows_found == 0:
+        return {"rows_found": 0, "session_ids": [], "booking_ids": [],
+                "action": "no_bookings"}
+
+    if request_type == "access":
+        return {
+            "rows_found": rows_found,
+            "session_ids": session_ids,
+            "booking_ids": booking_ids,
+            "action": "exported",
+            # SR4: project out coordinator/internal fields — the subject's
+            # appointment data without the staff member's email/calendar ids.
+            "exported_rows": [_project_booking_row(r) for r in matched],
+        }
+
+    if dry_run:
+        calendar_pending = sum(
+            1 for r in matched
+            if r.get("external_event_id") or r.get("rescheduled_old_event_id")
+        )
+        return {
+            "rows_found": rows_found,
+            "session_ids": session_ids,
+            "booking_ids": booking_ids,
+            "action": "dry_run_count",
+            "calendar_events_pending": calendar_pending,
+        }
+
+    # delete-real: calendar-delete-first, then the booking row.
+    token_cache = {}
+    deleted = 0
+    delete_failed = 0
+    calendar_failed = 0
+    calendar_events_deleted = 0
+    calendar_events_already_gone = 0
+    skipped_corrupted = 0
+    for row in matched:
+        booking_id = row.get("booking_id")
+        if booking_id is None:
+            skipped_corrupted += 1
+            logger.error(
+                "booking_delete_skipped_corrupted: tenantId=%s — row missing "
+                "booking_id; cannot delete safely", row.get("tenantId"),
+            )
+            continue
+        cal_ok, cal_outcome, _cal_err = _delete_booking_calendar_events(
+            tenant_id, row, token_cache)
+        calendar_events_deleted += cal_outcome.get("events_deleted", 0)
+        calendar_events_already_gone += cal_outcome.get("events_already_gone", 0)
+        if not cal_ok:
+            # Keep the row so the calendar event id stays recoverable for the
+            # operator's manual cleanup + a future idempotent re-invoke.
+            calendar_failed += 1
+            continue
+        try:
+            table.delete_item(Key={"tenantId": tenant_id, "booking_id": booking_id})
+            deleted += 1
+        except ClientError as exc:
+            delete_failed += 1
+            logger.error(
+                "booking_delete_failed: code=%s",
+                exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
+        "session_ids": session_ids,
+        "booking_ids": booking_ids,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
+        "rows_skipped_corrupted": skipped_corrupted,
+        "calendar_failed": calendar_failed,
+        "calendar_events_deleted": calendar_events_deleted,
+        "calendar_events_already_gone": calendar_events_already_gone,
+    }
+
+
+def _walk_scheduled_messages(tenant_id, booking_ids, request_type, dry_run):
+    """Walk picasso-scheduled-messages for one subject via booking_ids (F0).
+
+    Chained by appointment_id == booking_id (advisory B3: NOT recipient_email —
+    the attendance row's recipient is the COORDINATOR, and SMS-only rows would
+    be missed). Query the by-appointment GSI (HASH=appointment_id, Projection
+    ALL → DeleteItem uses the base (pk, sk)) per booking_id, paginated.
+
+    For delete-real, ALSO sweep the paired EventBridge schedules by
+    deterministic name (advisory B4) — once per booking_id, independent of how
+    many DDB rows survive (the schedule outlives a TTL'd row).
+    """
+    if not booking_ids:
+        return {"rows_found": 0, "action": "no_bookings"}
+    table = ddb.Table(TABLE_SCHEDULED_MESSAGES)
+    matched = []
+    failed_booking_ids = []
+    # Dedupe (a subject's booking_ids are already unique, but defensive).
+    for booking_id in list(dict.fromkeys(booking_ids)):
+        last_evaluated_key = None
+        while True:
+            kwargs = {
+                "IndexName": GSI_SCHEDULED_MESSAGES_BY_APPOINTMENT,
+                "KeyConditionExpression": Key("appointment_id").eq(booking_id),
+            }
+            if last_evaluated_key:
+                kwargs["ExclusiveStartKey"] = last_evaluated_key
+            try:
+                resp = table.query(**kwargs)
+            except ClientError as exc:
+                logger.error(
+                    "scheduled_messages_query_failed: code=%s",
+                    exc.response.get("Error", {}).get("Code"),
+                )
+                failed_booking_ids.append(booking_id)
+                break
+            matched.extend(resp.get("Items", []))
+            last_evaluated_key = resp.get("LastEvaluatedKey")
+            if not last_evaluated_key:
+                break
+
+    rows_found = len(matched)
+    progress = {}
+    if failed_booking_ids:
+        progress["query_failed_count"] = len(failed_booking_ids)
+
+    if request_type == "access":
+        return {"rows_found": rows_found, "action": "exported",
+                "exported_rows": matched, **progress}
+    if dry_run:
+        return {"rows_found": rows_found, "action": "dry_run_count", **progress}
+
+    deleted = 0
+    delete_failed = 0
+    skipped_corrupted = 0
+    for row in matched:
+        pk = row.get("pk")
+        sk = row.get("sk")
+        if pk is None or sk is None:
+            skipped_corrupted += 1
+            logger.error(
+                "scheduled_messages_delete_skipped_corrupted: pk=%s sk=%s — "
+                "row missing PK/SK", pk, sk,
+            )
+            continue
+        try:
+            table.delete_item(Key={"pk": pk, "sk": sk})
+            deleted += 1
+        except ClientError as exc:
+            delete_failed += 1
+            logger.error(
+                "scheduled_messages_delete_failed: code=%s",
+                exc.response.get("Error", {}).get("Code"),
+            )
+    # EventBridge sweep per booking_id (B4) — idempotent; independent of rows.
+    schedules_deleted = 0
+    schedules_failed = 0
+    for booking_id in list(dict.fromkeys(booking_ids)):
+        d, f = _delete_booking_schedules(booking_id)
+        schedules_deleted += d
+        schedules_failed += f
+    return {
+        "rows_found": rows_found,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
+        "rows_skipped_corrupted": skipped_corrupted,
+        "schedules_deleted": schedules_deleted,
+        "schedules_failed": schedules_failed,
+        **progress,
+    }
+
+
+def _walk_conversation_scheduling_session(tenant_id, session_ids, request_type, dry_run):
+    """Walk picasso-conversation-scheduling-session-staging by session_id (F0).
+
+    Chained by session_id (advisory B2: state rows carry NO attendee_email —
+    verified live — and the binding row SK=binding#<session_id> has none
+    either). PK=tenantId, SK=session_id; no GSI → point operations. For each
+    session_id, reach BOTH the state row (SK=session_id) and the binding row
+    (SK=binding#<session_id>); a non-existent key is a harmless no-op on delete.
+
+    session_ids are the union of booking + form-submissions session_ids
+    (deduped, bounded). NOTE: an ABANDONED scheduling session (no booking, no
+    form) has no email/booking linkage and a state row with no attendee_email —
+    it is NOT email-reachable here; the table currently has TTL DISABLED, so
+    that residual is a documented gap (feeds the §12 retention-TTL decision),
+    not silently clean.
+    """
+    if not session_ids:
+        return {"rows_found": 0, "action": "no_sessions"}
+    table = ddb.Table(TABLE_SCHEDULING_SESSION)
+
+    # Dedupe + bound fan-out (booking + form session_ids may overlap).
+    unique_ids = list(dict.fromkeys(sid for sid in session_ids if sid))
+    truncated = 0
+    if len(unique_ids) > MAX_SESSION_IDS_PER_INVOCATION:
+        truncated = len(unique_ids) - MAX_SESSION_IDS_PER_INVOCATION
+        unique_ids = unique_ids[:MAX_SESSION_IDS_PER_INVOCATION]
+        logger.warning(
+            "scheduling_session_ids_truncated: cap=%d overflow=%d",
+            MAX_SESSION_IDS_PER_INVOCATION, truncated,
+        )
+
+    found = []
+    get_failed = 0
+    for sid in unique_ids:
+        for sk in (sid, f"binding#{sid}"):
+            try:
+                resp = table.get_item(Key={"tenantId": tenant_id, "session_id": sk})
+            except ClientError as exc:
+                # Continue-on-error (mirrors the chained walkers): a transient
+                # GetItem failure on one key must not abandon the rest. Count it
+                # so the dispatcher can taint partial_error (invisible residue
+                # otherwise).
+                get_failed += 1
+                logger.error(
+                    "scheduling_session_get_failed: code=%s",
+                    exc.response.get("Error", {}).get("Code"),
+                )
+                continue
+            item = resp.get("Item")
+            if item:
+                found.append(item)
+
+    rows_found = len(found)
+    progress = {}
+    if truncated:
+        progress["truncated_session_id_count"] = truncated
+    if get_failed:
+        progress["get_failed"] = get_failed
+
+    if request_type == "access":
+        return {"rows_found": rows_found, "action": "exported",
+                "exported_rows": found, **progress}
+    if dry_run:
+        return {"rows_found": rows_found, "action": "dry_run_count", **progress}
+
+    deleted = 0
+    delete_failed = 0
+    skipped_corrupted = 0
+    for item in found:
+        sk = item.get("session_id")
+        if sk is None:
+            skipped_corrupted += 1
+            logger.error(
+                "scheduling_session_delete_skipped_corrupted: row missing "
+                "session_id SK — cannot delete safely")
+            continue
+        try:
+            table.delete_item(Key={"tenantId": tenant_id, "session_id": sk})
+            deleted += 1
+        except ClientError as exc:
+            delete_failed += 1
+            logger.error(
+                "scheduling_session_delete_failed: code=%s",
+                exc.response.get("Error", {}).get("Code"),
+            )
+    return {
+        "rows_found": rows_found,
+        "action": "deleted",
+        "rows_deleted": deleted,
+        "rows_delete_failed": delete_failed,
+        "rows_skipped_corrupted": skipped_corrupted,
+        **progress,
+    }
+
+
+def _apply_scheduling_walker_results(
+    tenant_id, normalized_email, prior_session_ids, request_type, dry_run,
+    rows_touched, manual_followups, exported_rows, walker_results,
+):
+    """F0 scheduling identity-graph deletion. Walk booking (by attendee_email,
+    calendar-delete-first) → scheduled-messages (by booking_id + EventBridge
+    sweep) → scheduling-session (by session_id). Mutates the dispatcher
+    accumulators in place (mirrors _apply_session_events_walker_result). Surface
+    keys: booking, calendar, scheduled-messages, scheduling-session.
+
+    Email-keyed: runs independent of pii_subject_id (operator decision B) so a
+    scheduling-only subject (F-DSAR4 class) is reachable. prior_session_ids are
+    the form-submissions session_ids (empty when no subject resolved); the
+    booking walker contributes its own session_ids for the scheduling-session
+    chain.
+    """
+    # ── booking ──
+    bk = _walk_booking(tenant_id, normalized_email, request_type, dry_run)
+    rows_touched["booking"] = bk["rows_found"]
+    booking_ids = bk.get("booking_ids", [])
+    booking_session_ids = bk.get("session_ids", [])
+
+    if bk.get("error"):
+        manual_followups.append(
+            f"booking: query failed ({bk['error']}); retry advised")
+        walker_results["booking"] = {
+            "status": "errored", "error": bk["error"],
+            "rows_touched": bk["rows_found"]}
+    elif bk.get("action") == "no_bookings":
+        walker_results["booking"] = {
+            "status": "completed", "action": "no_bookings", "rows_touched": 0}
+    elif bk.get("action") == "exported":
+        exported_rows["booking"] = bk["exported_rows"]
+        walker_results["booking"] = {
+            "status": "completed", "action": "exported",
+            "rows_touched": bk["rows_found"]}
+        manual_followups.append(
+            "booking: access export includes the subject's appointments, "
+            "projected to subject-facing fields (coordinator email + internal "
+            "calendar/operational ids are stripped per SR4). Review before "
+            "delivery as usual.")
+    elif bk.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"booking: dry_run=true; {bk['rows_found']} booking(s) would be "
+            f"deleted along with {bk.get('calendar_events_pending', 0)} Google "
+            f"Calendar event(s); re-invoke with dry_run=false to delete.")
+        walker_results["booking"] = {
+            "status": "completed", "action": "dry_run_count",
+            "rows_touched": bk["rows_found"]}
+    else:  # deleted
+        result = {
+            "status": "completed", "action": "deleted",
+            "rows_touched": bk["rows_found"],
+            "rows_deleted": bk.get("rows_deleted", 0),
+            "rows_delete_failed": bk.get("rows_delete_failed", 0),
+            "rows_skipped_corrupted": bk.get("rows_skipped_corrupted", 0),
+            "calendar_events_deleted": bk.get("calendar_events_deleted", 0),
+            "calendar_events_already_gone": bk.get("calendar_events_already_gone", 0),
+        }
+        if bk.get("calendar_failed", 0) > 0:
+            manual_followups.append(
+                f"booking: {bk['calendar_failed']} booking(s) had a Google "
+                f"Calendar event that could NOT be confirmed deleted "
+                f"(coordinator OAuth secret unresolved or Google API error). "
+                f"The booking ROW was KEPT so the event id is recoverable. "
+                f"Operator must delete the calendar event(s) manually for the "
+                f"affected coordinator, then re-invoke (idempotent). Error "
+                f"class only is in CloudWatch; ids/emails are not logged.")
+            result["status"] = "errored"
+            result["error"] = "calendar_delete_unconfirmed"
+            result["calendar_failed"] = bk["calendar_failed"]
+        if bk.get("rows_delete_failed", 0) > 0:
+            manual_followups.append(
+                f"booking: {bk['rows_delete_failed']} row(s) matched but "
+                f"DeleteItem failed — re-invoke to retry the un-deleted rows.")
+            result["status"] = "errored"
+            result.setdefault("error", "rows_delete_failed")
+        if bk.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"booking: {bk['rows_skipped_corrupted']} row(s) skipped "
+                f"(missing booking_id) — manual inspection required.")
+            result["status"] = "errored"
+            result.setdefault("error", "rows_skipped_corrupted")
+        walker_results["booking"] = result
+
+    # ── calendar (roll-up of the calendar-delete outcomes the booking walker
+    # performed inline, surfaced as its own audit row per §11) ──
+    cal_deleted = bk.get("calendar_events_deleted", 0)
+    cal_already = bk.get("calendar_events_already_gone", 0)
+    cal_failed = bk.get("calendar_failed", 0)
+    if bk.get("error"):
+        # SR6: the booking QUERY failed, so no calendar delete was even
+        # attempted. Report not_attempted — NOT completed/0, which would
+        # mislead the operator into thinking the calendar surface was clean.
+        rows_touched["calendar"] = 0
+        walker_results["calendar"] = {
+            "status": "errored", "action": "not_attempted",
+            "error": "booking_query_failed", "rows_touched": 0}
+    elif request_type == "access":
+        rows_touched["calendar"] = 0
+        walker_results["calendar"] = {
+            "status": "completed", "action": "not_applicable_access",
+            "rows_touched": 0}
+    elif dry_run:
+        rows_touched["calendar"] = 0
+        walker_results["calendar"] = {
+            "status": "completed", "action": "dry_run_count", "rows_touched": 0}
+    else:
+        rows_touched["calendar"] = cal_deleted + cal_already
+        cal_result = {
+            "status": "errored" if cal_failed > 0 else "completed",
+            "action": "deleted",
+            "rows_touched": cal_deleted + cal_already,
+            "rows_deleted": cal_deleted,
+            "events_already_gone": cal_already,
+        }
+        if cal_failed > 0:
+            cal_result["error"] = "calendar_delete_unconfirmed"
+            cal_result["calendar_failed"] = cal_failed
+        walker_results["calendar"] = cal_result
+
+    # ── scheduled-messages (chained by booking_id + EventBridge sweep) ──
+    smr = _walk_scheduled_messages(tenant_id, booking_ids, request_type, dry_run)
+    rows_touched["scheduled-messages"] = smr["rows_found"]
+    if smr.get("action") == "no_bookings":
+        walker_results["scheduled-messages"] = {
+            "status": "completed", "action": "no_bookings", "rows_touched": 0}
+    elif smr.get("action") == "exported":
+        exported_rows["scheduled-messages"] = smr["exported_rows"]
+        walker_results["scheduled-messages"] = {
+            "status": "completed", "action": "exported",
+            "rows_touched": smr["rows_found"]}
+    elif smr.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"scheduled-messages: dry_run=true; {smr['rows_found']} reminder/"
+            f"attendance row(s) would be deleted (chained from booking_ids); "
+            f"re-invoke with dry_run=false to delete.")
+        walker_results["scheduled-messages"] = {
+            "status": "completed", "action": "dry_run_count",
+            "rows_touched": smr["rows_found"]}
+    else:  # deleted
+        sm_result = {
+            "status": "completed", "action": "deleted",
+            "rows_touched": smr["rows_found"],
+            "rows_deleted": smr.get("rows_deleted", 0),
+            "rows_delete_failed": smr.get("rows_delete_failed", 0),
+            "rows_skipped_corrupted": smr.get("rows_skipped_corrupted", 0),
+            "schedules_deleted": smr.get("schedules_deleted", 0),
+            "schedules_failed": smr.get("schedules_failed", 0),
+        }
+        if smr.get("rows_delete_failed", 0) > 0:
+            manual_followups.append(
+                f"scheduled-messages: {smr['rows_delete_failed']} row(s) failed "
+                f"DeleteItem — re-invoke to retry.")
+            sm_result["status"] = "errored"
+            sm_result.setdefault("error", "rows_delete_failed")
+        if smr.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"scheduled-messages: {smr['rows_skipped_corrupted']} row(s) "
+                f"skipped (corrupted PK/SK) — manual inspection required.")
+            sm_result["status"] = "errored"
+            sm_result.setdefault("error", "rows_skipped_corrupted")
+        if smr.get("schedules_failed", 0) > 0:
+            manual_followups.append(
+                f"scheduled-messages: {smr['schedules_failed']} EventBridge "
+                f"schedule delete(s) failed (non-ResourceNotFound) — the named "
+                f"schedule is residue; check CloudWatch + manually "
+                f"`aws scheduler delete-schedule`.")
+            sm_result["status"] = "errored"
+            sm_result.setdefault("error", "schedules_failed")
+        if smr.get("query_failed_count", 0) > 0:
+            sm_result["status"] = "errored"
+            sm_result.setdefault("error", "query_failed")
+        walker_results["scheduled-messages"] = sm_result
+
+    # ── scheduling-session (chained by session_id: booking + form-submissions) ──
+    all_session_ids = list(prior_session_ids or []) + booking_session_ids
+    ss = _walk_conversation_scheduling_session(
+        tenant_id, all_session_ids, request_type, dry_run)
+    rows_touched["scheduling-session"] = ss["rows_found"]
+    if ss.get("action") == "no_sessions":
+        walker_results["scheduling-session"] = {
+            "status": "completed", "action": "no_sessions", "rows_touched": 0}
+    elif ss.get("action") == "exported":
+        exported_rows["scheduling-session"] = ss["exported_rows"]
+        walker_results["scheduling-session"] = {
+            "status": "completed", "action": "exported",
+            "rows_touched": ss["rows_found"]}
+    elif ss.get("action") == "dry_run_count":
+        manual_followups.append(
+            f"scheduling-session: dry_run=true; {ss['rows_found']} state/binding "
+            f"row(s) would be deleted (chained by session_id); re-invoke with "
+            f"dry_run=false to delete.")
+        walker_results["scheduling-session"] = {
+            "status": "completed", "action": "dry_run_count",
+            "rows_touched": ss["rows_found"]}
+    else:  # deleted
+        ss_result = {
+            "status": "completed", "action": "deleted",
+            "rows_touched": ss["rows_found"],
+            "rows_deleted": ss.get("rows_deleted", 0),
+            "rows_delete_failed": ss.get("rows_delete_failed", 0),
+            "rows_skipped_corrupted": ss.get("rows_skipped_corrupted", 0),
+        }
+        if ss.get("rows_delete_failed", 0) > 0:
+            manual_followups.append(
+                f"scheduling-session: {ss['rows_delete_failed']} row(s) failed "
+                f"DeleteItem — re-invoke to retry.")
+            ss_result["status"] = "errored"
+            ss_result.setdefault("error", "rows_delete_failed")
+        if ss.get("rows_skipped_corrupted", 0) > 0:
+            manual_followups.append(
+                f"scheduling-session: {ss['rows_skipped_corrupted']} row(s) "
+                f"skipped (missing SK) — manual inspection required.")
+            ss_result["status"] = "errored"
+            ss_result.setdefault("error", "rows_skipped_corrupted")
+        walker_results["scheduling-session"] = ss_result
+    # A GetItem failure during the walk (any request_type) means the row state
+    # is unknown — taint so the DSAR closes partial_error, never a false clean.
+    if ss.get("get_failed", 0) > 0:
+        manual_followups.append(
+            f"scheduling-session: {ss['get_failed']} GetItem call(s) failed "
+            f"(transient) — row state unknown; re-invoke to retry.")
+        existing = walker_results.get("scheduling-session", {})
+        walker_results["scheduling-session"] = {
+            **existing, "status": "errored",
+            "error": existing.get("error") or "get_failed"}
+
+    # Abandoned-session residual (TTL disabled on the table): always surfaced so
+    # the operator never reads "0 scheduling-session rows" as proof of clean.
+    manual_followups.append(
+        "scheduling-session: this walker reaches sessions linked via a booking "
+        "or a form submission. A scheduling session abandoned BEFORE a booking "
+        "(no booking_id, no form) has a state row with no attendee_email and is "
+        "NOT email-reachable; the table has TTL DISABLED, so that residual does "
+        "not age out — tracked as the §12 retention-TTL decision.")
 
 
 def _walk_notification_sends(tenant_id, normalized_email, request_type, dry_run):
@@ -2222,6 +3075,13 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
         # F-DSAR31 (closed): session-summaries, reached via operator-passed
         # tenant_hash. Stays 0 when tenant_hash is absent (surface skipped).
         "session-summaries": 0,
+        # F0: scheduling identity-graph surfaces. Email-keyed (booking by
+        # attendee_email) + chained by booking_id/session_id — run even when
+        # pii_subject_id is None (operator decision B; F-DSAR4 reachability).
+        "booking": 0,
+        "calendar": 0,
+        "scheduled-messages": 0,
+        "scheduling-session": 0,
     }
     rows_touched.update({s: 0 for s in MFS_SCOPED_SURFACES})
     manual_followups = []
@@ -2290,6 +3150,17 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "resolved)"
         )
         walker_results["session-summaries"] = {"status": "skipped_no_subject"}
+        # F0: the scheduling surfaces are email-keyed (booking by attendee_email,
+        # then chained by booking_id/session_id), NOT pii_subject_id-keyed — so
+        # they run EVEN when the subject-index didn't resolve. This is the whole
+        # point of operator decision B: a scheduling-only subject (a booking but
+        # no form → no subject-index entry, the F-DSAR4 class) is still
+        # hard-deletable. prior_session_ids is empty (no form was walked); the
+        # booking walker supplies its own session_ids for the chain.
+        _apply_scheduling_walker_results(
+            tenant_id, normalized_email, [], request_type, dry_run,
+            rows_touched, manual_followups, exported_rows, walker_results,
+        )
         for surface, reason in MFS_SCOPED_SURFACES.items():
             manual_followups.append(f"{surface}: {reason}")
             walker_results[surface] = {"status": "deferred", "reason": reason}
@@ -2776,6 +3647,15 @@ def _walk_mfs_surfaces(pii_subject_id, tenant_id, normalized_email, request_type
             "status": "deferred",
             "reason": "tenant_hash not provided on the DSAR event",
         }
+
+    # F0: scheduling identity-graph surfaces (booking → calendar → scheduled-
+    # messages → scheduling-session). Email-keyed; the booking walker also
+    # contributes session_ids, unioned with the form-submissions session_ids
+    # (captured_session_ids) for the scheduling-session chain.
+    _apply_scheduling_walker_results(
+        tenant_id, normalized_email, captured_session_ids, request_type, dry_run,
+        rows_touched, manual_followups, exported_rows, walker_results,
+    )
 
     # Other surfaces: still scaffolded.
     for surface, reason in MFS_SCOPED_SURFACES.items():

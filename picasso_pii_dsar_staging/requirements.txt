@@ -13,7 +13,10 @@
 # dep is added, pin to exact version + checksum (`pip install -t .` +
 # include the resulting site-packages in the deploy zip).
 #
-# Stdlib used: hashlib, json, logging, os, re, datetime, uuid, typing.
+# Stdlib used: hashlib, json, logging, os, re, datetime, uuid, typing,
+#   urllib (F0 scheduling: Google Calendar OAuth token refresh + events.delete
+#   use stdlib urllib — deliberately NO google-auth dependency, so the deploy
+#   zip stays lambda_function.py only).
 # Runtime-provided: boto3, botocore (per AWS Lambda Python 3.11 runtime).
 
 # (intentionally empty — runtime-only)
