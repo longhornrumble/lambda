@@ -403,9 +403,11 @@ describe('default implementations — DynamoDB', () => {
       tenantId: { S: TENANT },
       employeeId: { S: 'u1' },
     });
-    // projects only the three fields the resolver reads (cost + PII minimisation).
+    // projects the fields the resolver reads (cost + PII minimisation).
+    // G4: availability_windows and max_bookings_per_day added to the projection
+    // (additive — old rows without those attrs return unchanged; see G4 contract tests).
     expect(calls[0].args[0].input.ProjectionExpression).toBe(
-      'employeeId, #email, scheduling_tags'
+      'employeeId, #email, scheduling_tags, availability_windows, max_bookings_per_day'
     );
     expect(calls[0].args[0].input.ExpressionAttributeNames).toEqual({ '#email': 'email' });
   });

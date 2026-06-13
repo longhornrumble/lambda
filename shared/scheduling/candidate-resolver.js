@@ -161,10 +161,14 @@ async function defaultQueryEmployees({ tenantId }) {
         TableName: EMPLOYEE_REGISTRY_TABLE,
         KeyConditionExpression: 'tenantId = :t',
         ExpressionAttributeValues: { ':t': { S: tenantId } },
-        // Pull ONLY the three fields the resolver reads — not the whole registry row
+        // Pull ONLY the fields the resolver reads — not the whole registry row
         // (cost + avoids dragging unrelated PII into this query). `email` is a DDB
         // reserved word, so it is aliased via ExpressionAttributeNames.
-        ProjectionExpression: 'employeeId, #email, scheduling_tags',
+        // G4: availability_windows and max_bookings_per_day are optional new fields;
+        // including them in the projection is additive + forward-compatible (old rows
+        // that lack them simply return without those attributes — no crash, no change
+        // to the unmarshalled object shape other than the fields being absent).
+        ProjectionExpression: 'employeeId, #email, scheduling_tags, availability_windows, max_bookings_per_day',
         ExpressionAttributeNames: { '#email': 'email' },
         ExclusiveStartKey,
       })
@@ -270,11 +274,24 @@ async function resolveCandidates(
     if (!isEligible(tags, tagConditions)) {
       continue;
     }
-    candidates.push({
+    // G4: carry availability_windows and max_bookings_per_day only when present and
+    // valid — never push undefined/null/garbage into the candidate object. Old-shape
+    // registry rows (without these fields) produce a candidate identical to today's.
+    const candidate = {
       resourceId: email,
       scheduling_tags: tags,
       coordinatorEmail: email,
-    });
+    };
+    if (emp.availability_windows !== null && emp.availability_windows !== undefined &&
+        typeof emp.availability_windows === 'object' && !Array.isArray(emp.availability_windows)) {
+      candidate.availability_windows = emp.availability_windows;
+    }
+    if (typeof emp.max_bookings_per_day === 'number' &&
+        Number.isFinite(emp.max_bookings_per_day) &&
+        emp.max_bookings_per_day > 0) {
+      candidate.max_bookings_per_day = emp.max_bookings_per_day;
+    }
+    candidates.push(candidate);
   }
 
   // 5. §B7 revoked→pool-exclusion: never offer a calendar whose per-coordinator OAuth secret is
