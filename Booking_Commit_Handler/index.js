@@ -42,7 +42,7 @@ const { getOAuthClient, getCoordinatorCalendarId, clearCacheEntry } = require('.
 const calendarEvents = require('./calendar-events');
 const { resolveProvider } = require('./conference-providers');
 const bookingStore = require('./booking-store');
-const { sendConfirmationEmail } = require('./confirmation-email');
+const { sendConfirmationEmail, buildActionLinks } = require('./confirmation-email');
 const reminderScheduler = require('../Reminder_Scheduler/scheduler'); // Track 1 (§E1): per-booking reminder + attendance schedules at commit
 
 const CONFIRMATION_SLA_MS = 60 * 1000; // AC #7
@@ -135,8 +135,9 @@ function reminderTenantPrefs(config) {
 // The plain-object booking view scheduleReminders.readBooking consumes (snake_case). NOT
 // the marshalled DDB bookingItem — readBooking expects plain string values, so a {S:...}
 // AttributeValue map would silently mis-parse (start_at → NaN fire times).
-// G1: include join_url and cancellation_window_hours so scheduler.js can bake them into
-// the reminder rows (reschedule/cancel/join links + whenLabel).
+// G1: include join_url so scheduler.js can bake it onto the reminder rows. The
+// reschedule/cancel token URLs are minted on the commit path (buildActionLinks) and passed
+// to scheduleReminders separately — NOT booking fields, so they do not belong on this view.
 function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail, joinUrl }) {
   const a = ctx.attendee || {};
   return {
@@ -152,9 +153,8 @@ function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail, 
     appointment_type_name: ctx.appointmentTypeName,
     organization_name: ctx.orgName,
     is_synthetic: ctx.isSynthetic === true,
-    // G1 additive fields (forward-compatible — old rows lacking them work fine):
+    // G1 additive field (forward-compatible — old rows lacking it work fine):
     join_url: joinUrl || '',
-    cancellation_window_hours: ctx.cancellationWindowHours || 0,
   };
 }
 
@@ -163,8 +163,11 @@ function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail, 
 // back a committed booking (mirrors the email step's "fail forward, alert" discipline). The
 // org SMS pref is read from the tenant config here, post-commit — NOT on the latency-sensitive
 // pre-commit path; the in-chat reschedule path re-binds via the event-passed org flag instead.
-// G1: joinUrl is passed in so scheduler.js can bake the join_url field into reminder rows.
-async function scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail, joinUrl }) {
+// G1: joinUrl + the pre-minted reschedule/cancel URLs are passed in so scheduler.js can bake
+// the action-link fields onto reminder rows (scheduler.js itself mints nothing — no signing dep).
+async function scheduleBookingReminders({
+  tenantId, bookingId, ctx, coordinatorEmail, joinUrl, rescheduleUrl = '', cancelUrl = '',
+}) {
   // Inert-and-QUIET until S6 wires the EventBridge Scheduler IaC: with no scheduler target
   // configured, every CreateSchedule would throw + alert on EVERY booking (alert-channel
   // noise). Skip silently when the scheduler env is absent — activates the instant S6 sets
@@ -188,8 +191,9 @@ async function scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorE
       {
         booking: buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail, joinUrl }),
         tenantPrefs: reminderTenantPrefs(tenantConfig),
-        // G1: thread signOpts (test seam for token signing key) into scheduler.js.
-        signOpts: ctx.signOpts,
+        // G1: pre-minted action links (commit path owns the signing dep); '' → fields omitted.
+        rescheduleUrl,
+        cancelUrl,
       },
     );
   } catch (err) {
@@ -428,8 +432,25 @@ async function commitAgainstResource({
     // inside the commit's compensating try/catch, so wrap it too — a future edit that adds a
     // throw path can NEVER turn a committed booking into a rollback (structural isolation).
     try {
-      // G1: pass joinUrl so scheduler.js can bake it into reminder rows for action links.
-      await scheduleBookingReminders({ tenantId, bookingId, ctx, coordinatorEmail: calendarId, joinUrl });
+      // G1: mint the one-tap reschedule/cancel links HERE (the commit path owns the tokens.js +
+      // Secrets Manager dependency; scheduler.js must stay signing-SDK-free for the
+      // Reminder_Scheduler Lambda). Best-effort — a mint failure just omits the links; the
+      // reminders (with time + join) still schedule. Same per-purpose token contract as the
+      // confirmation email's links (reuses confirmation-email.buildActionLinks).
+      let rescheduleUrl = '';
+      let cancelUrl = '';
+      try {
+        ({ rescheduleUrl, cancelUrl } = await buildActionLinks(
+          { tenantId, bookingId, startAt: ctx.start, cancellationWindowHours: ctx.cancellationWindowHours },
+          ctx.signOpts
+        ));
+      } catch (linkErr) {
+        warn('reminder_link_mint_failed', { booking_id: bookingId, error: linkErr.message });
+      }
+      // G1: pass joinUrl + the minted links so scheduler.js bakes them onto the reminder rows.
+      await scheduleBookingReminders({
+        tenantId, bookingId, ctx, coordinatorEmail: calendarId, joinUrl, rescheduleUrl, cancelUrl,
+      });
     } catch (remErr) {
       warn('reminder_schedule_unexpected', { booking_id: bookingId, error: remErr.message });
     }

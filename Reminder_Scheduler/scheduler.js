@@ -35,9 +35,6 @@
 
 const { computeReminderTiers } = require('./cadence');
 
-// G1: SCHEDULE_BASE_URL mirrors confirmation-email.js's constant (same env var source).
-const SCHEDULE_BASE_URL = process.env.SCHEDULE_BASE_URL || 'https://schedule.myrecruiter.ai';
-
 // ─── field access (forward-compatible reads — snake_case OR camelCase) ─────────────────
 
 function pick(obj, ...keys) {
@@ -118,9 +115,8 @@ function readBooking(booking) {
       pick(booking, 'organization_name', 'organizationName', 'org_name') || 'us',
     isSynthetic: pick(booking, 'is_synthetic', 'isSynthetic') === true,
     existingState: pick(booking, 'reminder_schedule_state', 'reminderScheduleState'),
-    // G1 additive: forward-compatible (undefined on old rows → action block skipped).
+    // G1 additive: forward-compatible (undefined on old rows → join link skipped).
     joinUrl: pick(booking, 'join_url', 'joinUrl'),
-    cancellationWindowHours: pick(booking, 'cancellation_window_hours', 'cancellationWindowHours'),
   };
 }
 
@@ -315,12 +311,19 @@ async function writeScheduleState(deps, table, tenantId, bookingId, state) {
  * @param {object} args.booking       - the persisted Booking (snake_case or camelCase)
  * @param {object} [args.tenantPrefs] - tenant config slice ({ notificationPrefs, sms_quiet_hours })
  *        used to snapshot the fire-time §E3 gate inputs into each row.
- * @param {object} [args.signOpts]    - G1: passed through to tokens.sign (test key injection).
+ * @param {string} [args.rescheduleUrl] - G1: pre-minted one-tap reschedule link. Minted by the
+ *        COMMIT path (BCH buildActionLinks, which owns the tokens.js + Secrets Manager dep) and
+ *        passed in — so scheduler.js imports NO signing SDK and stays loadable in the
+ *        Reminder_Scheduler Lambda. Absent ('') → the row omits the field (fail-soft).
+ * @param {string} [args.cancelUrl]     - G1: pre-minted one-tap cancel link (same rationale).
  * @param {object} [deps]             - injected { ddb, scheduler, now, logger, config }
  * @returns {Promise<{ tenantId, bookingId, reminders: {tier,scheduleName,sk}[],
  *          attendance: {scheduleName,sk}, tiers: string[] }>} the persisted reminder_schedule_state.
  */
-async function scheduleReminders({ booking, tenantPrefs, signOpts } = {}, deps = buildDefaultDeps()) {
+async function scheduleReminders(
+  { booking, tenantPrefs, rescheduleUrl = '', cancelUrl = '' } = {},
+  deps = buildDefaultDeps()
+) {
   const b = readBooking(booking);
   if (!b.tenantId) throw new Error('scheduleReminders requires booking.tenant_id');
   if (!b.bookingId) throw new Error('scheduleReminders requires booking.booking_id');
@@ -336,35 +339,10 @@ async function scheduleReminders({ booking, tenantPrefs, signOpts } = {}, deps =
   const tenantPrefsSnap = snapshotTenantPrefs(tenantPrefs);
   const tiers = computeReminderTiers({ startAt: b.startAt, nowMs, synthetic });
 
-  // G1: mint cancel + reschedule tokens ONCE (shared across all reminder rows for this
-  // booking). FAIL-SOFT: if signing fails for any reason (missing key, reconciler path
-  // lacking the grant), set urls to '' and continue — reminders still schedule without links.
-  let rescheduleUrl = '';
-  let cancelUrl = '';
-  let whenLabel = '';
-  try {
-    const { sign } = require('../shared/scheduling/tokens');
-    const baseClaims = {
-      tenant_id: b.tenantId,
-      booking_id: b.bookingId,
-      start_at: b.startAt,
-      cancellation_window_hours: b.cancellationWindowHours || 0,
-    };
-    const [cancelToken, rescheduleToken] = await Promise.all([
-      sign('cancel', baseClaims, signOpts),
-      sign('reschedule', baseClaims, signOpts),
-    ]);
-    cancelUrl = `${SCHEDULE_BASE_URL}/cancel?t=${encodeURIComponent(cancelToken)}`;
-    rescheduleUrl = `${SCHEDULE_BASE_URL}/reschedule?t=${encodeURIComponent(rescheduleToken)}`;
-    whenLabel = formatWhenLabel(b.startAt, b.timezone);
-  } catch (mintErr) {
-    log.warn(JSON.stringify({
-      event: 'reminder_link_mint_failed',
-      booking_id: b.bookingId,
-      error: mintErr.message || String(mintErr),
-    }));
-    // Links stay '' — reminders schedule without action block (fail-soft).
-  }
+  // G1: whenLabel is pure (Intl) — always computed so reminders show the appointment time
+  // even when no action links were minted. The reschedule/cancel URLs arrive pre-minted from
+  // the commit path (no signing dependency here). join link rides the booking row (b.joinUrl).
+  const whenLabel = formatWhenLabel(b.startAt, b.timezone);
 
   const state = {
     tenantId: b.tenantId,
@@ -526,7 +504,10 @@ async function deleteReminders({ booking, tenantId, bookingId } = {}, deps = bui
  * same booking_id). Deletes the old schedules+rows, recomputes tiers vs the NEW start_at,
  * and creates fresh. This is the ONLY re-bind trigger — calendar_moved is a DELETE.
  */
-async function rebindReminders({ booking, tenantPrefs } = {}, deps = buildDefaultDeps()) {
+async function rebindReminders(
+  { booking, tenantPrefs, rescheduleUrl = '', cancelUrl = '' } = {},
+  deps = buildDefaultDeps()
+) {
   const b = readBooking(booking);
   if (!b.tenantId || !b.bookingId) {
     throw new Error('rebindReminders requires booking.tenant_id and booking.booking_id');
@@ -534,10 +515,12 @@ async function rebindReminders({ booking, tenantPrefs } = {}, deps = buildDefaul
   await deleteReminders({ booking }, deps);
   // Re-read nothing — `booking` already carries the new start_at (executeReschedule
   // mutated it in place). Drop the stale state so scheduleReminders starts clean.
+  // G1: pass through the freshly-minted (for the NEW start_at) action links so the rebound
+  // reminders carry working reschedule/cancel links too.
   const fresh = { ...booking };
   delete fresh.reminder_schedule_state;
   delete fresh.reminderScheduleState;
-  return scheduleReminders({ booking: fresh, tenantPrefs }, deps);
+  return scheduleReminders({ booking: fresh, tenantPrefs, rescheduleUrl, cancelUrl }, deps);
 }
 
 // ─── booking-row helpers ──────────────────────────────────────────────────────────────

@@ -294,87 +294,67 @@ describe('rebindReminders — TOKEN-RESCHEDULE re-derives the schedule (WS-E-REM
 // ── G1: reminder row enrichment (reschedule/cancel/join links + whenLabel) ─────────────
 
 describe('G1 — reminder row enrichment (action links + whenLabel)', () => {
-  // G1 requires token signing; inject a fixed signing key via signOpts.
-  const signOpts = { signingKey: 'test-key-minimum-16-chars', now: Math.floor(Date.parse('2026-06-10T12:00:00Z') / 1000) };
+  // G1: action links are minted by the COMMIT path (BCH buildActionLinks) and PASSED IN —
+  // scheduler.js imports no signing SDK. whenLabel is pure (Intl) and always computed.
+  const rescheduleUrl = 'https://schedule.myrecruiter.ai/reschedule?t=RTOKEN';
+  const cancelUrl = 'https://schedule.myrecruiter.ai/cancel?t=CTOKEN';
 
   function makeG1Deps(extra = {}) {
     return makeDeps({ ...extra });
   }
 
-  test('G1: reminder rows carry reschedule_url, cancel_url, when_label when signOpts present', async () => {
+  test('G1: reminder rows carry reschedule_url, cancel_url, join_url, when_label when links passed', async () => {
     const { deps, ddbCalls } = makeG1Deps();
     await scheduler.scheduleReminders(
       {
-        booking: baseBooking({ join_url: 'https://meet.google.com/abc', cancellation_window_hours: 24 }),
-        signOpts,
+        booking: baseBooking({ join_url: 'https://meet.google.com/abc' }),
+        rescheduleUrl,
+        cancelUrl,
       },
       deps
     );
     const rows = putRows(ddbCalls).filter((r) => r.tier !== undefined);
     expect(rows.length).toBeGreaterThan(0);
-    // Every reminder row should have the action-link fields.
+    // Every reminder row carries the passed-in action links + the computed time label.
     rows.forEach((row) => {
-      expect(row).toHaveProperty('reschedule_url');
-      expect(row).toHaveProperty('cancel_url');
+      expect(row).toHaveProperty('reschedule_url', rescheduleUrl);
+      expect(row).toHaveProperty('cancel_url', cancelUrl);
       expect(row).toHaveProperty('join_url', 'https://meet.google.com/abc');
       expect(row).toHaveProperty('when_label');
-      expect(row.reschedule_url).toContain('/reschedule?t=');
-      expect(row.cancel_url).toContain('/cancel?t=');
       expect(typeof row.when_label).toBe('string');
       expect(row.when_label.length).toBeGreaterThan(0);
     });
   });
 
-  test('G1: FAIL-SOFT — signing throws → rows still created, urls empty, warn logged', async () => {
-    // Use jest.mock on the tokens module to make sign() throw, then restore.
-    // We test this via a custom deps.sign seam — scheduler.js does require() at call time,
-    // so we mock the module. This confirms the try/catch fail-soft path.
+  test('G1: no links passed (mint failed / reconciler path) → rows still created, action links omitted, time still shown', async () => {
     const { deps, ddbCalls } = makeG1Deps();
-    const warns = [];
-    deps.logger.warn = (msg) => warns.push(msg);
-
-    // Temporarily mock the tokens module to throw.
-    const tokensMod = require('../shared/scheduling/tokens');
-    const origSign = tokensMod.sign;
-    tokensMod.sign = async () => { throw new Error('signing-key-unavailable'); };
-    try {
-      await scheduler.scheduleReminders(
-        {
-          booking: baseBooking({ join_url: 'https://meet.google.com/xyz', cancellation_window_hours: 0 }),
-          signOpts: { signingKey: 'test-key-minimum-16-chars' },
-        },
-        deps
-      );
-    } finally {
-      tokensMod.sign = origSign; // always restore
-    }
-
+    await scheduler.scheduleReminders(
+      { booking: baseBooking({ join_url: 'https://meet.google.com/xyz' }) },
+      deps
+    );
     const rows = putRows(ddbCalls).filter((r) => r.tier !== undefined);
-    // Rows must still exist (reminders scheduled despite minting failure)
     expect(rows.length).toBeGreaterThan(0);
-    // Action-link fields must be absent (empty → omitted by buildReminderRow)
     rows.forEach((row) => {
+      // No reschedule/cancel links when none were minted/passed (fail-soft by absence).
       expect(row).not.toHaveProperty('reschedule_url');
       expect(row).not.toHaveProperty('cancel_url');
+      // when_label is pure (Intl) — always present so the reminder still shows the time.
+      expect(row).toHaveProperty('when_label');
+      // join still rides the booking row.
+      expect(row).toHaveProperty('join_url', 'https://meet.google.com/xyz');
     });
-    // A warn must have been logged about the mint failure
-    const warnStr = warns.map((w) => (typeof w === 'string' ? w : JSON.stringify(w))).join(' ');
-    expect(warnStr).toMatch(/reminder_link_mint_failed/);
   });
 
   test('G1: readBooking projects join_url (snake_case AND camelCase)', () => {
-    const snakeCase = scheduler.readBooking({ tenant_id: 'T', booking_id: 'B', start_at: 'S', join_url: 'https://join.example', cancellation_window_hours: 12 });
+    const snakeCase = scheduler.readBooking({ tenant_id: 'T', booking_id: 'B', start_at: 'S', join_url: 'https://join.example' });
     expect(snakeCase.joinUrl).toBe('https://join.example');
-    expect(snakeCase.cancellationWindowHours).toBe(12);
 
-    const camelCase = scheduler.readBooking({ tenantId: 'T', bookingId: 'B', startAt: 'S', joinUrl: 'https://join.camel', cancellationWindowHours: 6 });
+    const camelCase = scheduler.readBooking({ tenantId: 'T', bookingId: 'B', startAt: 'S', joinUrl: 'https://join.camel' });
     expect(camelCase.joinUrl).toBe('https://join.camel');
-    expect(camelCase.cancellationWindowHours).toBe(6);
 
-    // Old-shape row (missing join_url and cancellation_window_hours) → undefined, no crash.
+    // Old-shape row (missing join_url) → undefined, no crash.
     const oldShape = scheduler.readBooking({ tenant_id: 'T', booking_id: 'B', start_at: 'S' });
     expect(oldShape.joinUrl).toBeUndefined();
-    expect(oldShape.cancellationWindowHours).toBeUndefined();
   });
 
   test('G1: buildReminderRow omits action-link fields when values are empty (old-shape compat)', () => {
@@ -395,7 +375,7 @@ describe('G1 — reminder row enrichment (action links + whenLabel)', () => {
   test('G1: attendance row does NOT get action-link fields (coordinator-facing, not attendee)', async () => {
     const { deps, ddbCalls } = makeG1Deps();
     await scheduler.scheduleReminders(
-      { booking: baseBooking(), signOpts },
+      { booking: baseBooking(), rescheduleUrl, cancelUrl },
       deps
     );
     const rows = putRows(ddbCalls);
@@ -407,11 +387,11 @@ describe('G1 — reminder row enrichment (action links + whenLabel)', () => {
     expect(attendanceRow).not.toHaveProperty('join_url');
   });
 
-  test('G1: forward-compatible read — booking rows without join_url field → no crash, no action links', async () => {
+  test('G1: forward-compatible read — booking rows without join_url field → no crash, no join link', async () => {
     const { deps, ddbCalls } = makeG1Deps();
-    // baseBooking() has no join_url or cancellation_window_hours fields
+    // baseBooking() has no join_url field
     await scheduler.scheduleReminders(
-      { booking: baseBooking(), signOpts },
+      { booking: baseBooking(), rescheduleUrl, cancelUrl },
       deps
     );
     const rows = putRows(ddbCalls).filter((r) => r.tier !== undefined);

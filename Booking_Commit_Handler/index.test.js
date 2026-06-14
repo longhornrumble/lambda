@@ -77,6 +77,11 @@ jest.mock('./booking-store', () => {
 });
 jest.mock('./confirmation-email', () => ({
   sendConfirmationEmail: jest.fn(async () => ({ messageId: 'msg-1', rescheduleUrl: 'r', cancelUrl: 'c' })),
+  // G1: index.js mints the reminder action links via buildActionLinks on the commit path.
+  buildActionLinks: jest.fn(async () => ({
+    rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=RTOKEN',
+    cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=CTOKEN',
+  })),
 }));
 // G2: when no injected getAppointmentType, index.js requires candidate-resolver at runtime.
 // Mock it so tests without injected getAppointmentType don't hit real DDB.
@@ -807,19 +812,28 @@ describe('Track 1 — reminder scheduling at commit', () => {
     }
   });
 
-  it('G1: cancellation_window_hours is baked into the booking view', async () => {
-    const inj = reminderInjection();
-    await handler(baseEvent({ appointment_type: { id: 'apt', name: 'Volunteer intake', format: 'one_to_one', timezone: 'America/Chicago', cancellation_window_hours: 48 } }), {}, inj);
-    const bookingArg = inj.scheduleReminders.mock.calls[0][0].booking;
-    expect(bookingArg.cancellation_window_hours).toBe(48);
-  });
-
-  it('G1: signOpts is threaded into the scheduleReminders call', async () => {
+  // G1 (post-redesign): the reschedule/cancel tokens are minted on the COMMIT path
+  // (buildActionLinks) and passed to scheduleReminders as rescheduleUrl/cancelUrl — scheduler.js
+  // imports no signing SDK. cancellation_window_hours drives the reschedule token's expiry, so it
+  // is consumed by the mint, NOT placed on the reminder booking view.
+  it('G1: minted reschedule/cancel links are threaded into the scheduleReminders call', async () => {
     const signOpts = { signingKey: 'test-key-1234567890' };
     const inj = { ...reminderInjection(), signOpts };
     await handler(baseEvent(), {}, inj);
     const callArg = inj.scheduleReminders.mock.calls[0][0];
-    expect(callArg.signOpts).toBe(signOpts);
+    expect(callArg.rescheduleUrl).toContain('/reschedule?t=');
+    expect(callArg.cancelUrl).toContain('/cancel?t=');
+  });
+
+  it('G1: cancellation_window_hours drives the link mint, NOT the reminder booking view', async () => {
+    const signOpts = { signingKey: 'test-key-1234567890' };
+    const inj = { ...reminderInjection(), signOpts };
+    await handler(baseEvent({ appointment_type: { id: 'apt', name: 'Volunteer intake', format: 'one_to_one', timezone: 'America/Chicago', cancellation_window_hours: 48 } }), {}, inj);
+    const callArg = inj.scheduleReminders.mock.calls[0][0];
+    // The view no longer carries cancellation_window_hours (it is consumed by buildActionLinks).
+    expect(callArg.booking).not.toHaveProperty('cancellation_window_hours');
+    // The link was still minted (proves the window value flowed into the mint path).
+    expect(callArg.rescheduleUrl).toContain('/reschedule?t=');
   });
 });
 

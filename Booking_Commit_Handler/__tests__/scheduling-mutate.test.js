@@ -4,7 +4,7 @@ const { handleSchedulingMutate } = require('../scheduling-mutate');
 
 // Minimal fakes for the injected seam (no real Google/Zoom/DDB).
 function baseInjected(overrides = {}) {
-  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [], rebind: [] };
+  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [], rebind: [], actionLinks: [] };
   const calendarEvents = {
     buildEventBody: (x) => ({ built: x }),
     insertEvent: (calId, body) => { calls.facade.push(['insert', calId]); return { id: 'evt-new' }; },
@@ -35,6 +35,12 @@ function baseInjected(overrides = {}) {
       // Track 1: rebind reminders on a successful reschedule (deterministic fake; the real
       // scheduler is covered by Reminder_Scheduler's own suite).
       rebindReminders: async (args) => { calls.rebind.push(args); return { reminders: [], attendance: null, tiers: [] }; },
+      // G1: mint the rebound reminders' action links for the NEW start_at (deterministic fake;
+      // real buildActionLinks is covered by confirmation-email.test.js).
+      buildActionLinks: async (claims) => {
+        calls.actionLinks.push(claims);
+        return { rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=RT', cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=CT' };
+      },
       logger: { warn: () => {}, error: () => {} },
       ...overrides,
     },
@@ -49,7 +55,7 @@ const RESCH_EVENT = {
   // real reminder data (phone → SMS supplement; org/appt → real copy).
   booking: { booking_id: 'bk1', tenant_id: 'T1', coordinator_email: 'coord@x.com', external_event_id: 'evt-old',
     attendee_phone: '+15125550199', attendee_name: 'Sam Patel', organization_name: 'Austin Angels',
-    appointment_type_name: 'Volunteer intake', timezone: 'America/Chicago' },
+    appointment_type_name: 'Volunteer intake', timezone: 'America/Chicago', channel_details: 'https://meet.example/x' },
   newSlot: { start: '2026-07-01T15:00:00Z', end: '2026-07-01T15:30:00Z' },
 };
 
@@ -374,6 +380,12 @@ describe('handleSchedulingMutate — reschedule reminder rebind (Track 1, §E1)'
     expect(booking.attendee_name).toBe('Sam Patel');
     expect(booking.timezone).toBe('America/Chicago');
     expect(tenantPrefs).toEqual({ notificationPrefs: { sms: false }, sms_quiet_hours: null });
+    // G1: fresh action links minted for the NEW start_at + threaded into the rebind; join link
+    // (the reused conference, preserved by reschedule.js) rides the rebind view.
+    expect(calls.rebind[0].rescheduleUrl).toContain('/reschedule?t=');
+    expect(calls.rebind[0].cancelUrl).toContain('/cancel?t=');
+    expect(booking.join_url).toBe('https://meet.example/x');
+    expect(calls.actionLinks[0].startAt).toBe(RESCH_EVENT.newSlot.start);
   });
 
   it('truthy-non-bool org_sms_enabled ("yes"/1/"true") does NOT enable SMS on rebind (strict === true)', async () => {
