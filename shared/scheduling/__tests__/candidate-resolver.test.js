@@ -403,9 +403,11 @@ describe('default implementations — DynamoDB', () => {
       tenantId: { S: TENANT },
       employeeId: { S: 'u1' },
     });
-    // projects only the three fields the resolver reads (cost + PII minimisation).
+    // projects the fields the resolver reads (cost + PII minimisation).
+    // G4: availability_windows and max_bookings_per_day added to the projection
+    // (additive — old rows without those attrs return unchanged; see G4 contract tests).
     expect(calls[0].args[0].input.ProjectionExpression).toBe(
-      'employeeId, #email, scheduling_tags'
+      'employeeId, #email, scheduling_tags, availability_windows, max_bookings_per_day'
     );
     expect(calls[0].args[0].input.ExpressionAttributeNames).toEqual({ '#email': 'email' });
   });
@@ -548,6 +550,59 @@ describe('§B7 revoked-exclusion', () => {
     );
     expect(out).toEqual([]);
     expect(getCoordinatorStatus).not.toHaveBeenCalled();
+  });
+
+  describe('max_bookings_per_day input validation (FIX 2)', () => {
+    // After FIX 2, the guard requires typeof==='number' && isFinite && isInteger && >0.
+    // Fractional, string, NaN, and other non-integer values must be omitted.
+    const makeEmp = (max_bookings_per_day) => ({
+      employeeId: 'u-test',
+      email: 'test@org.com',
+      scheduling_tags: ['sched'],
+      max_bookings_per_day,
+    });
+    const singleEmpDeps = (emp) => ({
+      getRoutingPolicy: async () => ({ routing_policy_id: 'rp1', tag_conditions: [] }),
+      queryEmployees: async () => [emp],
+      getCoordinatorStatus: async () => 'connected',
+      log: quietLog,
+    });
+
+    it('NaN max_bookings_per_day → field omitted from candidate', async () => {
+      const out = await resolveCandidates(
+        { tenantId: TENANT, routingPolicyId: 'rp1' },
+        singleEmpDeps(makeEmp(NaN))
+      );
+      expect(out).toHaveLength(1);
+      expect(Object.prototype.hasOwnProperty.call(out[0], 'max_bookings_per_day')).toBe(false);
+    });
+
+    it('string "3" max_bookings_per_day → field omitted (must be number type)', async () => {
+      const out = await resolveCandidates(
+        { tenantId: TENANT, routingPolicyId: 'rp1' },
+        singleEmpDeps(makeEmp('3'))
+      );
+      expect(out).toHaveLength(1);
+      expect(Object.prototype.hasOwnProperty.call(out[0], 'max_bookings_per_day')).toBe(false);
+    });
+
+    it('fractional 1.5 max_bookings_per_day → field omitted (must be integer)', async () => {
+      const out = await resolveCandidates(
+        { tenantId: TENANT, routingPolicyId: 'rp1' },
+        singleEmpDeps(makeEmp(1.5))
+      );
+      expect(out).toHaveLength(1);
+      expect(Object.prototype.hasOwnProperty.call(out[0], 'max_bookings_per_day')).toBe(false);
+    });
+
+    it('valid integer 2 max_bookings_per_day → carried onto candidate', async () => {
+      const out = await resolveCandidates(
+        { tenantId: TENANT, routingPolicyId: 'rp1' },
+        singleEmpDeps(makeEmp(2))
+      );
+      expect(out).toHaveLength(1);
+      expect(out[0].max_bookings_per_day).toBe(2);
+    });
   });
 
   describe('defaultGetCoordinatorStatus (Secrets Manager)', () => {

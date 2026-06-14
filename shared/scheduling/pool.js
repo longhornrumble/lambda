@@ -80,6 +80,7 @@
 const {
   DynamoDBClient,
   PutItemCommand,
+  QueryCommand,
 } = require('@aws-sdk/client-dynamodb');
 
 const availability = require('./availability'); // §B1 (C4)
@@ -141,6 +142,150 @@ function isResourceDegraded(tenantId, resourceId) {
 
 function _resetCircuitBreaker() {
   _breaker.clear();
+}
+
+// ─── G4: per-staff availability intersection ─────────────────────────────────────────
+//
+// intersectAvailabilityWindows(staff, type)
+//   - `staff` null/undefined → return `type` UNCHANGED (identity, no copy). This is the
+//     byte-identical guarantee: a candidate without availability_windows must not even
+//     shallow-copy the normalized object, so downstream callers can assert strict
+//     reference equality.
+//   - else per day key: intersect staff intervals with type intervals. For each pair of
+//     overlapping [s,e] ranges (compared as "HH:MM" strings, converted to minutes):
+//     emit {start,end} for overlap [max(starts), min(ends)] when min(ends) > max(starts).
+//   - A day absent in staff → empty (staff unavailable that day); a day absent in type
+//     → empty (type doesn't offer it); days with 0 intervals after intersection are
+//     omitted from the result.
+//   - Malformed entries (non-string start/end, un-parseable, NaN) are silently skipped.
+//   - Times re-emitted as "HH:MM" zero-padded to match input format.
+//   - Never throws.
+
+function _parseMinutes(hhmm) {
+  if (typeof hhmm !== 'string') return NaN;
+  const colon = hhmm.indexOf(':');
+  if (colon < 0) return NaN;
+  const h = parseInt(hhmm.slice(0, colon), 10);
+  const m = parseInt(hhmm.slice(colon + 1), 10);
+  if (Number.isNaN(h) || Number.isNaN(m)) return NaN;
+  return h * 60 + m;
+}
+
+function _minutesToHHMM(mins) {
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+}
+
+function intersectAvailabilityWindows(staff, type) {
+  // null/undefined staff = no per-staff constraint → return `type` UNCHANGED (identity, no copy).
+  // Byte-identical guarantee: the exact reference is passed through so callers can assert ===.
+  // {} (empty object) = staff is explicitly unavailable all days → intersection runs and
+  // produces zero windows. This is semantically distinct from null (no constraint).
+  if (staff == null) return type;
+
+  const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+  const result = {};
+
+  for (const day of DAY_KEYS) {
+    const staffIntervals = Array.isArray(staff[day]) ? staff[day] : [];
+    const typeIntervals = Array.isArray(type.availability_windows && type.availability_windows[day])
+      ? type.availability_windows[day]
+      : [];
+
+    // If either side has no intervals for this day, the intersection for that day is empty.
+    if (staffIntervals.length === 0 || typeIntervals.length === 0) continue;
+
+    const dayResult = [];
+    for (const si of staffIntervals) {
+      const sStart = _parseMinutes(si && si.start);
+      const sEnd = _parseMinutes(si && si.end);
+      if (Number.isNaN(sStart) || Number.isNaN(sEnd) || sEnd <= sStart) continue; // malformed
+
+      for (const ti of typeIntervals) {
+        const tStart = _parseMinutes(ti && ti.start);
+        const tEnd = _parseMinutes(ti && ti.end);
+        if (Number.isNaN(tStart) || Number.isNaN(tEnd) || tEnd <= tStart) continue; // malformed
+
+        const overlapStart = Math.max(sStart, tStart);
+        const overlapEnd = Math.min(sEnd, tEnd);
+        if (overlapEnd > overlapStart) {
+          dayResult.push({ start: _minutesToHHMM(overlapStart), end: _minutesToHHMM(overlapEnd) });
+        }
+      }
+    }
+
+    if (dayResult.length > 0) {
+      result[day] = dayResult;
+    }
+  }
+
+  // Return a per-resource appointmentType with the intersected windows substituted.
+  return { ...type, availability_windows: result };
+}
+
+// ─── G5: per-staff max-bookings-per-day booking count helper ─────────────────────────
+//
+// countBookingsByDay({ tenantId, coordinatorEmail, winStartISO, winEndISO, businessTz })
+//   → Map(dayKey → count) where dayKey is the business-tz civil date "YYYY-MM-DD".
+//
+// Queries GSI `tenantId-coordinator_email-index` for real bookings (item_type='booking',
+// status='booked') with start_at inside the freeBusy window. Follows pagination to
+// completion (pilot scale is small). Uses Intl.DateTimeFormat for tz-correct day bucketing
+// — the same helper is used for slot-day lookup in select(), keeping the two keys byte-identical.
+//
+// Injectable: the `select` function accepts an optional `countBookingsByDay` DI param
+// (default = this function) so tests don't touch DDB.
+
+function _civilDay(isoInstant, businessTz) {
+  // Returns the "YYYY-MM-DD" civil date of isoInstant in businessTz.
+  // Uses en-CA locale for guaranteed ISO-format date output from DateTimeFormat.
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: businessTz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date(isoInstant));
+  } catch {
+    // Fallback: UTC date (should only happen with a bad tz, and is consistent with
+    // the slot-key fallback in select()).
+    return isoInstant.slice(0, 10);
+  }
+}
+
+async function countBookingsByDay({ tenantId, coordinatorEmail, winStartISO, winEndISO, businessTz }) {
+  const counts = new Map();
+  let ExclusiveStartKey;
+  do {
+    const res = await ddb.send(
+      new QueryCommand({
+        TableName: BOOKING_TABLE,
+        IndexName: 'tenantId-coordinator_email-index',
+        KeyConditionExpression: 'tenantId = :t AND coordinator_email = :c',
+        FilterExpression:
+          'item_type = :booking AND #st = :booked AND start_at BETWEEN :ws AND :we',
+        ExpressionAttributeNames: { '#st': 'status' },
+        ExpressionAttributeValues: {
+          ':t':       { S: tenantId },
+          ':c':       { S: coordinatorEmail },
+          ':booking': { S: 'booking' },
+          ':booked':  { S: 'booked' },
+          ':ws':      { S: winStartISO },
+          ':we':      { S: winEndISO },
+        },
+        ExclusiveStartKey,
+      })
+    );
+    for (const item of res.Items || []) {
+      const startAt = item.start_at && item.start_at.S;
+      if (!startAt) continue;
+      const dayKey = _civilDay(startAt, businessTz);
+      counts.set(dayKey, (counts.get(dayKey) || 0) + 1);
+    }
+    ExclusiveStartKey = res.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return counts;
 }
 
 // ─── Field-shim: config appointmentType → the normalized shape C7 reads ─────────────
@@ -310,7 +455,7 @@ function sampleDaypartDiverse(merged, count, userTimeZone) {
 /**
  * select({ tenantId, appointmentType, routingPolicy, candidates, userTimeZone,
  *          alreadyRejected?, now?, windowStart?, windowEnd?, dateWindow?, maxSlots?,
- *          sampling? })
+ *          sampling?, countBookingsByDay? })
  *   → { status, poolBranch, orderedPool, tieBreaker, roundRobinCursor, slots }
  *
  *   status:    'SLOTS_PROPOSED' | 'SLOT_UNAVAILABLE'
@@ -327,6 +472,21 @@ function sampleDaypartDiverse(merged, count, userTimeZone) {
  *   Absent → behavior byte-identical to today (earliest-first slice at maxSlots).
  *   Present → generateSlots called with CANDIDATE_CAP=48; after merge+alreadyRejected
  *   filter, diverse-3 sampling applied. Per-chip shape unchanged.
+ *
+ *   G4: When a candidate has availability_windows, the effective windows passed to
+ *   generateSlots are the intersection of the staff windows with the appointment-type
+ *   windows. When the candidate has NO availability_windows (undefined/null), the
+ *   exact `normalized` object is passed through UNCHANGED — zero copies, strict identity.
+ *
+ *   G5: When a candidate has max_bookings_per_day, days at/over the cap are excluded
+ *   from that resource's generated slots. When the cap is absent, countBookingsByDay is
+ *   NOT called and slot generation is byte-identical to the pre-G5 path.
+ *   RESIDUAL RACE (documented, not fixed): slot-gen exclusion is not a hard commit-time
+ *   lock; a rare propose→commit race can let the (cap+1)th booking through. Acceptable
+ *   v1 guardrail — Booking_Commit_Handler owns the hard idempotency fence.
+ *
+ *   countBookingsByDay: optional DI parameter (default = module function) so tests don't
+ *   need to hit DynamoDB.
  */
 async function select({
   tenantId,
@@ -341,6 +501,7 @@ async function select({
   dateWindow,
   maxSlots = DEFAULT_MAX_SLOTS,
   sampling,
+  countBookingsByDay: _countBookingsByDay = countBookingsByDay,
 }) {
   if (!tenantId) throw new Error('tenantId is required');
   if (!userTimeZone) throw new Error('userTimeZone is required');
@@ -358,6 +519,12 @@ async function select({
     windowEnd || new Date(nowMs + searchDays * 24 * 60 * 60 * 1000).toISOString();
 
   const pool = Array.isArray(candidates) ? candidates : [];
+
+  // G4: build resourceId → candidate map for per-resource window intersection lookup.
+  const candidatesById = new Map();
+  for (const cand of pool) {
+    if (cand && cand.resourceId) candidatesById.set(cand.resourceId, cand);
+  }
 
   // §10.2 step 2: per-resource freeBusy. Each query is independent — one failure
   // never breaks the pool; a degraded coordinator is excluded up front.
@@ -421,9 +588,44 @@ async function select({
   const byStart = new Map(); // startISO → { start, end, label, resources: Set }
   for (const resourceId of ordered) {
     const fb = freeBusyByResource[resourceId];
-    const resourceSlots = slots.generateSlots({
+    const cand = candidatesById.get(resourceId);
+
+    // G4: intersect per-staff availability_windows with the appointment-type windows.
+    // When the staff member has NO availability_windows, pass normalized UNCHANGED
+    // (strict identity — no copy, no mutation; byte-identical guarantee).
+    const effectiveApptType = intersectAvailabilityWindows(
+      cand && cand.availability_windows,
+      normalized
+    );
+
+    // G5: when the candidate has a max_bookings_per_day cap, query existing bookings
+    // over the freeBusy window and build a day → count map for exclusion below.
+    // Cap absent → NO query, NO filtering (byte-identical default path).
+    const cap = cand && cand.max_bookings_per_day;
+    let bookedDayCounts = null;
+    if (cap != null) {
+      try {
+        // G5 query cost: countBookingsByDay uses start_at BETWEEN as a FilterExpression
+        // (not a KeyCondition) on tenantId-coordinator_email-index, so it scans the
+        // coordinator's bookings in the freeBusy window. Acceptable at pilot scale;
+        // flag a GSI follow-up (start_at as range key) if max_bookings_per_day adoption grows.
+        bookedDayCounts = await _countBookingsByDay({
+          tenantId,
+          coordinatorEmail: cand.coordinatorEmail || resourceId,
+          winStartISO: winStart,
+          winEndISO: winEnd,
+          businessTz: (appointmentType && appointmentType.timezone) || 'UTC',
+        });
+      } catch {
+        // Fail-open: if the count query errors, proceed without cap enforcement
+        // rather than dropping the resource from slot generation entirely.
+        bookedDayCounts = null;
+      }
+    }
+
+    let resourceSlots = slots.generateSlots({
       busyIntervals: (fb && fb.busy) || [],
-      appointmentType: normalized,
+      appointmentType: effectiveApptType,
       userTimeZone,
       resourceId,
       now,
@@ -433,6 +635,17 @@ async function select({
       // selected day. When absent (undefined) generateSlots ignores it (no-op).
       dateWindow,
     });
+
+    // G5: exclude slots on days at/over the cap for this resource. When cap is absent
+    // (bookedDayCounts === null), this block is entirely skipped (byte-identical).
+    if (bookedDayCounts !== null && cap != null) {
+      const businessTz = (appointmentType && appointmentType.timezone) || 'UTC';
+      resourceSlots = resourceSlots.filter((s) => {
+        const dayKey = _civilDay(s.start, businessTz);
+        return (bookedDayCounts.get(dayKey) || 0) < cap;
+      });
+    }
+
     for (const s of resourceSlots) {
       const existing = byStart.get(s.start);
       if (existing) {
@@ -596,4 +809,8 @@ module.exports = {
   _BOOKING_TABLE: BOOKING_TABLE,
   _CB_THRESHOLD: CB_THRESHOLD,
   _CB_WINDOW_MS: CB_WINDOW_MS,
+  // G4+G5 helpers (exported for unit coverage):
+  intersectAvailabilityWindows,
+  countBookingsByDay,
+  _civilDay,
 };
