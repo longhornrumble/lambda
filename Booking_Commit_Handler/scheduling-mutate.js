@@ -215,7 +215,9 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
             injected.signOpts
           ));
         } catch (linkErr) {
-          (logger.warn || logger.error || (() => {}))('reminder_link_mint_failed', { error_name: (linkErr && linkErr.name) || 'unknown' });
+          // Optional-chaining (not a `|| (() => {})` fallback) so we don't introduce an
+          // arrow that tests never reach — a missing logger is simply a no-op.
+          (logger.warn || logger.error)?.('reminder_link_mint_failed', { error_name: (linkErr && linkErr.name) || 'unknown' });
         }
         await _rebindReminders({
           booking: {

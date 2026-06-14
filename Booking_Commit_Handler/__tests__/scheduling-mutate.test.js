@@ -388,6 +388,27 @@ describe('handleSchedulingMutate — reschedule reminder rebind (Track 1, §E1)'
     expect(calls.actionLinks[0].startAt).toBe(RESCH_EVENT.newSlot.start);
   });
 
+  it('G1: buildActionLinks failure is non-fatal — rebind still runs with empty links', async () => {
+    const { injected, calls } = baseInjected({
+      buildActionLinks: async () => { throw new Error('signing key unavailable'); },
+    });
+    const out = await handleSchedulingMutate({ ...RESCH_EVENT, org_sms_enabled: false }, injected);
+    expect(out.outcome).toBe('success');
+    expect(calls.rebind).toHaveLength(1);
+    // Mint failed → links empty, but the rebind (with time + join) still happened.
+    expect(calls.rebind[0].rescheduleUrl).toBe('');
+    expect(calls.rebind[0].cancelUrl).toBe('');
+  });
+
+  it('G1: rebind join_url falls back to camelCase joinUrl when set on the booking', async () => {
+    const { injected, calls } = baseInjected();
+    await handleSchedulingMutate(
+      { ...RESCH_EVENT, booking: { ...RESCH_EVENT.booking, channel_details: undefined, joinUrl: 'https://meet.example/camel' } },
+      injected
+    );
+    expect(calls.rebind[0].booking.join_url).toBe('https://meet.example/camel');
+  });
+
   it('truthy-non-bool org_sms_enabled ("yes"/1/"true") does NOT enable SMS on rebind (strict === true)', async () => {
     for (const truthy of ['yes', 'true', 1]) {
       const { injected, calls } = baseInjected();
