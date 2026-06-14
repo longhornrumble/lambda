@@ -202,6 +202,13 @@ function stripCrlf(s) {
   return String(s ?? '').replace(/[\r\n]+/g, ' ').trim();
 }
 
+// FIX 9: scheme guard — only https:// URLs are emitted as <a href> or plain-text links.
+// Blocks javascript:/data: XSS in join_url/reschedule_url/cancel_url (mirrored from
+// confirmation-email.js isHttpsUrl).
+function isHttpsUrl(u) {
+  return typeof u === 'string' && /^https:\/\//i.test(u);
+}
+
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;',
@@ -222,10 +229,13 @@ function escapeHtml(s) {
  */
 function buildActionBlock(message) {
   const whenLabel = message.when_label || '';
-  const joinUrl = message.join_url || '';
-  const rescheduleUrl = message.reschedule_url || '';
-  const cancelUrl = message.cancel_url || '';
-  // No fields present → no block (old-shape row, or minting failed at schedule-create).
+  // FIX 9: apply https gate to all bearer href fields — blocks javascript:/data: XSS.
+  // Only present-AND-https URLs are rendered as links (plain text or <a href>).
+  const joinUrl = isHttpsUrl(message.join_url) ? message.join_url : '';
+  const rescheduleUrl = isHttpsUrl(message.reschedule_url) ? message.reschedule_url : '';
+  const cancelUrl = isHttpsUrl(message.cancel_url) ? message.cancel_url : '';
+  // No fields present → no block (old-shape row, or minting failed at schedule-create,
+  // or a javascript: URL was rejected by the scheme guard above).
   if (!whenLabel && !joinUrl && !rescheduleUrl && !cancelUrl) {
     return { text: '', html: '', sms: '' };
   }
@@ -237,6 +247,7 @@ function buildActionBlock(message) {
 
   const htmlParts = [];
   if (whenLabel) htmlParts.push(`<p>When: ${escapeHtml(whenLabel)}</p>`);
+  // joinUrl already scheme-gated above; escapeHtml still applied for entity safety.
   if (joinUrl) htmlParts.push(`<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>`);
   if (rescheduleUrl) htmlParts.push(`<a href="${escapeHtml(rescheduleUrl)}">Reschedule</a>`);
   if (cancelUrl) {
@@ -248,6 +259,14 @@ function buildActionBlock(message) {
   if (rescheduleUrl) smsLinks.push(`Reschedule: ${rescheduleUrl}`);
   if (cancelUrl) smsLinks.push(`Cancel: ${cancelUrl}`);
   if (joinUrl) smsLinks.push(`Join: ${joinUrl}`);
+
+  // FIX 11 (comment only — soak watch-item, NO behavior change):
+  // Two HS256 token URLs (reschedule + cancel) + a join URL can push this SMS body to
+  // ~6-7 segments once the STOP footer rides last (appendStopOnce in sendSms appends it).
+  // If carriers (Telnyx) start filtering or truncating multi-segment URL SMS, the
+  // follow-up is a short-link service (e.g. Dub) or email-only action links. Do NOT
+  // reduce the URL count here — the plan's done-bar explicitly includes time + join +
+  // reschedule + cancel in SMS. This is intentionally a SOAK WATCH-ITEM only.
 
   return {
     text: textLines.length ? '\n\n' + textLines.join('\n') : '',

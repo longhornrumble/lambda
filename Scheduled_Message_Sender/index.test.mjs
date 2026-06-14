@@ -865,3 +865,73 @@ test('G1: forward-compat read — old-shape row (no link fields) never crashes d
   assert.equal(res.success, true);
   assert.equal(lastStatus(ddbCalls), 'sent');
 });
+
+// ─── FIX 9: https scheme gate in buildActionBlock ─────────────────────────────────────────
+// (buildActionBlock is already imported above at line 698)
+
+test('FIX9/buildActionBlock: javascript: join_url is NOT rendered as a link (omitted)', () => {
+  const block = buildActionBlock({ join_url: 'javascript:alert(1)' });
+  assert.equal(block.text, '');
+  assert.equal(block.html, '');
+  assert.equal(block.sms, '');
+  // The dangerous scheme must not appear anywhere in any format
+  assert.ok(!block.text.includes('javascript:'));
+  assert.ok(!block.html.includes('javascript:'));
+  assert.ok(!block.sms.includes('javascript:'));
+});
+
+test('FIX9/buildActionBlock: data: join_url is NOT rendered as a link (omitted)', () => {
+  const block = buildActionBlock({ join_url: 'data:text/html,<script>alert(1)</script>' });
+  assert.equal(block.text, '');
+  assert.equal(block.html, '');
+  assert.equal(block.sms, '');
+  assert.ok(!block.html.includes('data:'));
+});
+
+test('FIX9/buildActionBlock: https join_url IS rendered as a link', () => {
+  const block = buildActionBlock({ join_url: 'https://meet.google.com/x' });
+  assert.match(block.text, /Join: https:\/\/meet\.google\.com\/x/);
+  assert.match(block.html, /href="https:\/\/meet\.google\.com\/x"/);
+  assert.match(block.sms, /Join: https:\/\/meet\.google\.com\/x/);
+});
+
+test('FIX9/buildActionBlock: javascript: reschedule_url is omitted from all formats', () => {
+  const block = buildActionBlock({
+    reschedule_url: 'javascript:void(0)',
+    cancel_url: 'https://schedule.myrecruiter.ai/cancel?t=c',
+  });
+  assert.ok(!block.text.includes('javascript:'));
+  assert.ok(!block.html.includes('javascript:'));
+  assert.ok(!block.sms.includes('javascript:'));
+  assert.ok(!block.text.includes('Reschedule:'));
+  // cancel still rendered
+  assert.match(block.text, /Cancel:/);
+});
+
+test('FIX9/buildActionBlock: javascript: cancel_url is omitted from all formats', () => {
+  const block = buildActionBlock({
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+    cancel_url: 'javascript:evil()',
+  });
+  assert.ok(!block.html.includes('javascript:'));
+  assert.ok(!block.text.includes('Cancel:'));
+  assert.match(block.text, /Reschedule:/);
+});
+
+test('FIX9: end-to-end dispatch with javascript: join_url → link omitted, dispatch still succeeds', async () => {
+  const message = reminderRow({
+    join_url: 'javascript:alert(1)',
+    reschedule_url: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+    cancel_url: 'https://schedule.myrecruiter.ai/cancel?t=c',
+  });
+  const { deps, lambdaCalls } = makeDeps({ message });
+  const res = await dispatch(EVENT(message), deps);
+  assert.equal(res.success, true);
+  const email = parseEmail(lambdaCalls);
+  // The javascript: URL must not appear anywhere in the outgoing email
+  assert.ok(!email.html_body.includes('javascript:'));
+  assert.ok(!email.text_body.includes('javascript:'));
+  // But the valid https links are present
+  assert.match(email.text_body, /Reschedule:/);
+  assert.match(email.text_body, /Cancel:/);
+});

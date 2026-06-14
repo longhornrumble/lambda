@@ -45,6 +45,12 @@ const SCHED_NOTIF_TEMPLATE_TABLE = process.env.SCHED_NOTIF_TEMPLATE_TABLE || '';
 
 // ─── sanitization helpers ──────────────────────────────────────────────────────────
 
+// FIX 9: scheme guard — only https:// URLs are emitted as <a href> or plain-text links.
+// Blocks javascript:/data: XSS vectors in joinUrl/rescheduleUrl/cancelUrl.
+function isHttpsUrl(u) {
+  return typeof u === 'string' && /^https:\/\//i.test(u);
+}
+
 // Reject CR/LF from any header-context value (subject, MIME headers, ICS lines).
 function stripCrlf(value) {
   if (value == null) return '';
@@ -63,13 +69,15 @@ function escapeHtml(value) {
 }
 
 // RFC 5545 §3.3.11 TEXT escaping: backslash, semicolon, comma, and newline.
+// FIX 7: escape ALL line-break forms (CR+LF, lone CR, lone LF) so attacker-controlled
+// agenda / attendee name values cannot inject ICS properties via a bare 0x0D.
 function escapeIcsText(value) {
   if (value == null) return '';
   return String(value)
     .replace(/\\/g, '\\\\')
     .replace(/;/g, '\\;')
     .replace(/,/g, '\\,')
-    .replace(/\r?\n/g, '\\n');
+    .replace(/\r\n|\r|\n/g, '\\n');
 }
 
 // ─── .ics generation ────────────────────────────────────────────────────────────────
@@ -256,23 +264,24 @@ function buildBodies({ firstName, orgName, apptTypeName, whenLabel, joinUrl, res
   // sanitize is a no-op for the shared default (no comments/styles/links by construction).
   const editableHtml = sanitizeOverrideHtml(renderVars(pickField('html'), htmlVars));
 
+  // FIX 9 + FIX 10: only render links when present AND https (blocks javascript:/data: XSS
+  // and suppresses empty "Reschedule: " / empty <a href=""> lines).
   const textBody = [
     editableText,
     '',
-    ...(joinUrl ? [`Join: ${joinUrl}`] : []),
-    `Reschedule: ${rescheduleUrl}`,
-    `Cancel: ${cancelUrl}`,
+    ...(isHttpsUrl(joinUrl) ? [`Join: ${joinUrl}`] : []),
+    ...(isHttpsUrl(rescheduleUrl) ? [`Reschedule: ${rescheduleUrl}`] : []),
+    ...(isHttpsUrl(cancelUrl) ? [`Cancel: ${cancelUrl}`] : []),
     '',
     `— ${vars.org}`,
   ].join('\n');
 
   const htmlBody = `<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;color:#333;line-height:1.6;">
 ${editableHtml}
-${joinUrl ? `<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>` : ''}
-<p>
-  <a href="${escapeHtml(rescheduleUrl)}">Reschedule</a> &nbsp;|&nbsp;
-  <a href="${escapeHtml(cancelUrl)}">Cancel</a>
-</p>
+${isHttpsUrl(joinUrl) ? `<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>` : ''}
+${(isHttpsUrl(rescheduleUrl) || isHttpsUrl(cancelUrl)) ? `<p>
+  ${isHttpsUrl(rescheduleUrl) ? `<a href="${escapeHtml(rescheduleUrl)}">Reschedule</a>` : ''}${isHttpsUrl(rescheduleUrl) && isHttpsUrl(cancelUrl) ? ' &nbsp;|&nbsp; ' : ''}${isHttpsUrl(cancelUrl) ? `<a href="${escapeHtml(cancelUrl)}">Cancel</a>` : ''}
+</p>` : ''}
 <p style="color:#999;font-size:12px;">&mdash; ${htmlVars.org}</p>
 </body></html>`;
 
@@ -394,6 +403,7 @@ module.exports = {
   renderVars,
   escapeHtml,
   escapeIcsText,
+  isHttpsUrl,
   stripCrlf,
   toIcsUtc,
 };

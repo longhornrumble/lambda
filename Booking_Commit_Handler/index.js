@@ -445,7 +445,12 @@ async function commitAgainstResource({
           ctx.signOpts
         ));
       } catch (linkErr) {
-        warn('reminder_link_mint_failed', { booking_id: bookingId, error: linkErr.message });
+        // FIX 8: use error_name (not .message) — TokenError.message embeds the raw
+        // start_at ISO value ("invalid start_at: <ISO>"), which ties an appointment
+        // time to the booking_id in CloudWatch (PII leak). The name (e.g. "TokenError")
+        // is the actionable part and carries no PII. Matches the reschedule path in
+        // scheduling-mutate.js which already applies this discipline.
+        warn('reminder_link_mint_failed', { booking_id: bookingId, error_name: (linkErr && linkErr.name) || 'unknown' });
       }
       // G1: pass joinUrl + the minted links so scheduler.js bakes them onto the reminder rows.
       await scheduleBookingReminders({

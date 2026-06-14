@@ -397,10 +397,13 @@ describe('sanitizeOverrideHtml — the override cannot interfere with the action
 });
 
 describe('S4c behavioral pins + coverage', () => {
+  // BASE3: use real https URLs so the isHttpsUrl gate passes (non-https URLs are
+  // intentionally suppressed by FIX 9/10 — tested separately in the FIX 9/10 describes).
   const BASE3 = {
     firstName: 'Sam', orgName: 'Austin Angels', apptTypeName: 'Volunteer intake',
     whenLabel: 'Wed, Jun 3 - 1:00 PM CT', joinUrl: '',
-    rescheduleUrl: 'r', cancelUrl: 'c',
+    rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+    cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
   };
 
   it('coordinatorName is deliberately ABSENT from the editable copy; apptType renders (SR-2 pin)', () => {
@@ -426,7 +429,7 @@ describe('S4c behavioral pins + coverage', () => {
     });
     expect(textBody).not.toContain('Join:');
     expect(htmlBody).not.toContain('Join the meeting');
-    expect(textBody).toContain('Reschedule: r');
+    expect(textBody).toContain('Reschedule: https://schedule.myrecruiter.ai/reschedule?t=r');
   });
 
   it('ALL html vars are escaped (org/apptType/whenLabel, not just firstName)', () => {
@@ -562,6 +565,154 @@ describe('G3 — orgName flows into confirmation email sign-off', () => {
     await email.sendConfirmationEmail({ ...ARGS, orgName: '' }, { loadTemplateOverride: async () => null });
     const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
     expect(raw).toContain('the team');
+  });
+});
+
+// ─── Security audit fixes (FIX 7, FIX 9, FIX 10) ─────────────────────────────────────
+
+describe('FIX 7 — ICS injection via lone carriage return', () => {
+  it('lone \\r in agenda is escaped to literal \\\\n in DESCRIPTION (not a bare CR)', () => {
+    const ics = email.buildIcs({
+      bookingId: 'b', summary: 's', start: ARGS.start, end: ARGS.end,
+      description: email.escapeIcsText('agenda\rMETHOD:CANCEL'),
+    });
+    // The DESCRIPTION line must not have a bare CR (i.e. a CR not followed by LF).
+    expect(ics).not.toMatch(/DESCRIPTION:[^\r]*\r(?!\n)/);
+    // The injected property must NOT appear as a standalone ICS line.
+    // ICS lines are \r\n-delimited; a successful injection would produce a
+    // line starting with "METHOD:CANCEL". Split and verify no such line exists.
+    const lines = ics.split('\r\n');
+    const injectedLine = lines.find((l) => l.startsWith('METHOD:CANCEL'));
+    expect(injectedLine).toBeUndefined();
+    // The CR is escaped to the RFC 5545 \n escape sequence (literal backslash-n in the .ics text).
+    const descLine = lines.find((l) => l.startsWith('DESCRIPTION:'));
+    expect(descLine).toBeDefined();
+    expect(descLine).toContain('\\n');
+  });
+
+  it('lone \\r in agenda cannot inject ATTENDEE: or ORGANIZER: properties', () => {
+    const injected = 'agenda\rATTENDEE:mailto:evil@x.com';
+    const ics = email.buildIcs({
+      bookingId: 'b', summary: 's', start: ARGS.start, end: ARGS.end,
+      description: email.escapeIcsText(injected),
+    });
+    expect(ics).not.toMatch(/^ATTENDEE:mailto:evil/m);
+    expect(ics).not.toMatch(/^ORGANIZER:mailto:evil/m);
+  });
+
+  it('escapeIcsText escapes CR+LF, lone CR, and lone LF all to \\\\n', () => {
+    expect(email.escapeIcsText('a\r\nb')).toBe('a\\nb');
+    expect(email.escapeIcsText('a\rb')).toBe('a\\nb');
+    expect(email.escapeIcsText('a\nb')).toBe('a\\nb');
+    expect(email.escapeIcsText('a\r\nb\rc\nd')).toBe('a\\nb\\nc\\nd');
+  });
+});
+
+describe('FIX 9 — joinUrl rendered only when https (XSS defense-in-depth)', () => {
+  it('javascript: joinUrl is NOT rendered as a link in htmlBody or textBody', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: 'javascript:alert(1)',
+      rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+      cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
+    });
+    expect(htmlBody).not.toContain('javascript:');
+    expect(htmlBody).not.toContain('Join the meeting');
+    expect(textBody).not.toContain('Join:');
+  });
+
+  it('data: joinUrl is NOT rendered as a link', () => {
+    const { htmlBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: 'data:text/html,<script>alert(1)</script>',
+      rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+      cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
+    });
+    expect(htmlBody).not.toContain('data:');
+    expect(htmlBody).not.toContain('Join the meeting');
+  });
+
+  it('https: joinUrl IS rendered as a link', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: 'https://meet.google.com/x',
+      rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+      cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
+    });
+    expect(htmlBody).toContain('href="https://meet.google.com/x"');
+    expect(textBody).toContain('Join: https://meet.google.com/x');
+  });
+
+  it('javascript: rescheduleUrl is NOT rendered as a link', () => {
+    const { htmlBody, textBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: '',
+      rescheduleUrl: 'javascript:alert(1)',
+      cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
+    });
+    expect(htmlBody).not.toContain('javascript:');
+    expect(textBody).not.toContain('Reschedule:');
+  });
+
+  it('javascript: cancelUrl is NOT rendered as a link', () => {
+    const { htmlBody, textBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: '',
+      rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+      cancelUrl: 'javascript:void(0)',
+    });
+    expect(htmlBody).not.toContain('javascript:');
+    expect(textBody).not.toContain('Cancel:');
+  });
+});
+
+describe('FIX 10 — empty reschedule/cancel URLs produce no empty link lines', () => {
+  it('empty rescheduleUrl → no "Reschedule:" line in textBody, no empty <a href> in htmlBody', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: '',
+      rescheduleUrl: '',
+      cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=c',
+    });
+    expect(textBody).not.toContain('Reschedule:');
+    expect(htmlBody).not.toContain('href=""');
+    expect(htmlBody).not.toMatch(/href="\s*"/);
+    expect(textBody).toContain('Cancel: https://schedule.myrecruiter.ai/cancel?t=c');
+  });
+
+  it('empty cancelUrl → no "Cancel:" line in textBody, no empty <a href> in htmlBody', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: '',
+      rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=r',
+      cancelUrl: '',
+    });
+    expect(textBody).not.toContain('Cancel:');
+    expect(htmlBody).not.toContain('href=""');
+    expect(textBody).toContain('Reschedule: https://schedule.myrecruiter.ai/reschedule?t=r');
+  });
+
+  it('both empty → no Reschedule/Cancel lines at all', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      firstName: 'Sam', orgName: 'Org', whenLabel: 'soon',
+      joinUrl: '', rescheduleUrl: '', cancelUrl: '',
+    });
+    expect(textBody).not.toContain('Reschedule:');
+    expect(textBody).not.toContain('Cancel:');
+    expect(htmlBody).not.toMatch(/<a href="">/);
+  });
+});
+
+describe('isHttpsUrl helper', () => {
+  it('returns true only for https:// scheme', () => {
+    expect(email.isHttpsUrl('https://example.com')).toBe(true);
+    expect(email.isHttpsUrl('HTTPS://example.com')).toBe(true);
+    expect(email.isHttpsUrl('http://example.com')).toBe(false);
+    expect(email.isHttpsUrl('javascript:alert(1)')).toBe(false);
+    expect(email.isHttpsUrl('data:text/html,x')).toBe(false);
+    expect(email.isHttpsUrl('')).toBe(false);
+    expect(email.isHttpsUrl(null)).toBe(false);
+    expect(email.isHttpsUrl(undefined)).toBe(false);
   });
 });
 
