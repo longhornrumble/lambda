@@ -38,7 +38,10 @@ const lambdaMock = mockClient(LambdaClient); // E6 disposition → notify.js Lam
 const KEY = 'test-signing-key-0123456789abcdef'; // ≥16 chars (MIN_SIGNING_KEY_LENGTH)
 const JTI_TABLE = 'picasso-token-jti-blacklist-staging';
 const SESSION_TABLE = 'picasso-conversation-scheduling-session-staging';
+const BOOKING_TABLE = 'picasso-booking-staging';
+const REGISTRY_TABLE = 'picasso-tenant-registry-staging';
 const TENANT = 'TEN-D4-TEST';
+const TENANT_HASH = 'hsh-d4-test';
 const BOOKING = 'bk-abc123';
 const CHAT_BASE = 'https://staging.chat.myrecruiter.ai';
 const FAR_FUTURE_START = '2999-01-01T10:00:00Z';
@@ -77,13 +80,19 @@ function bookingItem() {
   };
 }
 
+function registryItem() {
+  return { Item: { tenantId: { S: TENANT }, tenantHash: { S: TENANT_HASH } } };
+}
+
 beforeEach(() => {
   ddbMock.reset();
   smMock.reset();
   lambdaMock.reset();
   smMock.on(GetSecretValueCommand).resolves({ SecretString: KEY });
-  // Default happy DDB: booking present, both PutItems succeed.
-  ddbMock.on(GetItemCommand).resolves(bookingItem());
+  // Default happy DDB: booking present, registry hash present, both PutItems succeed.
+  // Table-specific matchers (booking vs registry) — both reads are GetItemCommand.
+  ddbMock.on(GetItemCommand, { TableName: BOOKING_TABLE }).resolves(bookingItem());
+  ddbMock.on(GetItemCommand, { TableName: REGISTRY_TABLE }).resolves(registryItem());
   ddbMock.on(PutItemCommand).resolves({});
   // E6 disposition: conditional transition returns the booked→terminal ALL_NEW row by default.
   ddbMock.on(UpdateItemCommand).resolves({
@@ -161,9 +170,12 @@ describe('volunteer-facing: valid → bind + redirect', () => {
     const res = await handler(evt('/cancel', t));
 
     expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toMatch(
-      new RegExp(`^${CHAT_BASE}/\\?session=[0-9a-f-]{36}$`)
-    );
+    // Lands on the branded /schedule/ page, identified by the tenant HASH (?t=).
+    const loc = new URL(res.headers.location);
+    expect(loc.origin + loc.pathname).toBe(`${CHAT_BASE}/schedule/index.html`);
+    expect(loc.searchParams.get('t')).toBe(TENANT_HASH);
+    expect(loc.searchParams.get('purpose')).toBe('cancel'); // page renders cancel framing
+    expect(res.headers.location).not.toContain(TENANT); // never the raw tenant_id
 
     // §13.7: the jti was burned (PutItem to the jti table).
     const jtiPuts = ddbMock
@@ -186,7 +198,8 @@ describe('volunteer-facing: valid → bind + redirect', () => {
     expect(item.form_submission_id).toBeUndefined();
 
     // The session id in the redirect matches the binding SK.
-    const sid = res.headers.location.split('session=')[1];
+    const sid = new URL(res.headers.location).searchParams.get('session');
+    expect(sid).toMatch(/^[0-9a-f-]{36}$/);
     expect(item.session_id.S).toBe(`binding#${sid}`);
   });
 
@@ -207,6 +220,41 @@ describe('volunteer-facing: valid → bind + redirect', () => {
       .commandCalls(PutItemCommand)
       .find((c) => c.args[0].input.TableName === SESSION_TABLE).args[0].input.Item;
     expect(item.intent.S).toBe('rescheduling_intent');
+    // reschedule also lands on the branded /schedule/ page with the tenant HASH.
+    const loc = new URL(res.headers.location);
+    expect(loc.origin + loc.pathname).toBe(`${CHAT_BASE}/schedule/index.html`);
+    expect(loc.searchParams.get('t')).toBe(TENANT_HASH);
+    expect(loc.searchParams.get('purpose')).toBe('reschedule');
+  });
+
+  test('tenant-hash lookup MISS (no registry row / no hash) → 500, no redirect', async () => {
+    ddbMock.on(GetItemCommand, { TableName: REGISTRY_TABLE }).resolves({}); // no Item
+    const t = await tokens.sign(
+      'cancel',
+      { tenant_id: TENANT, booking_id: BOOKING, start_at: FAR_FUTURE_START },
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/cancel', t));
+    expect(res.statusCode).toBe(500);
+    // binding still written + jti burned (failure is after the bind; a re-click 410s).
+    const bindPuts = ddbMock
+      .commandCalls(PutItemCommand)
+      .filter((c) => c.args[0].input.TableName === SESSION_TABLE);
+    expect(bindPuts).toHaveLength(1);
+  });
+
+  test('tenant-hash lookup ERROR → 500 (no detail leak)', async () => {
+    ddbMock
+      .on(GetItemCommand, { TableName: REGISTRY_TABLE })
+      .rejects(new Error('registry throttled'));
+    const t = await tokens.sign(
+      'cancel',
+      { tenant_id: TENANT, booking_id: BOOKING, start_at: FAR_FUTURE_START },
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/cancel', t));
+    expect(res.statusCode).toBe(500);
+    expect(res.body).not.toMatch(/registry|throttled/i);
   });
 
   test('recovery (/resume) → 302, recovery_intent binding, no booking lookup, carries form_submission_id', async () => {
@@ -218,7 +266,12 @@ describe('volunteer-facing: valid → bind + redirect', () => {
     const res = await handler(evt('/resume', t));
     expect(res.statusCode).toBe(302);
 
-    // No booking_id on the token → no booking GetItem.
+    // recovery keeps the chat-widget target (NOT the /schedule/ page) — no tenant hash lookup.
+    const loc = new URL(res.headers.location);
+    expect(loc.pathname).toBe('/');
+    expect(loc.searchParams.get('t')).toBeNull();
+
+    // No booking_id on the token → no booking GetItem; recovery does NO registry lookup.
     expect(ddbMock.commandCalls(GetItemCommand)).toHaveLength(0);
 
     const item = ddbMock
@@ -232,7 +285,7 @@ describe('volunteer-facing: valid → bind + redirect', () => {
   });
 
   test('missing booking → 404 not-found page (no execution)', async () => {
-    ddbMock.on(GetItemCommand).resolves({}); // no Item
+    ddbMock.on(GetItemCommand, { TableName: BOOKING_TABLE }).resolves({}); // no Item
     const t = await tokens.sign(
       'cancel',
       { tenant_id: TENANT, booking_id: BOOKING, start_at: FAR_FUTURE_START },
