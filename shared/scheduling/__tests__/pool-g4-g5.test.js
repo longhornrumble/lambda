@@ -246,6 +246,17 @@ describe('intersectAvailabilityWindows', () => {
     expect(result.availability_windows).toEqual({});
   });
 
+  it('{} staff = explicitly unavailable: result is NOT identity (intersection runs) and all days are blocked', () => {
+    // {} is not null/undefined — the null-guard does NOT fire. The intersection runs over
+    // all 7 day keys and produces zero windows because staff has no intervals on any day.
+    // This is semantically distinct from null (no constraint → identity pass-through).
+    const result = intersectAvailabilityWindows({}, typeWindows);
+    // Must NOT be the same reference as typeWindows (intersection ran, not identity).
+    expect(result).not.toBe(typeWindows);
+    // All days blocked: availability_windows is an empty object.
+    expect(result.availability_windows).toEqual({});
+  });
+
   it('does NOT mutate the original type object', () => {
     const typeOriginal = {
       availability_windows: { mon: [{ start: '09:00', end: '17:00' }] },
@@ -295,12 +306,46 @@ describe('G4 byte-identical regression: no-staff-windows path', () => {
     ]);
   }
 
-  it('(a) appointmentType passed to generateSlots is the exact normalized instance — no availability_windows on candidates', async () => {
+  it('(a) appointmentType passed to generateSlots is the exact normalized instance — no availability_windows on candidates (STRICT reference identity)', async () => {
+    // NON-NEGOTIABLE byte-identical guarantee: when no candidate has availability_windows,
+    // pool.select must pass the EXACT same `normalized` object reference (===) to every
+    // generateSlots call — not a copy, not a spread. A future edit that returns
+    // `{ ...type }` on the null-staff branch must cause this test to FAIL.
+    //
+    // Strategy: intercept slots.generateSlots (already mocked) to capture the reference
+    // from the first call, then assert every subsequent call gets the SAME reference (===).
+    // This works regardless of whether normalizeAppointmentType is called by-name internally
+    // (spying on the export would not intercept an internal direct call).
     const candidates = [
       { resourceId: 'maya@org.com', scheduling_tags: ['sched'], coordinatorEmail: 'maya@org.com' },
       { resourceId: 'sam@org.com', scheduling_tags: ['sched'], coordinatorEmail: 'sam@org.com' },
     ];
-    setupSelectWithCandidates(candidates);
+
+    // Both candidates have NO availability_windows and NO cap — all go through the
+    // null-staff identity branch of intersectAvailabilityWindows.
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({
+      ordered: candidates.map((c) => c.resourceId),
+      tieBreaker: 'round_robin',
+      roundRobinCursor: null,
+    });
+
+    let capturedRef = undefined;
+    slots.generateSlots.mockImplementation(({ appointmentType, resourceId }) => {
+      // Capture the reference on first call; every subsequent call must be the same object.
+      if (capturedRef === undefined) {
+        capturedRef = appointmentType;
+      }
+      return [
+        {
+          slotId: `${resourceId}|2026-06-03T14:00:00Z`,
+          start: '2026-06-03T14:00:00Z',
+          end: '2026-06-03T14:20:00Z',
+          label: '9 AM',
+          resourceId,
+        },
+      ];
+    });
 
     await pool.select({
       tenantId: TENANT,
@@ -311,24 +356,14 @@ describe('G4 byte-identical regression: no-staff-windows path', () => {
       now: '2026-06-02T12:00:00Z',
     });
 
-    // For EVERY generateSlots call, the appointmentType arg must be the exact
-    // `normalized` object. We verify this by checking that all calls received the
-    // same object reference — which we can access via pool's normalizeAppointmentType.
-    const normalized = pool.normalizeAppointmentType(APPT);
+    // generateSlots was called once per candidate (2 total).
+    expect(slots.generateSlots.mock.calls).toHaveLength(2);
+    expect(capturedRef).toBeDefined();
+
+    // Every call must have received the EXACT same reference (===).
+    // A shallow copy ({ ...normalized }) would produce a different object and FAIL this.
     for (const call of slots.generateSlots.mock.calls) {
-      const passedApptType = call[0].appointmentType;
-      // Deep-equal is necessary (normalized is always freshly created), but we also
-      // verify it has the exact same shape with NO extra/missing keys.
-      expect(passedApptType).toEqual(normalized);
-      // No availability_windows mutation: the passed object must NOT have keys that
-      // indicate G4 intersection ran (result of intersect always has availability_windows
-      // as an empty object {} or modified; only the `type` pass-through identity
-      // preserves the original availability_windows from APPT).
-      expect(passedApptType.availability_windows).toEqual(APPT.availability_windows);
-      // Guard: must not have any extraneous properties (e.g. from a shallow copy).
-      const expectedKeys = Object.keys(normalized).sort();
-      const actualKeys = Object.keys(passedApptType).sort();
-      expect(actualKeys).toEqual(expectedKeys);
+      expect(call[0].appointmentType).toBe(capturedRef);
     }
   });
 
@@ -846,6 +881,63 @@ describe('G5: max_bookings_per_day cap enforcement', () => {
     expect(passedApptType.availability_windows.tue).toEqual([{ start: '09:00', end: '11:00' }]);
     // Wed: staff 09:00-17:00 ∩ type 09:00-17:00 = 09:00-17:00
     expect(passedApptType.availability_windows.wed).toEqual([{ start: '09:00', end: '17:00' }]);
+  });
+
+  it('G5 timezone-midnight bucketing: near-midnight UTC slot on different civil day in business tz is excluded; next-day slot is offered', async () => {
+    // 2026-06-03T04:00:00Z = 2026-06-02 23:00 in America/Chicago (CDT = UTC-5).
+    // Civil day in Chicago = 2026-06-02, not 2026-06-03.
+    // countBookingsByDay returns Map([['2026-06-02', 1]]) with cap=1 → that slot excluded.
+    // 2026-06-03T14:00:00Z = 2026-06-03 09:00 CDT → civil day 2026-06-03 → count=0 → offered.
+    // This proves slot-day key and booking-day key use the SAME business tz (not UTC).
+    const candidates = [
+      {
+        resourceId: 'maya@org.com',
+        scheduling_tags: ['sched'],
+        coordinatorEmail: 'maya@org.com',
+        max_bookings_per_day: 1,
+      },
+    ];
+
+    availability.getBusyIntervals.mockResolvedValue(fb());
+    routing.evaluatePool.mockResolvedValue({ ordered: ['maya@org.com'], tieBreaker: 'round_robin', roundRobinCursor: null });
+
+    // Two slots: one that is near midnight UTC (civil day 2026-06-02 in Chicago)
+    // and one that is clearly on 2026-06-03 in Chicago.
+    slots.generateSlots.mockReturnValue([
+      {
+        slotId: 'maya@org.com|2026-06-03T04:00:00Z',
+        start: '2026-06-03T04:00:00Z', // = 2026-06-02 23:00 CDT → civil day 2026-06-02
+        end: '2026-06-03T04:20:00Z',
+        label: '11 PM',
+        resourceId: 'maya@org.com',
+      },
+      {
+        slotId: 'maya@org.com|2026-06-03T14:00:00Z',
+        start: '2026-06-03T14:00:00Z', // = 2026-06-03 09:00 CDT → civil day 2026-06-03
+        end: '2026-06-03T14:20:00Z',
+        label: '9 AM',
+        resourceId: 'maya@org.com',
+      },
+    ]);
+
+    // 2026-06-02 is at cap (1 booking); 2026-06-03 has 0 bookings.
+    const countSpy = jest.fn().mockResolvedValue(new Map([['2026-06-02', 1]]));
+
+    const res = await pool.select({
+      tenantId: TENANT,
+      appointmentType: APPT, // timezone: 'America/Chicago'
+      routingPolicy: POLICY,
+      candidates,
+      userTimeZone: TZ,
+      now: '2026-06-02T12:00:00Z',
+      countBookingsByDay: countSpy,
+    });
+
+    // The 04:00Z slot (Chicago civil day 2026-06-02, at cap) must be excluded.
+    // The 14:00Z slot (Chicago civil day 2026-06-03, under cap) must be offered.
+    expect(res.status).toBe('SLOTS_PROPOSED');
+    expect(res.slots).toHaveLength(1);
+    expect(res.slots[0].start).toBe('2026-06-03T14:00:00Z');
   });
 
   it('coordinatorEmail absent on candidate → falls back to resourceId for countBookingsByDay', async () => {

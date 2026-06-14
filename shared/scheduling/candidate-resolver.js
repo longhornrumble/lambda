@@ -288,6 +288,7 @@ async function resolveCandidates(
     }
     if (typeof emp.max_bookings_per_day === 'number' &&
         Number.isFinite(emp.max_bookings_per_day) &&
+        Number.isInteger(emp.max_bookings_per_day) &&
         emp.max_bookings_per_day > 0) {
       candidate.max_bookings_per_day = emp.max_bookings_per_day;
     }

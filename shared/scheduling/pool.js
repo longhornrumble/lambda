@@ -178,7 +178,10 @@ function _minutesToHHMM(mins) {
 }
 
 function intersectAvailabilityWindows(staff, type) {
-  // Identity branch: no staff windows → use type unchanged (byte-identical guarantee).
+  // null/undefined staff = no per-staff constraint → return `type` UNCHANGED (identity, no copy).
+  // Byte-identical guarantee: the exact reference is passed through so callers can assert ===.
+  // {} (empty object) = staff is explicitly unavailable all days → intersection runs and
+  // produces zero windows. This is semantically distinct from null (no constraint).
   if (staff == null) return type;
 
   const DAY_KEYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
@@ -602,6 +605,10 @@ async function select({
     let bookedDayCounts = null;
     if (cap != null) {
       try {
+        // G5 query cost: countBookingsByDay uses start_at BETWEEN as a FilterExpression
+        // (not a KeyCondition) on tenantId-coordinator_email-index, so it scans the
+        // coordinator's bookings in the freeBusy window. Acceptable at pilot scale;
+        // flag a GSI follow-up (start_at as range key) if max_bookings_per_day adoption grows.
         bookedDayCounts = await _countBookingsByDay({
           tenantId,
           coordinatorEmail: cand.coordinatorEmail || resourceId,
