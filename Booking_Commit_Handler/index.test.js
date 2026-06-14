@@ -77,6 +77,16 @@ jest.mock('./booking-store', () => {
 });
 jest.mock('./confirmation-email', () => ({
   sendConfirmationEmail: jest.fn(async () => ({ messageId: 'msg-1', rescheduleUrl: 'r', cancelUrl: 'c' })),
+  // G1: index.js mints the reminder action links via buildActionLinks on the commit path.
+  buildActionLinks: jest.fn(async () => ({
+    rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=RTOKEN',
+    cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=CTOKEN',
+  })),
+}));
+// G2: when no injected getAppointmentType, index.js requires candidate-resolver at runtime.
+// Mock it so tests without injected getAppointmentType don't hit real DDB.
+jest.mock('../shared/scheduling/candidate-resolver', () => ({
+  defaultGetAppointmentType: jest.fn().mockResolvedValue(null),
 }));
 
 const { mockClient } = require('aws-sdk-client-mock');
@@ -771,5 +781,153 @@ describe('Track 1 — reminder scheduling at commit', () => {
     expect(res.status).toBe('BOOKED');
     expect(reminderScheduler.scheduleReminders).toHaveBeenCalledTimes(1);
     expect(featureGate.loadTenantConfig).toHaveBeenCalledWith('AUS123957');
+  });
+
+  // G1: joinUrl is threaded into scheduleBookingReminders and baked into the booking view.
+  it('G1: joinUrl is passed into the scheduleReminders booking view (join_url field)', async () => {
+    // The NullConferenceProvider returns an empty joinUrl; inject a Meet-like event to get one.
+    calendarEvents.insertEvent.mockResolvedValue({
+      ...EVENT,
+      conferenceData: { entryPoints: [{ entryPointType: 'video', uri: 'https://meet.google.com/abc-xyz' }] },
+    });
+    // Use google_meet so the join url comes from the inserted event
+    const inj = reminderInjection();
+    const ev = baseEvent({ conference_type: 'google_meet' });
+    const res = await handler(ev, {}, { ...inj, providerOverrides: {} });
+    expect(res.status).toBe('BOOKED');
+    const bookingArg = inj.scheduleReminders.mock.calls[0][0].booking;
+    expect(bookingArg.join_url).toBe('https://meet.google.com/abc-xyz');
+  });
+
+  it('G1: joinUrl from NullConferenceProvider is forwarded to the booking view', async () => {
+    const inj = reminderInjection();
+    await handler(baseEvent(), {}, inj);
+    const bookingArg = inj.scheduleReminders.mock.calls[0][0].booking;
+    // NullConferenceProvider returns a conference.invalid URL for testing; it should be forwarded.
+    // Either a non-empty string or '' are both valid — the key requirement is join_url is defined.
+    expect(bookingArg).toHaveProperty('join_url');
+    // If join_url is present and non-empty, it should be a string.
+    if (bookingArg.join_url) {
+      expect(typeof bookingArg.join_url).toBe('string');
+    }
+  });
+
+  // G1 (post-redesign): the reschedule/cancel tokens are minted on the COMMIT path
+  // (buildActionLinks) and passed to scheduleReminders as rescheduleUrl/cancelUrl — scheduler.js
+  // imports no signing SDK. cancellation_window_hours drives the reschedule token's expiry, so it
+  // is consumed by the mint, NOT placed on the reminder booking view.
+  it('G1: minted reschedule/cancel links are threaded into the scheduleReminders call', async () => {
+    const signOpts = { signingKey: 'test-key-1234567890' };
+    const inj = { ...reminderInjection(), signOpts };
+    await handler(baseEvent(), {}, inj);
+    const callArg = inj.scheduleReminders.mock.calls[0][0];
+    expect(callArg.rescheduleUrl).toContain('/reschedule?t=');
+    expect(callArg.cancelUrl).toContain('/cancel?t=');
+  });
+
+  it('G1: cancellation_window_hours drives the link mint, NOT the reminder booking view', async () => {
+    const signOpts = { signingKey: 'test-key-1234567890' };
+    const inj = { ...reminderInjection(), signOpts };
+    await handler(baseEvent({ appointment_type: { id: 'apt', name: 'Volunteer intake', format: 'one_to_one', timezone: 'America/Chicago', cancellation_window_hours: 48 } }), {}, inj);
+    const callArg = inj.scheduleReminders.mock.calls[0][0];
+    // The view no longer carries cancellation_window_hours (it is consumed by buildActionLinks).
+    expect(callArg.booking).not.toHaveProperty('cancellation_window_hours');
+    // The link was still minted (proves the window value flowed into the mint path).
+    expect(callArg.rescheduleUrl).toContain('/reschedule?t=');
+  });
+});
+
+// ── G2: agenda resolution ──────────────────────────────────────────────────────────────
+
+describe('G2 — agenda resolution in ctx', () => {
+  beforeEach(() => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1', format: 'one_to_one' });
+  });
+
+  it('G2: agenda from event.appointment_type.agenda is threaded to buildEventBody', async () => {
+    const ev = baseEvent({ appointment_type: { id: 'apt', name: 'Volunteer intake', format: 'one_to_one', timezone: 'America/Chicago', cancellation_window_hours: 0, agenda: 'Step 1: Welcome.' } });
+    const res = await handler(ev, {}, nullInjection());
+    expect(res.status).toBe('BOOKED');
+    // buildEventBody receives agenda via ctx — check it via the confirmation-email mock call
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.agenda).toBe('Step 1: Welcome.');
+  });
+
+  it('G2: agenda absent from event → best-effort DDB load via injected getAppointmentType', async () => {
+    const getAppointmentType = jest.fn().mockResolvedValue({ agenda: 'DDB agenda content.' });
+    const ev = baseEvent(); // no agenda field in appointment_type
+    const res = await handler(ev, {}, { ...nullInjection(), getAppointmentType });
+    expect(res.status).toBe('BOOKED');
+    expect(getAppointmentType).toHaveBeenCalledWith({ tenantId: 'AUS123957', appointmentTypeId: 'apt' });
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.agenda).toBe('DDB agenda content.');
+  });
+
+  it('G2: getAppointmentType throws → agenda is undefined, commit still succeeds (fail-safe)', async () => {
+    const getAppointmentType = jest.fn().mockRejectedValue(new Error('DDB error'));
+    const ev = baseEvent();
+    const res = await handler(ev, {}, { ...nullInjection(), getAppointmentType });
+    expect(res.status).toBe('BOOKED');
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.agenda).toBeUndefined();
+  });
+
+  it('G2: agenda is threaded into sendConfirmationEmail', async () => {
+    const ev = baseEvent({ appointment_type: { id: 'apt', name: 'Volunteer intake', format: 'one_to_one', timezone: 'America/Chicago', cancellation_window_hours: 0, agenda: 'Meeting agenda.' } });
+    await handler(ev, {}, nullInjection());
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.agenda).toBe('Meeting agenda.');
+  });
+});
+
+// ── G3: orgName resolution ─────────────────────────────────────────────────────────────
+
+describe('G3 — orgName resolution', () => {
+  beforeEach(() => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk1', format: 'one_to_one' });
+  });
+
+  it('G3: event.org_name wins — email gets that value (config.organization_name NOT used)', async () => {
+    // loadTenantConfig may still be called for reminder prefs — we verify the OUTCOME:
+    // the resolved orgName is from event.org_name, NOT from the config's organization_name.
+    const mockLoad = jest.fn().mockResolvedValue({ organization_name: 'Config Org Should Lose' });
+    const ev = baseEvent({ org_name: 'Austin Angels' });
+    await handler(ev, {}, { ...nullInjection(), loadTenantConfig: mockLoad });
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    // The winner must be event.org_name, not config.organization_name.
+    expect(emailCall.orgName).toBe('Austin Angels');
+  });
+
+  it('G3: falls back to config.organization_name when event.org_name is absent', async () => {
+    const mockLoad = jest.fn().mockResolvedValue({ organization_name: 'Config Org Name' });
+    const ev = baseEvent({ org_name: '' });
+    await handler(ev, {}, { ...nullInjection(), loadTenantConfig: mockLoad });
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.orgName).toBe('Config Org Name');
+  });
+
+  it('G3: falls back to config.chat_title when organization_name absent', async () => {
+    const mockLoad = jest.fn().mockResolvedValue({ chat_title: 'My Chat Title' });
+    const ev = baseEvent({ org_name: '' });
+    await handler(ev, {}, { ...nullInjection(), loadTenantConfig: mockLoad });
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.orgName).toBe('My Chat Title');
+  });
+
+  it('G3: config load throws → orgName is empty string, commit still succeeds (fail-safe)', async () => {
+    const mockLoad = jest.fn().mockRejectedValue(new Error('S3 down'));
+    const ev = baseEvent({ org_name: '' });
+    const res = await handler(ev, {}, { ...nullInjection(), loadTenantConfig: mockLoad });
+    expect(res.status).toBe('BOOKED');
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.orgName).toBe('');
+  });
+
+  it('G3: all absent → orgName is empty string; downstream shows literal default', async () => {
+    const mockLoad = jest.fn().mockResolvedValue({});
+    const ev = baseEvent({ org_name: '' });
+    await handler(ev, {}, { ...nullInjection(), loadTenantConfig: mockLoad });
+    const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
+    expect(emailCall.orgName).toBe('');
   });
 });

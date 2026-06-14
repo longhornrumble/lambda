@@ -37,8 +37,11 @@ function clean(value) {
 /**
  * Build the events.insert requestBody. Content per §5.7.
  *   { bookingId, appointmentTypeName, attendeeFirstName, attendeeLastName,
- *     attendeeEmail, start, end, timezone, deepLink,
+ *     attendeeEmail, start, end, timezone, deepLink, agenda?,
  *     conference: { provider, joinUrl?, conferenceId?, calendarCreateRequest? } }
+ *
+ * G2: agenda (optional plain-text string from AppointmentType.agenda) is prepended
+ * to the description when present. Absent → description byte-identical to pre-G2.
  */
 function buildEventBody({
   bookingId,
@@ -51,6 +54,7 @@ function buildEventBody({
   timezone,
   deepLink,
   conference,
+  agenda,
 }) {
   if (!bookingId) throw new Error('bookingId is required (ownership tag)');
   const firstName = clean(attendeeFirstName);
@@ -59,9 +63,12 @@ function buildEventBody({
   // Title: type + first name ONLY (visible in previews / lock-screen). No last name.
   const summary = `${typeName}${firstName ? ` — ${firstName}` : ''}`;
 
-  // Description: first+last + auth-gated deep link. No phone, no form contents.
+  // Description: agenda (G2) first when present, then first+last + auth-gated deep link.
+  // No phone, no form contents.
   const fullName = clean(`${attendeeFirstName || ''} ${attendeeLastName || ''}`);
   const descLines = [];
+  // G2: agenda prepended so it appears before attendee/link lines in the calendar event.
+  if (agenda) descLines.unshift(clean(agenda));
   if (fullName) descLines.push(`Attendee: ${fullName}`);
   if (deepLink) descLines.push(`Manage this booking: ${clean(deepLink)}`);
 

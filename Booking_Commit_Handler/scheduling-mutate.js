@@ -47,6 +47,9 @@ const { readSmsConsent } = require('./sms-consent');
 // the reminder schedules to the NEW time. The ONLY re-bind trigger (a calendar move is a
 // cancel, handled by the cal-lifecycle consumer).
 const reminderScheduler = require('../Reminder_Scheduler/scheduler');
+// G1: mint the rebound reminders' one-tap action links for the NEW start_at (same per-purpose
+// token contract + URL format as the commit-path confirmation email).
+const { buildActionLinks } = require('./confirmation-email');
 
 // tolerate camel OR snake on the inbound booking (schema discipline)
 function pick(b, camel, snake) {
@@ -67,6 +70,7 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   const _selectChannels = injected.selectChannels || selectChannels;
   const _readSmsConsent = injected.readSmsConsent || readSmsConsent;
   const _rebindReminders = injected.rebindReminders || reminderScheduler.rebindReminders;
+  const _buildActionLinks = injected.buildActionLinks || buildActionLinks;
   const logger = injected.logger || console;
 
   const { mutation, tenantId, coordinatorId, booking } = event;
@@ -195,6 +199,26 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
       // Build the view from the NEW slot explicitly (do not trust result.booking to carry it).
       // tenantPrefs.org SMS = the event-passed org flag (ADA-resolved, mirrors reschedule_link).
       try {
+        // G1: mint fresh action links for the NEW start_at (best-effort — a mint failure just
+        // omits the links; the rebound reminders still carry time + join). join link rides the
+        // reused conference (preserved by reschedule.js) → carry it on the rebind view.
+        let rescheduleUrl = '';
+        let cancelUrl = '';
+        try {
+          ({ rescheduleUrl, cancelUrl } = await _buildActionLinks(
+            {
+              tenantId,
+              bookingId: pick(b, 'bookingId', 'booking_id'),
+              startAt: newSlot.start,
+              cancellationWindowHours: event.cancellation_window_hours || 0,
+            },
+            injected.signOpts
+          ));
+        } catch (linkErr) {
+          // Optional-chaining (not a `|| (() => {})` fallback) so we don't introduce an
+          // arrow that tests never reach — a missing logger is simply a no-op.
+          (logger.warn || logger.error)?.('reminder_link_mint_failed', { error_name: (linkErr && linkErr.name) || 'unknown' });
+        }
         await _rebindReminders({
           booking: {
             tenant_id: tenantId,
@@ -208,11 +232,16 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
             coordinator_email: pick(b, 'coordinatorEmail', 'coordinator_email'),
             appointment_type_name: pick(b, 'appointmentTypeName', 'appointment_type_name'),
             organization_name: pick(b, 'organizationName', 'organization_name'),
+            // join URL is persisted on the Booking row as channel_details (booking-store) — check
+            // both names. pick() here is the 2-key (camel, snake) local helper, so OR two calls.
+            join_url: pick(b, 'joinUrl', 'join_url') || pick(b, 'channelDetails', 'channel_details'),
           },
           tenantPrefs: {
             notificationPrefs: { sms: event.org_sms_enabled === true },
             sms_quiet_hours: event.sms_quiet_hours || null,
           },
+          rescheduleUrl,
+          cancelUrl,
         });
       } catch (err) {
         (logger.warn || logger.error || (() => {}))('reminder_rebind_failed', { error_name: (err && err.name) || 'unknown' });

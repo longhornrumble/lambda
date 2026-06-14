@@ -202,6 +202,13 @@ function stripCrlf(s) {
   return String(s ?? '').replace(/[\r\n]+/g, ' ').trim();
 }
 
+// FIX 9: scheme guard — only https:// URLs are emitted as <a href> or plain-text links.
+// Blocks javascript:/data: XSS in join_url/reschedule_url/cancel_url (mirrored from
+// confirmation-email.js isHttpsUrl).
+function isHttpsUrl(u) {
+  return typeof u === 'string' && /^https:\/\//i.test(u);
+}
+
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
     '&': '&amp;',
@@ -210,6 +217,62 @@ function escapeHtml(s) {
     '"': '&quot;',
     "'": '&#39;',
   }[c]));
+}
+
+/**
+ * G1: build the action block appended to attendee-facing reminders OUTSIDE the editable
+ * body. Mirrors the confirmation-email.js discipline — the consumer, not the template,
+ * owns this region, so an override can neither remove nor duplicate these lines.
+ *
+ * Old-shape rows (no link fields) → all values are falsy → returns '' for all formats.
+ * STOP footer is still appended after this block (STOP stays last — see sendEmail/sendSms).
+ */
+function buildActionBlock(message) {
+  const whenLabel = message.when_label || '';
+  // FIX 9: apply https gate to all bearer href fields — blocks javascript:/data: XSS.
+  // Only present-AND-https URLs are rendered as links (plain text or <a href>).
+  const joinUrl = isHttpsUrl(message.join_url) ? message.join_url : '';
+  const rescheduleUrl = isHttpsUrl(message.reschedule_url) ? message.reschedule_url : '';
+  const cancelUrl = isHttpsUrl(message.cancel_url) ? message.cancel_url : '';
+  // No fields present → no block (old-shape row, or minting failed at schedule-create,
+  // or a javascript: URL was rejected by the scheme guard above).
+  if (!whenLabel && !joinUrl && !rescheduleUrl && !cancelUrl) {
+    return { text: '', html: '', sms: '' };
+  }
+  const textLines = [];
+  if (whenLabel) textLines.push(`When: ${whenLabel}`);
+  if (joinUrl) textLines.push(`Join: ${joinUrl}`);
+  if (rescheduleUrl) textLines.push(`Reschedule: ${rescheduleUrl}`);
+  if (cancelUrl) textLines.push(`Cancel: ${cancelUrl}`);
+
+  const htmlParts = [];
+  if (whenLabel) htmlParts.push(`<p>When: ${escapeHtml(whenLabel)}</p>`);
+  // joinUrl already scheme-gated above; escapeHtml still applied for entity safety.
+  if (joinUrl) htmlParts.push(`<p><a href="${escapeHtml(joinUrl)}">Join the meeting</a></p>`);
+  if (rescheduleUrl) htmlParts.push(`<a href="${escapeHtml(rescheduleUrl)}">Reschedule</a>`);
+  if (cancelUrl) {
+    const sep = rescheduleUrl ? ' &nbsp;|&nbsp; ' : '';
+    htmlParts.push(`${sep}<a href="${escapeHtml(cancelUrl)}">Cancel</a>`);
+  }
+
+  const smsLinks = [];
+  if (rescheduleUrl) smsLinks.push(`Reschedule: ${rescheduleUrl}`);
+  if (cancelUrl) smsLinks.push(`Cancel: ${cancelUrl}`);
+  if (joinUrl) smsLinks.push(`Join: ${joinUrl}`);
+
+  // FIX 11 (comment only — soak watch-item, NO behavior change):
+  // Two HS256 token URLs (reschedule + cancel) + a join URL can push this SMS body to
+  // ~6-7 segments once the STOP footer rides last (appendStopOnce in sendSms appends it).
+  // If carriers (Telnyx) start filtering or truncating multi-segment URL SMS, the
+  // follow-up is a short-link service (e.g. Dub) or email-only action links. Do NOT
+  // reduce the URL count here — the plan's done-bar explicitly includes time + join +
+  // reschedule + cancel in SMS. This is intentionally a SOAK WATCH-ITEM only.
+
+  return {
+    text: textLines.length ? '\n\n' + textLines.join('\n') : '',
+    html: htmlParts.length ? '\n' + htmlParts.join('\n') : '',
+    sms: smsLinks.length ? ' ' + smsLinks.join(' ') : '',
+  };
 }
 
 // Override/default rendering: unknown {{vars}} become '' (the §E14 editor promises a var
@@ -304,14 +367,23 @@ async function updateMessageStatus(ddb, pk, sk, status, error = '') {
 // Invoke send_email (SES) — the §E1 email-as-floor branch. send_email reads `event.body`
 // as a JSON string (API-Gateway-shaped), so wrap accordingly (mirrors notify.js).
 async function sendEmail(deps, message, content) {
-  // Attendee-facing reminder emails carry the unsubscribe line OUTSIDE the editable body
-  // (same invariant as SMS_STOP_FOOTER); coordinator attendance prompts do not.
+  // Attendee-facing reminder emails carry the action block + unsubscribe line OUTSIDE the
+  // editable body. The action block (G1 when/join/reschedule/cancel) is appended first,
+  // then appendStopOnce ensures STOP stays last. Coordinator attendance prompts get neither.
   const attendeeFacing = message.moment === 'reminder' && !message.attendance_check;
+  let textBody = content.text;
+  let htmlBody = content.html;
+  if (attendeeFacing) {
+    const actionBlock = buildActionBlock(message);
+    // Append action block (may be '' for old-shape rows), then STOP (always last).
+    textBody = appendStopOnce(textBody + actionBlock.text, STOP_LINE_TEXT);
+    htmlBody = appendStopOnce(htmlBody + actionBlock.html, STOP_LINE_HTML);
+  }
   const inner = {
     to: [message.recipient_email],
     subject: stripCrlf(content.subject),
-    text_body: attendeeFacing ? appendStopOnce(content.text, STOP_LINE_TEXT) : content.text,
-    html_body: attendeeFacing ? appendStopOnce(content.html, STOP_LINE_HTML) : content.html,
+    text_body: textBody,
+    html_body: htmlBody,
     tags: {
       tenant_id: String(message.tenant_id || 'unknown').slice(0, 256),
       email_type: 'scheduled_reminder',
@@ -325,6 +397,13 @@ async function sendEmail(deps, message, content) {
 }
 
 async function sendSms(deps, message, content) {
+  // G1: append the action block for attendee-facing reminders before STOP (STOP stays last).
+  const attendeeFacing = message.moment === 'reminder' && !message.attendance_check;
+  let smsBody = content.sms;
+  if (attendeeFacing) {
+    const actionBlock = buildActionBlock(message);
+    smsBody = smsBody + actionBlock.sms; // may be '' → no change for old-shape rows
+  }
   await deps.lambda.send(new InvokeCommand({
     FunctionName: SMS_SENDER_FUNCTION,
     InvocationType: 'Event',
@@ -334,7 +413,7 @@ async function sendSms(deps, message, content) {
       to: toE164(message.recipient_phone) || message.recipient_phone,
       // The STOP/HELP footer rides OUTSIDE the (possibly tenant-overridden) body — §E3/§E14
       // compliance invariant: an override can neither remove nor duplicate it.
-      body: appendStopOnce(content.sms, SMS_STOP_FOOTER),
+      body: appendStopOnce(smsBody, SMS_STOP_FOOTER),
       tenantId: message.tenant_id,
       formId: message.template || 'scheduled',
       submissionId: message.appointment_id || message.message_id,
@@ -465,6 +544,7 @@ export {
   reminderMomentFromRow,
   loadTemplateOverride,
   buildReminderContent,
+  buildActionBlock,
   REMINDER_TEMPLATES,
   SMS_STOP_FOOTER,
   STOP_LINE_TEXT,

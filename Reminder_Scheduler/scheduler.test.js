@@ -290,3 +290,115 @@ describe('rebindReminders — TOKEN-RESCHEDULE re-derives the schedule (WS-E-REM
     expect(created.some((c) => c.Name === 'sched-reminder-t15m-booking-abc123')).toBe(true);
   });
 });
+
+// ── G1: reminder row enrichment (reschedule/cancel/join links + whenLabel) ─────────────
+
+describe('G1 — reminder row enrichment (action links + whenLabel)', () => {
+  // G1: action links are minted by the COMMIT path (BCH buildActionLinks) and PASSED IN —
+  // scheduler.js imports no signing SDK. whenLabel is pure (Intl) and always computed.
+  const rescheduleUrl = 'https://schedule.myrecruiter.ai/reschedule?t=RTOKEN';
+  const cancelUrl = 'https://schedule.myrecruiter.ai/cancel?t=CTOKEN';
+
+  function makeG1Deps(extra = {}) {
+    return makeDeps({ ...extra });
+  }
+
+  test('G1: reminder rows carry reschedule_url, cancel_url, join_url, when_label when links passed', async () => {
+    const { deps, ddbCalls } = makeG1Deps();
+    await scheduler.scheduleReminders(
+      {
+        booking: baseBooking({ join_url: 'https://meet.google.com/abc' }),
+        rescheduleUrl,
+        cancelUrl,
+      },
+      deps
+    );
+    const rows = putRows(ddbCalls).filter((r) => r.tier !== undefined);
+    expect(rows.length).toBeGreaterThan(0);
+    // Every reminder row carries the passed-in action links + the computed time label.
+    rows.forEach((row) => {
+      expect(row).toHaveProperty('reschedule_url', rescheduleUrl);
+      expect(row).toHaveProperty('cancel_url', cancelUrl);
+      expect(row).toHaveProperty('join_url', 'https://meet.google.com/abc');
+      expect(row).toHaveProperty('when_label');
+      expect(typeof row.when_label).toBe('string');
+      expect(row.when_label.length).toBeGreaterThan(0);
+    });
+  });
+
+  test('G1: no links passed (mint failed / reconciler path) → rows still created, action links omitted, time still shown', async () => {
+    const { deps, ddbCalls } = makeG1Deps();
+    await scheduler.scheduleReminders(
+      { booking: baseBooking({ join_url: 'https://meet.google.com/xyz' }) },
+      deps
+    );
+    const rows = putRows(ddbCalls).filter((r) => r.tier !== undefined);
+    expect(rows.length).toBeGreaterThan(0);
+    rows.forEach((row) => {
+      // No reschedule/cancel links when none were minted/passed (fail-soft by absence).
+      expect(row).not.toHaveProperty('reschedule_url');
+      expect(row).not.toHaveProperty('cancel_url');
+      // when_label is pure (Intl) — always present so the reminder still shows the time.
+      expect(row).toHaveProperty('when_label');
+      // join still rides the booking row.
+      expect(row).toHaveProperty('join_url', 'https://meet.google.com/xyz');
+    });
+  });
+
+  test('G1: readBooking projects join_url (snake_case AND camelCase)', () => {
+    const snakeCase = scheduler.readBooking({ tenant_id: 'T', booking_id: 'B', start_at: 'S', join_url: 'https://join.example' });
+    expect(snakeCase.joinUrl).toBe('https://join.example');
+
+    const camelCase = scheduler.readBooking({ tenantId: 'T', bookingId: 'B', startAt: 'S', joinUrl: 'https://join.camel' });
+    expect(camelCase.joinUrl).toBe('https://join.camel');
+
+    // Old-shape row (missing join_url) → undefined, no crash.
+    const oldShape = scheduler.readBooking({ tenant_id: 'T', booking_id: 'B', start_at: 'S' });
+    expect(oldShape.joinUrl).toBeUndefined();
+  });
+
+  test('G1: buildReminderRow omits action-link fields when values are empty (old-shape compat)', () => {
+    const b = scheduler.readBooking(baseBooking());
+    const row = scheduler.buildReminderRow({
+      b, tier: 't24h', fireAtMs: Date.now() + 86400000,
+      tenantPrefsSnap: { notificationPrefs: { sms: false }, sms_quiet_hours: null },
+      config: { fromNumber: '', scheduledMessagesTable: 'x', stagingTestMode: false },
+      rescheduleUrl: '', cancelUrl: '', joinUrl: '', whenLabel: '',
+    });
+    // All falsy values → fields NOT set on the row
+    expect(row).not.toHaveProperty('reschedule_url');
+    expect(row).not.toHaveProperty('cancel_url');
+    expect(row).not.toHaveProperty('join_url');
+    expect(row).not.toHaveProperty('when_label');
+  });
+
+  test('G1: attendance row does NOT get action-link fields (coordinator-facing, not attendee)', async () => {
+    const { deps, ddbCalls } = makeG1Deps();
+    await scheduler.scheduleReminders(
+      { booking: baseBooking(), rescheduleUrl, cancelUrl },
+      deps
+    );
+    const rows = putRows(ddbCalls);
+    const attendanceRow = rows.find((r) => r.message_id && r.message_id.endsWith('#attendance'));
+    expect(attendanceRow).toBeDefined();
+    // attendance rows must NOT have action-link fields (coordinator can't opt out)
+    expect(attendanceRow).not.toHaveProperty('reschedule_url');
+    expect(attendanceRow).not.toHaveProperty('cancel_url');
+    expect(attendanceRow).not.toHaveProperty('join_url');
+  });
+
+  test('G1: forward-compatible read — booking rows without join_url field → no crash, no join link', async () => {
+    const { deps, ddbCalls } = makeG1Deps();
+    // baseBooking() has no join_url field
+    await scheduler.scheduleReminders(
+      { booking: baseBooking(), rescheduleUrl, cancelUrl },
+      deps
+    );
+    const rows = putRows(ddbCalls).filter((r) => r.tier !== undefined);
+    expect(rows.length).toBeGreaterThan(0);
+    // join_url omitted from rows (empty from readBooking → buildReminderRow omits it)
+    rows.forEach((row) => {
+      expect(row).not.toHaveProperty('join_url');
+    });
+  });
+});
