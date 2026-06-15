@@ -110,10 +110,11 @@ describe('CORS + parsing', () => {
 });
 
 describe('tenant + binding resolution', () => {
-  test('tenant hash not found → 404', async () => {
+  test('SR-2: unknown tenant hash → 401 (indistinguishable from no binding — no tenant oracle)', async () => {
     ddbMock.on(QueryCommand).resolves({ Items: [] });
     const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
-    expect(res.statusCode).toBe(404);
+    expect(res.statusCode).toBe(401);
+    expect(JSON.parse(res.body).error).toBe('session_expired');
   });
 
   test('binding missing/expired → 401', async () => {
@@ -165,6 +166,14 @@ describe('propose', () => {
     const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
     expect(res.statusCode).toBe(502);
   });
+
+  test('BLOCK-1: propose with a cancellation-intent binding → 403; BCH never invoked', async () => {
+    ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves(bindingRow('cancellation_intent'));
+    const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION, date: '2026-06-18' }));
+    expect(res.statusCode).toBe(403);
+    expect(JSON.parse(res.body).error).toBe('intent_mismatch');
+    expect(lambdaMock.commandCalls(InvokeCommand)).toHaveLength(0); // no freeBusy quota burn
+  });
 });
 
 describe('mutate', () => {
@@ -187,6 +196,43 @@ describe('mutate', () => {
   test('reschedule missing newSlot → 400', async () => {
     const res = await handler(evt({ action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule' }));
     expect(res.statusCode).toBe(400);
+  });
+
+  test('SR-1: reschedule with non-ISO newSlot → 400 invalid_newSlot; BCH not invoked', async () => {
+    const res = await handler(evt({
+      action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule',
+      newSlot: { start: 'not-a-date', end: 'also-bad' },
+    }));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('invalid_newSlot');
+    expect(lambdaMock.commandCalls(InvokeCommand)).toHaveLength(0);
+  });
+
+  test('SR-1: reschedule with start >= end → 400 invalid_newSlot', async () => {
+    const res = await handler(evt({
+      action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule',
+      newSlot: { start: '2026-06-18T18:30:00Z', end: '2026-06-18T18:00:00Z' },
+    }));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('invalid_newSlot');
+  });
+
+  test('SR-1: reschedule with oversized newSlot string → 400 invalid_newSlot', async () => {
+    const res = await handler(evt({
+      action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule',
+      newSlot: { start: '2026-06-18T18:00:00Z' + 'A'.repeat(60), end: '2026-06-18T18:30:00Z' },
+    }));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('invalid_newSlot');
+  });
+
+  test('SR-1: reschedule with a non-string newSlot field → 400 invalid_newSlot', async () => {
+    const res = await handler(evt({
+      action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule',
+      newSlot: { start: 12345, end: '2026-06-18T18:30:00Z' },
+    }));
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toBe('invalid_newSlot');
   });
 
   test('intent mismatch (reschedule binding, cancel request) → 403', async () => {
