@@ -176,6 +176,7 @@ describe('volunteer-facing: valid → bind + redirect', () => {
     expect(loc.searchParams.get('t')).toBe(TENANT_HASH);
     expect(loc.searchParams.get('purpose')).toBe('cancel'); // page renders cancel framing
     expect(res.headers.location).not.toContain(TENANT); // never the raw tenant_id
+    expect(res.headers['referrer-policy']).toBe('no-referrer'); // REF-1: don't leak ?session= via Referer
 
     // §13.7: the jti was burned (PutItem to the jti table).
     const jtiPuts = ddbMock

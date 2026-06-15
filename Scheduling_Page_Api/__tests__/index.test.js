@@ -12,6 +12,7 @@ const {
   DynamoDBClient,
   GetItemCommand,
   QueryCommand,
+  DeleteItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 
@@ -80,6 +81,7 @@ beforeEach(() => {
   // binding row (rescheduling by default) + booking row — table-specific matchers
   ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves(bindingRow('rescheduling_intent'));
   ddbMock.on(GetItemCommand, { TableName: BOOKING_TABLE }).resolves(bookingRow());
+  ddbMock.on(DeleteItemCommand).resolves({}); // REPLAY-1 binding burn
   // BCH invoke default: propose ok
   lambdaMock.on(InvokeCommand).resolves(
     bchPayload({ outcome: 'ok', slots: [{ slotId: 's1', label: '1:00 PM', start: 'x', end: 'y' }], context: { duration_minutes: 30 } })
@@ -109,23 +111,44 @@ describe('CORS + parsing', () => {
   });
 });
 
-describe('tenant + binding resolution', () => {
-  test('tenant hash not found → 404', async () => {
+describe('tenant + binding resolution (ENUM-1: pre-auth failures uniformly 401)', () => {
+  test('tenant hash not found → 401 unauthorized', async () => {
     ddbMock.on(QueryCommand).resolves({ Items: [] });
     const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
-    expect(res.statusCode).toBe(404);
+    expect(res.statusCode).toBe(401);
+    expect(JSON.parse(res.body).error).toBe('unauthorized');
   });
 
-  test('binding missing/expired → 401', async () => {
+  test('binding missing/expired → 401 unauthorized', async () => {
     ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves({}); // no Item
+    const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
+    expect(res.statusCode).toBe(401);
+    expect(JSON.parse(res.body).error).toBe('unauthorized');
+  });
+
+  test('booking not found → 401 unauthorized (no booking-state oracle)', async () => {
+    ddbMock.on(GetItemCommand, { TableName: BOOKING_TABLE }).resolves({});
     const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
     expect(res.statusCode).toBe(401);
   });
 
-  test('booking not found → 404', async () => {
-    ddbMock.on(GetItemCommand, { TableName: BOOKING_TABLE }).resolves({});
+  test('binding with no booking_id → 401 unauthorized', async () => {
+    ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves({
+      Item: {
+        tenantId: { S: TENANT },
+        session_id: { S: `binding#${SESSION}` },
+        intent: { S: 'rescheduling_intent' },
+        expires_at: { N: String(FAR_FUTURE_MS) },
+      },
+    });
     const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
-    expect(res.statusCode).toBe(404);
+    expect(res.statusCode).toBe(401);
+  });
+
+  test('recovery_intent binding → 403 forbidden (INTENT-1: page API is reschedule/cancel only)', async () => {
+    ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves(bindingRow('recovery_intent'));
+    const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
+    expect(res.statusCode).toBe(403);
   });
 
   test('registry read error → 500', async () => {
@@ -150,7 +173,11 @@ describe('propose', () => {
     expect(payload.action).toBe('scheduling_propose');
     expect(payload.appointmentTypeId).toBe('intro-call');
     expect(payload.userTimeZone).toBe('America/Chicago');
-    expect(payload.date_window).toEqual({ start: '2026-06-18T00:00:00', end: '2026-06-18T23:59:59' });
+    // TZ-1: the day Jun 18 in America/Chicago (CDT, UTC-5) → UTC bounds 05:00Z → next-day 04:59:59Z.
+    expect(payload.date_window).toEqual({
+      start: '2026-06-18T05:00:00.000Z',
+      end: '2026-06-19T04:59:59.000Z',
+    });
   });
 
   test('no date → propose without date_window (whole horizon)', async () => {
@@ -182,11 +209,35 @@ describe('mutate', () => {
     expect(payload.coordinatorId).toBe('emp-maya'); // resource_id wins
     expect(payload.newSlot.start).toBe('2026-06-18T18:00:00Z');
     expect(payload.booking.appointment_type_id).toBe('intro-call');
+    // REPLAY-1: binding burned after the successful calendar op
+    const dels = ddbMock.commandCalls(DeleteItemCommand);
+    expect(dels).toHaveLength(1);
+    expect(dels[0].args[0].input.Key.session_id.S).toBe(`binding#${SESSION}`);
   });
 
   test('reschedule missing newSlot → 400', async () => {
     const res = await handler(evt({ action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule' }));
     expect(res.statusCode).toBe(400);
+  });
+
+  test('VAL-1: non-ISO / inverted newSlot → 400, no BCH invoke', async () => {
+    for (const bad of [
+      { start: 'tomorrow', end: '2026-06-18T18:30:00Z' },
+      { start: '2026-06-18', end: '2026-06-18' },
+      { start: '2026-06-18T18:30:00Z', end: '2026-06-18T18:00:00Z' }, // end before start
+    ]) {
+      lambdaMock.reset();
+      const res = await handler(evt({ action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule', newSlot: bad }));
+      expect(res.statusCode).toBe(400);
+      expect(lambdaMock.commandCalls(InvokeCommand)).toHaveLength(0);
+    }
+  });
+
+  test('REPLAY-1: binding NOT burned when the mutate fails', async () => {
+    ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves(bindingRow('cancellation_intent'));
+    lambdaMock.on(InvokeCommand).resolves(bchPayload({ outcome: 'failed' }));
+    await handler(evt({ action: 'mutate', t: HASH, session: SESSION, mutation: 'cancel' }));
+    expect(ddbMock.commandCalls(DeleteItemCommand)).toHaveLength(0);
   });
 
   test('intent mismatch (reschedule binding, cancel request) → 403', async () => {
@@ -236,10 +287,11 @@ describe('mutate', () => {
 });
 
 describe('_internal helpers', () => {
-  test('coordinatorIdOf precedence: binding.coordinator_id > resource_id > coordinator_email', () => {
+  test('OAUTH-1: coordinatorIdOf = binding.coordinator_id > resource_id; NEVER coordinator_email', () => {
     expect(_internal.coordinatorIdOf({ resource_id: 'r', coordinator_email: 'e' }, { coordinator_id: 'b' })).toBe('b');
     expect(_internal.coordinatorIdOf({ resource_id: 'r', coordinator_email: 'e' }, {})).toBe('r');
-    expect(_internal.coordinatorIdOf({ coordinator_email: 'e' }, {})).toBe('e');
+    // email is NOT the OAuth secret-path key — must NOT be used as coordinatorId
+    expect(_internal.coordinatorIdOf({ coordinator_email: 'e' }, {})).toBeNull();
     expect(_internal.coordinatorIdOf({}, {})).toBeNull();
   });
 

@@ -33,6 +33,7 @@ const {
   DynamoDBClient,
   GetItemCommand,
   QueryCommand,
+  DeleteItemCommand,
 } = require('@aws-sdk/client-dynamodb');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { NodeHttpHandler } = require('@smithy/node-http-handler');
@@ -50,6 +51,19 @@ const BCH_FUNCTION =
 const ALLOWED_ORIGIN =
   process.env.PAGE_ALLOWED_ORIGIN || 'https://staging.chat.myrecruiter.ai';
 const DEFAULT_TZ = process.env.DEFAULT_TIMEZONE || 'America/Chicago';
+// The §B10 binding row lives in the conversation-scheduling-session table at SK
+// `binding#<sessionId>` (same default sessionBinding.js uses). We delete it after a
+// successful mutate (one-time-use — no replay of the real calendar op).
+const SCHEDULING_SESSION_TABLE =
+  process.env.SCHEDULING_SESSION_TABLE ||
+  `picasso-conversation-scheduling-session-${ENV}`;
+
+// newSlot timestamps must be RFC3339/ISO-8601 with an explicit offset/Z — arbitrary
+// strings would reach the Google Calendar API. (SEC-S3.)
+const ISO_DATETIME_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const MAX_HASH_LEN = 128;
+const MAX_SESSION_LEN = 64;
 
 const REQUEST_TIMEOUT_MS = Number(process.env.AWS_REQUEST_TIMEOUT_MS || 5000);
 const CONNECTION_TIMEOUT_MS = Number(process.env.AWS_CONNECTION_TIMEOUT_MS || 3000);
@@ -84,7 +98,10 @@ function warn(event, fields) {
   console.warn(JSON.stringify({ event, level: 'WARN', ...fields }));
 }
 
-// ─── responses (CORS-locked to the page origin) ─────────────────────────────────────
+// ─── responses ──────────────────────────────────────────────────────────────────────
+// NOTE: CORS is a BROWSER-enforced convention, NOT a server security boundary — a non-
+// browser caller (curl/SSR) ignores it entirely. Auth is the §B10 binding, never CORS.
+// `Referrer-Policy: no-referrer` keeps the ?session=/?t= from leaking via Referer (SEC-S2).
 function corsHeaders() {
   return {
     'access-control-allow-origin': ALLOWED_ORIGIN,
@@ -92,6 +109,7 @@ function corsHeaders() {
     'access-control-allow-headers': 'content-type',
     'access-control-max-age': '600',
     vary: 'origin',
+    'referrer-policy': 'no-referrer',
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
   };
@@ -163,16 +181,56 @@ async function getBooking(tenantId, bookingId) {
   return res && res.Item ? unmarshall(res.Item) : null;
 }
 
-// booking → coordinatorId (mirror schedulingFlow._executeViaExecutor / calendarIdOf):
-// binding.coordinator_id → booking.resource_id → booking.coordinator_email.
+// booking → coordinatorId. coordinatorId is the OAuth secret-path key
+// (picasso/scheduling/oauth/{tenantId}/{coordinatorId}) = the routing resource_id, NOT the
+// coordinator EMAIL. Falling back to the email routes BCH's getOAuthClient to a non-existent
+// secret → silent failure (OAUTH-1). So: binding.coordinator_id → booking.resource_id only.
 function coordinatorIdOf(booking, binding) {
   return (
     (binding && binding.coordinator_id) ||
     booking.resource_id ||
     booking.resourceId ||
-    booking.coordinator_email ||
-    booking.coordinatorEmail ||
     null
+  );
+}
+
+// Full-day UTC window for a calendar day `dateIso` (YYYY-MM-DD) in tenant tz `tz`.
+// The naive `${date}T00:00:00` (no offset) is parsed as UTC in the Lambda → a user west of
+// the coordinator loses that day's later slots (TZ-1). We resolve the tz's UTC offset for
+// the date (sampled at local noon to dodge the midnight DST edge) and shift the bounds.
+function zonedDayWindowUTC(dateIso, tz) {
+  const [y, m, d] = dateIso.split('-').map(Number);
+  const noonUTC = Date.UTC(y, m - 1, d, 12, 0, 0);
+  let offsetMs = 0;
+  try {
+    const dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz, hour12: false,
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit',
+    });
+    const p = Object.fromEntries(
+      dtf.formatToParts(new Date(noonUTC)).filter((x) => x.type !== 'literal').map((x) => [x.type, +x.value])
+    );
+    // hour can come back as 24 for midnight in some engines — normalize.
+    const hh = p.hour === 24 ? 0 : p.hour;
+    const wallAsUTC = Date.UTC(p.year, p.month - 1, p.day, hh, p.minute, p.second);
+    offsetMs = wallAsUTC - noonUTC; // tz is ahead of UTC by offsetMs
+  } catch (_) {
+    offsetMs = 0; // bad tz → fall back to UTC bounds (no worse than before)
+  }
+  const startUTC = Date.UTC(y, m - 1, d, 0, 0, 0) - offsetMs;
+  const endUTC = Date.UTC(y, m - 1, d, 23, 59, 59) - offsetMs;
+  return { start: new Date(startUTC).toISOString(), end: new Date(endUTC).toISOString() };
+}
+
+// One-time-use: burn the §B10 binding after a successful mutate so the real calendar op
+// cannot be replayed for the rest of the 30-min TTL (REPLAY-1). Best-effort.
+async function deleteBinding(tenantId, sessionId) {
+  await ddb.send(
+    new DeleteItemCommand({
+      TableName: SCHEDULING_SESSION_TABLE,
+      Key: { tenantId: { S: tenantId }, session_id: { S: `binding#${sessionId}` } },
+    })
   );
 }
 
@@ -203,13 +261,19 @@ exports.handler = async (event) => {
   if (!body) return json(400, { error: 'bad_request' });
 
   const action = body.action;
-  const tenantHash = typeof body.t === 'string' ? body.t : null;
-  const sessionId = typeof body.session === 'string' ? body.session : null;
+  const tenantHash =
+    typeof body.t === 'string' && body.t.length <= MAX_HASH_LEN ? body.t : null;
+  const sessionId =
+    typeof body.session === 'string' && body.session.length <= MAX_SESSION_LEN
+      ? body.session
+      : null;
   if (!tenantHash || !sessionId || (action !== 'propose' && action !== 'mutate')) {
     return json(400, { error: 'missing_params' });
   }
 
-  // hash → tenantId
+  // hash → tenantId. ENUM-1: every PRE-auth failure (bad hash, missing/expired binding,
+  // booking gone) returns an IDENTICAL 401 — no differential oracle to enumerate tenants /
+  // live sessions / booking state. Server logs still distinguish for ops.
   let tenantId;
   try {
     tenantId = await getTenantIdByHash(tenantHash);
@@ -219,10 +283,10 @@ exports.handler = async (event) => {
   }
   if (!tenantId) {
     log('gw_tenant_not_found', {});
-    return json(404, { error: 'not_found' });
+    return json(401, { error: 'unauthorized' });
   }
 
-  // resolve the §B10 binding (the auth). Missing/expired → 401.
+  // resolve the §B10 binding (the auth).
   let binding;
   try {
     binding = await resolveBinding({ tenantId, sessionId });
@@ -232,10 +296,19 @@ exports.handler = async (event) => {
   }
   if (!binding) {
     log('gw_binding_missing_or_expired', { tenant_id: tenantId });
-    return json(401, { error: 'session_expired' });
+    return json(401, { error: 'unauthorized' });
   }
   if (!binding.booking_id) {
-    return json(400, { error: 'no_booking' });
+    log('gw_binding_no_booking', { tenant_id: tenantId });
+    return json(401, { error: 'unauthorized' });
+  }
+
+  // Intent gate (SEC-S1): only a reschedule/cancel binding may use the page API. A
+  // recovery_intent binding must not enumerate availability. (cancel mode calls propose
+  // once for the booking summary, so both reschedule + cancel intents are allowed here.)
+  if (binding.intent !== 'rescheduling_intent' && binding.intent !== 'cancellation_intent') {
+    log('gw_intent_unsupported', { tenant_id: tenantId, intent: binding.intent });
+    return json(403, { error: 'forbidden' });
   }
 
   // load the booking
@@ -252,7 +325,7 @@ exports.handler = async (event) => {
   }
   if (!booking) {
     log('gw_booking_not_found', { tenant_id: tenantId });
-    return json(404, { error: 'booking_not_found' });
+    return json(401, { error: 'unauthorized' });
   }
 
   // ── propose: that day's available times (deterministic, read-only) ──
@@ -271,11 +344,9 @@ exports.handler = async (event) => {
       userTimeZone,
     };
     // Optional single-day window (the calendar / quick-day buttons pass ?date=YYYY-MM-DD).
+    // TZ-1: bound the day in the tenant timezone, emitted as UTC ISO (not naive local).
     if (typeof body.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(body.date)) {
-      payload.date_window = {
-        start: `${body.date}T00:00:00`,
-        end: `${body.date}T23:59:59`,
-      };
+      payload.date_window = zonedDayWindowUTC(body.date, userTimeZone);
     }
     let res;
     try {
@@ -332,6 +403,15 @@ exports.handler = async (event) => {
   if (mutation === 'reschedule') {
     const ns = body.newSlot;
     if (!ns || !ns.start || !ns.end) return json(400, { error: 'missing_newSlot' });
+    // VAL-1: only ISO-8601 timestamps with an explicit offset, start strictly before end —
+    // arbitrary strings would reach the Google Calendar API.
+    if (
+      !ISO_DATETIME_RE.test(ns.start) ||
+      !ISO_DATETIME_RE.test(ns.end) ||
+      !(new Date(ns.start) < new Date(ns.end))
+    ) {
+      return json(400, { error: 'invalid_slot' });
+    }
     payload.newSlot = { start: ns.start, end: ns.end };
   }
 
@@ -345,6 +425,16 @@ exports.handler = async (event) => {
   const outcome = (res && res.outcome) || 'failed';
   const ok =
     outcome === 'success' || outcome === 'deleted' || outcome === 'pending_calendar_sync';
+  // REPLAY-1: one-time-use — burn the binding after a successful real calendar op so it
+  // can't be replayed for the rest of the 30-min TTL. Best-effort (the mutate already
+  // succeeded; a failed delete just leaves it redeemable until TTL — log, don't fail).
+  if (ok) {
+    try {
+      await deleteBinding(tenantId, sessionId);
+    } catch (err) {
+      warn('gw_binding_burn_failed', { mutation, tenant_id: tenantId, name: err && err.name });
+    }
+  }
   log('gw_mutated', { mutation, tenant_id: tenantId, outcome });
   return json(ok ? 200 : 502, { outcome });
 };

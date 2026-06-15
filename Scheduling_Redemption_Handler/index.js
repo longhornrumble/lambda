@@ -212,7 +212,10 @@ function page(statusCode, title, body) {
 function redirect(location) {
   return {
     statusCode: 302,
-    headers: { location, 'cache-control': 'no-store' },
+    // Referrer-Policy: no-referrer — the Location carries ?session=&t=<hash> (the §B10
+    // binding id + tenant hash). Without it the browser leaks the full URL via Referer to
+    // any third-party resource the landing page loads (REF-1 / SEC-S2).
+    headers: { location, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' },
     body: '',
   };
 }
