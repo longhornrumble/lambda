@@ -76,6 +76,13 @@ const INTENT_FOR = Object.freeze({
   cancel: 'cancellation_intent',
 });
 
+// SR-1: a full ISO-8601 datetime (date + time, optional fractional seconds + Z/offset).
+// newSlot.start/end are forwarded to BCH for the reschedule commit; BCH re-validates,
+// but the gateway claims to be the validated input surface — reject malformed/oversized
+// values here rather than relay them.
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/;
+const MAX_SLOT_LEN = 40; // a well-formed ISO datetime is <= ~33 chars; cap to bound payload size.
+
 // ─── logging (no PII) ───────────────────────────────────────────────────────────────
 function log(event, fields) {
   console.log(JSON.stringify({ event, ...fields }));
@@ -218,8 +225,13 @@ exports.handler = async (event) => {
     return json(500, { error: 'server_error' });
   }
   if (!tenantId) {
+    // SR-2: return the SAME 401 as a missing/expired binding so an unknown
+    // tenantHash is indistinguishable from a valid hash without a binding — closes
+    // the tenant-existence oracle on the opaque hash. The FE treats 401 uniformly
+    // ("reopen the link"). (booking_not_found below stays distinct: it is POST-auth,
+    // i.e. the binding holder learning their own booking is gone — not an oracle.)
     log('gw_tenant_not_found', {});
-    return json(404, { error: 'not_found' });
+    return json(401, { error: 'session_expired' });
   }
 
   // resolve the §B10 binding (the auth). Missing/expired → 401.
@@ -257,6 +269,14 @@ exports.handler = async (event) => {
 
   // ── propose: that day's available times (deterministic, read-only) ──
   if (action === 'propose') {
+    // BLOCK-1: propose (the day/time picker) only makes sense for a reschedule.
+    // A cancellation-intent binding must NOT be able to query coordinator
+    // availability (data leak) or burn a Google freeBusy call. Mirror the mutate
+    // intent-gate below.
+    if (binding.intent !== INTENT_FOR.reschedule) {
+      log('gw_intent_mismatch', { action: 'propose', intent: binding.intent });
+      return json(403, { error: 'intent_mismatch' });
+    }
     const apptId = booking.appointment_type_id || booking.appointmentTypeId;
     if (!apptId) {
       log('gw_no_appointment_type', { tenant_id: tenantId });
@@ -332,6 +352,19 @@ exports.handler = async (event) => {
   if (mutation === 'reschedule') {
     const ns = body.newSlot;
     if (!ns || !ns.start || !ns.end) return json(400, { error: 'missing_newSlot' });
+    // SR-1: validate format + length + ordering before forwarding to BCH.
+    if (
+      typeof ns.start !== 'string' ||
+      typeof ns.end !== 'string' ||
+      ns.start.length > MAX_SLOT_LEN ||
+      ns.end.length > MAX_SLOT_LEN ||
+      !ISO_DATETIME_RE.test(ns.start) ||
+      !ISO_DATETIME_RE.test(ns.end) ||
+      !(new Date(ns.start).getTime() < new Date(ns.end).getTime())
+    ) {
+      log('gw_invalid_newSlot', { tenant_id: tenantId });
+      return json(400, { error: 'invalid_newSlot' });
+    }
     payload.newSlot = { start: ns.start, end: ns.end };
   }
 
