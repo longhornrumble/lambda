@@ -34,6 +34,7 @@ on:
           - Calendar_Watch_Offboarder
           - Booking_Commit_Handler
           - Scheduling_Redemption_Handler
+          - Scheduling_Page_Api
           - Calendar_Event_Consumer
           - Calendar_Lifecycle_Consumer
           - Calendar_OAuth_Connect
@@ -76,6 +77,7 @@ jobs:
       calendar_watch_renewer: ${{ steps.filter.outputs.calendar_watch_renewer }}
       calendar_watch_offboarder: ${{ steps.filter.outputs.calendar_watch_offboarder }}
       booking_commit_handler: ${{ steps.filter.outputs.booking_commit_handler }}
+      scheduling_page_api: ${{ steps.filter.outputs.scheduling_page_api }}
       calendar_oauth_connect: ${{ steps.filter.outputs.calendar_oauth_connect }}
       reminder_scheduler: ${{ steps.filter.outputs.reminder_scheduler }}
       scheduled_message_sender: ${{ steps.filter.outputs.scheduled_message_sender }}
@@ -126,6 +128,12 @@ jobs:
               # after such a change:
               #   gh workflow run "Deploy Lambda — Staging" -f lambda=Booking_Commit_Handler
               - 'Booking_Commit_Handler/**'
+            scheduling_page_api:
+              # Scheduling PAGE M1 gateway. Dir-only — like C8/redemption it *bundles*
+              # shared/scheduling/sessionBinding.js, so a shared/scheduling-only change
+              # WITHOUT a Scheduling_Page_Api/** change won't auto-rebundle; redeploy manually:
+              #   gh workflow run "Deploy Lambda — Staging" -f lambda=Scheduling_Page_Api
+              - 'Scheduling_Page_Api/**'
             calendar_oauth_connect:
               # E11 per-staff Google consent Lambda (G3). Dir-only — like C8/redemption it
               # *bundles* shared/scheduling/featureGate.js, so a shared/scheduling-only change
@@ -182,6 +190,7 @@ jobs:
       needs.detect-changes.outputs.calendar_watch_renewer == 'true' ||
       needs.detect-changes.outputs.calendar_watch_offboarder == 'true' ||
       needs.detect-changes.outputs.booking_commit_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_page_api == 'true' ||
       needs.detect-changes.outputs.calendar_oauth_connect == 'true' ||
       needs.detect-changes.outputs.reminder_scheduler == 'true' ||
       needs.detect-changes.outputs.scheduled_message_sender == 'true' ||
@@ -598,6 +607,36 @@ jobs:
             # Public Function URL, but every path is token-gated — an unauthenticated
             # synthetic probe would 4xx (no token) rather than exercise a real flow.
             # Live smoke is the integrator's curl of the redemption host post-deploy.
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
+          - source_dir: Scheduling_Page_Api
+            # Scheduling PAGE M1 (lambda#330) — the deterministic Calendly-style
+            # reschedule/cancel gateway (the same-origin /schedule-api endpoint behind
+            # cloudfront-widget-staging). Node.js esbuild bundle (npm run package =
+            # node esbuild.config.mjs + zip); bundles ../shared/scheduling/sessionBinding.js
+            # with @aws-sdk/* externalized (Lambda runtime provides v3), so — like
+            # Scheduling_Redemption_Handler — NO shared/scheduling npm install needed.
+            # Dir-filtered (detect-changes scheduling_page_api) so a Scheduling_Page_Api/**
+            # change auto-deploys. A shared/scheduling-only change (e.g. sessionBinding.js)
+            # WITHOUT a Scheduling_Page_Api/** change won't auto-rebundle — redeploy manually:
+            #   gh workflow run "Deploy Lambda — Staging" -f lambda=Scheduling_Page_Api
+            # Function provisioned by Terraform in picasso infra/ module
+            # lambda-scheduling-page-api-staging; this entry ships the real code over the
+            # placeholder. Env vars Terraform-managed there.
+            # NOTE: the staging function will not exist until that infra module is APPLIED —
+            # do not merge/dispatch before then or update-function-code 404s (fail-fast:false,
+            # so it fails in isolation). Also: the public Function URL needs the one-time
+            # Console "2nd resource-policy statement" step (see the TF module header) before
+            # /schedule-api returns anything but 403.
+            staging_function: Scheduling_Page_Api
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # Public Function URL, but binding-gated — an unauthenticated synthetic probe
+            # 401s (no valid §B10 binding) rather than exercise a real flow. Live smoke is
+            # the integrator's curl of /schedule-api post-deploy (expect 401, not 403).
             smoke_path: ''
             smoke_expect_status: ''
             smoke_invoke_event: ''
