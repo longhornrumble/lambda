@@ -269,20 +269,28 @@ exports.handler = async (event) => {
 
   // ── propose: that day's available times (deterministic, read-only) ──
   if (action === 'propose') {
-    // BLOCK-1: propose (the day/time picker) only makes sense for a reschedule.
-    // A cancellation-intent binding must NOT be able to query coordinator
-    // availability (data leak) or burn a Google freeBusy call. Mirror the mutate
-    // intent-gate below.
+    const userTimeZone = booking.timezone || booking.timeZone || DEFAULT_TZ;
+    // Hero context (current appointment) — from the already-loaded booking (no extra read).
+    // The page renders "Current appointment: <formatted current_start_at>" below the headline
+    // in BOTH reschedule and cancel mode, so propose returns it regardless of intent.
+    const hero = {
+      appointment_label: booking.appointment_type_name || booking.appointmentTypeName || null,
+      current_start_at: booking.start_at || booking.startAt || null,
+      timezone: userTimeZone,
+    };
+    // BLOCK-1: only a RESCHEDULING binding may query availability (the BCH freeBusy call). A
+    // cancellation binding gets the hero context ONLY — no slots, no BCH invoke — so it cannot
+    // leak the coordinator's availability or burn a Google freeBusy quota call. The cancel page
+    // calls propose on mount purely for the hero; the actual cancel goes through `mutate`.
     if (binding.intent !== INTENT_FOR.reschedule) {
-      log('gw_intent_mismatch', { action: 'propose', intent: binding.intent });
-      return json(403, { error: 'intent_mismatch' });
+      log('gw_propose_hero_only', { tenant_id: tenantId, intent: binding.intent });
+      return json(200, { outcome: 'ok', slots: [], context: null, ...hero });
     }
     const apptId = booking.appointment_type_id || booking.appointmentTypeId;
     if (!apptId) {
       log('gw_no_appointment_type', { tenant_id: tenantId });
       return json(409, { error: 'no_appointment_type' });
     }
-    const userTimeZone = booking.timezone || booking.timeZone || DEFAULT_TZ;
     const payload = {
       action: 'scheduling_propose',
       tenantId,
@@ -313,11 +321,7 @@ exports.handler = async (event) => {
       outcome: (res && res.outcome) || 'failed',
       slots: (res && res.slots) || [],
       context: (res && res.context) || null,
-      // Hero context (no extra read — the booking is already loaded). Lets the page render
-      // "Current appointment: <formatted current_start_at in timezone>" below the headline.
-      appointment_label: booking.appointment_type_name || booking.appointmentTypeName || null,
-      current_start_at: booking.start_at || booking.startAt || null,
-      timezone: userTimeZone,
+      ...hero,
     });
   }
 

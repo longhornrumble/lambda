@@ -167,11 +167,17 @@ describe('propose', () => {
     expect(res.statusCode).toBe(502);
   });
 
-  test('BLOCK-1: propose with a cancellation-intent binding → 403; BCH never invoked', async () => {
+  test('BLOCK-1: propose with a cancellation-intent binding → 200 hero-only (no slots, BCH NOT invoked)', async () => {
+    // The cancel page calls propose on mount purely for the hero (current appointment). It must
+    // get that hero, but with NO availability + NO BCH freeBusy call (BLOCK-1's security intent).
     ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves(bindingRow('cancellation_intent'));
     const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION, date: '2026-06-18' }));
-    expect(res.statusCode).toBe(403);
-    expect(JSON.parse(res.body).error).toBe('intent_mismatch');
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.outcome).toBe('ok');
+    expect(body.slots).toEqual([]); // no coordinator availability leaked to a cancel binding
+    expect(body.appointment_label).toBe('Intro Call'); // hero from the loaded booking
+    expect(body.current_start_at).toBe('2026-06-15T15:30:00Z');
     expect(lambdaMock.commandCalls(InvokeCommand)).toHaveLength(0); // no freeBusy quota burn
   });
 });
