@@ -233,6 +233,16 @@ describe('mutate', () => {
     }
   });
 
+  test('VAL-1: valid offset/fractional ISO slots are accepted', async () => {
+    lambdaMock.on(InvokeCommand).resolves(bchPayload({ outcome: 'success' }));
+    const res = await handler(evt({
+      action: 'mutate', t: HASH, session: SESSION, mutation: 'reschedule',
+      newSlot: { start: '2026-06-18T18:00:00+05:30', end: '2026-06-18T18:30:00.500+05:30' },
+    }));
+    expect(res.statusCode).toBe(200);
+    expect(lambdaMock.commandCalls(InvokeCommand)).toHaveLength(1);
+  });
+
   test('REPLAY-1: binding NOT burned when the mutate fails', async () => {
     ddbMock.on(GetItemCommand, { TableName: SESSION_TABLE }).resolves(bindingRow('cancellation_intent'));
     lambdaMock.on(InvokeCommand).resolves(bchPayload({ outcome: 'failed' }));

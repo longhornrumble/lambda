@@ -216,7 +216,8 @@ function zonedDayWindowUTC(dateIso, tz) {
     const wallAsUTC = Date.UTC(p.year, p.month - 1, p.day, hh, p.minute, p.second);
     offsetMs = wallAsUTC - noonUTC; // tz is ahead of UTC by offsetMs
   } catch (_) {
-    offsetMs = 0; // bad tz → fall back to UTC bounds (no worse than before)
+    warn('gw_bad_timezone', { tz }); // observability — a misconfigured booking.timezone
+    offsetMs = 0; // fall back to UTC bounds (no worse than the pre-fix behavior)
   }
   const startUTC = Date.UTC(y, m - 1, d, 0, 0, 0) - offsetMs;
   const endUTC = Date.UTC(y, m - 1, d, 23, 59, 59) - offsetMs;
