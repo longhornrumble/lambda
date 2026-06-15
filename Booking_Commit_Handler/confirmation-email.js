@@ -88,7 +88,12 @@ function toIcsUtc(iso) {
   return `${d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')}`;
 }
 
-function buildIcs({ bookingId, summary, description, location, start, end, organizerEmail, attendeeEmail, dtstamp }) {
+function buildIcs({ bookingId, summary, description, location, start, end, organizerEmail, attendeeEmail, dtstamp, sequence = 0 }) {
+  // RFC 5545 §3.8.7.4: SEQUENCE is a non-negative integer; an UPDATE to an existing
+  // event (same UID) MUST carry a higher SEQUENCE than the revision the client already
+  // holds, or the client ignores it. Commit = 0; each reschedule passes the booking's
+  // bumped ics_sequence so the re-sent invite updates in place. Clamp defensively.
+  const seq = Number.isInteger(sequence) && sequence >= 0 ? sequence : 0;
   const lines = [
     'BEGIN:VCALENDAR',
     'VERSION:2.0',
@@ -97,12 +102,11 @@ function buildIcs({ bookingId, summary, description, location, start, end, organ
     'BEGIN:VEVENT',
     `UID:${escapeIcsText(bookingId)}@myrecruiter.ai`,
     // RFC 5545 §3.8.7.2: DTSTAMP is when the iCalendar object was CREATED (now),
-    // NOT the event start. SEQUENCE:0 is the initial revision (future
-    // reschedule/cancel .ics for the same UID increment it so clients update).
+    // NOT the event start.
     `DTSTAMP:${toIcsUtc(dtstamp || new Date().toISOString())}`,
     `DTSTART:${toIcsUtc(start)}`,
     `DTEND:${toIcsUtc(end)}`,
-    `SEQUENCE:0`,
+    `SEQUENCE:${seq}`,
     `SUMMARY:${escapeIcsText(summary)}`,
   ];
   if (description) lines.push(`DESCRIPTION:${escapeIcsText(description)}`);
@@ -316,6 +320,12 @@ async function sendConfirmationEmail(args, opts = {}) {
     start, end, whenLabel, joinUrl, deepLink,
     startAt, cancellationWindowHours,
     agenda,
+    // .ics revision (RFC 5545 SEQUENCE). Commit omits it → 0; reschedule passes the
+    // booking's bumped ics_sequence so the re-sent invite updates the entry in place.
+    sequence,
+    // SES email_type tag — distinguishes the initial booking confirmation from a
+    // reschedule confirmation in SES Event Destinations / metrics. Default unchanged.
+    emailType = 'booking_confirmation',
   } = args;
 
   if (!attendeeEmail) throw new Error('attendeeEmail is required for the confirmation email');
@@ -353,6 +363,7 @@ async function sendConfirmationEmail(args, opts = {}) {
     end,
     organizerEmail: coordinatorEmail,
     attendeeEmail,
+    sequence, // 0 (commit) or the reschedule's bumped ics_sequence
     // dtstamp defaults to now() inside buildIcs (RFC 5545 — not the event start).
   });
 
@@ -384,7 +395,8 @@ async function sendConfirmationEmail(args, opts = {}) {
     ConfigurationSetName: CONFIG_SET,
     Tags: [
       { Name: 'tenant_id', Value: String(tenantId || 'unknown').slice(0, 256) },
-      { Name: 'email_type', Value: 'booking_confirmation' },
+      // SES tag values are restricted to [A-Za-z0-9_-]; clamp to the known set.
+      { Name: 'email_type', Value: emailType === 'reschedule_confirmation' ? 'reschedule_confirmation' : 'booking_confirmation' },
     ],
   }));
 

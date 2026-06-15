@@ -55,6 +55,22 @@ describe('buildIcs', () => {
     });
     expect(ics).toContain('SUMMARY:A\\; B\\, C\\\\D');
   });
+
+  it('defaults SEQUENCE to 0 (commit revision) when sequence is omitted', () => {
+    const ics = email.buildIcs({ bookingId: 'b', summary: 's', start: ARGS.start, end: ARGS.end });
+    expect(ics).toContain('SEQUENCE:0');
+  });
+
+  it('emits the passed SEQUENCE so a reschedule .ics updates the entry in place (same UID)', () => {
+    const ics = email.buildIcs({ bookingId: 'b', summary: 's', start: ARGS.start, end: ARGS.end, sequence: 2 });
+    expect(ics).toContain('SEQUENCE:2');
+    expect(ics).not.toContain('SEQUENCE:0');
+  });
+
+  it('clamps a non-integer/negative SEQUENCE back to 0 (defensive)', () => {
+    expect(email.buildIcs({ bookingId: 'b', summary: 's', start: ARGS.start, end: ARGS.end, sequence: -3 })).toContain('SEQUENCE:0');
+    expect(email.buildIcs({ bookingId: 'b', summary: 's', start: ARGS.start, end: ARGS.end, sequence: 1.5 })).toContain('SEQUENCE:0');
+  });
 });
 
 describe('buildActionLinks — §13 signed cancel/reschedule', () => {
@@ -124,6 +140,15 @@ describe('sendConfirmationEmail — AC #7', () => {
     expect(raw).toContain('Join the meeting');
     expect(raw).toContain('signed.reschedule.token');
     expect(sent.ConfigurationSetName).toBe('picasso-emails');
+  });
+
+  it('tags SES email_type — default booking_confirmation; reschedule_confirmation when passed (N-1)', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'm' });
+    await email.sendConfirmationEmail(ARGS, {});
+    await email.sendConfirmationEmail({ ...ARGS, emailType: 'reschedule_confirmation' }, {});
+    const calls = sesMock.commandCalls(SendRawEmailCommand);
+    expect(calls[0].args[0].input.Tags).toContainEqual({ Name: 'email_type', Value: 'booking_confirmation' });
+    expect(calls[1].args[0].input.Tags).toContainEqual({ Name: 'email_type', Value: 'reschedule_confirmation' });
   });
 
   it('HTML-encodes the volunteer first name in the HTML body (output sanitization)', () => {

@@ -49,12 +49,28 @@ const { readSmsConsent } = require('./sms-consent');
 const reminderScheduler = require('../Reminder_Scheduler/scheduler');
 // G1: mint the rebound reminders' one-tap action links for the NEW start_at (same per-purpose
 // token contract + URL format as the commit-path confirmation email).
-const { buildActionLinks } = require('./confirmation-email');
+// sendConfirmationEmail: re-send the booking confirmation (with an updated .ics) for the NEW
+// time on reschedule — the commit path's notify step, which the reschedule path was missing.
+const { buildActionLinks, sendConfirmationEmail } = require('./confirmation-email');
 
 // tolerate camel OR snake on the inbound booking (schema discipline)
 function pick(b, camel, snake) {
   if (!b) return undefined;
   return b[camel] != null ? b[camel] : b[snake];
+}
+
+// Local copy of index.js formatWhen (index.js requires THIS module → can't import back
+// without a cycle). The human-readable "when" line for the reschedule confirmation email.
+function formatWhen(start, timeZone) {
+  try {
+    return new Intl.DateTimeFormat('en-US', {
+      weekday: 'short', month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+      timeZone: timeZone || 'UTC',
+    }).format(new Date(start));
+  } catch (_) {
+    return start;
+  }
 }
 
 async function handleSchedulingMutate(event = {}, injected = {}) {
@@ -71,6 +87,7 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   const _readSmsConsent = injected.readSmsConsent || readSmsConsent;
   const _rebindReminders = injected.rebindReminders || reminderScheduler.rebindReminders;
   const _buildActionLinks = injected.buildActionLinks || buildActionLinks;
+  const _sendConfirmationEmail = injected.sendConfirmationEmail || sendConfirmationEmail;
   const logger = injected.logger || console;
 
   const { mutation, tenantId, coordinatorId, booking } = event;
@@ -185,14 +202,61 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
       }
       // Option A: persist the reschedule fields (cancel is listener-owned). Non-fatal —
       // the calendar is the source of truth + the §14.2 listener is the backstop.
+      let icsSequence;
       try {
-        await bookingStore.updateBookingReschedule(tenantId, pick(b, 'bookingId', 'booking_id'), {
+        const persisted = await bookingStore.updateBookingReschedule(tenantId, pick(b, 'bookingId', 'booking_id'), {
           startAt: newSlot.start,
+          endAt: newSlot.end,
           externalEventId: pick(b, 'externalEventId', 'external_event_id'),
           pendingCalendarSync: result.outcome === 'pending_calendar_sync',
         });
+        icsSequence = persisted && persisted.icsSequence;
       } catch (err) {
         (logger.warn || logger.error || (() => {}))('booking_persist_failed', { error_name: (err && err.name) || 'unknown' });
+      }
+      // The reschedule confirmation email — the equivalent of the commit path's step 6,
+      // which the reschedule branch was MISSING (the guest got no notice of the new time,
+      // and Google sends no invite either — no sendUpdates). Best-effort: a send failure
+      // must never undo the committed move. Reuses sendConfirmationEmail (SES + an updated
+      // .ics, SEQUENCE-bumped from ics_sequence so the guest's calendar entry updates in
+      // place). It mints its own fresh reschedule/cancel links from the NEW startAt.
+      // S-2: only send when the persist returned a real (bumped) ics_sequence. If the persist
+      // above threw, icsSequence is undefined → a SEQUENCE:0 .ics would COLLIDE with the original
+      // commit revision and be silently ignored by calendar clients (the guest's calendar keeps
+      // the OLD time) — worse than no email. Skip + log instead.
+      if (icsSequence === undefined) {
+        (logger.warn || logger.error || (() => {}))('reschedule_confirmation_skipped_no_sequence', { booking_id: pick(b, 'bookingId', 'booking_id') });
+      } else {
+        try {
+          await _sendConfirmationEmail({
+            tenantId,
+            bookingId: pick(b, 'bookingId', 'booking_id'),
+            attendeeEmail: pick(b, 'attendeeEmail', 'attendee_email'),
+            attendeeFirstName: pick(b, 'attendeeFirstName', 'attendee_first_name'),
+            appointmentTypeName: pick(b, 'appointmentTypeName', 'appointment_type_name'),
+            orgName: pick(b, 'organizationName', 'organization_name'),
+            coordinatorName: pick(b, 'coordinatorName', 'coordinator_name'),
+            coordinatorEmail: pick(b, 'coordinatorEmail', 'coordinator_email'),
+            start: newSlot.start,
+            end: newSlot.end,
+            whenLabel: formatWhen(newSlot.start, pick(b, 'timeZone', 'timezone')),
+            joinUrl: pick(b, 'joinUrl', 'join_url') || pick(b, 'channelDetails', 'channel_details'),
+            startAt: newSlot.start,
+            // S-1 (DEFERRED, pre-existing): cancellation_window_hours is not threaded to the
+            // mutate path (the gateway/BSH payload omits it + it's not persisted on the booking),
+            // so it defaults to 0 — the reschedule LINK in this email expires at start_at rather
+            // than start_at-window. The reminder rebind below has the SAME `|| 0`. Tracked
+            // follow-up: persist it at commit + read on reschedule (fixes both surfaces). window=0
+            // tenants are unaffected.
+            cancellationWindowHours: event.cancellation_window_hours || 0,
+            agenda: b.agenda,
+            sequence: icsSequence,
+            emailType: 'reschedule_confirmation', // N-1: distinct SES email_type tag
+          }, { signOpts: injected.signOpts });
+          (logger.log || logger.info || (() => {}))('reschedule_confirmation_sent', { booking_id: pick(b, 'bookingId', 'booking_id') });
+        } catch (emailErr) {
+          (logger.warn || logger.error || (() => {}))('reschedule_confirmation_failed', { error_name: (emailErr && emailErr.name) || 'unknown' });
+        }
       }
       // Track 1 (§E1): re-bind reminders to the NEW start_at. Best-effort — the calendar +
       // §14.2 listener remain the source of truth; a rebind failure must not undo the move.
