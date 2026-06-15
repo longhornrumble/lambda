@@ -50,6 +50,11 @@ const { postFormOffer } = require('./scheduling/postFormOffer');
 // the recovery loop; engages on the widget's scheduling_intent:'new_booking' signal or an
 // in-flight new-booking session row.
 const { runNewBookingEntry, captureAttendeeEmail, EMAIL_SHAPE } = require('./scheduling/newBookingEntry');
+// [Fix-2a B-2] The §B10 binding uuid (body.session) is forwarded into a DynamoDB SK
+// (binding#<uuid>) + can drive a reschedule/cancel via the §B14 boundary, so format-gate it:
+// accept ONLY a canonical UUID (crypto.randomUUID shape). Rejects probing strings, oversized
+// payloads, and the reserved 'unknown'/'default' placeholders in one check.
+const BINDING_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Deterministic-pipeline copy: scheduling CLICK turns (entry / select / confirm) and the
 // email-capture turn bypass Bedrock, so these templated lines are the ONLY assistant text.
 const SCHEDULING_ENTRY_COPY = 'Happy to set that up — let me pull up some openings for you…';
@@ -358,6 +363,10 @@ const streamingHandler = async (event, responseStream, context) => {
     
     const tenantHash = body.tenant_hash || '';
     const sessionId = body.session_id || 'default';
+    // §B12: the §B10 binding uuid the redemption handler mints + the page/widget forwards as
+    // ?session= (request body.session). Distinct from the chat session_id — it keys the
+    // recovery-binding row (binding#<uuid>) read in injectSchedulingContext. null on normal chat.
+    const bindingSessionId = (typeof body.session === 'string' && BINDING_UUID_RE.test(body.session)) ? body.session : null;
     const userInput = body.user_input || '';
     const isFormMode = body.form_mode === true;
     const skipConfigCache = body.nocache === true || queryParams.nocache !== undefined;
@@ -742,6 +751,7 @@ const streamingHandler = async (event, responseStream, context) => {
       ? await injectSchedulingContext(formPrompt, {
           tenantId: config?.tenant_id,
           sessionId,
+          bindingSessionId,
           deps: { loadState: schedulingDeps.loadState },
         })
       : formPrompt;
@@ -886,7 +896,7 @@ const streamingHandler = async (event, responseStream, context) => {
       const schedulingResult = schedulingEnabled
         ? await runSchedulingTurn({
             responseText: responseBuffer, conversationHistory,
-            tenantId: config?.tenant_id, sessionId, config, bedrock, write,
+            tenantId: config?.tenant_id, sessionId, bindingSessionId, config, bedrock, write,
             deps: { ...schedulingDeps, ...schedulingExecDep },
           })
         : null;
@@ -1093,6 +1103,9 @@ const bufferedHandler = async (event, context) => {
     const body = event.body ? JSON.parse(event.body) : {};
     const tenantHash = body.tenant_hash || '';
     const sessionId = body.session_id || 'default';
+    // §B12: the §B10 binding uuid forwarded as ?session= (body.session) — distinct from the
+    // chat session_id; keys the recovery-binding read in injectSchedulingContext. null on normal chat.
+    const bindingSessionId = (typeof body.session === 'string' && BINDING_UUID_RE.test(body.session)) ? body.session : null;
     const userInput = body.user_input || '';
     const skipConfigCache = body.nocache === true || queryParams.nocache !== undefined;
 
@@ -1219,7 +1232,7 @@ const bufferedHandler = async (event, context) => {
     // Feature-gated: OFF unless feature_flags.scheduling_enabled (like Forms).
     const schedulingEnabled = isSchedulingEnabled(config);
     const prompt = schedulingEnabled
-      ? await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId })
+      ? await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId, bindingSessionId })
       : formPrompt;
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
     const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
@@ -1338,7 +1351,7 @@ const bufferedHandler = async (event, context) => {
       const schedulingResult = schedulingEnabled
         ? await runSchedulingTurn({
             responseText: responseBuffer, conversationHistory,
-            tenantId: config?.tenant_id, sessionId, config, bedrock,
+            tenantId: config?.tenant_id, sessionId, bindingSessionId, config, bedrock,
             write: (data) => chunks.splice(chunks.length - 1, 0, data),
             deps: { ...schedulingDeps, ...schedulingExecDep },
           })

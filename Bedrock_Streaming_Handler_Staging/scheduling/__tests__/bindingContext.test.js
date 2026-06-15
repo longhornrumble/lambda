@@ -152,6 +152,25 @@ describe('injectSchedulingContext (the index.js call-site wrapper)', () => {
     expect(out.indexOf('<scheduling_context>')).toBeLessThan(out.indexOf(BASE));
   });
 
+  test('§B12 contract: resolves the binding by bindingSessionId (body.session uuid), NOT the chat session_id', async () => {
+    // The page/widget sends session_id=<chat sess_...> AND session=<binding uuid>. The §B10
+    // binding row lives at binding#<uuid>; resolving by the chat session_id (the pre-fix bug)
+    // finds nothing → empty <scheduling_context> → the LLM has no idea it's a reschedule.
+    const resolveBinding = jest.fn().mockResolvedValue(RESCHEDULE_BINDING);
+    const out = await injectSchedulingContext(BASE, {
+      tenantId: 't', sessionId: 'sess_chat_abc', bindingSessionId: 'uuid-binding-123', deps: { resolveBinding },
+    });
+    expect(resolveBinding).toHaveBeenCalledWith(expect.objectContaining({ tenantId: 't', sessionId: 'uuid-binding-123' }));
+    expect(resolveBinding).not.toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess_chat_abc' }));
+    expect(out).toContain('<scheduling_context>');
+  });
+
+  test('back-compat: with no bindingSessionId, resolves the binding by sessionId (normal chat / legacy)', async () => {
+    const resolveBinding = jest.fn().mockResolvedValue(null);
+    await injectSchedulingContext(BASE, { tenantId: 't', sessionId: 's-chat', deps: { resolveBinding } });
+    expect(resolveBinding).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 's-chat' }));
+  });
+
   test('recovery_intent binding (no minimal-loop state) → prompt unchanged', async () => {
     const resolveBinding = jest.fn().mockResolvedValue({ ...RESCHEDULE_BINDING, intent: 'recovery_intent' });
     const out = await injectSchedulingContext(BASE, { tenantId: 't', sessionId: 's', deps: { resolveBinding } });

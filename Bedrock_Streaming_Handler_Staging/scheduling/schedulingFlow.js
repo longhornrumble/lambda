@@ -387,6 +387,7 @@ async function runSchedulingTurn({
   conversationHistory,
   tenantId,
   sessionId,
+  bindingSessionId,
   config,
   bedrock,
   write,
@@ -397,8 +398,13 @@ async function runSchedulingTurn({
     // [B-2] guard before realResolveBinding (which throws on empty keys) — a misconfigured
     // tenant (no tenant_id) / missing session becomes a clean no-op, not a per-turn CloudWatch error.
     if (!tenantId || !sessionId) return { handled: false };
+    // §B12: resolve the §B10 binding by the binding uuid (body.session) the page/widget forwards,
+    // NOT the chat session_id — the binding row is keyed by it (binding#<uuid>). The same field
+    // mismatch that blanked injectSchedulingContext also blanked this §B14 action boundary. The
+    // saveState calls below stay on the CHAT sessionId (the C9 state row). Falls back for normal chat.
+    const bindingSession = bindingSessionId || sessionId;
     const resolveFn = deps.resolveBinding || realResolveBinding;
-    const binding = await resolveFn({ tenantId, sessionId, deps });
+    const binding = await resolveFn({ tenantId, sessionId: bindingSession, deps });
     if (!binding) return { handled: false };
 
     const initialState = initStateFromIntent(binding.intent);
