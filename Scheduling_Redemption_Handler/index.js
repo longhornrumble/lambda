@@ -48,7 +48,7 @@
  *   path, purpose, outcome, status, and opaque references (tenant_id, booking_id).
  *
  * Env (deploy note — IaC is the integrator's):
- *   ENVIRONMENT, BOOKING_TABLE, CONVERSATION_SCHEDULING_SESSION_TABLE,
+ *   ENVIRONMENT, BOOKING_TABLE, CONVERSATION_SCHEDULING_SESSION_TABLE, TENANT_REGISTRY_TABLE,
  *   CHAT_REDIRECT_BASE_URL, SESSION_BINDING_TTL_SECONDS, JTI_BLACKLIST_TABLE (tokens.js),
  *   JWT_SECRET_KEY_NAME (tokens.js; = picasso/staging/jwt/signing-key, the #343 fix),
  *   AWS_REQUEST_TIMEOUT_MS / AWS_CONNECTION_TIMEOUT_MS / AWS_MAX_ATTEMPTS.
@@ -79,6 +79,11 @@ const BOOKING_TABLE = process.env.BOOKING_TABLE || `picasso-booking-${ENV}`;
 const SESSION_TABLE =
   process.env.CONVERSATION_SCHEDULING_SESSION_TABLE ||
   `picasso-conversation-scheduling-session-${ENV}`;
+// Tenant registry — reverse-maps tenant_id → public tenant HASH for the scheduling-page
+// redirect (the page is identified publicly by the hash, never the raw tenant_id). Same
+// table shape Master_Function / bedrock-core use (PK tenantId, attr tenantHash).
+const TENANT_REGISTRY_TABLE =
+  process.env.TENANT_REGISTRY_TABLE || `picasso-tenant-registry-${ENV}`;
 // Integration seam: the chat-widget bootstrap target. Default staging per work-order.
 const CHAT_REDIRECT_BASE_URL =
   process.env.CHAT_REDIRECT_BASE_URL || 'https://staging.chat.myrecruiter.ai';
@@ -299,6 +304,20 @@ async function getBooking(tenantId, bookingId) {
   };
 }
 
+// ─── tenant hash reverse-lookup (public-surface identifier) ─────────────────────────
+// The branded scheduling page is identified publicly by the tenant HASH (?t=), never the
+// raw tenant_id. Map tenant_id → tenantHash via a PK GetItem on the tenant registry.
+// Returns null when the row or the attribute is absent (caller fails closed → 500).
+async function getTenantHashForId(tenantId) {
+  const res = await ddb.send(
+    new GetItemCommand({
+      TableName: TENANT_REGISTRY_TABLE,
+      Key: { tenantId: { S: tenantId } },
+    })
+  );
+  return (res && res.Item && res.Item.tenantHash && res.Item.tenantHash.S) || null;
+}
+
 // ─── §B10 session-context binding write ─────────────────────────────────────────────
 
 async function writeBinding({ purpose, claims, sessionId, nowMs }) {
@@ -489,9 +508,40 @@ exports.handler = async (event) => {
     booking_id: claims.booking_id,
   });
 
-  // Integration seam (flagged): the chat-widget bootstrap. We hand the binding's session id
-  // to the chat origin via `?session=`; the integrator owns how the widget resolves the
-  // tenant + reads the §B10 binding to enforce booking ownership in-session (§13.4).
+  // ── Redirect into the bound session (§13.4). ──
+  // reschedule/cancel land on the branded hosted scheduling page (/schedule/), identified
+  // publicly by the tenant HASH (?t=) — never the raw tenant_id — plus the §B10 binding
+  // session id (?session=). The page resolves the hash → config/branding and replays the
+  // binding through the streaming flow. post_application_recovery keeps the chat-widget
+  // target for now (M2 — the recovery surface is a separate concern).
+  if (purpose === 'reschedule' || purpose === 'cancel') {
+    let tenantHash;
+    try {
+      tenantHash = await getTenantHashForId(claims.tenant_id);
+    } catch (err) {
+      // Binding is already written + jti burned (a re-click 410s). Rare registry-read fail.
+      warn('redemption_tenant_hash_lookup_error', {
+        purpose,
+        tenant_id: claims.tenant_id,
+        name: err && err.name,
+      });
+      return failurePage(500);
+    }
+    if (!tenantHash) {
+      log('redemption_tenant_hash_not_found', { purpose, tenant_id: claims.tenant_id });
+      return failurePage(500);
+    }
+    // Target the explicit index.html: the widget-bucket CloudFront serves S3 via a REST
+    // origin with NO directory-index rewrite, so /schedule/ would 403 (verified: /go/ 403s,
+    // /go/index.html 200s). /schedule/index.html is the servable key.
+    const location =
+      `${CHAT_REDIRECT_BASE_URL}/schedule/index.html?session=${encodeURIComponent(sessionId)}` +
+      `&t=${encodeURIComponent(tenantHash)}` +
+      `&purpose=${encodeURIComponent(purpose)}`;
+    return redirect(location);
+  }
+
+  // post_application_recovery — unchanged chat-widget target (M2).
   const location = `${CHAT_REDIRECT_BASE_URL}/?session=${encodeURIComponent(sessionId)}`;
   return redirect(location);
 };
