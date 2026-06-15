@@ -177,20 +177,31 @@ async function recordConferenceOnLock(tenantId, lockKey, { conferenceId, provide
 // external_event_id + the pending_calendar_sync flag). UpdateItem (not writeBooking,
 // which is conditional-create); guarded on the booking already existing. CANCEL is
 // NOT persisted here — the §14.2 cal-lifecycle listener owns Booking.status on delete.
-async function updateBookingReschedule(tenantId, bookingId, { startAt, externalEventId, pendingCalendarSync } = {}) {
+async function updateBookingReschedule(tenantId, bookingId, { startAt, externalEventId, pendingCalendarSync, endAt } = {}) {
   if (!tenantId || !bookingId) throw new Error('updateBookingReschedule requires tenantId and bookingId');
   const sets = ['last_calendar_mutation_at = :now'];
-  const vals = { ':now': s(new Date().toISOString()) };
+  // :one is consumed by the ADD below (the .ics SEQUENCE counter); always present.
+  const vals = { ':now': s(new Date().toISOString()), ':one': { N: '1' } };
   if (startAt) { sets.push('start_at = :sa'); vals[':sa'] = s(startAt); }
+  // end_at MUST move with start_at — readers (DSAR export, duration, .ics regen) trust
+  // the row, and the executor/reminders use newSlot.end, so a stale end_at desyncs them.
+  if (endAt) { sets.push('end_at = :ea'); vals[':ea'] = s(endAt); }
   if (externalEventId) { sets.push('external_event_id = :eid'); vals[':eid'] = s(externalEventId); }
   if (pendingCalendarSync !== undefined) { sets.push('pending_calendar_sync = :pcs'); vals[':pcs'] = { BOOL: !!pendingCalendarSync }; }
-  await ddb.send(new UpdateItemCommand({
+  // .ics SEQUENCE counter (RFC 5545): bump per reschedule so the re-sent invite UPDATES
+  // the attendee's existing calendar entry (same UID = booking_id) instead of duplicating
+  // it. Absent attribute = 0 (the commit .ics), so the first reschedule lands at 1.
+  // UPDATED_NEW returns the post-increment value for the confirmation email.
+  const res = await ddb.send(new UpdateItemCommand({
     TableName: BOOKING_TABLE,
     Key: BOOKING_KEY(tenantId, bookingId),
-    UpdateExpression: 'SET ' + sets.join(', '),
+    UpdateExpression: 'SET ' + sets.join(', ') + ' ADD ics_sequence :one',
     ExpressionAttributeValues: vals,
     ConditionExpression: 'attribute_exists(booking_id)',
+    ReturnValues: 'UPDATED_NEW',
   }));
+  const raw = res && res.Attributes && res.Attributes.ics_sequence && res.Attributes.ics_sequence.N;
+  return { icsSequence: raw != null ? Number(raw) : undefined };
 }
 
 // G6 cancel-with-reason — persist the audit-only cancel reason + actor. The Booking.status

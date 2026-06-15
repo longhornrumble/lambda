@@ -4,7 +4,7 @@ const { handleSchedulingMutate } = require('../scheduling-mutate');
 
 // Minimal fakes for the injected seam (no real Google/Zoom/DDB).
 function baseInjected(overrides = {}) {
-  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [], rebind: [], actionLinks: [] };
+  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [], rebind: [], actionLinks: [], confirm: [] };
   const calendarEvents = {
     buildEventBody: (x) => ({ built: x }),
     insertEvent: (calId, body) => { calls.facade.push(['insert', calId]); return { id: 'evt-new' }; },
@@ -19,7 +19,7 @@ function baseInjected(overrides = {}) {
       resolveProvider: () => ({ createConference: async () => ({ provider: 'google_meet' }) }),
       zoomClient: { updateMeeting: async (a) => { calls.zoom.push(a); } },
       bookingStore: {
-        updateBookingReschedule: async (t, id, f) => { calls.persist.push([t, id, f]); },
+        updateBookingReschedule: async (t, id, f) => { calls.persist.push([t, id, f]); return { icsSequence: 3 }; },
         updateBookingCancelReason: async (t, id, f) => { calls.cancelReason.push([t, id, f]); },
         touchRescheduleLinkSentAt: async (t, id, cd) => { calls.cooldown.push([t, id, cd]); return true; },
       },
@@ -41,6 +41,10 @@ function baseInjected(overrides = {}) {
         calls.actionLinks.push(claims);
         return { rescheduleUrl: 'https://schedule.myrecruiter.ai/reschedule?t=RT', cancelUrl: 'https://schedule.myrecruiter.ai/cancel?t=CT' };
       },
+      // Re-send the booking confirmation (updated .ics) for the NEW time on reschedule —
+      // the commit path's notify step the reschedule branch was missing. Deterministic
+      // fake; the real sendConfirmationEmail is covered by confirmation-email.test.js.
+      sendConfirmationEmail: async (args, opts) => { calls.confirm.push({ args, opts }); return { messageId: 'rcm1' }; },
       logger: { warn: () => {}, error: () => {} },
       ...overrides,
     },
@@ -54,7 +58,7 @@ const RESCH_EVENT = {
   // already-projected attendee_name / appointment_type_name / timezone) so a rebind snapshots
   // real reminder data (phone → SMS supplement; org/appt → real copy).
   booking: { booking_id: 'bk1', tenant_id: 'T1', coordinator_email: 'coord@x.com', external_event_id: 'evt-old',
-    attendee_phone: '+15125550199', attendee_name: 'Sam Patel', organization_name: 'Austin Angels',
+    attendee_email: 'sam@example.com', attendee_phone: '+15125550199', attendee_name: 'Sam Patel', organization_name: 'Austin Angels',
     appointment_type_name: 'Volunteer intake', timezone: 'America/Chicago', channel_details: 'https://meet.example/x' },
   newSlot: { start: '2026-07-01T15:00:00Z', end: '2026-07-01T15:30:00Z' },
 };
@@ -325,8 +329,49 @@ describe('handleSchedulingMutate — reschedule', () => {
     expect(t).toBe('T1');
     expect(id).toBe('bk1');
     expect(fields.startAt).toBe(RESCH_EVENT.newSlot.start);
+    expect(fields.endAt).toBe(RESCH_EVENT.newSlot.end); // end_at moves with start_at (no stale end)
     expect(fields.externalEventId).toBe('evt-new');
     expect(fields.pendingCalendarSync).toBe(false);
+  });
+
+  it('re-sends the booking confirmation email for the NEW slot (the missing notify step)', async () => {
+    const { injected, calls } = baseInjected();
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out.outcome).toBe('success');
+    expect(calls.confirm).toHaveLength(1);
+    const { args } = calls.confirm[0];
+    expect(args.start).toBe(RESCH_EVENT.newSlot.start);
+    expect(args.end).toBe(RESCH_EVENT.newSlot.end);
+    expect(args.attendeeEmail).toBe('sam@example.com');
+    expect(args.bookingId).toBe('bk1');
+    expect(args.startAt).toBe(RESCH_EVENT.newSlot.start); // fresh reschedule/cancel links mint off the NEW time
+    expect(args.sequence).toBe(3); // the bumped ics_sequence from the persist → the .ics updates in place
+    expect(args.emailType).toBe('reschedule_confirmation'); // N-1: distinct SES tag
+  });
+
+  it('S-2: skips the confirmation email when persist returned no ics_sequence (avoids a SEQUENCE:0 collision)', async () => {
+    const { injected, calls } = baseInjected({
+      bookingStore: { updateBookingReschedule: async () => ({}) }, // no icsSequence back
+    });
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out.outcome).toBe('success'); // the move stands
+    expect(calls.confirm).toHaveLength(0); // but no misleading SEQUENCE:0 email
+  });
+
+  it('a confirmation-email failure is non-fatal (the move already happened)', async () => {
+    const { injected } = baseInjected({
+      sendConfirmationEmail: async () => { throw new Error('SES down'); },
+    });
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out.outcome).toBe('success'); // swallowed
+  });
+
+  it('does NOT send a confirmation on a failed reschedule', async () => {
+    const { injected, calls } = baseInjected({
+      executeReschedule: async () => ({ outcome: 'failed', booking: RESCH_EVENT.booking }),
+    });
+    await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(calls.confirm).toHaveLength(0);
   });
 
   it('does NOT call zoom.updateMeeting for a non-zoom (google_meet) booking', async () => {
