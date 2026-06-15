@@ -237,13 +237,25 @@ async function resolveNewBookingSessionRow({ tenantId, sessionId, deps = {} } = 
  * unchanged; with no binding AND no in-flight new-booking session the prompt is returned
  * byte-identical (no-regression).
  * @param {string} basePrompt
- * @param {object} params - { tenantId, sessionId, deps }
+ * @param {object} params - { tenantId, sessionId, bindingSessionId, deps }
+ *   - sessionId        : the chat session_id (keys the §B17d new-booking C9 state row).
+ *   - bindingSessionId : the §B10/§B12 binding uuid the redemption handler minted and the
+ *                        page/widget forwards as `?session=` (request body.session). The
+ *                        binding row lives at `binding#<uuid>`, NOT `binding#<chat session_id>`,
+ *                        so the recovery-binding read MUST use this. Absent on normal chat →
+ *                        falls back to sessionId (which simply resolves to no binding).
  * @returns {Promise<string>}
  */
 async function injectSchedulingContext(basePrompt, params = {}) {
   let prompt = basePrompt;
 
-  const binding = await resolveSchedulingBinding(params);
+  // §B12: resolve the recovery binding against the binding uuid (body.session) when present,
+  // not the chat session_id — they differ on every page/widget turn (the binding row is keyed
+  // by the redemption-minted uuid). Falls back to sessionId for back-compat / normal chat.
+  const bindingParams = params.bindingSessionId
+    ? { ...params, sessionId: params.bindingSessionId }
+    : params;
+  const binding = await resolveSchedulingBinding(bindingParams);
   if (binding) {
     const block = buildSchedulingContextBlock(binding, initStateFromIntent(binding.intent));
     if (block) prompt = `${block}\n\n${prompt}`;
@@ -252,7 +264,8 @@ async function injectSchedulingContext(basePrompt, params = {}) {
   // §B17d (additive): in-flight new-booking state line. Recovery rows ('rescheduling' /
   // 'canceling') never match NEW_BOOKING_IN_FLIGHT_STATES, so the recovery path above is
   // untouched. A recovery_intent re-entry that landed in 'qualifying' (B-remainder) DOES
-  // get the line — that session is a new-booking arc.
+  // get the line — that session is a new-booking arc. Keyed on the CHAT sessionId (the C9
+  // state row), NOT the binding uuid.
   const sessionRow = await resolveNewBookingSessionRow(params);
   const stateLine = buildNewBookingStateLine(sessionRow);
   if (stateLine) prompt = `${stateLine}\n\n${prompt}`;

@@ -126,6 +126,25 @@ describe('runSchedulingTurn — no binding (no-regression)', () => {
   });
 });
 
+describe('runSchedulingTurn — §B12 binding-session resolution (Fix-2a B-1)', () => {
+  test('resolves the binding by bindingSessionId (the uuid), NOT the chat sessionId', async () => {
+    const resolveBinding = jest.fn().mockResolvedValue(null);
+    await runSchedulingTurn(baseTurn({
+      sessionId: 'sess-chat-xyz', bindingSessionId: 'uuid-binding-1',
+      bedrock: fakeBedrock({ action: 'confirm_reschedule' }),
+      deps: { resolveBinding },
+    }));
+    expect(resolveBinding).toHaveBeenCalledWith(expect.objectContaining({ tenantId: 'TEN', sessionId: 'uuid-binding-1' }));
+    expect(resolveBinding).not.toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess-chat-xyz' }));
+  });
+
+  test('back-compat: with no bindingSessionId, resolves by the chat sessionId', async () => {
+    const resolveBinding = jest.fn().mockResolvedValue(null);
+    await runSchedulingTurn(baseTurn({ sessionId: 'sess-chat', bedrock: fakeBedrock({ action: 'confirm_reschedule' }), deps: { resolveBinding } }));
+    expect(resolveBinding).toHaveBeenCalledWith(expect.objectContaining({ sessionId: 'sess-chat' }));
+  });
+});
+
 describe('runSchedulingTurn — §B14: free text never executes', () => {
   test("action 'none' in 'confirming' (LLM prose 'I confirmed it') → executeReschedule NOT called", async () => {
     const executeReschedule = jest.fn();
