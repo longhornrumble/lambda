@@ -656,6 +656,16 @@ jobs:
   #
   # npm audit for all Node.js Lambdas that have package-lock.json files.
   # Runs after tests pass. High-severity vulnerabilities fail the build.
+  #
+  # Documented exclusions (intentionally NOT in this matrix):
+  #   - send_email:          Python (stdlib + boto3); no package.json/lockfile. Real
+  #                          gap is it has NO tests at all and is a live prod dep
+  #                          (invoked by Scheduled_Message_Sender) — needs test
+  #                          authoring (a code task), not an npm-audit slot.
+  #   - SSO_Token_Generator: no package.json/lockfile; nothing for npm audit to scan.
+  #   - n8n_scheduler_wake:  package.json with zero dependencies; no lockfile → no-op.
+  #   - deploy_tenant_stack / ses_event_handler: Python, prod-only; no node deps.
+  #   - picasso_pii_* :      Python; Terraform-provisioned (infra/modules/lambda-pii-*).
   # ---------------------------------------------------------------------------
   security:
     name: Security Audit — ${{ matrix.lambda }}
@@ -694,6 +704,7 @@ jobs:
           - lambda: Scheduling_Synthetic_Monitor # WS-E-CI6 synthetic monitor — jest tests + deps
           - lambda: Calendar_OAuth_Connect # WS-E-OAUTH 3LO consent — jest tests + deps
           - lambda: Scheduling_Page_Api # M1 deterministic picker gateway — jest tests + deps
+          - lambda: Stripe_Webhook_Handler # payment webhook (HMAC auth, DDB + Secrets Manager); no tests yet — audit covers the @aws-sdk/* dep chain (has package-lock.json)
 
     steps:
       - name: Checkout
