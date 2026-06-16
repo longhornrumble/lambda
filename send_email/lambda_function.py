@@ -223,7 +223,11 @@ def send_email(sender, to, cc, bcc, reply_to, subject, html_body, text_body, att
             filename = att.get('filename', 'attachment')
             content_base64 = att.get('content_base64', '')
             content_type = att.get('content_type', 'application/octet-stream')
-            content = base64.b64decode(content_base64)
+            # validate=True rejects non-base64 characters instead of silently
+            # stripping them (default behavior), which would otherwise decode
+            # malformed input into a corrupt attachment. The resulting
+            # binascii.Error is caught below and re-raised as ValueError.
+            content = base64.b64decode(content_base64, validate=True)
             attachment_part = MIMEApplication(content)
             attachment_part.add_header('Content-Disposition', 'attachment', filename=filename)
             attachment_part.add_header('Content-Type', content_type)
