@@ -85,6 +85,15 @@ jobs:
       attribution_aggregator:        ${{ steps.filter.outputs.attribution_aggregator }}
       attribution_recap_generator:   ${{ steps.filter.outputs.attribution_recap_generator }}
       attribution_unsubscribe:       ${{ steps.filter.outputs.attribution_unsubscribe }}
+      # Scheduling Lambdas that were in the matrix + dispatch menu but ABSENT from
+      # this gate: a push touching ONLY one of their dirs left every detect output
+      # false -> the deploy job's if: was skipped -> silent no-deploy. Added here to
+      # close that gap (the deploy job runs the full matrix once any output is true).
+      calendar_event_consumer: ${{ steps.filter.outputs.calendar_event_consumer }}
+      calendar_lifecycle_consumer: ${{ steps.filter.outputs.calendar_lifecycle_consumer }}
+      scheduling_redemption_handler: ${{ steps.filter.outputs.scheduling_redemption_handler }}
+      scheduling_synthetic_monitor: ${{ steps.filter.outputs.scheduling_synthetic_monitor }}
+      attendance_disposition_handler: ${{ steps.filter.outputs.attendance_disposition_handler }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -158,6 +167,23 @@ jobs:
               - 'Attribution_Recap_Generator/**'
             attribution_unsubscribe:
               - 'Attribution_Unsubscribe/**'
+            # --- Scheduling Lambdas: silent-no-deploy gap fix ---
+            # All five are esbuild bundlers of ../shared/scheduling/* (aws-sdk
+            # externalized). Dir-only, matching the sibling bundler filters
+            # (Scheduling_Page_Api / Calendar_OAuth_Connect / Booking_Commit_Handler):
+            # a shared/scheduling-only change won't auto-rebundle these -> redeploy
+            # manually, e.g.
+            #   gh workflow run "Deploy Lambda — Staging" -f lambda=Calendar_Event_Consumer
+            calendar_event_consumer:
+              - 'Calendar_Event_Consumer/**'
+            calendar_lifecycle_consumer:
+              - 'Calendar_Lifecycle_Consumer/**'
+            scheduling_redemption_handler:
+              - 'Scheduling_Redemption_Handler/**'
+            scheduling_synthetic_monitor:
+              - 'Scheduling_Synthetic_Monitor/**'
+            attendance_disposition_handler:
+              - 'Attendance_Disposition_Handler/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -197,7 +223,12 @@ jobs:
       needs.detect-changes.outputs.attribution_mint_service == 'true' ||
       needs.detect-changes.outputs.attribution_aggregator == 'true' ||
       needs.detect-changes.outputs.attribution_recap_generator == 'true' ||
-      needs.detect-changes.outputs.attribution_unsubscribe == 'true'
+      needs.detect-changes.outputs.attribution_unsubscribe == 'true' ||
+      needs.detect-changes.outputs.calendar_event_consumer == 'true' ||
+      needs.detect-changes.outputs.calendar_lifecycle_consumer == 'true' ||
+      needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
+      needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true' ||
+      needs.detect-changes.outputs.attendance_disposition_handler == 'true'
     strategy:
       fail-fast: false
       matrix:
