@@ -779,16 +779,11 @@ def test_send_email_valid_attachment():
 def test_send_email_invalid_attachment_raises_value_error():
     """Non-base64 attachment content must raise ValueError.
 
-    NOTE ON BASE64 BEHAVIOR (production finding):
-    Python's base64.b64decode() silently ignores non-alphabet characters
-    (spaces, punctuation like '!') unless validate=True is passed.  This means
-    many "obviously wrong" strings like '!!!THIS IS NOT VALID BASE64!!!' are
-    silently accepted — the ! chars get stripped, leaving valid-looking base64.
-    The handler uses the default (no validate=True), so only inputs with
-    *incorrect padding* (where stripping non-base64 chars still leaves a
-    length that is not a multiple of 4) reliably raise binascii.Error, which
-    is then re-raised as ValueError.  We use 'abc' (3 chars = incorrect padding)
-    to reliably trigger the error.
+    The handler decodes with validate=True, so any non-base64 input raises
+    binascii.Error, which is re-raised as ValueError. Here 'abc' (3 chars =
+    incorrect padding) triggers it; the non-alphabet-character case (which the
+    pre-validate=True handler silently accepted) is covered by
+    test_send_email_rejects_non_alphabet_base64 below.
     """
     client = _setup_moto_ses()
     bad_attachment = {
@@ -808,6 +803,38 @@ def test_send_email_invalid_attachment_raises_value_error():
                 html_body="<p>hi</p>",
                 text_body="",
                 attachments=[bad_attachment],
+                tags={},
+            )
+
+
+@mock_ses
+def test_send_email_rejects_non_alphabet_base64():
+    """Regression guard for the validate=True hardening.
+
+    'aGVs bG8=' contains a space (a non-base64-alphabet char). Before the fix,
+    base64.b64decode() (default validate=False) silently stripped the space and
+    decoded the remainder to b'hello' — a corrupt attachment slipped through.
+    With validate=True the space raises binascii.Error, re-raised as ValueError.
+    If this test ever fails with "did not raise", validate=True was lost.
+    """
+    client = _setup_moto_ses()
+    sneaky_attachment = {
+        "filename": "sneaky.pdf",
+        "content_base64": "aGVs bG8=",  # valid-after-strip, but contains a space
+        "content_type": "application/pdf",
+    }
+    with patch.object(lambda_function, "ses", client):
+        with pytest.raises(ValueError, match="Invalid attachment"):
+            lambda_function.send_email(
+                sender=SENDER,
+                to=[RECIPIENT],
+                cc=[],
+                bcc=[],
+                reply_to=[],
+                subject="Sneaky attachment",
+                html_body="<p>hi</p>",
+                text_body="",
+                attachments=[sneaky_attachment],
                 tags={},
             )
 
