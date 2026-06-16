@@ -47,6 +47,7 @@ on:
           - Attribution_Recap_Generator
           - Attribution_Unsubscribe
           - send_email
+          - Stranded_Booking_Remediator
 
 concurrency:
   group: deploy-staging-${{ github.ref }}
@@ -96,6 +97,7 @@ jobs:
       scheduling_synthetic_monitor: ${{ steps.filter.outputs.scheduling_synthetic_monitor }}
       attendance_disposition_handler: ${{ steps.filter.outputs.attendance_disposition_handler }}
       send_email: ${{ steps.filter.outputs.send_email }}
+      stranded_booking_remediator: ${{ steps.filter.outputs.stranded_booking_remediator }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -188,6 +190,12 @@ jobs:
               - 'Attendance_Disposition_Handler/**'
             send_email:
               - 'send_email/**'
+            stranded_booking_remediator:
+              # B11 remediator. Node.js esbuild bundle of ../shared/scheduling/* +
+              # ../shared/booking-status. Dir-only like the sibling bundlers; a
+              # shared-only change won't auto-rebundle — redeploy manually:
+              #   gh workflow run "Deploy Lambda — Staging" -f lambda=Stranded_Booking_Remediator
+              - 'Stranded_Booking_Remediator/**'
 
   deploy:
     name: Deploy ${{ matrix.lambda.staging_function }}
@@ -233,7 +241,8 @@ jobs:
       needs.detect-changes.outputs.scheduling_redemption_handler == 'true' ||
       needs.detect-changes.outputs.scheduling_synthetic_monitor == 'true' ||
       needs.detect-changes.outputs.attendance_disposition_handler == 'true' ||
-      needs.detect-changes.outputs.send_email == 'true'
+      needs.detect-changes.outputs.send_email == 'true' ||
+      needs.detect-changes.outputs.stranded_booking_remediator == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -296,6 +305,22 @@ jobs:
             # email sent). The invoke smoke only checks StatusCode 200 + no
             # FunctionError, which any send_email response satisfies.
             smoke_invoke_event: '{"httpMethod":"OPTIONS"}'
+          - source_dir: Stranded_Booking_Remediator
+            # B11 stranded-booking remediator. Node.js esbuild bundle (npm run
+            # package = build dist/index.js + zip); bundles ../shared/scheduling/*
+            # + ../shared/booking-status with @aws-sdk/* externalized. Was
+            # hand-deployed before this entry.
+            staging_function: Stranded_Booking_Remediator
+            handler: index.handler
+            runtime: nodejs
+            include_globs: ''
+            env_vars: ''
+            # SQS/EventBridge-invoked (no HTTP frontend); a synthetic invoke would
+            # attempt real DDB/SES writes, so no automated smoke (matches the
+            # calendar consumers).
+            smoke_path: ''
+            smoke_expect_status: ''
+            smoke_invoke_event: ''
           - source_dir: Analytics_Event_Processor
             # BSH staging-twin Phase C: SQS-triggered Lambda that consumes
             # browser analytics events and writes to S3 + DDB session-events.
