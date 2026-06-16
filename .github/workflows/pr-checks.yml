@@ -70,6 +70,7 @@ jobs:
       attribution_recap_generator:   ${{ steps.filter.outputs.attribution_recap_generator }}
       attribution_unsubscribe:       ${{ steps.filter.outputs.attribution_unsubscribe }}
       ses_event_handler:             ${{ steps.filter.outputs.ses_event_handler }}
+      send_email:                    ${{ steps.filter.outputs.send_email }}
       session_archiver:          ${{ steps.filter.outputs.session_archiver }}
       pii_dsar:                  ${{ steps.filter.outputs.pii_dsar }}
       pii_dsar_sla_monitor:      ${{ steps.filter.outputs.pii_dsar_sla_monitor }}
@@ -178,6 +179,8 @@ jobs:
               - 'Attribution_Unsubscribe/**'
             ses_event_handler:
               - 'ses_event_handler/**'
+            send_email:
+              - 'send_email/**'
             session_archiver:
               - 'picasso_session_archiver/**'
             pii_dsar:
@@ -454,7 +457,8 @@ jobs:
       needs.detect-changes.outputs.pii_dsar == 'true' ||
       needs.detect-changes.outputs.pii_dsar_sla_monitor == 'true' ||
       needs.detect-changes.outputs.pii_dsar_weekly_reminder == 'true' ||
-      needs.detect-changes.outputs.pii_tenant_purge == 'true'
+      needs.detect-changes.outputs.pii_tenant_purge == 'true' ||
+      needs.detect-changes.outputs.send_email == 'true'
 
     strategy:
       fail-fast: false
@@ -491,6 +495,11 @@ jobs:
           - lambda: ses_event_handler
             changed: ${{ needs.detect-changes.outputs.ses_event_handler }}
             # boto3 from Lambda runtime; no requirements.txt.
+            has_requirements: false
+          - lambda: send_email
+            changed: ${{ needs.detect-changes.outputs.send_email }}
+            # boto3 from Lambda runtime; no requirements.txt. 72 unit tests added —
+            # was a live prod dep (invoked by Scheduled_Message_Sender) with zero CI.
             has_requirements: false
           - lambda: picasso_session_archiver
             changed: ${{ needs.detect-changes.outputs.session_archiver }}
@@ -658,10 +667,10 @@ jobs:
   # Runs after tests pass. High-severity vulnerabilities fail the build.
   #
   # Documented exclusions (intentionally NOT in this matrix):
-  #   - send_email:          Python (stdlib + boto3); no package.json/lockfile. Real
-  #                          gap is it has NO tests at all and is a live prod dep
-  #                          (invoked by Scheduled_Message_Sender) — needs test
-  #                          authoring (a code task), not an npm-audit slot.
+  #   - send_email:          Python (stdlib + boto3); no package.json/lockfile, so
+  #                          nothing for npm audit to scan. Logic IS covered — see the
+  #                          send_email python-tests entry above (72 unit tests; it is a
+  #                          live prod dep invoked by Scheduled_Message_Sender).
   #   - SSO_Token_Generator: no package.json/lockfile; nothing for npm audit to scan.
   #   - n8n_scheduler_wake:  package.json with zero dependencies; no lockfile → no-op.
   #   - deploy_tenant_stack / ses_event_handler: Python, prod-only; no node deps.
