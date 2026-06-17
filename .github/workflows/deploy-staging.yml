@@ -6,6 +6,18 @@ name: Deploy Lambda — Staging
 #
 # See feedback_uniform_env_rules.md: per-environment conventions apply uniformly.
 # Staging is $LATEST-only.
+#
+# Intentionally NOT in this staging deploy matrix (documented exception, Phase-A
+# audit 2026-06-17): `kb_proposal_applier` and `notification_hub`. Their CODE is
+# still tested + security-audited in pr-checks.yml, but the live functions are
+# `kb_proposal_applier_staging` and `notification_hub` in the PROD account
+# (614056832592), deployed out-of-band (last touched 2026-04/05). This workflow
+# deploys via OIDC into the STAGING account (525409062831) and cannot target 614
+# functions — a matrix entry here would deploy into a void (ResourceNotFound).
+# They join the differently-deployed exceptions (deploy_tenant_stack,
+# Picasso_Config_Manager). NOTE: `kb_proposal_applier_staging` is a `_staging`-
+# named function living in the PROD account — a pre-account-split naming smell
+# tracked in the account-hygiene backlog (alongside EmployeeRegistryV2Read).
 
 on:
   push:
