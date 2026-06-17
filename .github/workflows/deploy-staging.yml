@@ -6,6 +6,18 @@ name: Deploy Lambda — Staging
 #
 # See feedback_uniform_env_rules.md: per-environment conventions apply uniformly.
 # Staging is $LATEST-only.
+#
+# Intentionally NOT in this staging deploy matrix (documented exception, Phase-A
+# audit 2026-06-17): `kb_proposal_applier` and `notification_hub`. Their CODE is
+# still tested + security-audited in pr-checks.yml, but the live functions are
+# `kb_proposal_applier_staging` and `notification_hub` in the PROD account
+# (614056832592), deployed out-of-band (last touched 2026-04/05). This workflow
+# deploys via OIDC into the STAGING account (525409062831) and cannot target 614
+# functions — a matrix entry here would deploy into a void (ResourceNotFound).
+# They join the differently-deployed exceptions (deploy_tenant_stack,
+# Picasso_Config_Manager). NOTE: `kb_proposal_applier_staging` is a `_staging`-
+# named function living in the PROD account — a pre-account-split naming smell
+# tracked in the account-hygiene backlog (alongside EmployeeRegistryV2Read).
 
 on:
   push:
@@ -957,13 +969,18 @@ jobs:
           if [ "$MISSING" -eq 0 ]; then echo "Zip-manifest guard: all tracked runtime files present."; fi
           exit $MISSING
 
-      # C8 (Booking_Commit_Handler) bundles ../shared/scheduling/* at esbuild
-      # time. esbuild resolves those modules' own deps (@googleapis/calendar,
-      # google-auth-library, @aws-sdk/*) from shared/scheduling/node_modules, so
-      # install them before `npm run package` below. Mirrors the equivalent
-      # pr-checks.yml step. Gated on the source_dir so no other Lambda pays it.
-      - name: Install shared/scheduling deps (Booking_Commit_Handler bundles them)
-        if: matrix.lambda.source_dir == 'Booking_Commit_Handler'
+      # Booking_Commit_Handler AND Stranded_Booking_Remediator both esbuild-bundle
+      # ../shared/scheduling/availability.js, whose top-level requires
+      # (@googleapis/calendar, google-auth-library) esbuild resolves from
+      # shared/scheduling/node_modules — NOT from the function's own node_modules
+      # (esbuild walks up from the imported file's dir). So install those deps
+      # before `npm run package` below. Mirrors the equivalent pr-checks.yml step.
+      # Gated on the source_dir so the other (pure-module) bundlers don't pay it.
+      # (Stranded was added 2026-06-17: its deploy build fails without this —
+      # `Could not resolve "google-auth-library"` — proven by a clean CI-replica
+      # build during the Phase-A completion audit.)
+      - name: Install shared/scheduling deps (Booking_Commit_Handler + Stranded_Booking_Remediator bundle them)
+        if: matrix.lambda.source_dir == 'Booking_Commit_Handler' || matrix.lambda.source_dir == 'Stranded_Booking_Remediator'
         working-directory: shared/scheduling
         run: npm install
 
