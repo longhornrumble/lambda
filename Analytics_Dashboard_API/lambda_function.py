@@ -8554,7 +8554,35 @@ def handle_preferences_patch(auth_result: Dict[str, Any], body: Dict[str, Any]) 
 # Clerk Webhook Handler
 # =============================================================================
 
-CLERK_WEBHOOK_SECRET = os.environ.get('CLERK_WEBHOOK_SECRET', '')
+# Webhook (Svix) signing secret. Prod sets the raw CLERK_WEBHOOK_SECRET env;
+# staging keeps it out of env/tfstate (F2) via CLERK_WEBHOOK_SECRET_SECRET_ID
+# pointing at a Secrets Manager entry. Prefer the raw env, else read SM (cached) —
+# mirrors get_clerk_secret_key().
+CLERK_WEBHOOK_SECRET_SECRET_ID = os.environ.get('CLERK_WEBHOOK_SECRET_SECRET_ID', '')
+_clerk_webhook_secret_cache: Dict[str, str] = {}
+
+
+def get_clerk_webhook_secret() -> str:
+    """Return the Clerk webhook signing secret (whsec_...) for this environment."""
+    env_value = os.environ.get('CLERK_WEBHOOK_SECRET', '')
+    if env_value:
+        return env_value
+    if 'value' in _clerk_webhook_secret_cache:
+        return _clerk_webhook_secret_cache['value']
+    if not CLERK_WEBHOOK_SECRET_SECRET_ID:
+        return ''
+    try:
+        raw = _secrets_client.get_secret_value(SecretId=CLERK_WEBHOOK_SECRET_SECRET_ID).get('SecretString', '') or ''
+    except Exception as exc:
+        logger.error(f'[clerk-webhook] Failed to read webhook secret from Secrets Manager: {exc}')
+        return ''
+    try:
+        parsed = json.loads(raw)
+        value = parsed.get('webhook_secret') or parsed.get('value') or raw
+    except (json.JSONDecodeError, TypeError):
+        value = raw
+    _clerk_webhook_secret_cache['value'] = value
+    return value
 
 
 def _verify_svix_signature(payload_bytes: bytes, headers: Dict[str, str]) -> bool:
@@ -8564,9 +8592,9 @@ def _verify_svix_signature(payload_bytes: bytes, headers: Dict[str, str]) -> boo
     Signature format: v1,<base64-hmac-sha256>
     Message to sign: "{msg_id}.{timestamp}.{body}"
     """
-    secret = CLERK_WEBHOOK_SECRET
+    secret = get_clerk_webhook_secret()
     if not secret:
-        logger.error('[clerk-webhook] CLERK_WEBHOOK_SECRET env var not set')
+        logger.error('[clerk-webhook] Clerk webhook secret not configured (CLERK_WEBHOOK_SECRET / CLERK_WEBHOOK_SECRET_SECRET_ID)')
         return False
 
     # Strip 'whsec_' prefix if present
