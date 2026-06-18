@@ -1537,9 +1537,6 @@ TENANTS_PREFIX = 'tenants'
 
 s3_client = boto3.client('s3')
 
-# Tenants excluded from the admin panel (demo/test accounts)
-_ADMIN_EXCLUDED_TENANTS = {'MYR384719', 'TEST_REGISTRY_001'}
-
 
 def handle_tenant_switcher(user_role: Optional[str]) -> Dict[str, Any]:
     """
@@ -1611,8 +1608,6 @@ def handle_admin_tenants(user_role: Optional[str]) -> Dict[str, Any]:
 
         result = []
         for t in tenants:
-            if t.get('tenantId', '') in _ADMIN_EXCLUDED_TENANTS:
-                continue
             result.append({
                 'tenantId': t.get('tenantId', ''),
                 'tenantHash': t.get('tenantHash', ''),
@@ -1906,13 +1901,13 @@ def handle_admin_employees_list(user_role: Optional[str], params: Dict[str, str]
         tenant_id_filter = params.get('tenant_id', '')
         search = (params.get('search', '') or '').strip().lower()
 
-        if tenant_id_filter:
-            employees = tenant_registry_ops.list_employees(tenant_id_filter)
-        else:
-            employees = tenant_registry_ops.list_all_employees()
+        # Admin employee roster is always tenant-scoped — the dashboard sends a
+        # specific tenant_id. No cross-tenant Scan is supported (a Query per the
+        # selected tenant only).
+        if not tenant_id_filter:
+            return cors_response(400, {'error': 'tenant_id is required'})
 
-        # Exclude demo/test tenants
-        employees = [e for e in employees if e.get('tenantId', '') not in _ADMIN_EXCLUDED_TENANTS]
+        employees = tenant_registry_ops.list_employees(tenant_id_filter)
 
         # Client-side search filter (acceptable at current scale)
         if search:
@@ -1921,13 +1916,6 @@ def handle_admin_employees_list(user_role: Optional[str], params: Dict[str, str]
                 if search in (e.get('email', '') or '').lower()
                 or search in (e.get('name', '') or '').lower()
             ]
-
-        # Enrich with company name for cross-tenant view
-        if not tenant_id_filter:
-            all_tenants = tenant_registry_ops.list_all_tenants()
-            tenant_names = {t['tenantId']: t.get('companyName', t['tenantId']) for t in all_tenants}
-            for e in employees:
-                e['companyName'] = tenant_names.get(e.get('tenantId', ''), '')
 
         employees.sort(key=lambda e: (e.get('name', '') or e.get('email', '')).lower())
 
