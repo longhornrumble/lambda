@@ -1098,6 +1098,19 @@ def _portal_role_to_clerk(portal_role: str) -> str:
     return 'org:admin' if portal_role == 'admin' else 'org:member'
 
 
+def _invite_redirect_url(first_name: str, last_name: str) -> str:
+    """Build the Clerk-invitation post-accept redirect URL for THIS environment.
+
+    Env-aware: reads DASHBOARD_APP_URL (default = prod). Without this, a staging
+    invite (created on the dev Clerk instance) would send the accepter to the prod
+    dashboard, logging them into prod instead of staging.
+    """
+    base = os.environ.get('DASHBOARD_APP_URL', 'https://app.myrecruiter.ai')
+    if first_name:
+        return f'{base}/sign-up?first_name={first_name}&last_name={last_name}'
+    return f'{base}/sign-up'
+
+
 # Cache for tenant_id → org_id mapping (TTL: 5 minutes)
 _tenant_org_cache: Dict[str, str] = {}
 _tenant_org_cache_time: Dict[str, float] = {}
@@ -2107,7 +2120,7 @@ def handle_admin_employee_invite(user_role: Optional[str], body: Dict[str, Any])
         invite_body = {
             'email_address': email,
             'role': clerk_role,
-            'redirect_url': f'https://app.myrecruiter.ai/sign-up?first_name={first_name}&last_name={last_name}' if first_name else 'https://app.myrecruiter.ai/sign-up',
+            'redirect_url': _invite_redirect_url(first_name, last_name),
             'public_metadata': {'first_name': first_name, 'last_name': last_name} if (first_name or last_name) else {},
         }
         result = _clerk_api_request('POST', f'/v1/organizations/{org_id}/invitations', invite_body)
@@ -7994,7 +8007,7 @@ def handle_team_invite(auth_result: Dict[str, Any], tenant_id: str, body: Dict[s
         invite_body = {
             'email_address': email,
             'role': clerk_role,
-            'redirect_url': f'https://app.myrecruiter.ai/sign-up?first_name={first_name}&last_name={last_name}' if first_name else 'https://app.myrecruiter.ai/sign-up',
+            'redirect_url': _invite_redirect_url(first_name, last_name),
             'public_metadata': {'first_name': first_name, 'last_name': last_name} if (first_name or last_name) else {},
         }
         # Only set inviter_user_id if the caller is a member of the target org.
