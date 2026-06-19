@@ -7301,6 +7301,30 @@ def handle_settings_notifications_get(tenant_id: str) -> Dict[str, Any]:
             'notifications': _deep_merge_notifications(DEFAULT_NOTIFICATIONS, form.get('notifications', {})),
         }
 
+    # Resolve recipient_employee_ids (across all forms) to a small display directory so the
+    # portal can show a *former* (deactivated) employee by NAME instead of a bare UUID. We
+    # include inactive employees on purpose (list_employees returns all statuses) — the record
+    # is retained on soft-delete, we just surface the name. IDs with no registry record are
+    # absent → the portal falls back to its "Former team member <id>" row (true erasure case).
+    recipient_ids = set()
+    for f in forms_out.values():
+        internal = (f.get('notifications', {}) or {}).get('internal', {}) or {}
+        recipient_ids.update(internal.get('recipient_employee_ids') or [])
+
+    recipients_directory: Dict[str, Any] = {}
+    if recipient_ids:
+        try:
+            for emp in tenant_registry_ops.list_employees(tenant_id):
+                emp_id = emp.get('employeeId')
+                if emp_id in recipient_ids:
+                    recipients_directory[emp_id] = {
+                        'name': emp.get('name', ''),
+                        'email': emp.get('email', ''),
+                        'status': emp.get('status', 'active'),
+                    }
+        except Exception as exc:
+            logger.warning(f"[settings/notifications] recipient directory lookup failed: {exc}")
+
     # SMS provisioning check: tenant has a dedicated Telnyx number assigned
     sms_settings = config.get('sms_settings', {})
     sms_provisioned = bool(sms_settings.get('from_number'))
@@ -7312,6 +7336,7 @@ def handle_settings_notifications_get(tenant_id: str) -> Dict[str, Any]:
     return cors_response(200, {
         'forms': forms_out,
         'sms_provisioned': sms_provisioned,
+        'recipients_directory': recipients_directory,
     })
 
 
