@@ -1509,8 +1509,15 @@ def get_tenant_features(tenant_id: str) -> Dict[str, bool]:
         'dashboard_attribution': features.get('dashboard_attribution', False) or feature_flags.get('dashboard_attribution', False),
         'dashboard_notifications': features.get('dashboard_notifications', False) or feature_flags.get('dashboard_notifications', False),
         'dashboard_settings': features.get('dashboard_settings', False) or feature_flags.get('dashboard_settings', False),
-        # D1 Flag A scheduling entitlement — off until the tenant enables it (config features/feature_flags).
-        'dashboard_scheduling': features.get('dashboard_scheduling', False) or feature_flags.get('dashboard_scheduling', False),
+        # Dashboard scheduling surface (Scheduling + Integrations tabs) is tied to the master
+        # backend gate: any tenant provisioned for scheduling (feature_flags.scheduling_enabled
+        # — the same flag the widget/booking/commit/agent chain enforces fail-closed) gets the
+        # dashboard scheduling tabs. An explicit dashboard_scheduling flag can still force it on.
+        'dashboard_scheduling': (
+            features.get('dashboard_scheduling', False)
+            or feature_flags.get('dashboard_scheduling', False)
+            or feature_flags.get('scheduling_enabled', False)
+        ),
     }
 
 
