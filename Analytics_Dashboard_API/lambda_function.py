@@ -651,6 +651,11 @@ def lambda_handler(event, context):
         elif path.endswith('/settings/notifications') and method == 'PATCH':
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_settings_notifications_patch(auth_result, tenant_id, body)
+        elif path.endswith('/settings/scheduling/activation') and method == 'GET':
+            return handle_scheduling_activation_get(tenant_id, user_role)
+        elif path.endswith('/settings/scheduling/activation') and method == 'PATCH':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_scheduling_activation_patch(auth_result, tenant_id, body)
 
         # =================================================================
         # Team Management endpoints (Phase 3)
@@ -7242,6 +7247,98 @@ def update_tenant_notifications(
         f"tenant={redact_tenant_id(tenant_id)} form={form_id}"
     )
     return result
+
+
+def update_tenant_scheduling_activation(tenant_id: str, enabled: bool) -> bool:
+    """
+    Set feature_flags.scheduling_enabled on the tenant config (org-level activation).
+
+    This is the master scheduling switch the whole platform reads (widget agent,
+    booking commit, Calendar_OAuth_Connect connect-gate, dashboard tab visibility).
+    Read-modify-write with S3 ETag optimistic locking, mirroring
+    update_tenant_notifications. Returns the new enabled state.
+    """
+    bucket = S3_CONFIG_BUCKET
+    key = f"tenants/{tenant_id}/{tenant_id}-config.json"
+
+    response = s3.get_object(Bucket=bucket, Key=key)
+    etag = response['ETag']
+    config = json.loads(response['Body'].read().decode('utf-8'))
+
+    feature_flags = config.get('feature_flags')
+    if not isinstance(feature_flags, dict):
+        feature_flags = {}
+    feature_flags['scheduling_enabled'] = bool(enabled)
+    config['feature_flags'] = feature_flags
+
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(config, indent=2),
+            ContentType='application/json',
+            IfMatch=etag,
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] in ('PreconditionFailed', '412'):
+            raise ConcurrentModificationError(
+                "Config was modified by another user. Please refresh."
+            )
+        raise
+
+    _tenant_config_cache.pop(tenant_id, None)
+    _tenant_config_cache_time.pop(tenant_id, None)
+    logger.info(
+        f"[settings/scheduling] activation set to {bool(enabled)} "
+        f"tenant={redact_tenant_id(tenant_id)}"
+    )
+    return bool(enabled)
+
+
+def handle_scheduling_activation_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
+    """
+    GET /settings/scheduling/activation
+
+    Returns the org's RAW scheduling activation state (feature_flags.scheduling_enabled)
+    plus whether the caller may change it. Raw — not the super_admin-masked
+    dashboard_scheduling entitlement — so the admin toggle reflects the real config.
+    """
+    config = get_tenant_config(tenant_id)
+    enabled = bool(((config or {}).get('feature_flags') or {}).get('scheduling_enabled', False))
+    return cors_response(200, {
+        'enabled': enabled,
+        'can_manage': user_role in _WRITE_ROLES,
+    })
+
+
+def handle_scheduling_activation_patch(
+    auth_result: Dict[str, Any],
+    tenant_id: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    PATCH /settings/scheduling/activation   Body: { "enabled": bool }
+
+    Admin-only. Flips feature_flags.scheduling_enabled — the org-level master switch
+    that gates calendar connection, the widget scheduling agent, and booking.
+    """
+    role_error = _require_write_role(auth_result.get('role'))
+    if role_error:
+        return role_error
+
+    enabled = body.get('enabled')
+    if not isinstance(enabled, bool):
+        return cors_response(400, {'error': 'enabled (boolean) is required'})
+
+    try:
+        new_state = update_tenant_scheduling_activation(tenant_id, enabled)
+    except ConcurrentModificationError as e:
+        return cors_response(409, {'error': str(e)})
+    except ClientError as e:
+        logger.error(f"[settings/scheduling] S3 error: {e}")
+        return cors_response(500, {'error': 'Failed to update scheduling activation'})
+
+    return cors_response(200, {'enabled': new_state})
 
 
 # ---------------------------------------------------------------------------
