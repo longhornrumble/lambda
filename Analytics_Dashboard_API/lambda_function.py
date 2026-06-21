@@ -3767,6 +3767,12 @@ def _booking_projection(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# Page cap for the bookings-list accumulation loop (the synthetic-row FilterExpression can
+# make a single DDB page sparse; we follow pages until a full page of real rows). Bounded
+# like _SCHED_METRICS_MAX_PAGES — a hit is LOGGED (never a silent truncation).
+_SCHED_BOOKINGS_MAX_PAGES = 50
+
+
 def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
                                user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
     """
@@ -3812,14 +3818,14 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
         return cors_response(400, {'error': 'invalid page_size'})
     page_size = max(1, min(page_size, BOOKING_PAGE_SIZE_MAX))
 
-    query_params: Dict[str, Any] = {
-        'TableName': BOOKING_TABLE,
-        'IndexName': index_name,
-        'KeyConditionExpression': key_condition,
-        'ExpressionAttributeValues': expr_values,
-        'Limit': page_size,
-    }
+    # De-noise: exclude synthetic-monitor canary rows (is_synthetic=true) from the
+    # customer-facing view — internal health-check bookings must never surface to a tenant.
+    # Real rows lack the attribute entirely, so attribute_not_exists() always passes them.
+    # Only the burn-in tenant (MYR384719) carries synthetic rows -> no-op for real tenants.
+    expr_values[':synfalse'] = {'BOOL': False}
+    filter_expression = 'attribute_not_exists(is_synthetic) OR is_synthetic = :synfalse'
 
+    start_key = None
     cursor = params.get('cursor')
     if cursor:
         # Opaque to clients but server-validated: the cursor must decode to a key for
@@ -3833,19 +3839,52 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
                 or set(decoded.keys()) - _BOOKING_CURSOR_KEYS.get(index_name, set())
                 or decoded.get('tenantId', {}).get('S') != tenant_id):
             return cors_response(400, {'error': 'invalid cursor'})
-        query_params['ExclusiveStartKey'] = decoded
+        start_key = decoded
 
-    try:
-        response = dynamodb.query(**query_params)
-    except ClientError as e:
-        logger.error(f"§E7 bookings query failed (tenant={redact_tenant_id(tenant_id)}, scope={scope}): {e}")
-        return cors_response(502, {'error': 'failed to load bookings'})
+    # A DynamoDB FilterExpression is applied AFTER Limit, so a single page can come back
+    # sparse when a tenant carries synthetic rows. Accumulate across pages until we have a
+    # full page of REAL rows (or the window is exhausted / the page cap is hit) so the
+    # client's single fetch isn't mostly-empty. Bounded — same posture as the metrics
+    # handler. (v1 pilot scale is a handful of real bookings per tenant; if one ever holds
+    # > page_size real rows in the window, the page boundary may skip a few until a
+    # key-based cursor is added — LOGGED below, never a silent truncation.)
+    items: list = []
+    pages = 0
+    next_key = None
+    while True:
+        query_params: Dict[str, Any] = {
+            'TableName': BOOKING_TABLE,
+            'IndexName': index_name,
+            'KeyConditionExpression': key_condition,
+            'FilterExpression': filter_expression,
+            'ExpressionAttributeValues': expr_values,
+            'Limit': page_size,
+        }
+        if start_key:
+            query_params['ExclusiveStartKey'] = start_key
+        try:
+            response = dynamodb.query(**query_params)
+        except ClientError as e:
+            logger.error(f"§E7 bookings query failed (tenant={redact_tenant_id(tenant_id)}, scope={scope}): {e}")
+            return cors_response(502, {'error': 'failed to load bookings'})
+        items.extend(response.get('Items', []))
+        start_key = response.get('LastEvaluatedKey')
+        pages += 1
+        if len(items) >= page_size:
+            next_key = start_key  # a full page collected; more may remain past it
+            break
+        if not start_key:
+            break  # window fully scanned
+        if pages >= _SCHED_BOOKINGS_MAX_PAGES:
+            next_key = start_key
+            logger.warning(f"[scheduling/bookings] page cap hit (tenant={redact_tenant_id(tenant_id)}, "
+                           f"pages={pages}) — list may be partial")
+            break
 
-    bookings = [_booking_projection(item) for item in response.get('Items', [])]
+    bookings = [_booking_projection(item) for item in items[:page_size]]
     body: Dict[str, Any] = {'bookings': bookings}
-    last_key = response.get('LastEvaluatedKey')
-    if last_key:
-        body['nextCursor'] = base64.b64encode(json.dumps(last_key).encode('utf-8')).decode('utf-8')
+    if next_key:
+        body['nextCursor'] = base64.b64encode(json.dumps(next_key).encode('utf-8')).decode('utf-8')
     logger.info(f"[scheduling/bookings] tenant={redact_tenant_id(tenant_id)} scope={scope} count={len(bookings)}")
     return cors_response(200, body)
 
@@ -3893,7 +3932,11 @@ def handle_scheduling_metrics(tenant_id: str, params: Dict[str, str],
             'TableName': BOOKING_TABLE,
             'IndexName': BOOKING_TENANT_START_INDEX,
             'KeyConditionExpression': 'tenantId = :t AND start_at BETWEEN :lo AND :hi',
-            'ExpressionAttributeValues': {':t': {'S': tenant_id}, ':lo': {'S': lo}, ':hi': {'S': hi}},
+            # Exclude synthetic-monitor canary rows (is_synthetic=true) — internal
+            # health-check bookings must not inflate a tenant's metrics. Real rows lack the
+            # attribute, so attribute_not_exists() always passes them.
+            'FilterExpression': 'attribute_not_exists(is_synthetic) OR is_synthetic = :synfalse',
+            'ExpressionAttributeValues': {':t': {'S': tenant_id}, ':lo': {'S': lo}, ':hi': {'S': hi}, ':synfalse': {'BOOL': False}},
             # `status` is a DDB reserved word → alias. Project only what we aggregate.
             'ProjectionExpression': '#s, appointment_type_id',
             'ExpressionAttributeNames': {'#s': 'status'},

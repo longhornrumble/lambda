@@ -268,3 +268,58 @@ def test_projection_handles_fractional_z_start_at(mock_ddb):
     mock_ddb.query.return_value = {'Items': [item]}
     body = _body(handle_scheduling_bookings('TEN1', {'scope': 'tenant_aggregate'}, 'admin', 'a@example.com'))
     assert body['bookings'][0]['start_at'] == '2026-06-10T18:00:00.000Z'
+
+
+# --------------------------------------------------------------------------- #
+# De-noise: synthetic-monitor canary exclusion (FilterExpression + accumulation)
+# --------------------------------------------------------------------------- #
+
+@patch('lambda_function.dynamodb')
+def test_query_carries_synthetic_exclusion_filter(mock_ddb):
+    """Every §E7 query excludes is_synthetic canary rows server-side (real rows lack the attr)."""
+    mock_ddb.query.return_value = {'Items': [_item()]}
+    handle_scheduling_bookings('TEN1', {'scope': 'tenant_aggregate'}, 'admin', 'a@example.com')
+    kw = mock_ddb.query.call_args.kwargs
+    assert 'attribute_not_exists(is_synthetic)' in kw['FilterExpression']
+    assert kw['ExpressionAttributeValues'][':synfalse'] == {'BOOL': False}
+
+
+@patch('lambda_function.dynamodb')
+def test_accumulates_across_sparse_pages_until_full(mock_ddb):
+    """A FilterExpression is applied AFTER Limit, so DDB can return a sparse page + a cursor.
+    The handler follows pages until it has a full page of real rows."""
+    lek = {'tenantId': {'S': 'TEN1'}, 'booking_id': {'S': 'X'}, 'coordinator_email': {'S': 'c@example.com'}}
+    mock_ddb.query.side_effect = [
+        {'Items': [_item(booking_id={'S': f'A{i}'}) for i in range(20)], 'LastEvaluatedKey': lek},
+        {'Items': [_item(booking_id={'S': f'B{i}'}) for i in range(20)], 'LastEvaluatedKey': lek},
+        {'Items': [_item(booking_id={'S': f'C{i}'}) for i in range(20)]},  # no LEK
+    ]
+    body = _body(handle_scheduling_bookings('TEN1', {'scope': 'staff_self', 'page_size': '50'}, 'member', 'c@example.com'))
+    assert mock_ddb.query.call_count == 3   # 20+20 < 50 -> a third page
+    assert len(body['bookings']) == 50      # sliced to page_size
+
+
+@patch('lambda_function.dynamodb')
+def test_accumulation_stops_when_window_exhausted(mock_ddb):
+    """Window fully scanned before page_size real rows -> return what we have, no cursor."""
+    lek = {'tenantId': {'S': 'TEN1'}, 'booking_id': {'S': 'A1'}, 'coordinator_email': {'S': 'c@example.com'}}
+    mock_ddb.query.side_effect = [
+        {'Items': [_item(booking_id={'S': 'A1'})], 'LastEvaluatedKey': lek},
+        {'Items': [_item(booking_id={'S': 'A2'})]},  # no LEK -> exhausted
+    ]
+    body = _body(handle_scheduling_bookings('TEN1', {'scope': 'staff_self'}, 'member', 'c@example.com'))
+    assert mock_ddb.query.call_count == 2
+    assert len(body['bookings']) == 2
+    assert 'nextCursor' not in body
+
+
+@patch('lambda_function.dynamodb')
+def test_accumulation_respects_page_cap(mock_ddb):
+    """An all-synthetic window (every page filtered to empty but still cursored) stops at the
+    cap and emits a resume cursor rather than looping unbounded."""
+    lek = {'tenantId': {'S': 'TEN1'}, 'booking_id': {'S': 'x'}, 'coordinator_email': {'S': 'c@example.com'}}
+    mock_ddb.query.return_value = {'Items': [], 'LastEvaluatedKey': lek}
+    body = _body(handle_scheduling_bookings('TEN1', {'scope': 'staff_self'}, 'member', 'c@example.com'))
+    assert mock_ddb.query.call_count == lambda_function._SCHED_BOOKINGS_MAX_PAGES
+    assert body['bookings'] == []
+    assert body['nextCursor']  # client can resume past the scanned window

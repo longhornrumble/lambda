@@ -157,3 +157,13 @@ def test_page_cap_marks_partial(mock_ddb):
     body = _body(handle_scheduling_metrics('TEN1', {}, 'admin'))
     assert body.get('partial') is True
     assert mock_ddb.query.call_count == lambda_function._SCHED_METRICS_MAX_PAGES
+
+
+@patch('lambda_function.dynamodb')
+def test_metrics_query_excludes_synthetic(mock_ddb):
+    """Synthetic-monitor canary rows must not inflate a tenant's metrics."""
+    mock_ddb.query.return_value = {'Items': []}
+    handle_scheduling_metrics('TEN1', {}, 'admin')
+    kw = mock_ddb.query.call_args.kwargs
+    assert 'attribute_not_exists(is_synthetic)' in kw['FilterExpression']
+    assert kw['ExpressionAttributeValues'][':synfalse'] == {'BOOL': False}
