@@ -506,3 +506,64 @@ def test_routing_policy_update_unknown_tag_422_no_write(mock_ddb, _cfg):
         TENANT, 'rp_x', {'tag_conditions': [{'values': ['typo']}]}, ADMIN, EMAIL, 'tok')
     assert resp['statusCode'] == 422
     mock_ddb.update_item.assert_not_called()
+
+
+# =========================================================================== #
+# §B18b conference_type (meeting "location") — Phase 1: google_meet | zoom only
+# =========================================================================== #
+
+@patch('lambda_function.dynamodb')
+def test_appointment_type_conference_type_defaults_google_meet(mock_ddb):
+    # Old-shape client omits conference_type → server defaults to google_meet (read-side default).
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(TENANT, None, _at_body(), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 201
+    assert json.loads(resp['body'])['appointment_type']['conference_type'] == 'google_meet'
+    assert mock_ddb.put_item.call_args.kwargs['Item']['conference_type'] == {'S': 'google_meet'}
+
+
+@patch('lambda_function.dynamodb')
+def test_appointment_type_conference_type_empty_string_defaults(mock_ddb):
+    # An empty value is treated as absent → default (a client clearing the field falls back).
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(TENANT, None, _at_body(conference_type=''), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 201
+    assert json.loads(resp['body'])['appointment_type']['conference_type'] == 'google_meet'
+
+
+@patch('lambda_function.dynamodb')
+def test_appointment_type_conference_type_zoom_persists(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, None, _at_body(conference_type='zoom'), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 201
+    assert json.loads(resp['body'])['appointment_type']['conference_type'] == 'zoom'
+    assert mock_ddb.put_item.call_args.kwargs['Item']['conference_type'] == {'S': 'zoom'}
+
+
+@pytest.mark.parametrize('bad', ['phone', 'in_person', 'skype', 'teams', 'GOOGLE_MEET', 123])
+@patch('lambda_function.dynamodb')
+def test_appointment_type_conference_type_invalid_400_no_write(mock_ddb, bad):
+    # Future/unknown providers (incl. the still-unbuilt phone/in_person) are rejected so a
+    # booking can never carry a conference_type that resolveProvider would THROW on.
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, None, _at_body(conference_type=bad), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 400
+    mock_ddb.put_item.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_appointment_type_update_persists_conference_type(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    mock_ddb.update_item.return_value = {'Attributes': {
+        'appointment_type_id': {'S': 'at_1'}, 'tenantId': {'S': TENANT},
+        'name': {'S': 'Intro Call'}, 'duration_minutes': {'N': '30'},
+        'conference_type': {'S': 'zoom'}, 'routing_policy_id': {'S': 'rp_x'},
+        'modified_at': {'M': {'at': {'S': 'now'}, 'by': {'S': EMAIL}}},
+    }}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, 'at_1', _at_body(conference_type='zoom'), ADMIN, EMAIL, 'tok')
+    assert resp['statusCode'] == 200
+    assert 'conference_type' in mock_ddb.update_item.call_args.kwargs['ExpressionAttributeNames'].values()
+    assert json.loads(resp['body'])['appointment_type']['conference_type'] == 'zoom'
