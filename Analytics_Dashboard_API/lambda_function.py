@@ -4002,6 +4002,10 @@ _TAG_OPERATORS = {'in_any', 'equals'}
 _AT_DURATION_MAX = 480  # minutes — scheduling_config_schema.md appointmentTypeSchema
 _AT_NAME_MAX = 200      # appointment-type display-name length cap (app-level guard)
 _SCHED_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+# §B18b meeting-location ("conference_type") provider a booking joins. Phase 1 = the two LIVE
+# providers in Booking_Commit_Handler/conference-providers.js (resolveProvider THROWS on
+# anything else). phone/in_person are a planned future provider — intentionally NOT yet writable.
+_CONFERENCE_TYPES = {'google_meet', 'zoom'}
 
 
 def _marshal(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -4434,6 +4438,13 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
     if err:
         return err
 
+    # §B18b meeting location: which provider the booking joins. Absent → 'google_meet'
+    # (server default; matches the read side + scheduling-propose.js). Validated against the
+    # LIVE provider set — phone/in_person are a future provider, rejected for now.
+    conference_type = body.get('conference_type') or 'google_meet'
+    if conference_type not in _CONFERENCE_TYPES:
+        return cors_response(400, {'error': f"conference_type must be one of {sorted(_CONFERENCE_TYPES)}"})
+
     routing_policy_id = body.get('routing_policy_id')
     if not isinstance(routing_policy_id, str) or not routing_policy_id.strip():
         return cors_response(400, {'error': 'routing_policy_id is required (FK to a routing policy)'})
@@ -4469,6 +4480,7 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
         'buffer_before_minutes': buf_before,
         'buffer_after_minutes': buf_after,
         'lead_time_minutes': lead,
+        'conference_type': conference_type,
         'routing_policy_id': routing_policy_id,
         'modified_at': _modified_at(user_email),
     }
