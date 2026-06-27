@@ -13,7 +13,12 @@ import pytest
 from botocore.exceptions import ClientError
 
 import lambda_function
-from lambda_function import handle_scheduling_bookings, _booking_projection
+from lambda_function import (
+    handle_scheduling_bookings,
+    _booking_projection,
+    _lead_summary_for_session,
+    _pick_lead_note,
+)
 
 
 def _item(**over):
@@ -323,3 +328,82 @@ def test_accumulation_respects_page_cap(mock_ddb):
     assert mock_ddb.query.call_count == lambda_function._SCHED_BOOKINGS_MAX_PAGES
     assert body['bookings'] == []
     assert body['nextCursor']  # client can resume past the scanned window
+
+
+# --------------------------------------------------------------------------- #
+# Lead join (include_lead=1) — attach a booking's lead summary from its submission
+# --------------------------------------------------------------------------- #
+
+def test_pick_lead_note_prefers_open_question_label():
+    fields = {'first_name': 'Marcus', 'why_volunteer': 'Recently retired; wants to mentor students.', 'zip': '30312'}
+    assert _pick_lead_note(fields) == 'Recently retired; wants to mentor students.'
+
+
+def test_pick_lead_note_falls_back_to_longest_substantive_value():
+    fields = {'a': 'short', 'detail': 'A reasonably long free-text answer here.'}
+    assert _pick_lead_note(fields) == 'A reasonably long free-text answer here.'
+
+
+def test_pick_lead_note_none_when_all_short():
+    assert _pick_lead_note({'a': 'hi', 'b': 'yes'}) is None
+
+
+@patch('lambda_function.parse_lead_from_dynamodb')
+@patch('lambda_function.dynamodb')
+def test_lead_summary_joins_via_session_index(mock_ddb, mock_parse):
+    mock_ddb.query.return_value = {'Items': [{'submission_id': {'S': 'SUB-1'}}]}
+    mock_parse.return_value = {
+        'submission_id': 'SUB-1', 'form_label': 'Mentor Application',
+        'pipeline_status': 'reviewing', 'contacted_at': '2026-06-12T00:00:00Z',
+        'submitted_at': '2026-06-10T00:00:00Z',
+        'fields': {'why': 'Wants to mentor first-gen students and help with resumes.', 'zip': '30312'},
+    }
+    s = _lead_summary_for_session('TEN1', 'sess-9')
+    assert s['submission_id'] == 'SUB-1'
+    assert s['app_name'] == 'Mentor Application'
+    assert s['phase'] == 'Reviewing'           # pipeline_status capitalized to the UI phase
+    assert 'mentor first-gen' in s['note']
+    assert {'label': 'zip', 'value': '30312'} in s['fields']
+    kw = mock_ddb.query.call_args.kwargs
+    assert kw['IndexName'] == 'tenant-session-index'
+    assert kw['ExpressionAttributeValues'] == {':t': {'S': 'TEN1'}, ':s': {'S': 'sess-9'}}
+
+
+def test_lead_summary_none_without_session():
+    assert _lead_summary_for_session('TEN1', None) is None
+    assert _lead_summary_for_session('TEN1', '') is None
+
+
+@patch('lambda_function.dynamodb')
+def test_lead_summary_failsoft_on_index_error(mock_ddb):
+    """A table without tenant-session-index (or any query error) must yield None, not raise —
+    the bookings list stays intact."""
+    mock_ddb.query.side_effect = ClientError({'Error': {'Code': 'ValidationException'}}, 'Query')
+    assert _lead_summary_for_session('TEN1', 'sess-9') is None
+
+
+@patch('lambda_function.parse_lead_from_dynamodb')
+@patch('lambda_function.dynamodb')
+def test_handler_include_lead_attaches_summary(mock_ddb, mock_parse):
+    # 1st query = the bookings page; 2nd = the per-booking lead join.
+    mock_ddb.query.side_effect = [
+        {'Items': [_item(session_id={'S': 'sess-9'})]},
+        {'Items': [{'submission_id': {'S': 'SUB-1'}}]},
+    ]
+    mock_parse.return_value = {
+        'submission_id': 'SUB-1', 'form_label': 'Mentor Application',
+        'pipeline_status': 'new', 'submitted_at': '2026-06-10T00:00:00Z',
+        'fields': {'why': 'Wants to mentor first-gen students here.'},
+    }
+    body = _body(handle_scheduling_bookings('TEN1', {'scope': 'staff_self', 'include_lead': '1'}, 'member', 'coord@example.com'))
+    assert body['bookings'][0]['lead']['app_name'] == 'Mentor Application'
+    assert body['bookings'][0]['lead']['phase'] == 'New'
+
+
+@patch('lambda_function.dynamodb')
+def test_handler_without_include_lead_does_no_join(mock_ddb):
+    """Default behaviour is unchanged: no lead query, no `lead` field."""
+    mock_ddb.query.return_value = {'Items': [_item(session_id={'S': 'sess-9'})]}
+    body = _body(handle_scheduling_bookings('TEN1', {'scope': 'staff_self'}, 'member', 'coord@example.com'))
+    assert 'lead' not in body['bookings'][0]
+    assert mock_ddb.query.call_count == 1  # only the bookings query, no join
