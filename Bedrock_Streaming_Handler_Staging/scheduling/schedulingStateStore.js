@@ -59,7 +59,7 @@ function buildSchedulingDeps({ sessionTable, bookingTable, region, client } = {}
   // C9 state row write. PUTs the plain-<sessionId> row — never touches the
   // `binding#<sessionId>` row, so the §B10 binding is preserved. Guards `state`
   // (DDB rejects a null/undefined attribute, audit S-2).
-  async function saveState({ tenantId, sessionId, state, candidate_slots, selected_slot, proposal, rejected_slot_ids, attendee_email } = {}) {
+  async function saveState({ tenantId, sessionId, state, candidate_slots, selected_slot, proposal, rejected_slot_ids, attendee_email, booking_id, awaiting_prep_note, post_booking_question } = {}) {
     if (!tenantId || !sessionId || !state) return;
     const item = { tenantId, session_id: sessionId, state, updated_at: new Date().toISOString() };
     if (candidate_slots !== undefined) item.candidate_slots = candidate_slots;
@@ -72,6 +72,12 @@ function buildSchedulingDeps({ sessionTable, bookingTable, region, client } = {}
     // §B16d amendment (deterministic pipeline): chat-captured attendee email rides the
     // session row so the commit's identity gate can pass without a form submission.
     if (attendee_email !== undefined) item.attendee_email = attendee_email;
+    // §B post-booking amendment: after a booking commits, the booked row carries booking_id +
+    // the awaiting flag so the NEXT free-text turn is captured as the prep-note answer
+    // (index.js intercept), plus the form-configured question (carried forward + audit).
+    if (booking_id !== undefined) item.booking_id = booking_id;
+    if (awaiting_prep_note !== undefined) item.awaiting_prep_note = awaiting_prep_note;
+    if (post_booking_question !== undefined) item.post_booking_question = post_booking_question;
     try {
       await ddb.send(new PutCommand({ TableName: sessionTable, Item: item }));
     } catch (err) {

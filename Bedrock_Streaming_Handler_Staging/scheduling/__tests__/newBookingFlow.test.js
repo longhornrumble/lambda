@@ -1059,3 +1059,55 @@ describe('_propose — §B18b context forwarding (old-shape fixture)', () => {
     expect(slotFrames[0]).not.toHaveProperty('context'); // old-shape: absent, not null
   });
 });
+
+// ── post-booking prep note (§B post-booking amendment) ──────────────────────────────────
+
+describe('runNewBookingTurn — post-booking prep note', () => {
+  const QUESTION = 'One last thing — what would you like to talk about?';
+  const confirmingWithQ = { state: 'confirming', selected_slot: SLOT, proposal: { poolSize: 2 }, post_booking_question: QUESTION };
+  const bookedCommit = { status: 'BOOKED', bookingId: 'bk_q', resourceId: 'r', booking: { booking_id: 'bk_q' } };
+
+  test('confirm_book WITH a configured question → booked row carries booking_id + awaiting flag; question streams as ordinary text (NOT a card)', async () => {
+    const write = jest.fn();
+    const saveState = jest.fn();
+    const invokeBookingCommit = jest.fn().mockResolvedValue(bookedCommit);
+    const res = await runNewBookingTurn(baseTurn({
+      write,
+      bedrock: fakeBedrock({ action: 'confirm_book' }),
+      deps: { loadState: async () => confirmingWithQ, qualifyingContext: QCTX, invokeBookingCommit, saveState },
+    }));
+    expect(res.executed).toBe(true);
+    expect(saveState).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'booked', booking_id: 'bk_q', awaiting_prep_note: true, post_booking_question: QUESTION,
+    }));
+    const frames = write.mock.calls.map((c) => c[0]);
+    // streamed as a plain text frame — no new card / SSE type
+    expect(frames.some((m) => m.includes('"type":"text"') && m.includes(QUESTION))).toBe(true);
+    expect(frames.some((m) => m.includes('scheduling_prep') || m.includes('"card"'))).toBe(false);
+  });
+
+  test('confirm_book WITHOUT a configured question → booked saveState is byte-identical (no prep fields), no question streamed', async () => {
+    const write = jest.fn();
+    const saveState = jest.fn();
+    const invokeBookingCommit = jest.fn().mockResolvedValue({ status: 'BOOKED', bookingId: 'bk_n', resourceId: 'r', booking: { booking_id: 'bk_n' } });
+    await runNewBookingTurn(baseTurn({
+      write,
+      bedrock: fakeBedrock({ action: 'confirm_book' }),
+      deps: { loadState: async () => ({ state: 'confirming', selected_slot: SLOT, proposal: { poolSize: 2 } }), qualifyingContext: QCTX, invokeBookingCommit, saveState },
+    }));
+    expect(saveState).toHaveBeenCalledWith({ tenantId: 'TEN', sessionId: 'sess-1', state: 'booked' });
+    expect(write.mock.calls.map((c) => c[0]).some((m) => m.includes('"type":"text"'))).toBe(false);
+  });
+
+  test('select_slot carries a prior post_booking_question forward to the confirming row', async () => {
+    const saveState = jest.fn();
+    await runNewBookingTurn(baseTurn({
+      bedrock: fakeBedrock({ action: 'select_slot', slotId: 's1' }),
+      deps: {
+        loadState: async () => ({ state: 'proposing', candidate_slots: [SLOT], proposal: { poolSize: 2 }, post_booking_question: QUESTION }),
+        qualifyingContext: QCTX, saveState, invokeBookingCommit: jest.fn(),
+      },
+    }));
+    expect(saveState).toHaveBeenCalledWith(expect.objectContaining({ state: 'confirming', post_booking_question: QUESTION }));
+  });
+});

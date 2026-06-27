@@ -73,6 +73,7 @@ jest.mock('./booking-store', () => {
     releaseLock: jest.fn(async () => {}),
     flagLockForReconciliation: jest.fn(async () => {}),
     writeDegradedMarker: jest.fn(async () => {}),
+    updateBookingPrepNote: jest.fn(async () => {}),
   };
 });
 jest.mock('./confirmation-email', () => ({
@@ -929,5 +930,42 @@ describe('G3 — orgName resolution', () => {
     await handler(ev, {}, { ...nullInjection(), loadTenantConfig: mockLoad });
     const emailCall = confirmationEmail.sendConfirmationEmail.mock.calls[0][0];
     expect(emailCall.orgName).toBe('');
+  });
+});
+
+describe('attach_prep_note action — post-booking free-text answer (§B post-booking amendment)', () => {
+  const prepEvent = (o = {}) => ({
+    action: 'attach_prep_note', tenantId: 'AUS123957', bookingId: 'booking#abc', prepNote: 'Respite care options.', ...o,
+  });
+
+  it('attaches the answer to the booking and returns ok (no commit path)', async () => {
+    const res = await handler(prepEvent());
+    expect(bookingStore.updateBookingPrepNote).toHaveBeenCalledWith('AUS123957', 'booking#abc', 'Respite care options.');
+    expect(res).toEqual({ outcome: 'ok', bookingId: 'booking#abc' });
+    expect(bookingStore.writeBooking).not.toHaveBeenCalled(); // never the commit path
+  });
+
+  it('fail-closed when scheduling is disabled for the tenant', async () => {
+    const res = await handler(prepEvent(), {}, { isSchedulingEnabledForTenant: async () => false });
+    expect(res).toEqual({ outcome: 'failed', error: 'scheduling_disabled' });
+    expect(bookingStore.updateBookingPrepNote).not.toHaveBeenCalled();
+  });
+
+  it('rejects blank / missing answer before any write', async () => {
+    expect(await handler(prepEvent({ prepNote: '   ' }))).toEqual({ outcome: 'failed', error: 'invalid_prep_note' });
+    expect(await handler(prepEvent({ prepNote: undefined }))).toEqual({ outcome: 'failed', error: 'invalid_prep_note' });
+    expect(await handler(prepEvent({ bookingId: '' }))).toEqual({ outcome: 'failed', error: 'invalid_prep_note' });
+    expect(bookingStore.updateBookingPrepNote).not.toHaveBeenCalled();
+  });
+
+  it('returns not_found when the booking vanished (ConditionalCheckFailed)', async () => {
+    const e = new Error('cond'); e.name = 'ConditionalCheckFailedException';
+    bookingStore.updateBookingPrepNote.mockRejectedValueOnce(e);
+    expect(await handler(prepEvent())).toEqual({ outcome: 'not_found', error: 'booking_not_found' });
+  });
+
+  it('returns failed (attach_failed) on a non-conditional store error (e.g. throttle)', async () => {
+    bookingStore.updateBookingPrepNote.mockRejectedValueOnce(new Error('DDB throttle'));
+    expect(await handler(prepEvent())).toEqual({ outcome: 'failed', error: 'attach_failed' });
   });
 });

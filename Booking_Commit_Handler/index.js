@@ -627,6 +627,35 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
     return await handleSchedulingPropose(event, injected);
   }
 
+  // Post-booking prep note (§B post-booking amendment): BSH invokes BCH to attach the
+  // attendee's free-text answer to the operator-configured "what would you like to talk
+  // about?" question onto an already-committed Booking row (a SEPARATE turn after commit).
+  // No calendar I/O, no commit path. camelCase keys (matches scheduling_mutate/propose).
+  // Gate fail-closed (defense-in-depth — BSH already gates before invoking). PII: the
+  // answer text is NEVER logged (tenant_id + booking_id + err.name only).
+  if (event && event.action === 'attach_prep_note') {
+    const enabled = await gateScheduling(event.tenantId, injected);
+    if (!enabled) {
+      log('attach_prep_note_disabled', {});
+      return { outcome: 'failed', error: 'scheduling_disabled' };
+    }
+    if (!event.tenantId || !event.bookingId || typeof event.prepNote !== 'string' || !event.prepNote.trim()) {
+      return { outcome: 'failed', error: 'invalid_prep_note' };
+    }
+    try {
+      await bookingStore.updateBookingPrepNote(event.tenantId, event.bookingId, event.prepNote);
+      log('prep_note_attached', { tenant_id: event.tenantId, booking_id: event.bookingId });
+      return { outcome: 'ok', bookingId: event.bookingId };
+    } catch (err) {
+      if (bookingStore.isConditionalCheckFailed(err)) {
+        log('attach_prep_note_no_row', { tenant_id: event.tenantId, booking_id: event.bookingId });
+        return { outcome: 'not_found', error: 'booking_not_found' };
+      }
+      log('attach_prep_note_failed', { tenant_id: event.tenantId, error: (err && err.name) || 'unknown' });
+      return { outcome: 'failed', error: 'attach_failed' };
+    }
+  }
+
   const startedAtMs = Date.now();
   const { tenantId, slot, conferenceType } = validate(event);
 

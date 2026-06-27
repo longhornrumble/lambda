@@ -730,19 +730,43 @@ async function runNewBookingTurn({
               candidate_slots: (prior && prior.candidate_slots) || [],
               proposal: prior && prior.proposal,
               rejected_slot_ids: prior && prior.rejected_slot_ids,
+              // §B post-booking amendment: keep the prep question through a slot-taken retry.
+              post_booking_question: prior && prior.post_booking_question,
             });
           }
           return { handled: true, executed: false, action, state: 'proposing', reason: 'slot_unavailable' };
         }
 
+        // Post-booking prep note (§B post-booking amendment): when the originating form
+        // configured a question (carried on the session row), arrange to ask it AFTER the
+        // commit. Resolve it here so the booked saveState + the streamed text agree.
+        // Absent question → null → byte-identical to the prior behavior.
+        const prepQuestion = (res.executed && prior && typeof prior.post_booking_question === 'string' && prior.post_booking_question.trim() && res.bookingId)
+          ? prior.post_booking_question
+          : null;
+
         // DOUBLE-FIRE GUARD (§B16b, mirrors recovery loop SR-2): advance to 'booked' on commit
         // SUCCESS *or* the email fallback so a later turn cannot re-fire commit (booked→booked
         // is illegal → rejected). The seam-unwired / disabled / identity paths do NOT advance.
         if ((res.executed || res.fallback === 'email') && deps.saveState) {
-          await deps.saveState({ tenantId, sessionId, state: 'booked' });
+          const bookedState = { tenantId, sessionId, state: 'booked' };
+          // Persist booking_id + the awaiting flag so the NEXT free-text turn is captured as
+          // the answer (index.js intercept; saveState is a Put-overwrite that drops
+          // selected_slot, so booking_id can't be recomputed later). Carry the question for audit.
+          if (prepQuestion) {
+            bookedState.booking_id = res.bookingId;
+            bookedState.awaiting_prep_note = true;
+            bookedState.post_booking_question = prepQuestion;
+          }
+          await deps.saveState(bookedState);
         }
         if (res.fallback === 'email') _emitFallbackNotice(write, sessionId);
         if (res.executed) _emitBookingConfirmed(write, sessionId, res); // §10.4 reveal coordinator
+        // Stream the configured question as ordinary assistant text (the same path
+        // postFormOffer uses) right after the confirmation reveal — NOT a card.
+        if (prepQuestion && typeof write === 'function') {
+          write(`data: ${JSON.stringify({ type: 'text', content: prepQuestion, session_id: sessionId })}\n\n`);
+        }
 
         const nextState = (res.executed || res.fallback === 'email') ? 'booked' : state;
         return { handled: true, action, ...res, state: nextState };
@@ -772,6 +796,9 @@ async function runNewBookingTurn({
             rejected_slot_ids: prior && prior.rejected_slot_ids,
             // §B16d amendment: a previously chat-captured email survives re-selection.
             attendee_email: prior && prior.attendee_email,
+            // §B post-booking amendment: carry the form-configured prep question to the
+            // booked turn (same carry-forward discipline as attendee_email).
+            post_booking_question: prior && prior.post_booking_question,
           });
         }
         // Deterministic pipeline: the confirm affordance is SERVER-driven. With identity

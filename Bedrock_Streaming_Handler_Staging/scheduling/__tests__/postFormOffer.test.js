@@ -95,6 +95,20 @@ describe('postFormOffer — success (outcome:ok)', () => {
     });
   });
 
+  test('§B post-booking: a configured postBookingQuestion (trimmed) rides the proposing row for the booked turn', async () => {
+    const deps = makeDeps();
+    await postFormOffer({ tenantConfig: TENANT_CONFIG, sessionId: 'sess-1', attendee: { email: EMAIL }, postBookingQuestion: '  What would you like to talk about?  ', deps });
+    expect(deps.saveState).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'proposing', post_booking_question: 'What would you like to talk about?',
+    }));
+  });
+
+  test('§B post-booking: absent postBookingQuestion → proposing row has NO post_booking_question (byte-identical)', async () => {
+    const deps = makeDeps();
+    await call(deps); // call() never passes postBookingQuestion
+    expect(deps.saveState.mock.calls[0][0]).not.toHaveProperty('post_booking_question');
+  });
+
   test('saveState uses ONLY the deterministic pipeline whitelist keys (§B16b shared staging path)', async () => {
     const deps = makeDeps();
     await call(deps);
