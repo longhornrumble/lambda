@@ -26,6 +26,23 @@
 const PREP_NOTE_ACK = "Thanks — I'll pass that along so they can prepare for your conversation.";
 
 /**
+ * Cheap in-memory gate: does ANY form in the tenant config configure a post-booking question?
+ * If not, no session can ever carry `awaiting_prep_note`, so the per-turn capture state-read is
+ * skipped entirely — keeping tenants that don't use the feature BYTE-IDENTICAL (no extra DDB read).
+ * @param {object} config tenant config
+ * @returns {boolean}
+ */
+function tenantHasPostBookingQuestion(config) {
+  const forms = config && config.conversational_forms;
+  if (!forms || typeof forms !== 'object') return false;
+  for (const form of Object.values(forms)) {
+    const q = form && form.post_submission && form.post_submission.post_booking_question;
+    if (typeof q === 'string' && q.trim()) return true;
+  }
+  return false;
+}
+
+/**
  * @param {object} args
  * @param {string} args.tenantId
  * @param {string} args.sessionId
@@ -84,4 +101,4 @@ async function capturePrepNote({ tenantId, sessionId, userInput, deps = {}, writ
   return { captured: true };
 }
 
-module.exports = { capturePrepNote, PREP_NOTE_ACK };
+module.exports = { capturePrepNote, tenantHasPostBookingQuestion, PREP_NOTE_ACK };

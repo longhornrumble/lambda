@@ -9,7 +9,7 @@
  *  - the answer text is the verbatim user turn (trimmed); never a model call
  */
 
-const { capturePrepNote, PREP_NOTE_ACK } = require('../postBookingPrepNote');
+const { capturePrepNote, tenantHasPostBookingQuestion, PREP_NOTE_ACK } = require('../postBookingPrepNote');
 
 const BASE = { tenantId: 'TEN', sessionId: 'sess-1' };
 const awaitingRow = { state: 'booked', awaiting_prep_note: true, booking_id: 'booking#abc' };
@@ -90,5 +90,24 @@ describe('capturePrepNote', () => {
     const res = await capturePrepNote({ ...BASE, userInput: 'hello', deps: d, write: jest.fn() });
     expect(res).toEqual({ captured: true });
     expect(d.saveState).toHaveBeenCalled();
+  });
+});
+
+describe('tenantHasPostBookingQuestion — per-turn read gate (byte-identical for non-feature tenants)', () => {
+  test('true when ANY form configures a non-blank post_booking_question', () => {
+    expect(tenantHasPostBookingQuestion({
+      conversational_forms: {
+        a: { post_submission: { confirmation_message: 'Thanks' } },
+        b: { post_submission: { post_booking_question: 'What would you like to talk about?' } },
+      },
+    })).toBe(true);
+  });
+
+  test('false when no form configures one (blank / absent / no forms / bad shape)', () => {
+    expect(tenantHasPostBookingQuestion({ conversational_forms: { a: { post_submission: { post_booking_question: '   ' } } } })).toBe(false);
+    expect(tenantHasPostBookingQuestion({ conversational_forms: { a: { post_submission: {} } } })).toBe(false);
+    expect(tenantHasPostBookingQuestion({ conversational_forms: {} })).toBe(false);
+    expect(tenantHasPostBookingQuestion({})).toBe(false);
+    expect(tenantHasPostBookingQuestion(null)).toBe(false);
   });
 });
