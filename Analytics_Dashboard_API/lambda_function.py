@@ -3767,6 +3767,67 @@ def _booking_projection(item: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# Form-field labels that read like a free-text "what they want to talk about" question.
+_LEAD_NOTE_LABEL_RE = re.compile(r'about|why|tell|interest|message|comment|reason|goal|help|looking|need|share', re.I)
+
+
+def _pick_lead_note(fields: Dict[str, str]) -> Optional[str]:
+    """Heuristic 'what they want to talk about': prefer a substantive free-text field whose
+    label reads like an open question; otherwise the longest substantive value. Returns None
+    when nothing qualifies (the UI then shows an empty state)."""
+    best: Optional[str] = None
+    for label, value in fields.items():
+        v = (value or '').strip()
+        if len(v) < 12:
+            continue
+        if _LEAD_NOTE_LABEL_RE.search(label):
+            return v
+        if best is None or len(v) > len(best):
+            best = v
+    return best
+
+
+def _lead_summary_for_session(tenant_id: str, session_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Best-effort join of a booking to its lead's form submission via the form-submissions
+    `tenant-session-index`. Returns a compact summary for the scheduling Lead Workspace, or
+    None when there's no session_id, no matching submission, or the index is unavailable
+    (e.g. a table without tenant-session-index). NEVER raises — a join miss/failure must
+    leave the bookings list intact."""
+    if not session_id:
+        return None
+    try:
+        resp = dynamodb.query(
+            TableName=FORM_SUBMISSIONS_TABLE,
+            IndexName='tenant-session-index',
+            KeyConditionExpression='tenant_id = :t AND session_id = :s',
+            ExpressionAttributeValues={':t': {'S': tenant_id}, ':s': {'S': session_id}},
+            Limit=1,
+            ScanIndexForward=False,  # newest submission first if a session has several
+        )
+    except ClientError as e:
+        logger.debug(f"[scheduling] lead join skipped: {e.response.get('Error', {}).get('Code')}")
+        return None
+    items = resp.get('Items', [])
+    if not items:
+        return None
+    try:
+        lead = parse_lead_from_dynamodb(items[0])
+    except Exception as e:  # malformed submission row must not break the bookings list
+        logger.debug(f"[scheduling] lead parse skipped: {e}")
+        return None
+    fields = lead.get('fields') or {}
+    phase = (lead.get('pipeline_status') or '').strip()
+    return {
+        'submission_id': lead.get('submission_id') or None,
+        'app_name': lead.get('form_label') or None,
+        'note': _pick_lead_note(fields),
+        'phase': phase.capitalize() if phase else None,
+        'last_touch': lead.get('contacted_at') or lead.get('submitted_at') or None,
+        'submitted_at': lead.get('submitted_at') or None,
+        'fields': [{'label': k, 'value': v} for k, v in fields.items() if v],
+    }
+
+
 # Page cap for the bookings-list accumulation loop (the synthetic-row FilterExpression can
 # make a single DDB page sparse; we follow pages until a full page of real rows). Bounded
 # like _SCHED_METRICS_MAX_PAGES — a hit is LOGGED (never a silent truncation).
@@ -3881,7 +3942,16 @@ def handle_scheduling_bookings(tenant_id: str, params: Dict[str, str],
                            f"pages={pages}) — list may be partial")
             break
 
-    bookings = [_booking_projection(item) for item in items[:page_size]]
+    page_items = items[:page_size]
+    bookings = [_booking_projection(item) for item in page_items]
+    # Opt-in lead join (include_lead=1): attach each booking's lead summary, joined from its
+    # form submission via session_id. Best-effort + fail-soft (per-row) — a miss leaves the
+    # booking unchanged. OFF by default, so callers that don't request it are unaffected.
+    if params.get('include_lead') in ('1', 'true'):
+        for proj, item in zip(bookings, page_items):
+            summary = _lead_summary_for_session(tenant_id, (item.get('session_id') or {}).get('S'))
+            if summary:
+                proj['lead'] = summary
     body: Dict[str, Any] = {'bookings': bookings}
     if next_key:
         body['nextCursor'] = base64.b64encode(json.dumps(next_key).encode('utf-8')).decode('utf-8')
