@@ -138,6 +138,12 @@ def test_projection_full_item_nests_attendee():
     assert p['html_link'] == 'https://cal/evt'
 
 
+def test_projection_includes_prep_note_when_present():
+    """§B post-booking amendment: the attendee's free-text answer rides the booking row."""
+    p = _booking_projection(_item(prep_note={'S': 'I want to talk about respite care.'}))
+    assert p['prep_note'] == 'I want to talk about respite care.'
+
+
 def test_projection_old_shape_tolerates_missing_fields():
     """Old rows lack attendee_name/phone, html_link, last_calendar_mutation_at — must
     yield None, never KeyError (forward-compatible reads)."""
@@ -154,6 +160,7 @@ def test_projection_old_shape_tolerates_missing_fields():
     assert p['html_link'] is None
     assert p['last_calendar_mutation_at'] is None
     assert p['end_at'] is None
+    assert p['prep_note'] is None  # old-shape rows predate the post-booking question
 
 
 @patch('lambda_function.dynamodb')

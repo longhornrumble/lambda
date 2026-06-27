@@ -3764,6 +3764,10 @@ def _booking_projection(item: Dict[str, Any]) -> Dict[str, Any]:
         'created_at': g('created_at'),
         'last_calendar_mutation_at': g('last_calendar_mutation_at'),
         'html_link': g('html_link'),
+        # §B post-booking amendment: the attendee's free-text answer to the form-configured
+        # "what would you like to talk about?" question, attached after booking. The dashboard
+        # prefers this over the heuristic include_lead note. Old-shape rows lack it → None.
+        'prep_note': g('prep_note'),
     }
 
 

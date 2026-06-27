@@ -110,7 +110,7 @@ function _audit(logger, fields) {
  *     read first and an in-flight 'proposing'/'confirming' row suppresses the offer
  * @returns {Promise<{offerText: string|null, slotsResult: object|null}>}
  */
-async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = {}) {
+async function postFormOffer({ tenantConfig, sessionId, attendee, postBookingQuestion, deps = {} } = {}) {
   const logger = deps.logger || console;
   const suppressed = { offerText: null, slotsResult: null };
 
@@ -202,7 +202,7 @@ async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = 
       if (slotsResult.roundRobinCursor != null) proposal.roundRobinCursor = slotsResult.roundRobinCursor;
 
       if (deps.saveState) {
-        await deps.saveState({
+        const proposingState = {
           tenantId,
           sessionId,
           state: 'proposing',
@@ -210,7 +210,14 @@ async function postFormOffer({ tenantConfig, sessionId, attendee, deps = {} } = 
           proposal,
           rejected_slot_ids: [],
           attendee_email: email, // the D3 pre-fill: confirm never re-asks
-        });
+        };
+        // §B post-booking amendment: stash the form-configured "what would you like to talk
+        // about?" question on the session so the booked turn can ask it (carried forward
+        // through select_slot → confirm_book). Additive — absent → byte-identical.
+        if (typeof postBookingQuestion === 'string' && postBookingQuestion.trim()) {
+          proposingState.post_booking_question = postBookingQuestion.trim();
+        }
+        await deps.saveState(proposingState);
       }
       if (typeof deps.emitSse === 'function') {
         // §B18b: forward context when the propose result carries it (ADDITIVE; omit when absent —

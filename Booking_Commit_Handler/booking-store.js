@@ -223,6 +223,26 @@ async function updateBookingCancelReason(tenantId, bookingId, { reason, canceled
   }));
 }
 
+// Post-booking prep note (§B post-booking amendment): persist the attendee's free-text answer
+// to the operator-configured "what would you like to talk about?" question, captured on a
+// SEPARATE turn AFTER the booking commits. Audit-only attribute write — never touches status
+// or any commit field. ConditionExpression guards a vanished row (a concurrent cancel/delete).
+// Verbatim (trimmed); length-capped at 2000 chars to defend the row + downstream readers.
+async function updateBookingPrepNote(tenantId, bookingId, prepNote) {
+  if (!tenantId || !bookingId) throw new Error('updateBookingPrepNote requires tenantId and bookingId');
+  if (typeof prepNote !== 'string' || !prepNote.trim()) throw new Error('updateBookingPrepNote requires a non-empty prepNote string');
+  await ddb.send(new UpdateItemCommand({
+    TableName: BOOKING_TABLE,
+    Key: BOOKING_KEY(tenantId, bookingId),
+    UpdateExpression: 'SET prep_note = :pn, prep_note_added_at = :now',
+    ExpressionAttributeValues: {
+      ':pn': s(prepNote.trim().slice(0, 2000)),
+      ':now': s(new Date().toISOString()),
+    },
+    ConditionExpression: 'attribute_exists(booking_id)',
+  }));
+}
+
 // G6 reschedule-link rate limit (anti email-bombing): atomically claim a send-slot by writing
 // reschedule_link_sent_at ONLY if it is unset or older than cooldownSeconds. Returns true if the
 // slot was claimed (caller may proceed to mint+notify); false (ConditionalCheckFailed) if a send
@@ -316,6 +336,7 @@ module.exports = {
   writeBooking,
   updateBookingReschedule,
   updateBookingCancelReason,
+  updateBookingPrepNote,
   touchRescheduleLinkSentAt,
   readLock,
   recordConferenceOnLock,

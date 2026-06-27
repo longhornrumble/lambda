@@ -192,3 +192,37 @@ describe('writeDegradedMarker — §5.5 row 4 durable record', () => {
     expect(item.coordinator_email).toBeUndefined();
   });
 });
+
+describe('updateBookingPrepNote — post-booking free-text answer (§B post-booking amendment)', () => {
+  it('writes prep_note + prep_note_added_at, guarded on the booking existing', async () => {
+    ddbMock.on(UpdateItemCommand).resolves({});
+    await store.updateBookingPrepNote('AUS123957', 'booking#abc', 'I want to talk about respite care.');
+    const input = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
+    expect(input.Key).toEqual({ tenantId: { S: 'AUS123957' }, booking_id: { S: 'booking#abc' } });
+    expect(input.UpdateExpression).toContain('prep_note = :pn');
+    expect(input.UpdateExpression).toContain('prep_note_added_at = :now');
+    expect(input.ExpressionAttributeValues[':pn'].S).toBe('I want to talk about respite care.');
+    expect(input.ConditionExpression).toBe('attribute_exists(booking_id)');
+  });
+
+  it('trims and caps the answer at 2000 chars (verbatim defense)', async () => {
+    ddbMock.on(UpdateItemCommand).resolves({});
+    await store.updateBookingPrepNote('T', 'booking#x', `  ${'a'.repeat(2500)}  `);
+    const input = ddbMock.commandCalls(UpdateItemCommand)[0].args[0].input;
+    expect(input.ExpressionAttributeValues[':pn'].S).toBe('a'.repeat(2000));
+  });
+
+  it('rejects missing ids and empty/blank answers before any write', async () => {
+    await expect(store.updateBookingPrepNote('', 'booking#x', 'hi')).rejects.toThrow(/tenantId and bookingId/);
+    await expect(store.updateBookingPrepNote('T', '', 'hi')).rejects.toThrow(/tenantId and bookingId/);
+    await expect(store.updateBookingPrepNote('T', 'booking#x', '   ')).rejects.toThrow(/non-empty/);
+    await expect(store.updateBookingPrepNote('T', 'booking#x', 42)).rejects.toThrow(/non-empty/);
+    expect(ddbMock).toHaveReceivedCommandTimes(UpdateItemCommand, 0);
+  });
+
+  it('propagates ConditionalCheckFailed when the booking vanished (concurrent cancel)', async () => {
+    ddbMock.on(UpdateItemCommand).rejects(conditionalFail());
+    await expect(store.updateBookingPrepNote('T', 'booking#gone', 'hello'))
+      .rejects.toMatchObject({ name: 'ConditionalCheckFailedException' });
+  });
+});

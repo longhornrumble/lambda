@@ -46,6 +46,7 @@ const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
 const { agentTurn, isAgentTurnEnabled } = require('./scheduling/agentTurn');
 // WS-TRACKD-BE (D3): post-form scheduling offer — wired at the form-completion seam.
 const { postFormOffer } = require('./scheduling/postFormOffer');
+const { capturePrepNote, tenantHasPostBookingQuestion } = require('./scheduling/postBookingPrepNote');
 // WS-NEWBOOK (B-remainder §B16d): the in-chat NEW-booking entry-hook. No-op for normal chat +
 // the recovery loop; engages on the widget's scheduling_intent:'new_booking' signal or an
 // in-flight new-booking session row.
@@ -450,10 +451,17 @@ const streamingHandler = async (event, responseStream, context) => {
               sessionId,
             });
             if (existingRow == null) {
+              // §B post-booking amendment: the completed form may configure a question to ask
+              // AFTER booking ("what would you like to talk about?"). Read it here (old-shape
+              // tolerant — absent → null) and hand it to postFormOffer, which stashes it on the
+              // proposing session so the booked turn can stream it.
+              const postBookingQuestion =
+                (config?.conversational_forms?.[body.form_id]?.post_submission?.post_booking_question || '').trim() || null;
               const { offerText } = await postFormOffer({
                 tenantConfig: config,
                 sessionId,
                 attendee: formContact,
+                postBookingQuestion,
                 deps: {
                   ...schedulingDeps,
                   ...newBookingDep,
@@ -628,6 +636,39 @@ const streamingHandler = async (event, responseStream, context) => {
       if (cap.captured) {
         console.log('📅 attendee email captured for confirming session — bypassing Bedrock');
         write(`data: ${JSON.stringify({ type: 'text', content: SCHEDULING_EMAIL_GOT_COPY(cap.email), session_id: sessionId })}\n\n`);
+        write('data: [DONE]\n\n');
+        if (heartbeatInterval) {
+          clearInterval(heartbeatInterval);
+          heartbeatInterval = null;
+        }
+        streamEnded = true;
+        responseStream.end();
+        return;
+      }
+    }
+
+    // Post-booking prep note (§B post-booking amendment): when the originating form configured
+    // a question, the booked session row carries `awaiting_prep_note` + `booking_id`. The user's
+    // NEXT plain free-text turn is their answer — capture it DETERMINISTICALLY (no model call;
+    // the LLM would give a state-blind answer), attach it to the Booking row, clear the one-shot
+    // flag, and ack. Sits after the click router + email capture (those turns returned above) and
+    // before the agent/chat path. Fail-soft: any miss/error → fall through to normal chat.
+    // The cheap config gate (no form configures a question → no awaiting session can exist)
+    // keeps tenants NOT using the feature byte-identical — no per-turn state read.
+    if (isSchedulingEnabled(config) && !isSchedulingEntryClick && !widgetSchedulingAction && tenantHasPostBookingQuestion(config)) {
+      const prep = await capturePrepNote({
+        tenantId: config?.tenant_id,
+        sessionId,
+        userInput,
+        deps: {
+          loadState: schedulingDeps.loadState,
+          saveState: schedulingDeps.saveState,
+          invokeAttachPrepNote: schedulingExecDep.invokeSchedulingExecutor,
+        },
+        write,
+      });
+      if (prep.captured) {
+        console.log('📅 post-booking prep note captured — bypassing Bedrock');
         write('data: [DONE]\n\n');
         if (heartbeatInterval) {
           clearInterval(heartbeatInterval);
