@@ -30,6 +30,7 @@ ADMIN_EMAIL = 'admin@example.com'
 STAFF_EMAIL = 'staff@example.com'
 EMP_ID = 'a1b2c3d4-e5f6-7890-abcd-ef0123456789'  # uuid4 shape
 VOCAB = {'scheduling': {'scheduling_tag_vocabulary': ['mentoring', 'esl', 'weekend']}}
+VOCAB_LIST = VOCAB['scheduling']['scheduling_tag_vocabulary']  # post-unification: derived team names
 
 
 def _emp(email=STAFF_EMAIL, **extra):
@@ -79,7 +80,7 @@ def test_tags_non_string_or_empty_member_400():
 # G4 — tag-vocabulary read (admin-only)
 # --------------------------------------------------------------------------- #
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 def test_vocab_get_admin_200(_cfg):
     r = handle_scheduling_tag_vocabulary_get(TENANT, ADMIN)
     assert r['statusCode'] == 200
@@ -91,7 +92,7 @@ def test_vocab_get_non_admin_403(role):
     assert handle_scheduling_tag_vocabulary_get(TENANT, role)['statusCode'] == 403
 
 
-@patch('lambda_function.get_tenant_config', return_value={})
+@patch('lambda_function.get_tag_vocabulary', return_value=[])
 def test_vocab_get_missing_config_empty(_cfg):
     r = handle_scheduling_tag_vocabulary_get(TENANT, ADMIN)
     assert json.loads(r['body'])['scheduling_tag_vocabulary'] == []
@@ -101,7 +102,7 @@ def test_vocab_get_missing_config_empty(_cfg):
 # G1 write — scheduling_tags (ADMIN-only)
 # --------------------------------------------------------------------------- #
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_tags_admin_write_200(mock_reg, _cfg):
     mock_reg.get_employee.return_value = _emp()
@@ -114,7 +115,7 @@ def test_tags_admin_write_200(mock_reg, _cfg):
     assert json.loads(r['body'])['scheduling_tags'] == ['mentoring', 'esl']
 
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_tags_member_write_403(mock_reg, _cfg):
     mock_reg.get_employee.return_value = _emp()
@@ -124,7 +125,7 @@ def test_tags_member_write_403(mock_reg, _cfg):
     mock_reg.update_employee.assert_not_called()
 
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_tags_unknown_422_no_write(mock_reg, _cfg):
     mock_reg.get_employee.return_value = _emp()
@@ -273,7 +274,7 @@ def test_update_employee_raises_502(mock_reg):
     assert r['statusCode'] == 502
 
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_member_cannot_smuggle_admin_field_with_self_email(mock_reg, _cfg):
     # member editing own record tries to also set admin-only scheduling_tags -> 403, no write
@@ -286,7 +287,7 @@ def test_member_cannot_smuggle_admin_field_with_self_email(mock_reg, _cfg):
     mock_reg.update_employee.assert_not_called()
 
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_admin_sets_all_three_together_200(mock_reg, _cfg):
     mock_reg.get_employee.return_value = _emp()
@@ -369,7 +370,7 @@ def test_b2_conditional_write_passed_and_ccf_maps_404(mock_reg):
 
 # --- B3: scheduling_tags: null clears to [] (parity with override fields) --- #
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_b3_tags_null_clears_to_empty(mock_reg, _cfg):
     mock_reg.get_employee.return_value = _emp()
@@ -381,7 +382,7 @@ def test_b3_tags_null_clears_to_empty(mock_reg, _cfg):
 
 # --- SR2: scheduling_tags length cap --- #
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_sr2_tags_over_cap_400(mock_reg, _cfg):
     mock_reg.get_employee.return_value = _emp()
@@ -432,7 +433,7 @@ def test_sr4_padded_valid_email_trimmed(mock_reg):
 
 # --- SR6: super_admin write + email length boundary --- #
 
-@patch('lambda_function.get_tenant_config', return_value=VOCAB)
+@patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST)
 @patch('lambda_function.tenant_registry_ops')
 def test_sr6_super_admin_can_write(mock_reg, _cfg):
     mock_reg.get_employee.return_value = _emp()
@@ -442,7 +443,7 @@ def test_sr6_super_admin_can_write(mock_reg, _cfg):
 
 
 def test_sr6_super_admin_vocab_get_200():
-    with patch('lambda_function.get_tenant_config', return_value=VOCAB):
+    with patch('lambda_function.get_tag_vocabulary', return_value=VOCAB_LIST):
         assert handle_scheduling_tag_vocabulary_get(TENANT, SUPER)['statusCode'] == 200
 
 
