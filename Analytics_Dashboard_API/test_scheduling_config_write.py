@@ -179,6 +179,32 @@ def test_routing_policy_update_stale_if_match_409(mock_ddb, _cfg):
     assert resp['statusCode'] == 409
 
 
+@patch('lambda_function.get_tenant_config', return_value={'scheduling': {'scheduling_tag_vocabulary': ['mentoring']}})
+@patch('lambda_function.dynamodb')
+def test_routing_policy_update_star_if_match_no_unused_names(mock_ddb, _cfg):
+    """First edit of a legacy/fixture row (If-Match '*') takes the attribute_not_exists
+    branch, which must NOT leave an unused '#at' in ExpressionAttributeNames. Regression:
+    DynamoDB 502'd these with 'unused in expressions: keys: {#at}' (only mocked tests ran,
+    so the real ValidationException never surfaced)."""
+    mock_ddb.update_item.return_value = {'Attributes': {
+        'routing_policy_id': {'S': 'rp_x'}, 'tenantId': {'S': TENANT},
+        'tie_breaker': {'S': 'first_available'}, 'tag_conditions': {'L': []},
+        'modified_at': {'M': {'at': {'S': '2026-06-29T00:00:00Z'}, 'by': {'S': EMAIL}}},
+    }}
+    resp = handle_scheduling_routing_policy_write(
+        TENANT, 'rp_x', {'tie_breaker': 'first_available', 'tag_conditions': []},
+        ADMIN, EMAIL, '*')
+    assert resp['statusCode'] == 200
+    kw = mock_ddb.update_item.call_args.kwargs
+    assert kw['ConditionExpression'] == 'attribute_exists(#pk) AND attribute_not_exists(#mod)'
+    assert '#at' not in kw['ExpressionAttributeNames']
+    # General invariant: every declared ExpressionAttributeName must be referenced —
+    # DynamoDB rejects an UpdateItem with any unused key.
+    expr = kw['UpdateExpression'] + ' ' + kw['ConditionExpression']
+    for placeholder in kw['ExpressionAttributeNames']:
+        assert placeholder in expr, f'unused ExpressionAttributeName: {placeholder}'
+
+
 # --------------------------------------------------------------------------- #
 # AppointmentType create/update — FK + field validation
 # --------------------------------------------------------------------------- #

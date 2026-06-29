@@ -4190,7 +4190,7 @@ def _update_scheduling_row(table: str, key: Dict[str, Any], fields: Dict[str, An
     """
     if not if_match:
         return None, cors_response(428, {'error': 'If-Match (last-seen modified_at.at) required for update'})
-    names = {'#mod': 'modified_at', '#at': 'at'}
+    names = {'#mod': 'modified_at'}
     values = {}
     sets = []
     for i, (k, v) in enumerate(fields.items()):
@@ -4210,7 +4210,12 @@ def _update_scheduling_row(table: str, key: Dict[str, Any], fields: Dict[str, An
         # concurrently-stamped edit.
         condition = 'attribute_exists(#pk) AND attribute_not_exists(#mod)'
     else:
+        # `#at` is ONLY referenced here — declare it inside this branch so the '*' path
+        # (which never uses it) doesn't leave it in ExpressionAttributeNames. DynamoDB
+        # rejects an UpdateItem whose ExpressionAttributeNames contains an unused key
+        # ("Value provided in ExpressionAttributeNames unused in expressions: keys: {#at}").
         condition = 'attribute_exists(#pk) AND attribute_exists(#mod) AND #mod.#at = :ifmatch'
+        names['#at'] = 'at'
         values[':ifmatch'] = {'S': if_match}
     try:
         resp = dynamodb.update_item(
