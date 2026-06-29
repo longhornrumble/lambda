@@ -593,3 +593,215 @@ def test_appointment_type_update_persists_conference_type(mock_ddb):
     assert resp['statusCode'] == 200
     assert 'conference_type' in mock_ddb.update_item.call_args.kwargs['ExpressionAttributeNames'].values()
     assert json.loads(resp['body'])['appointment_type']['conference_type'] == 'zoom'
+
+
+# =========================================================================== #
+# F6: Team Name (scheduling_tag_vocabulary) AUTHORING — PUT /scheduling/tag-vocabulary
+# Single replace-list write (S3 RMW); ADMIN-only; FAIL-CLOSED delete-guard.
+# =========================================================================== #
+
+def _rp_item(rp_id, values, operator='in_any'):
+    """A marshalled routing-policy row whose tag_conditions reference `values`."""
+    return {
+        'tenantId': {'S': TENANT}, 'routing_policy_id': {'S': rp_id},
+        'tie_breaker': {'S': 'round_robin'},
+        'tag_conditions': {'L': [{'M': {
+            'operator': {'S': operator},
+            'values': {'L': [{'S': v} for v in values]},
+        }}]},
+    }
+
+
+# --- validation (pure) ------------------------------------------------------- #
+
+def test_validate_tag_vocabulary_trims_and_dedups_preserving_order():
+    norm, err = lf._validate_tag_vocabulary(['  Coordinators  ', 'Coordinators', 'ESL', 'ESL '])
+    assert err is None
+    assert norm == ['Coordinators', 'ESL']   # trimmed, de-duped, first-seen order
+
+
+def test_validate_tag_vocabulary_bad_shapes_400():
+    assert lf._validate_tag_vocabulary('nope')[1]['statusCode'] == 400          # not a list
+    assert lf._validate_tag_vocabulary([1])[1]['statusCode'] == 400             # non-string entry
+    assert lf._validate_tag_vocabulary(['   '])[1]['statusCode'] == 400         # empty after trim
+    assert lf._validate_tag_vocabulary(['x' * 51])[1]['statusCode'] == 400      # over char cap
+    assert lf._validate_tag_vocabulary(['ok'] * (lf._TAG_VOCAB_MAX + 1))[1]['statusCode'] == 400  # over count cap
+
+
+# --- auth -------------------------------------------------------------------- #
+
+@pytest.mark.parametrize('role', ['member', None, 'viewer'])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary')
+def test_tag_vocab_write_requires_admin(mock_put, role):
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, role, EMAIL)
+    assert resp['statusCode'] == 403
+    mock_put.assert_not_called()
+
+
+@patch('lambda_function.get_tag_vocabulary', return_value=[])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary', side_effect=lambda t, v: v)
+def test_tag_vocab_write_super_admin_allowed(mock_put, _cur):
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, 'super_admin', EMAIL)
+    assert resp['statusCode'] == 200
+
+
+def test_tag_vocab_write_non_dict_body_400():
+    assert lf.handle_scheduling_tag_vocabulary_write(TENANT, 'nope', ADMIN, EMAIL)['statusCode'] == 400
+
+
+# --- happy path (no removal -> guard skipped) -------------------------------- #
+
+@patch('lambda_function.tenant_registry_ops')
+@patch('lambda_function.dynamodb')
+@patch('lambda_function.get_tag_vocabulary', return_value=['A'])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary', side_effect=lambda t, v: v)
+def test_tag_vocab_write_add_only_skips_guard_200(mock_put, _cur, mock_ddb, mock_reg):
+    # current=['A'], new=['A','B'] -> only an addition -> the (DDB+registry) guard must NOT run.
+    resp = lf.handle_scheduling_tag_vocabulary_write(
+        TENANT, {'scheduling_tag_vocabulary': ['A', 'B']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 200
+    assert json.loads(resp['body'])['scheduling_tag_vocabulary'] == ['A', 'B']
+    mock_put.assert_called_once_with(TENANT, ['A', 'B'])
+    mock_ddb.query.assert_not_called()                 # guard skipped: nothing removed
+    mock_reg.list_employees.assert_not_called()
+
+
+@patch('lambda_function.get_tag_vocabulary', return_value=[])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary', side_effect=lambda t, v: v)
+def test_tag_vocab_write_persists_normalized(mock_put, _cur):
+    resp = lf.handle_scheduling_tag_vocabulary_write(
+        TENANT, {'scheduling_tag_vocabulary': ['  A  ', 'A', 'B']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 200
+    mock_put.assert_called_once_with(TENANT, ['A', 'B'])   # trimmed + de-duped before persist
+
+
+# --- delete-guard (FAIL-CLOSED) ---------------------------------------------- #
+
+@patch('lambda_function.tenant_registry_ops')
+@patch('lambda_function.dynamodb')
+@patch('lambda_function.get_tag_vocabulary', return_value=['A', 'B'])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary')
+def test_tag_vocab_remove_unused_ok_200(mock_put, _cur, mock_ddb, mock_reg):
+    mock_ddb.query.return_value = {'Items': []}            # no routing references
+    mock_reg.list_employees.return_value = [{'email': 'x@y.com', 'scheduling_tags': ['A']}]  # B unused
+    mock_put.side_effect = lambda t, v: v
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 200
+    mock_put.assert_called_once_with(TENANT, ['A'])
+
+
+@patch('lambda_function.tenant_registry_ops')
+@patch('lambda_function.dynamodb')
+@patch('lambda_function.get_tag_vocabulary', return_value=['A', 'B'])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary')
+def test_tag_vocab_remove_in_use_by_routing_422(mock_put, _cur, mock_ddb, mock_reg):
+    mock_ddb.query.return_value = {'Items': [_rp_item('rp_1', ['B'])]}   # rp_1 still references B
+    mock_reg.list_employees.return_value = []
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 422
+    body = json.loads(resp['body'])
+    assert body['inUseTags'] == ['B']
+    assert body['references']['B']['routing_policies'] == ['rp_1']
+    mock_put.assert_not_called()                           # write aborted
+
+
+@patch('lambda_function.tenant_registry_ops')
+@patch('lambda_function.dynamodb')
+@patch('lambda_function.get_tag_vocabulary', return_value=['A', 'B'])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary')
+def test_tag_vocab_remove_in_use_by_staff_422(mock_put, _cur, mock_ddb, mock_reg):
+    mock_ddb.query.return_value = {'Items': []}
+    mock_reg.list_employees.return_value = [{'email': 'coord@y.com', 'scheduling_tags': ['B']}]
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 422
+    body = json.loads(resp['body'])
+    assert body['inUseTags'] == ['B']
+    assert body['references']['B']['staff'] == ['coord@y.com']
+    mock_put.assert_not_called()
+
+
+@patch('lambda_function.tenant_registry_ops')
+@patch('lambda_function.dynamodb')
+@patch('lambda_function.get_tag_vocabulary', return_value=['A', 'B'])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary')
+def test_tag_vocab_remove_guard_read_error_502(mock_put, _cur, mock_ddb, mock_reg):
+    mock_ddb.query.side_effect = ClientError({'Error': {'Code': 'X', 'Message': 'y'}}, 'Query')
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 502
+    mock_put.assert_not_called()                           # fail-closed: never write on guard failure
+
+
+# --- S3 write errors --------------------------------------------------------- #
+
+@patch('lambda_function.get_tag_vocabulary', return_value=[])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary')
+def test_tag_vocab_write_concurrent_modification_409(mock_put, _cur):
+    # Raise at CALL time so the exception class matches the handler's `except` even if a
+    # sibling test reloaded lambda_function (which would swap the class object otherwise).
+    def _raise(*_a, **_k):
+        raise lf.ConcurrentModificationError('refresh')
+    mock_put.side_effect = _raise
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 409
+
+
+@patch('lambda_function.get_tag_vocabulary', return_value=[])
+@patch('lambda_function.update_tenant_scheduling_tag_vocabulary',
+       side_effect=ClientError({'Error': {'Code': 'AccessDenied', 'Message': 'x'}}, 'PutObject'))
+def test_tag_vocab_write_s3_error_502(mock_put, _cur):
+    resp = lf.handle_scheduling_tag_vocabulary_write(TENANT, {'scheduling_tag_vocabulary': ['A']}, ADMIN, EMAIL)
+    assert resp['statusCode'] == 502
+
+
+# --- the S3 RMW helper: only the one nested key is written ------------------- #
+
+def _s3_get(config):
+    body = MagicMock()
+    body.read.return_value = json.dumps(config).encode('utf-8')
+    return {'ETag': '"etag-1"', 'Body': body}
+
+
+@patch('lambda_function.s3')
+def test_update_vocab_rmw_preserves_siblings_and_uses_etag(mock_s3):
+    cfg = {
+        'tenant_id': TENANT,
+        'feature_flags': {'scheduling_enabled': True},
+        'scheduling': {'scheduling_tag_vocabulary': ['old'], 'other_sched_key': 42},
+    }
+    mock_s3.get_object.return_value = _s3_get(cfg)
+    out = lf.update_tenant_scheduling_tag_vocabulary(TENANT, ['New A', 'New B'])
+    assert out == ['New A', 'New B']
+    kw = mock_s3.put_object.call_args.kwargs
+    assert kw['IfMatch'] == '"etag-1"'                     # optimistic lock on the read ETag
+    written = json.loads(kw['Body'])
+    assert written['scheduling']['scheduling_tag_vocabulary'] == ['New A', 'New B']
+    assert written['scheduling']['other_sched_key'] == 42  # sibling scheduling key preserved
+    assert written['feature_flags'] == {'scheduling_enabled': True}  # sibling top-level preserved
+
+
+@patch('lambda_function.s3')
+def test_update_vocab_rmw_creates_scheduling_block_when_missing(mock_s3):
+    mock_s3.get_object.return_value = _s3_get({'tenant_id': TENANT})   # no `scheduling` block
+    lf.update_tenant_scheduling_tag_vocabulary(TENANT, ['A'])
+    written = json.loads(mock_s3.put_object.call_args.kwargs['Body'])
+    assert written['scheduling']['scheduling_tag_vocabulary'] == ['A']
+
+
+@patch('lambda_function.s3')
+def test_update_vocab_rmw_precondition_failed_raises_concurrent(mock_s3):
+    mock_s3.get_object.return_value = _s3_get({'scheduling': {'scheduling_tag_vocabulary': []}})
+    mock_s3.put_object.side_effect = ClientError(
+        {'Error': {'Code': 'PreconditionFailed', 'Message': 'x'}}, 'PutObject')
+    with pytest.raises(lf.ConcurrentModificationError):
+        lf.update_tenant_scheduling_tag_vocabulary(TENANT, ['A'])
+
+
+@patch('lambda_function.s3')
+def test_update_vocab_rmw_other_clienterror_reraises(mock_s3):
+    # A non-412 put error (e.g. the carve-out missing) is NOT a concurrent-edit — it re-raises
+    # the raw ClientError so the handler maps it to a 502 (not a misleading 409).
+    mock_s3.get_object.return_value = _s3_get({'scheduling': {'scheduling_tag_vocabulary': []}})
+    mock_s3.put_object.side_effect = ClientError(
+        {'Error': {'Code': 'AccessDenied', 'Message': 'x'}}, 'PutObject')
+    with pytest.raises(ClientError):
+        lf.update_tenant_scheduling_tag_vocabulary(TENANT, ['A'])
