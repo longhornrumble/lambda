@@ -486,15 +486,16 @@ def lambda_handler(event, context):
             rp_id = path.split('/scheduling/routing-policies/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_scheduling_routing_policy_write(tenant_id, rp_id, body, user_role, user_email, if_match)
-        # §G4 tag-vocabulary read (dropdown source for E13b/E13) + §G1 per-staff scheduling
-        # settings write. Tenant comes from auth (super-admin via X-Tenant-Override), not path.
-        # Substring match (consistent with the sibling /scheduling/* routes); no collision with
-        # the super-admin /admin/employees/* routes (different literal) or /scheduling/bookings.
+        elif '/scheduling/routing-policies/' in path and method == 'DELETE':
+            rp_id = path.split('/scheduling/routing-policies/')[1].split('/')[0]
+            return handle_scheduling_routing_policy_delete(tenant_id, rp_id, user_role, user_email, if_match)
+        # §G4 tag-vocabulary read (the team-name list a team/staff is tagged with — now DERIVED
+        # from routing policies post-unification) + §G1 per-staff scheduling settings write.
+        # Tenant comes from auth (super-admin via X-Tenant-Override), not path. Substring match
+        # (consistent with the sibling /scheduling/* routes); no collision with the super-admin
+        # /admin/employees/* routes (different literal) or /scheduling/bookings.
         elif path.endswith('/scheduling/tag-vocabulary') and method == 'GET':
             return handle_scheduling_tag_vocabulary_get(tenant_id, user_role)
-        elif path.endswith('/scheduling/tag-vocabulary') and method == 'PUT':
-            body = json.loads(event.get('body', '{}') or '{}')
-            return handle_scheduling_tag_vocabulary_write(tenant_id, body, user_role, user_email)
         elif '/scheduling/employees/' in path and method == 'PATCH':
             sched_employee_id = path.split('/scheduling/employees/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
@@ -4122,32 +4123,65 @@ def _modified_at(editor_email: Optional[str]) -> Dict[str, str]:
     return {'at': _now_iso(), 'by': (editor_email or 'unknown')}
 
 
+def _routing_policies_for_tenant(tenant_id: str) -> List[Dict[str, Any]]:
+    """Query the tenant's routing policies (= Teams). Bounded read (no GSI/pagination v1).
+    Raises ClientError on a DDB failure (callers decide fail-open vs fail-closed)."""
+    resp = dynamodb.query(
+        TableName=ROUTING_POLICY_TABLE,
+        KeyConditionExpression='tenantId = :t',
+        ExpressionAttributeValues={':t': {'S': tenant_id}},
+        Limit=_SCHED_CONFIG_LIST_LIMIT,
+    )
+    return [_unmarshal(i) for i in resp.get('Items', [])]
+
+
+def _policy_tag_names(policy: Dict[str, Any]) -> Set[str]:
+    """The Team Name(s) a routing policy carries = the non-empty strings in its tag_conditions
+    values. Empty set = the unconditioned 'Everyone' team."""
+    names: Set[str] = set()
+    for cond in policy.get('tag_conditions') or []:
+        for v in (cond or {}).get('values') or []:
+            if isinstance(v, str) and v:
+                names.add(v)
+    return names
+
+
 def get_tag_vocabulary(tenant_id: str) -> List[str]:
     """
-    The closed tag vocabulary = tenant config S3 scheduling.scheduling_tag_vocabulary.
-    Reads are allowed on staging (the config bucket is a read-only prod replica), so
-    vocab-validation works there even though the vocabulary is not EDITABLE from staging.
-    Missing config / block -> empty vocabulary (only solo policies may then be written).
+    The Team Name vocabulary = the names of the tenant's teams, DERIVED from the routing-policy
+    table (post-unification 2026-06-29: a team IS its name; there is no separate vocabulary
+    store). This is purely the dashboard's authoring/validation list — booking pools off
+    tag_conditions <-> staff scheduling_tags directly, never off this list. A DDB failure
+    yields [] (the staff-tag validation that consumes it then fail-closes any non-empty tag).
     """
-    config = get_tenant_config(tenant_id) or {}
-    scheduling = config.get('scheduling') or {}
-    vocab = scheduling.get('scheduling_tag_vocabulary') or []
-    return [t for t in vocab if isinstance(t, str)]
+    try:
+        policies = _routing_policies_for_tenant(tenant_id)
+    except ClientError as e:
+        logger.error(f"[tag-vocabulary] derive query failed (tenant={redact_tenant_id(tenant_id)}): {e}")
+        return []
+    names: Set[str] = set()
+    for p in policies:
+        names |= _policy_tag_names(p)
+    return sorted(names)
 
 
-def _validate_tag_conditions(tag_conditions: Any, vocabulary: List[str]):
+# Per-Team-Name char cap (mirrors config-builder Zod string().min(1).max(50)). Kept here (the
+# F6 vocabulary block that first defined it is retired by the Teams-unification merge).
+_TAG_NAME_MAX = 50
+
+
+def _validate_tag_conditions(tag_conditions: Any):
     """
-    §E13b vocab-validation (FAIL-CLOSED). Validates the runtime tag_conditions shape
-    [{operator: 'in_any'|'equals', values: [tag]}] AND that every tag is in the closed
-    vocabulary. Returns (normalized_conditions, error_response_or_None).
+    Shape-validate + trim the runtime tag_conditions [{operator:'in_any'|'equals', values:[name]}].
+    Post-unification (2026-06-29) there is NO closed-vocabulary membership check — a team's name
+    is authored here, and name uniqueness is enforced separately in the write handler. Returns
+    (normalized_conditions, error_response_or_None).
     """
     if tag_conditions is None:
         return [], None
     if not isinstance(tag_conditions, list):
         return None, cors_response(400, {'error': 'tag_conditions must be a list'})
-    vocab = set(vocabulary)
     normalized: List[Dict[str, Any]] = []
-    unknown: List[str] = []
     for cond in tag_conditions:
         if not isinstance(cond, dict):
             return None, cors_response(400, {'error': 'each tag_condition must be an object'})
@@ -4155,16 +4189,11 @@ def _validate_tag_conditions(tag_conditions: Any, vocabulary: List[str]):
         if operator not in _TAG_OPERATORS:
             return None, cors_response(400, {'error': f'invalid tag_condition operator: {operator!r}'})
         values = cond.get('values', [])
-        if not isinstance(values, list) or not values or not all(isinstance(v, str) and v for v in values):
+        if not isinstance(values, list) or not values or not all(isinstance(v, str) and v.strip() for v in values):
             return None, cors_response(400, {'error': 'tag_condition.values must be a non-empty list of non-empty strings'})
-        unknown.extend([v for v in values if v not in vocab])
-        normalized.append({'operator': operator, 'values': values})
-    if unknown:
-        # closed-vocabulary integrity: a typo'd tag would silently empty a routing pool.
-        return None, cors_response(422, {
-            'error': 'tag(s) not in scheduling_tag_vocabulary',
-            'unknownTags': sorted(set(unknown)),
-        })
+        if any(len(v.strip()) > _TAG_NAME_MAX for v in values):
+            return None, cors_response(400, {'error': f'team name must be 1..{_TAG_NAME_MAX} characters'})
+        normalized.append({'operator': operator, 'values': [v.strip() for v in values]})
     return normalized, None
 
 
@@ -4237,6 +4266,40 @@ def _update_scheduling_row(table: str, key: Dict[str, Any], fields: Dict[str, An
         logger.error(f"[{label}] update failed: {e}")
         return None, cors_response(502, {'error': f'failed to update {label}'})
     return _unmarshal(resp.get('Attributes', {})), None
+
+
+def _delete_scheduling_row(table: str, key: Dict[str, Any], if_match: Optional[str], label: str):
+    """
+    DELETE one row under the SAME §E13b optimistic lock as _update_scheduling_row: the row must
+    exist AND its modified_at.at must equal the caller's If-Match ('*' = a legacy/unstamped row).
+    Returns None on success, or an error cors_response. (`#at` is declared ONLY on the real-token
+    branch — the '*' branch never references it — to avoid the unused-ExpressionAttributeNames
+    ValidationException that bit the update path; see the F8 fix.)
+    """
+    if not if_match:
+        return cors_response(428, {'error': 'If-Match (last-seen modified_at.at) required for delete'})
+    names: Dict[str, str] = {'#pk': next(iter(key)), '#mod': 'modified_at'}
+    values: Dict[str, Any] = {}
+    if if_match == '*':
+        condition = 'attribute_exists(#pk) AND attribute_not_exists(#mod)'
+    else:
+        condition = 'attribute_exists(#pk) AND attribute_exists(#mod) AND #mod.#at = :ifmatch'
+        names['#at'] = 'at'
+        values[':ifmatch'] = {'S': if_match}
+    try:
+        kwargs: Dict[str, Any] = dict(
+            TableName=table, Key=key, ConditionExpression=condition, ExpressionAttributeNames=names,
+        )
+        if values:
+            kwargs['ExpressionAttributeValues'] = values
+        dynamodb.delete_item(**kwargs)
+    except ClientError as e:
+        if e.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+            return cors_response(409, {
+                'error': f'{label} not found, already stamped, or modified by another edit (stale If-Match)'})
+        logger.error(f"[{label}] delete failed: {e}")
+        return cors_response(502, {'error': f'failed to delete {label}'})
+    return None
 
 
 # §E13b routing config is admin-curated (canonical UI plan §8); the GET list
@@ -4581,13 +4644,64 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
     return cors_response(200, {'appointment_type': updated})
 
 
+def _cascade_staff_tag_change(tenant_id: str, old_names: Set[str], new_names: Set[str]) -> int:
+    """
+    Keep staff `scheduling_tags` consistent after a team's name(s) change (Teams unification).
+      - exactly one removed + one added -> RENAME: replace the old name with the new on each
+        staffer that carries it.
+      - otherwise -> each removed name is DROPPED from staff tags (it ceased to be a team).
+        Added-only needs no staff edit (a brand-new, unique name can't already be on anyone).
+    Best-effort + idempotent (scan registry, update only affected rows, dedupe). Returns the
+    count of staff rows updated. Per-row failures are LOGGED, not fatal: the team write already
+    succeeded, and booking pools off tag_conditions <-> scheduling_tags, so a missed re-tag only
+    degrades one staffer's pooling until repaired — it can't corrupt the team.
+    """
+    removed = old_names - new_names
+    added = new_names - old_names
+    if not removed:
+        return 0
+    rename: Optional[Tuple[str, str]] = None
+    if len(removed) == 1 and len(added) == 1:
+        rename = (next(iter(removed)), next(iter(added)))
+    updated = 0
+    for emp in tenant_registry_ops.list_employees(tenant_id):
+        tags = emp.get('scheduling_tags') or []
+        if not tags:
+            continue
+        next_tags: List[str] = []
+        changed = False
+        for t in tags:
+            if rename and t == rename[0]:
+                next_tags.append(rename[1]); changed = True
+            elif (not rename) and t in removed:
+                changed = True  # drop the now-defunct name
+            else:
+                next_tags.append(t)
+        if not changed:
+            continue
+        seen: Set[str] = set()
+        deduped = [t for t in next_tags if not (t in seen or seen.add(t))]
+        emp_id = emp.get('employeeId')
+        try:
+            tenant_registry_ops.update_employee(
+                tenant_id, emp_id, {'scheduling_tags': deduped},
+                condition_expression='attribute_exists(tenantId)')
+            updated += 1
+        except Exception as exc:
+            logger.error(f"[routing-policy] staff tag cascade failed emp={emp_id} "
+                         f"tenant={redact_tenant_id(tenant_id)}: {exc}")
+    return updated
+
+
 def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Optional[str],
                                            body: Dict[str, Any], user_role: Optional[str],
                                            user_email: Optional[str], if_match: Optional[str]) -> Dict[str, Any]:
     """
     POST /scheduling/routing-policies            (create; mints routing_policy_id if absent)
     PATCH /scheduling/routing-policies/{id}      (update; optimistic-lock via If-Match)
-    §E13b — ADMIN-only. tag_conditions vocab-validated FAIL-CLOSED; round-robin state never touched.
+    ADMIN-only. Post-unification a team IS its name: tag_conditions are shape-validated (no
+    closed-vocabulary check), the name must be unique among teams, and only one "Everyone"
+    (blank) team may exist. A rename cascades to staff scheduling_tags. RR state never touched.
     """
     guard = _require_write_role(user_role)
     if guard:
@@ -4602,17 +4716,43 @@ def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Op
     if tie_breaker not in _TIE_BREAKERS:
         return cors_response(400, {'error': f"tie_breaker must be one of {sorted(_TIE_BREAKERS)}"})
 
-    # Validate the row id (mint on create) BEFORE the vocabulary S3 read — a
-    # malformed id should not pay a config fetch (validation-ordering fix).
+    # Validate/mint the row id BEFORE the DDB reads — a malformed id shouldn't pay a query.
     if is_create:
         routing_policy_id = (body.get('routing_policy_id') or f'rp_{uuid.uuid4().hex[:12]}')
     if not isinstance(routing_policy_id, str) or not _SCHED_ID_RE.match(routing_policy_id):
         return cors_response(400, {'error': 'invalid routing_policy_id'})
 
-    vocabulary = get_tag_vocabulary(tenant_id)
-    normalized_conditions, err = _validate_tag_conditions(body.get('tag_conditions'), vocabulary)
+    normalized_conditions, err = _validate_tag_conditions(body.get('tag_conditions'))
     if err:
         return err
+    new_names: Set[str] = set()
+    for cond in normalized_conditions:
+        new_names |= set(cond['values'])
+
+    # A team IS its name → enforce name uniqueness + a single "Everyone". Load the tenant's
+    # teams once (also yields this row's OLD names for the rename cascade below).
+    try:
+        existing = _routing_policies_for_tenant(tenant_id)
+    except ClientError as e:
+        logger.error(f"[routing-policy] uniqueness query failed tenant={redact_tenant_id(tenant_id)}: {e}")
+        return cors_response(502, {'error': 'failed to validate team name'})
+    old_names: Set[str] = set()
+    used_by_others: Set[str] = set()
+    other_everyone = False
+    for p in existing:
+        pnames = _policy_tag_names(p)
+        if p.get('routing_policy_id') == routing_policy_id:
+            old_names = pnames
+            continue
+        used_by_others |= pnames
+        if not pnames:
+            other_everyone = True
+    dup = new_names & used_by_others
+    if dup:
+        return cors_response(409, {'error': f"a team named {sorted(dup)[0]!r} already exists",
+                                   'duplicateNames': sorted(dup)})
+    if not new_names and other_everyone:
+        return cors_response(409, {'error': "an 'Everyone' team already exists"})
 
     fields = {
         'tie_breaker': tie_breaker,
@@ -4630,8 +4770,82 @@ def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Op
     updated, err = _update_scheduling_row(ROUTING_POLICY_TABLE, key, fields, effective_if_match, 'routing policy')
     if err:
         return err
+    # Rename/unification cascade — only when the name(s) actually changed (post-successful write).
+    if old_names != new_names:
+        moved = _cascade_staff_tag_change(tenant_id, old_names, new_names)
+        if moved:
+            logger.info(f"[routing-policy] cascaded staff tags ({moved} staff) for {routing_policy_id} "
+                        f"tenant={redact_tenant_id(tenant_id)}")
     logger.info(f"[routing-policy] updated {routing_policy_id} tenant={redact_tenant_id(tenant_id)} by={user_email}")
     return cors_response(200, {'routing_policy': updated})
+
+
+def handle_scheduling_routing_policy_delete(tenant_id: str, routing_policy_id: str,
+                                            user_role: Optional[str], user_email: Optional[str],
+                                            if_match: Optional[str]) -> Dict[str, Any]:
+    """
+    DELETE /scheduling/routing-policies/{id}  — ADMIN-only. Deletes a team (routing policy).
+    BLOCKED (409) if any appointment type still routes to it (an orphan FK would break booking)
+    — reassign those first. On success, cascade-untags the team's name from all staff
+    scheduling_tags. Optimistic-locked via If-Match (header or ?expected_modified_at handled by
+    the caller passing if_match).
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    if not routing_policy_id or not _SCHED_ID_RE.match(routing_policy_id):
+        return cors_response(400, {'error': 'invalid routing_policy_id'})
+
+    # Load the team (existence + its name(s) for the cascade).
+    try:
+        resp = dynamodb.get_item(
+            TableName=ROUTING_POLICY_TABLE,
+            Key={'tenantId': {'S': tenant_id}, 'routing_policy_id': {'S': routing_policy_id}},
+        )
+    except ClientError as e:
+        logger.error(f"[routing-policy] delete load failed tenant={redact_tenant_id(tenant_id)}: {e}")
+        return cors_response(502, {'error': 'failed to load team'})
+    if 'Item' not in resp:
+        return cors_response(404, {'error': 'team not found'})
+    names = _policy_tag_names(_unmarshal(resp['Item']))
+
+    # FK guard: block if any appointment type points at this team (would orphan its FK).
+    try:
+        ats = dynamodb.query(
+            TableName=APPOINTMENT_TYPE_TABLE,
+            KeyConditionExpression='tenantId = :t',
+            ExpressionAttributeValues={':t': {'S': tenant_id}},
+            Limit=_SCHED_CONFIG_LIST_LIMIT,
+        )
+    except ClientError as e:
+        logger.error(f"[routing-policy] delete FK query failed tenant={redact_tenant_id(tenant_id)}: {e}")
+        return cors_response(502, {'error': 'failed to check appointment types'})
+    blocking = []
+    for i in ats.get('Items', []):
+        a = _unmarshal(i)
+        if a.get('routing_policy_id') == routing_policy_id:
+            blocking.append({'appointment_type_id': a.get('appointment_type_id'), 'name': a.get('name')})
+    if blocking:
+        return cors_response(409, {
+            'error': 'team is in use by appointment type(s); reassign them first',
+            'appointmentTypes': blocking,
+        })
+
+    # Delete under the optimistic lock.
+    key = {'tenantId': {'S': tenant_id}, 'routing_policy_id': {'S': routing_policy_id}}
+    err = _delete_scheduling_row(ROUTING_POLICY_TABLE, key, if_match, 'team')
+    if err:
+        return err
+
+    # Cascade-untag the now-defunct name from staff (best-effort; logged).
+    if names:
+        moved = _cascade_staff_tag_change(tenant_id, names, set())
+        if moved:
+            logger.info(f"[routing-policy] delete cascaded staff untag ({moved}) for {routing_policy_id} "
+                        f"tenant={redact_tenant_id(tenant_id)}")
+    logger.info(f"[routing-policy] deleted {routing_policy_id} tenant={redact_tenant_id(tenant_id)} "
+                f"by={redact_email(user_email or '')}")
+    return cors_response(200, {'deleted': True, 'routing_policy_id': routing_policy_id})
 
 
 # --- G1 / G4: per-staff scheduling settings (ui_plan Surface 3, §8 permission matrix) ---
@@ -4775,141 +4989,14 @@ def handle_scheduling_employee_settings_write(tenant_id: str, employee_id: str, 
 
 def handle_scheduling_tag_vocabulary_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
     """
-    GET /scheduling/tag-vocabulary -> { scheduling_tag_vocabulary: [<tag>] } (G4; ADMIN-only).
-    Lets E13b (team create) + E13 (staff tagging) render a dropdown instead of free text.
-    The fail-closed server validation on write stays authoritative regardless.
+    GET /scheduling/tag-vocabulary -> { scheduling_tag_vocabulary: [<team name>] } (ADMIN-only).
+    Post-unification the list is DERIVED from the tenant's teams (routing policies) — it's the
+    set of team names a staffer can be tagged with (the StaffSchedulingSection checkbox source).
     """
     guard = _require_write_role(user_role)
     if guard:
         return guard
     return cors_response(200, {'scheduling_tag_vocabulary': get_tag_vocabulary(tenant_id)})
-
-
-# --- F6: Team Name (scheduling_tag_vocabulary) AUTHORING -------------------------------- #
-# The closed Team Name vocabulary was read-only from every tool (dashboard GET only,
-# deploy_tenant_stack doesn't seed, config-builder validates but has no editor), so admins
-# could only ever build "Everyone" teams. This PUT is the single authoring surface: a
-# replace-list write of scheduling.scheduling_tag_vocabulary on the tenant config (S3 RMW,
-# modeled on update_tenant_scheduling_activation). Value-is-label (no slug). Removing a name
-# still referenced by a routing policy or a staffer's tags is BLOCKED so a delete can never
-# silently empty a routing pool or strand a staff tag (closed-vocabulary integrity, mirroring
-# the fail-closed write-side validation in _validate_tag_conditions / _validate_scheduling_tags).
-_TAG_NAME_MAX = 50       # per-Team-Name char cap (mirrors config-builder Zod string().min(1).max(50))
-_TAG_VOCAB_MAX = 100     # max distinct Team Names per tenant (closed vocab is small; guards abuse)
-
-
-def _validate_tag_vocabulary(raw: Any):
-    """
-    PUT /scheduling/tag-vocabulary payload validation. The vocabulary is a flat list of Team
-    Names (value-is-label). Each must be a non-empty (trimmed) string <= _TAG_NAME_MAX chars;
-    the list is de-duped preserving first-seen order. Returns (normalized, error_or_None).
-    """
-    if not isinstance(raw, list):
-        return None, cors_response(400, {'error': 'scheduling_tag_vocabulary must be a list'})
-    if len(raw) > _TAG_VOCAB_MAX:
-        return None, cors_response(400, {'error': f'scheduling_tag_vocabulary may not exceed {_TAG_VOCAB_MAX} entries'})
-    seen: Set[str] = set()
-    normalized: List[str] = []
-    for entry in raw:
-        if not isinstance(entry, str):
-            return None, cors_response(400, {'error': 'each team name must be a string'})
-        name = entry.strip()
-        if not name:
-            return None, cors_response(400, {'error': 'team name must not be empty'})
-        if len(name) > _TAG_NAME_MAX:
-            return None, cors_response(400, {'error': f'team name must be 1..{_TAG_NAME_MAX} characters'})
-        if name not in seen:
-            seen.add(name)
-            normalized.append(name)
-    return normalized, None
-
-
-def _tag_vocabulary_in_use(tenant_id: str, removed: Set[str]) -> Dict[str, Dict[str, List[str]]]:
-    """
-    For each REMOVED Team Name, find the live references a deletion would orphan:
-      - routing policies whose tag_conditions[].values include the name
-      - staff whose scheduling_tags include the name
-    Returns { name: {'routing_policies': [id...], 'staff': [email...]} } for names that are
-    actually referenced (empty dict if none). Read errors PROPAGATE (the caller aborts the
-    write) — the guard fails closed rather than silently dropping a reference.
-    """
-    refs: Dict[str, Dict[str, List[str]]] = {
-        name: {'routing_policies': [], 'staff': []} for name in removed
-    }
-
-    # Routing policies — the same tenant query handle_scheduling_routing_policies_get uses.
-    resp = dynamodb.query(
-        TableName=ROUTING_POLICY_TABLE,
-        KeyConditionExpression='tenantId = :t',
-        ExpressionAttributeValues={':t': {'S': tenant_id}},
-        Limit=_SCHED_CONFIG_LIST_LIMIT,
-    )
-    for item in resp.get('Items', []):
-        policy = _unmarshal(item)
-        pid = policy.get('routing_policy_id', '')
-        for cond in policy.get('tag_conditions') or []:
-            for value in (cond or {}).get('values') or []:
-                if value in refs:
-                    refs[value]['routing_policies'].append(pid)
-
-    # Staff scheduling_tags — the employee registry (paginated query, all in-tenant staff).
-    for emp in tenant_registry_ops.list_employees(tenant_id):
-        ident = emp.get('email') or emp.get('employeeId') or ''
-        for tag in emp.get('scheduling_tags') or []:
-            if tag in refs:
-                refs[tag]['staff'].append(ident)
-
-    return {name: r for name, r in refs.items() if r['routing_policies'] or r['staff']}
-
-
-def handle_scheduling_tag_vocabulary_write(tenant_id: str, body: Dict[str, Any],
-                                           user_role: Optional[str], user_email: Optional[str]) -> Dict[str, Any]:
-    """
-    PUT /scheduling/tag-vocabulary  Body: { scheduling_tag_vocabulary: [<name>] }  (F6; ADMIN-only).
-    Single replace-list of the closed Team Name vocabulary, persisted to
-    scheduling.scheduling_tag_vocabulary in the tenant config (S3 read-modify-write; only that
-    nested key is touched). Removing a name still in use is BLOCKED (422 {inUseTags, references}).
-    """
-    guard = _require_write_role(user_role)
-    if guard:
-        return guard
-    if not isinstance(body, dict):
-        return cors_response(400, {'error': 'body must be a JSON object'})
-
-    normalized, err = _validate_tag_vocabulary(body.get('scheduling_tag_vocabulary'))
-    if err:
-        return err
-
-    # Delete-guard: block removing any name still referenced (FULL check — routing policies
-    # AND staff tags). Reads run before the write; the tiny admin-only TOCTOU window is
-    # accepted, consistent with the rest of §E13b's low-contention assumption.
-    removed = set(get_tag_vocabulary(tenant_id)) - set(normalized)
-    if removed:
-        try:
-            in_use = _tag_vocabulary_in_use(tenant_id, removed)
-        except Exception as exc:   # DDB ClientError or a registry read failure — fail closed
-            logger.error(f"[scheduling/tag-vocabulary] in-use check failed "
-                         f"tenant={redact_tenant_id(tenant_id)}: {exc}")
-            return cors_response(502, {'error': 'failed to validate team-name usage'})
-        if in_use:
-            return cors_response(422, {
-                'error': 'team name(s) still in use cannot be removed',
-                'inUseTags': sorted(in_use),
-                'references': in_use,
-            })
-
-    try:
-        saved = update_tenant_scheduling_tag_vocabulary(tenant_id, normalized)
-    except ConcurrentModificationError as e:
-        return cors_response(409, {'error': str(e)})
-    except ClientError as e:
-        logger.error(f"[scheduling/tag-vocabulary] S3 write failed "
-                     f"tenant={redact_tenant_id(tenant_id)}: {e}")
-        return cors_response(502, {'error': 'failed to update team names'})
-
-    logger.info(f"[scheduling/tag-vocabulary] updated to {len(saved)} name(s) "
-                f"tenant={redact_tenant_id(tenant_id)} by={redact_email(user_email or '')}")
-    return cors_response(200, {'scheduling_tag_vocabulary': saved})
 
 
 # --- G2 / E14: scheduling notification-template overrides (ui_plan Surface E14) -------- #
@@ -7557,50 +7644,6 @@ def update_tenant_scheduling_activation(tenant_id: str, enabled: bool) -> bool:
         f"tenant={redact_tenant_id(tenant_id)}"
     )
     return bool(enabled)
-
-
-def update_tenant_scheduling_tag_vocabulary(tenant_id: str, vocabulary: List[str]) -> List[str]:
-    """
-    Replace scheduling.scheduling_tag_vocabulary on the tenant config (the closed Team Name
-    list E13b/E13 validate against). Read-modify-write with S3 ETag optimistic locking,
-    mirroring update_tenant_scheduling_activation — only the one nested key is written; every
-    sibling field (incl. the rest of `scheduling`) is preserved. Returns the persisted list.
-    """
-    bucket = S3_CONFIG_BUCKET
-    key = f"tenants/{tenant_id}/{tenant_id}-config.json"
-
-    response = s3.get_object(Bucket=bucket, Key=key)
-    etag = response['ETag']
-    config = json.loads(response['Body'].read().decode('utf-8'))
-
-    scheduling = config.get('scheduling')
-    if not isinstance(scheduling, dict):
-        scheduling = {}
-    scheduling['scheduling_tag_vocabulary'] = vocabulary
-    config['scheduling'] = scheduling
-
-    try:
-        s3.put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=json.dumps(config, indent=2),
-            ContentType='application/json',
-            IfMatch=etag,
-        )
-    except ClientError as e:
-        if e.response['Error']['Code'] in ('PreconditionFailed', '412'):
-            raise ConcurrentModificationError(
-                "Config was modified by another user. Please refresh."
-            )
-        raise
-
-    _tenant_config_cache.pop(tenant_id, None)
-    _tenant_config_cache_time.pop(tenant_id, None)
-    logger.info(
-        f"[scheduling/tag-vocabulary] persisted {len(vocabulary)} team name(s) "
-        f"tenant={redact_tenant_id(tenant_id)}"
-    )
-    return vocabulary
 
 
 def handle_scheduling_activation_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
