@@ -190,7 +190,7 @@ S3_ARCHIVE_KEY_PREFIX = "sessions/"
 # like the other staging-only surfaces (this Lambda is account-pinned via
 # EXPECTED_ACCOUNT). A future prod cutover would env-override them the way
 # FORM_SUBMISSIONS_TABLE does (D2).
-TABLE_BOOKING = "picasso-booking-staging"
+TABLE_BOOKING = "picasso-booking"
 TABLE_SCHEDULING_SESSION = "picasso-conversation-scheduling-session"
 TABLE_SCHEDULED_MESSAGES = "picasso-scheduled-messages"
 GSI_SCHEDULED_MESSAGES_BY_APPOINTMENT = "by-appointment"
@@ -1266,7 +1266,7 @@ def _project_booking_row(row):
 
 
 def _walk_booking(tenant_id, normalized_email, request_type, dry_run):
-    """Walk picasso-booking-staging for one subject by attendee_email (F0).
+    """Walk picasso-booking for one subject by attendee_email (F0).
 
     Email-keyed (operator decision B) — NO pii_subject_id needed, so a
     scheduling-only subject (the F-DSAR4 class) is reachable. Tenant-partition

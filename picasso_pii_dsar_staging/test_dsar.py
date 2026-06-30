@@ -117,7 +117,7 @@ def _valid_event(**overrides):
 # empty table (no rows, no item) so the scheduling walkers cleanly report
 # no_bookings / no_sessions.
 _F0_SCHEDULING_TABLES = (
-    "picasso-booking-staging",
+    "picasso-booking",
     "picasso-conversation-scheduling-session",
     "picasso-scheduled-messages",
 )
@@ -4798,7 +4798,7 @@ def _scheduling_route(booking_items, *, ss_get=None, sm_items=None):
     ss_table.get_item.side_effect = ss_get or (lambda Key: {})
 
     def route(name):
-        if name == "picasso-booking-staging":
+        if name == "picasso-booking":
             return booking_table
         if name == "picasso-scheduled-messages":
             return sm_table
@@ -5014,7 +5014,7 @@ def test_walk_booking_delete_item_failure_counts_and_taints(dsar):
     bt.query.return_value = {"Items": [_booking_row(booking_id="booking#1")]}
     bt.delete_item.side_effect = ClientError({"Error": {"Code": "Throttling"}}, "DeleteItem")
     empty = MagicMock(); empty.query.return_value = {"Items": []}; empty.get_item.return_value = {}
-    mock_ddb.Table.side_effect = lambda n: bt if n == "picasso-booking-staging" else empty
+    mock_ddb.Table.side_effect = lambda n: bt if n == "picasso-booking" else empty
     with patch.object(mod, "_delete_booking_calendar_events",
                       return_value=(True, {"events_deleted": 1, "events_already_gone": 0}, None)):
         mod._apply_scheduling_walker_results("TEN123", "subject@x.co", [], "delete", False,
@@ -5113,7 +5113,7 @@ def test_walk_scheduling_session_get_failure_continues_and_taints(dsar):
     empty = MagicMock(); empty.query.return_value = {"Items": []}
     def route(n):
         if n == "picasso-conversation-scheduling-session": return sst
-        if n == "picasso-booking-staging": return bt
+        if n == "picasso-booking": return bt
         return empty
     mock_ddb.Table.side_effect = route
     mod._apply_scheduling_walker_results("TEN123", "subject@x.co", ["sess_1"], "delete", False,
@@ -5157,7 +5157,7 @@ def test_handler_delete_real_scheduling_calendar_fail_partial_error(dsar):
     booking_table.query.return_value = {"Items": [_booking_row(booking_id="booking#1")]}
 
     def route(name):
-        if name == "picasso-booking-staging":
+        if name == "picasso-booking":
             return booking_table
         return base_route(name)
     mock_ddb.Table.side_effect = route
@@ -5222,7 +5222,7 @@ def test_apply_scheduling_booking_query_error_calendar_not_attempted(dsar):
     bt = MagicMock()
     bt.query.side_effect = ClientError({"Error": {"Code": "InternalServerError"}}, "Query")
     empty = MagicMock(); empty.query.return_value = {"Items": []}; empty.get_item.return_value = {}
-    mock_ddb.Table.side_effect = lambda n: bt if n == "picasso-booking-staging" else empty
+    mock_ddb.Table.side_effect = lambda n: bt if n == "picasso-booking" else empty
     rows_touched, followups, exported, wr = {}, [], {}, {}
     mod._apply_scheduling_walker_results("TEN123", "subject@x.co", [], "delete", False,
                                          rows_touched, followups, exported, wr)
