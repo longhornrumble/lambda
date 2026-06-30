@@ -191,7 +191,7 @@ S3_ARCHIVE_KEY_PREFIX = "sessions/"
 # EXPECTED_ACCOUNT). A future prod cutover would env-override them the way
 # FORM_SUBMISSIONS_TABLE does (D2).
 TABLE_BOOKING = "picasso-booking-staging"
-TABLE_SCHEDULING_SESSION = "picasso-conversation-scheduling-session-staging"
+TABLE_SCHEDULING_SESSION = "picasso-conversation-scheduling-session"
 TABLE_SCHEDULED_MESSAGES = "picasso-scheduled-messages"
 GSI_SCHEDULED_MESSAGES_BY_APPOINTMENT = "by-appointment"
 
@@ -1498,7 +1498,7 @@ def _walk_scheduled_messages(tenant_id, booking_ids, request_type, dry_run):
 
 
 def _walk_conversation_scheduling_session(tenant_id, session_ids, request_type, dry_run):
-    """Walk picasso-conversation-scheduling-session-staging by session_id (F0).
+    """Walk picasso-conversation-scheduling-session by session_id (F0).
 
     Chained by session_id (advisory B2: state rows carry NO attendee_email —
     verified live — and the binding row SK=binding#<session_id> has none
