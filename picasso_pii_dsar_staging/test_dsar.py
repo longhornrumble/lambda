@@ -118,7 +118,7 @@ def _valid_event(**overrides):
 # no_bookings / no_sessions.
 _F0_SCHEDULING_TABLES = (
     "picasso-booking-staging",
-    "picasso-conversation-scheduling-session-staging",
+    "picasso-conversation-scheduling-session",
     "picasso-scheduled-messages",
 )
 
@@ -4802,7 +4802,7 @@ def _scheduling_route(booking_items, *, ss_get=None, sm_items=None):
             return booking_table
         if name == "picasso-scheduled-messages":
             return sm_table
-        if name == "picasso-conversation-scheduling-session-staging":
+        if name == "picasso-conversation-scheduling-session":
             return ss_table
         return _route_unknown_table(name)
     return route, booking_table, sm_table, ss_table
@@ -5112,7 +5112,7 @@ def test_walk_scheduling_session_get_failure_continues_and_taints(dsar):
     sst.get_item.side_effect = [ClientError({"Error": {"Code": "Throttling"}}, "GetItem"), {}]
     empty = MagicMock(); empty.query.return_value = {"Items": []}
     def route(n):
-        if n == "picasso-conversation-scheduling-session-staging": return sst
+        if n == "picasso-conversation-scheduling-session": return sst
         if n == "picasso-booking-staging": return bt
         return empty
     mock_ddb.Table.side_effect = route
