@@ -139,16 +139,34 @@ async function buildActionLinks({ tenantId, bookingId, startAt, cancellationWind
 
 // ─── MIME assembly ────────────────────────────────────────────────────────────────────
 
-function buildRawMime({ from, to, subject, textBody, htmlBody, icsContent, icsFilename }) {
+/**
+ * A `From` header that reads as the org while the mailbox stays our verified sender:
+ * `"Atlanta Angels" <notify@myrecruiter.ai>`. The display name is RFC 2047 encoded when it has
+ * non-ASCII, quoted (with \ and " escaped) when plain ASCII, and dropped entirely when blank —
+ * so the address alone (a verified SES identity) is always what SES validates against.
+ */
+function formatFromHeader(name, email) {
+  const addr = stripCrlf(email);
+  const raw = stripCrlf(name || '').trim();
+  if (!raw) return addr;
+  if (/^[\x20-\x7E]*$/.test(raw)) {
+    return `"${raw.replace(/([\\"])/g, '\\$1')}" <${addr}>`;
+  }
+  return `=?UTF-8?B?${Buffer.from(raw, 'utf8').toString('base64')}?= <${addr}>`;
+}
+
+function buildRawMime({ from, to, subject, textBody, htmlBody, icsContent, icsFilename, replyTo }) {
   const boundaryMixed = `mixed_${crypto.randomBytes(12).toString('hex')}`;
   const boundaryAlt = `alt_${crypto.randomBytes(12).toString('hex')}`;
   const safeSubject = stripCrlf(subject);
   const safeTo = stripCrlf(to);
   const safeFrom = stripCrlf(from);
+  const safeReplyTo = replyTo ? stripCrlf(replyTo) : '';
   const icsB64 = Buffer.from(icsContent, 'utf8').toString('base64');
 
   return [
     `From: ${safeFrom}`,
+    ...(safeReplyTo ? [`Reply-To: ${safeReplyTo}`] : []),
     `To: ${safeTo}`,
     `Subject: ${safeSubject}`,
     'MIME-Version: 1.0',
@@ -379,7 +397,10 @@ async function sendConfirmationEmail(args, opts = {}) {
   });
 
   const raw = buildRawMime({
-    from: FROM_EMAIL,
+    // Show the org as the sender (mailbox stays our verified FROM_EMAIL); replies go to the
+    // coordinator hosting the booking — who is already the .ics ORGANIZER above.
+    from: formatFromHeader(orgName, FROM_EMAIL),
+    replyTo: coordinatorEmail,
     to: attendeeEmail,
     subject,
     textBody,
@@ -418,4 +439,5 @@ module.exports = {
   isHttpsUrl,
   stripCrlf,
   toIcsUtc,
+  formatFromHeader,
 };
