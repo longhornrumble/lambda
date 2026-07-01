@@ -4734,6 +4734,20 @@ def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Op
     if tie_breaker not in _TIE_BREAKERS:
         return cors_response(400, {'error': f"tie_breaker must be one of {sorted(_TIE_BREAKERS)}"})
 
+    # Program binding (additive, optional) — "Who handles bookings" §1. A team may be bound to ONE
+    # program from config.programs; a bound team is what makes that program *bookable*. `bookable`
+    # is a non-destructive on/off: unpublishing a program flips it false but keeps the team, its
+    # staff tags and the appointment-type FKs intact, so re-publishing restores the setup. Both are
+    # forward-compatible on read (absent on legacy teams → an unbound team, never surfaced in §1).
+    program_id = body.get('program_id')
+    if program_id is not None:
+        if not isinstance(program_id, str) or not program_id.strip() or len(program_id.strip()) > 128:
+            return cors_response(400, {'error': 'program_id must be a non-empty string (<=128 chars)'})
+        program_id = program_id.strip()
+    bookable = body.get('bookable')
+    if bookable is not None and not isinstance(bookable, bool):
+        return cors_response(400, {'error': 'bookable must be a boolean'})
+
     # Validate/mint the row id BEFORE the DDB reads — a malformed id shouldn't pay a query.
     if is_create:
         routing_policy_id = (body.get('routing_policy_id') or f'rp_{uuid.uuid4().hex[:12]}')
@@ -4757,6 +4771,7 @@ def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Op
     old_names: Set[str] = set()
     used_by_others: Set[str] = set()
     other_everyone = False
+    program_used_by_others: Set[str] = set()
     for p in existing:
         pnames = _policy_tag_names(p)
         if p.get('routing_policy_id') == routing_policy_id:
@@ -4765,6 +4780,9 @@ def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Op
         used_by_others |= pnames
         if not pnames:
             other_everyone = True
+        other_pid = p.get('program_id')
+        if other_pid:
+            program_used_by_others.add(other_pid)
     dup = new_names & used_by_others
     if dup:
         return cors_response(409, {'error': f"a team named {sorted(dup)[0]!r} already exists",
@@ -4772,11 +4790,28 @@ def handle_scheduling_routing_policy_write(tenant_id: str, routing_policy_id: Op
     if not new_names and other_everyone:
         return cors_response(409, {'error': "an 'Everyone' team already exists"})
 
+    # Program binding integrity: the program must be a real config.programs entry (shared-key
+    # guarantee) and can be bound to at most ONE team (program<->team is 1:1 — a program is
+    # handled by a single team).
+    if program_id is not None:
+        if program_id not in {pr['program_id'] for pr in get_programs(tenant_id)}:
+            return cors_response(422, {'error': f'program_id {program_id!r} does not exist in config.programs'})
+        if program_id in program_used_by_others:
+            return cors_response(409, {'error': 'that program is already bookable (bound to another team)',
+                                       'program_id': program_id})
+
     fields = {
         'tie_breaker': tie_breaker,
         'tag_conditions': normalized_conditions,
         'modified_at': _modified_at(user_email),
     }
+    if program_id is not None:
+        fields['program_id'] = program_id
+    if bookable is not None:
+        fields['bookable'] = bookable
+    elif is_create and program_id is not None:
+        # A newly-bound program is bookable by default; a plain (unbound) team omits the flag.
+        fields['bookable'] = True
     if is_create:
         row = {'tenantId': tenant_id, 'routing_policy_id': routing_policy_id, **fields}
         created, err = _create_scheduling_row(ROUTING_POLICY_TABLE, 'routing_policy_id', row, 'routing policy')
