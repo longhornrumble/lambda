@@ -56,10 +56,10 @@ def test_get_includes_reminder_and_confirmation_moments(mock_ddb):
     assert '{{whenLabel}}' in body['moments']['confirmation']['available_variables']
     assert '{{programName}}' in body['moments']['reminder_1h']['available_variables']
     assert '{{actionUrl}}' not in body['moments']['reminder_1h']['available_variables']
-    # Link tokens are universal EXCEPT confirmation (copy-only: it carries signed action
-    # tokens, so the editable body stays link-free — see sanitizeOverrideHtml).
+    # Link tokens are universal on EVERY moment, including confirmation (they render as the
+    # platform's own signed <a> after sanitizeOverrideHtml strips any admin-authored one).
     assert '{{rescheduleUrl}}' in body['moments']['reminder_1h']['available_variables']
-    assert '{{rescheduleUrl}}' not in body['moments']['confirmation']['available_variables']
+    assert '{{rescheduleUrl}}' in body['moments']['confirmation']['available_variables']
 
 
 @patch('lambda_function.dynamodb')

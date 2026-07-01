@@ -247,10 +247,16 @@ describe('ADA confirmation available_variables <-> sender parity', () => {
 
   // The sentinel each advertised token's SOURCE param is fed below. A newly-advertised
   // token with no entry here has no sender source → the test fails loudly (forces wiring).
-  const SENTINEL = { firstName: 'F', org: 'O', apptType: 'A', whenLabel: 'W', programName: 'P' };
+  // Link tokens must be https (the scheme guard drops anything else to '').
+  const SENTINEL = {
+    firstName: 'F', org: 'O', apptType: 'A', whenLabel: 'W', programName: 'P',
+    joinUrl: 'https://j.example/1', rescheduleUrl: 'https://r.example/2', cancelUrl: 'https://c.example/3',
+  };
 
-  it('advertises {{programName}} (the token is in the catalog)', () => {
-    expect(adaConfirmationVars()).toContain('programName');
+  it('advertises {{programName}} + the link tokens (they are in the catalog)', () => {
+    const vars = adaConfirmationVars();
+    expect(vars).toContain('programName');
+    expect(vars).toEqual(expect.arrayContaining(['joinUrl', 'rescheduleUrl', 'cancelUrl']));
   });
 
   it('every advertised confirmation var is resolved by the sender (no editor lie)', () => {
@@ -260,12 +266,46 @@ describe('ADA confirmation available_variables <-> sender parity', () => {
     const { textBody } = email.buildBodies({
       firstName: SENTINEL.firstName, orgName: SENTINEL.org, apptTypeName: SENTINEL.apptType,
       whenLabel: SENTINEL.whenLabel, programName: SENTINEL.programName,
+      joinUrl: SENTINEL.joinUrl, rescheduleUrl: SENTINEL.rescheduleUrl, cancelUrl: SENTINEL.cancelUrl,
       templateOverride: { subject: 'x', text: overrideText, html: '<p>x</p>' },
     });
     for (const v of advertised) {
       expect(SENTINEL[v]).toBeDefined(); // advertised token the sender has no source for
       expect(textBody).toContain(`[${v}=${SENTINEL[v]}]`); // resolved, not ''
     }
+  });
+});
+
+describe('confirmation link tokens (clickable html, raw text; admin <a> still stripped)', () => {
+  it('renders link tokens raw in text, clickable <a> in html', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      firstName: 'A', orgName: 'O', apptTypeName: 'T', whenLabel: 'W',
+      joinUrl: 'https://j.example/1', rescheduleUrl: 'https://r.example/2',
+      templateOverride: { text: 'resched {{rescheduleUrl}}', html: '<p>{{rescheduleUrl}} · {{joinUrl}}</p>' },
+    });
+    expect(textBody).toContain('resched https://r.example/2');
+    expect(htmlBody).toContain('<a href="https://r.example/2">https://r.example/2</a>');
+    expect(htmlBody).toContain('<a href="https://j.example/1">https://j.example/1</a>');
+  });
+
+  it('strips an ADMIN-authored <a> from the html override but keeps the platform link token', () => {
+    const { htmlBody } = email.buildBodies({
+      firstName: 'A', orgName: 'O', apptTypeName: 'T', whenLabel: 'W',
+      rescheduleUrl: 'https://r.example/2',
+      templateOverride: { html: '<p><a href="https://evil.example">click</a> {{rescheduleUrl}}</p>' },
+    });
+    expect(htmlBody).not.toContain('href="https://evil.example"'); // admin link stripped (pre-render sanitize)
+    expect(htmlBody).toContain('<a href="https://r.example/2">https://r.example/2</a>'); // token link survives
+  });
+
+  it('a non-https link token renders empty in html (scheme guard)', () => {
+    const { htmlBody } = email.buildBodies({
+      firstName: 'A', orgName: 'O', apptTypeName: 'T', whenLabel: 'W',
+      cancelUrl: 'javascript:alert(1)',
+      templateOverride: { html: '<p>[{{cancelUrl}}]</p>' },
+    });
+    expect(htmlBody).not.toContain('javascript:');
+    expect(htmlBody).toContain('[]');
   });
 });
 
