@@ -69,6 +69,8 @@ const {
   STOP_MARKER_RE: _STOP_MARKER_RE,
   appendStopOnce,
 } = require('./notif-defaults');
+// Single-source {{var}} substitution (was a local copy — see render.js header).
+const { render } = require('./render');
 
 // Created once at module load; reused across warm invocations.
 const lambda = new LambdaClient({});
@@ -97,14 +99,6 @@ function escapeHtml(s) {
     '"': '&quot;',
     "'": '&#39;',
   }[c]));
-}
-
-// {{var}} substitution. `vars` values are inserted verbatim into the text body and
-// HTML-escaped into the html body by the caller pre-escaping html-bound vars.
-function render(template, vars) {
-  return template.replace(/\{\{(\w+)\}\}/g, (_, key) =>
-    vars[key] != null ? String(vars[key]) : ''
-  );
 }
 
 // Forward-compatible read: accept either the in-memory camelCase booking or a

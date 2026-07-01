@@ -41,6 +41,9 @@ import {
   SMS_STOP_FOOTER,
   appendStopOnce,
 } from '../shared/scheduling/notif-defaults.js';
+// Single-source {{var}} substitution for editor-authored copy (unknown → '').
+// NB: `renderTemplate` below is the DIFFERENT baked-row renderer and stays local.
+import { render } from '../shared/scheduling/render.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const ddbClient = new DynamoDBClient({ region });
@@ -273,15 +276,6 @@ function buildActionBlock(message) {
     html: htmlParts.length ? '\n' + htmlParts.join('\n') : '',
     sms: smsLinks.length ? ' ' + smsLinks.join(' ') : '',
   };
-}
-
-// Override/default rendering: unknown {{vars}} become '' (the §E14 editor promises a var
-// used in the wrong moment renders empty — renderTemplate above leaves it literal, which
-// is right for the baked row body but wrong for editor-authored copy).
-function render(template, vars) {
-  return template.replace(/\{\{(\w+)\}\}/g, (_, key) =>
-    vars[key] != null ? String(vars[key]) : ''
-  );
 }
 
 /**
