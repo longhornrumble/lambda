@@ -152,6 +152,7 @@ function buildReminderBookingView({ tenantId, bookingId, ctx, coordinatorEmail, 
     coordinator_email: coordinatorEmail,
     appointment_type_name: ctx.appointmentTypeName,
     organization_name: ctx.orgName,
+    program_name: ctx.programName, // carried onto reminder rows for the {{programName}} token
     is_synthetic: ctx.isSynthetic === true,
     // G1 additive field (forward-compatible — old rows lacking it work fine):
     join_url: joinUrl || '',
@@ -358,6 +359,7 @@ async function commitAgainstResource({
         // reschedule re-binds reminders with real copy (the loaded row feeds the executor).
         appointmentTypeName: ctx.appointmentTypeName,
         organizationName: ctx.orgName,
+        programName: ctx.programName, // carried onto the row so notices can render {{programName}}
         attendeeEmail: ctx.attendee.email,
         attendeeName: [ctx.attendee.first_name, ctx.attendee.last_name].filter(Boolean).join(' '),
         attendeePhone: ctx.attendee.phone,

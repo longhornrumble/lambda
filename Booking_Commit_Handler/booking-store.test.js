@@ -88,6 +88,12 @@ describe('buildBookingItem — GSI keys + status discipline', () => {
     expect(withNames.appointment_type_name.S).toBe('Volunteer intake');
   });
 
+  it('persists program_name only when present (carried onto the row for {{programName}})', () => {
+    expect(store.buildBookingItem(fields).program_name).toBeUndefined();
+    const withProgram = store.buildBookingItem({ ...fields, programName: 'Family Support' });
+    expect(withProgram.program_name.S).toBe('Family Support');
+  });
+
   it('sets all optional fields when present (conference id, join url, html link, reschedule link)', () => {
     const item = store.buildBookingItem({
       ...fields, conferenceId: 'z-1', joinUrl: 'https://zoom.us/j/z-1', rescheduleOfBookingId: 'booking#old',

@@ -113,6 +113,9 @@ function readBooking(booking) {
       pick(booking, 'appointment_type_name', 'appointmentTypeName') || 'appointment',
     organizationName:
       pick(booking, 'organization_name', 'organizationName', 'org_name') || 'us',
+    // Additive, forward-compatible: absent on old rows → '' (the {{programName}} token
+    // then renders empty, per the §E14 unknown-var contract).
+    programName: pick(booking, 'program_name', 'programName') || '',
     isSynthetic: pick(booking, 'is_synthetic', 'isSynthetic') === true,
     existingState: pick(booking, 'reminder_schedule_state', 'reminderScheduleState'),
     // G1 additive: forward-compatible (undefined on old rows → join link skipped).
@@ -162,6 +165,7 @@ function buildReminderRow({ b, tier, fireAtMs, tenantPrefsSnap, config, reschedu
       organization_name: b.organizationName,
       appointment_type: b.appointmentTypeName,
       first_name: (b.attendeeName || '').split(' ')[0] || '',
+      program_name: b.programName || '',
     },
     appointment_id: b.bookingId,
     message_id: messageId,

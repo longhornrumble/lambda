@@ -200,6 +200,9 @@ describe('G4 programName resolution (appt-type program_id -> config.programs)', 
     const res = await handler(baseEvent(), {}, { ...nullInjection(), getAppointmentType, loadTenantConfig });
     expect(res.status).toBe('BOOKED');
     expect(confirmationEmail.sendConfirmationEmail.mock.calls[0][0].programName).toBe('Foster Care');
+    // Foundation: the resolved program name is also stamped onto the booking row, so the
+    // reschedule/cancel notice path (which reads the row, not config) can render it.
+    expect(bookingStore.writeBooking.mock.calls[0][0].programName).toBe('Foster Care');
   });
 
   it('resolves empty for a legacy appt type with no program_id', async () => {

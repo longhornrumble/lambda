@@ -109,6 +109,10 @@ function buildBookingItem(b) {
   // instead of the generic "your appointment with us" / "appointment" fallbacks.
   if (b.organizationName) item.organization_name = s(b.organizationName);
   if (b.appointmentTypeName) item.appointment_type_name = s(b.appointmentTypeName);
+  // Persist the resolved program name so the reschedule/cancel notice path (which reads
+  // this row, not tenant config) can render the {{programName}} token — same discipline
+  // as organization_name above. Absent/legacy → simply not set (forward-compatible).
+  if (b.programName) item.program_name = s(b.programName);
   if (b.conferenceId) item.conference_id = s(b.conferenceId);
   if (b.joinUrl) item.channel_details = s(b.joinUrl);
   // E16-descope replacement: the dashboard deep-links "Open in Google Calendar" from
