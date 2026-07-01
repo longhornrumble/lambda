@@ -496,6 +496,10 @@ def lambda_handler(event, context):
         # /admin/employees/* routes (different literal) or /scheduling/bookings.
         elif path.endswith('/scheduling/tag-vocabulary') and method == 'GET':
             return handle_scheduling_tag_vocabulary_get(tenant_id, user_role)
+        # Programs projection (read-only) from config.programs — the widget's canonical program
+        # taxonomy. Feeds the appointment-type program picker + "Who handles bookings" labels.
+        elif path.endswith('/scheduling/programs') and method == 'GET':
+            return handle_scheduling_programs_get(tenant_id, user_role)
         elif '/scheduling/employees/' in path and method == 'PATCH':
             sched_employee_id = path.split('/scheduling/employees/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
@@ -4619,6 +4623,19 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
     if 'Item' not in fk:
         return cors_response(422, {'error': f'routing_policy_id {routing_policy_id!r} does not exist'})
 
+    # Program binding: the appointment type belongs to ONE program (the widget's canonical
+    # program taxonomy — config.programs). Required on write (the program picker replaces the
+    # old free-text Name), FK-validated against config.programs so an appointment type can never
+    # bind to a nonexistent program — this is the shared-key guarantee. Forward-compatible on
+    # READ: pre-existing rows without program_id still load (the GET returns whatever attrs
+    # exist); they surface as unbound until re-saved through the picker.
+    program_id = body.get('program_id')
+    if not isinstance(program_id, str) or not program_id.strip():
+        return cors_response(400, {'error': 'program_id is required (FK to config.programs)'})
+    program_id = program_id.strip()
+    if program_id not in {p['program_id'] for p in get_programs(tenant_id)}:
+        return cors_response(422, {'error': f'program_id {program_id!r} does not exist in config.programs'})
+
     fields = {
         'name': name.strip(),
         'duration_minutes': duration,
@@ -4627,6 +4644,7 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
         'lead_time_minutes': lead,
         'conference_type': conference_type,
         'routing_policy_id': routing_policy_id,
+        'program_id': program_id,
         'modified_at': _modified_at(user_email),
     }
     if is_create:
@@ -4997,6 +5015,44 @@ def handle_scheduling_tag_vocabulary_get(tenant_id: str, user_role: Optional[str
     if guard:
         return guard
     return cors_response(200, {'scheduling_tag_vocabulary': get_tag_vocabulary(tenant_id)})
+
+
+def get_programs(tenant_id: str) -> List[Dict[str, str]]:
+    """
+    The tenant's programs, projected from config.programs (S3 tenant config, cached — the SAME
+    taxonomy the chat widget keys off; forms/CTAs carry the program id). Scheduling references
+    these same ids so widget<->scheduling matching is by a shared key, never a lookalike.
+
+    Read-only projection: [{program_id, program_name}] in config order. Schema-discipline:
+    tolerate missing fields — a program dict without program_id falls back to its object key,
+    without program_name falls back to the id.
+    """
+    config = get_tenant_config(tenant_id) or {}
+    programs = config.get('programs') or {}
+    out: List[Dict[str, str]] = []
+    if isinstance(programs, dict):
+        for key, prog in programs.items():
+            if not isinstance(prog, dict):
+                continue
+            pid = prog.get('program_id') or key
+            if not pid:
+                continue
+            out.append({'program_id': str(pid), 'program_name': str(prog.get('program_name') or pid)})
+    return out
+
+
+def handle_scheduling_programs_get(tenant_id: str, user_role: Optional[str]) -> Dict[str, Any]:
+    """
+    GET /scheduling/programs -> { programs: [{program_id, program_name}] } (ADMIN-only).
+    Projected from config.programs (the widget's canonical program taxonomy). Feeds the
+    appointment-type program picker and the "Who handles bookings" read-out labels. No new
+    store — reads the cached tenant config (5-min TTL), so it costs no extra round-trip on warm
+    invocations.
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    return cors_response(200, {'programs': get_programs(tenant_id)})
 
 
 # --- G2 / E14: scheduling notification-template overrides (ui_plan Surface E14) -------- #
