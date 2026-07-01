@@ -226,6 +226,75 @@ def test_routing_policy_update_star_if_match_no_unused_names(mock_ddb, _cfg):
 
 
 # --------------------------------------------------------------------------- #
+# RoutingPolicy program binding (§1 "Who handles bookings") — program_id + bookable
+# --------------------------------------------------------------------------- #
+
+@patch('lambda_function.dynamodb')
+def test_routing_policy_create_with_program_binding_201(mock_ddb):
+    """Make a program bookable = create its team bound to program_id; defaults bookable=True."""
+    resp = handle_scheduling_routing_policy_write(
+        TENANT, None,
+        {'program_id': 'prog_x', 'tie_breaker': 'round_robin',
+         'tag_conditions': [{'operator': 'in_any', 'values': ['Volunteer Coordinators']}]},
+        ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 201
+    pol = json.loads(resp['body'])['routing_policy']
+    assert pol['program_id'] == 'prog_x'
+    assert pol['bookable'] is True
+
+
+@patch('lambda_function.dynamodb')
+def test_routing_policy_unknown_program_422(mock_ddb):
+    """program_id must be a real config.programs entry (shared-key guarantee)."""
+    resp = handle_scheduling_routing_policy_write(
+        TENANT, None, {'program_id': 'ghost', 'tag_conditions': []}, ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 422
+    mock_ddb.put_item.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_routing_policy_program_already_bound_409(mock_ddb):
+    """program<->team is 1:1 — a program already bound to another team can't be re-bound."""
+    other = _rp_row('rp_other', ['Other Team'])
+    other['program_id'] = {'S': 'prog_x'}
+    mock_ddb.query.return_value = {'Items': [other]}
+    resp = handle_scheduling_routing_policy_write(
+        TENANT, None, {'program_id': 'prog_x', 'tag_conditions': []}, ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 409
+    assert json.loads(resp['body'])['program_id'] == 'prog_x'
+    mock_ddb.put_item.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_routing_policy_bad_bookable_400(mock_ddb):
+    resp = handle_scheduling_routing_policy_write(
+        TENANT, None, {'program_id': 'prog_x', 'bookable': 'yes', 'tag_conditions': []},
+        ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 400
+    mock_ddb.put_item.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_routing_policy_unpublish_sets_bookable_false(mock_ddb):
+    """Stop making bookable = PATCH bookable=false (non-destructive; program_id preserved via SET)."""
+    mock_ddb.update_item.return_value = {'Attributes': {
+        'routing_policy_id': {'S': 'rp_x'}, 'tenantId': {'S': TENANT},
+        'program_id': {'S': 'prog_x'}, 'bookable': {'BOOL': False},
+        'tie_breaker': {'S': 'round_robin'}, 'tag_conditions': {'L': []},
+        'modified_at': {'M': {'at': {'S': '2026-07-01T00:00:01Z'}, 'by': {'S': EMAIL}}},
+    }}
+    resp = handle_scheduling_routing_policy_write(
+        TENANT, 'rp_x',
+        {'bookable': False, 'tie_breaker': 'round_robin',
+         'tag_conditions': [{'operator': 'in_any', 'values': ['Volunteer Coordinators']}]},
+        ADMIN, EMAIL, '2026-07-01T00:00:00Z')
+    assert resp['statusCode'] == 200
+    kw = mock_ddb.update_item.call_args.kwargs
+    assert {'BOOL': False} in kw['ExpressionAttributeValues'].values()  # bookable=false in SET
+    assert json.loads(resp['body'])['routing_policy']['bookable'] is False
+
+
+# --------------------------------------------------------------------------- #
 # AppointmentType create/update — FK + field validation
 # --------------------------------------------------------------------------- #
 
