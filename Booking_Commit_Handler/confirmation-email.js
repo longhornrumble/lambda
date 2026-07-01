@@ -24,6 +24,8 @@ const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 
 const { sign } = require('../shared/scheduling/tokens');
 const { CONFIRMATION_DEFAULTS } = require('../shared/scheduling/notif-defaults');
+// Single-source {{var}} substitution (was a local `renderVars` copy — see render.js header).
+const { render: renderVars } = require('../shared/scheduling/render');
 const { sdkConfig } = require('./aws-client-config');
 
 const SES_REGION = process.env.AWS_REGION || 'us-east-1';
@@ -204,14 +206,6 @@ function buildRawMime({ from, to, subject, textBody, htmlBody, icsContent, icsFi
 }
 
 // ─── content templates (§E14 S4c: override → else shared defaults) ────────────────────
-
-// {{var}} substitution; unknown vars render '' (the §E14 editor contract — a var used in
-// the wrong moment renders empty, never a literal {{...}} in a volunteer's inbox).
-function renderVars(template, vars) {
-  return template.replace(/\{\{(\w+)\}\}/g, (_, key) =>
-    vars[key] != null ? String(vars[key]) : ''
-  );
-}
 
 /**
  * §E14 S4c loader — GetItem of the tenant's `confirmation` override. FAIL-SAFE: unset
