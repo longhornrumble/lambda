@@ -5281,6 +5281,9 @@ def handle_scheduling_notification_templates_get(tenant_id: str, user_role: Opti
         moments_out[moment] = {
             **effective,
             'is_override': is_override,
+            # On/off toggle — the dispatchers skip a disabled moment. Absent → enabled
+            # (forward-compat: a moment with no stored row has never been turned off).
+            'enabled': ov.get('enabled', True) is not False,
             'default': dict(default),
             'modified_at': ov.get('modified_at'),
             'available_variables': _SCHED_NOTIF_MOMENT_VARS[moment],
@@ -5334,8 +5337,15 @@ def handle_scheduling_notification_template_write(tenant_id: str, moment: str, b
         if len(v) > _SCHED_SMS_FIELD_MAX:
             return cors_response(400, {'error': f'sms_text exceeds {_SCHED_SMS_FIELD_MAX} chars'})
         fields['sms_text'] = v
+    # On/off toggle for the whole moment — the dispatchers skip a disabled moment (a partial
+    # save with only {enabled:false} is valid).
+    if 'enabled' in body:
+        v = body['enabled']
+        if not isinstance(v, bool):
+            return cors_response(400, {'error': 'enabled must be a boolean'})
+        fields['enabled'] = v
     if not fields:
-        return cors_response(400, {'error': 'provide at least one of subject, body_text, body_html, sms_text'})
+        return cors_response(400, {'error': 'provide at least one of subject, body_text, body_html, sms_text, enabled'})
 
     fields['modified_at'] = _modified_at(user_email)
     # No ConditionExpression (no optimistic lock per §E13c) → no '#pk' alias: DynamoDB rejects

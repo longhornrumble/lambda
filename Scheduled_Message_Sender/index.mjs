@@ -310,7 +310,8 @@ async function loadTemplateOverride({ tenantId, moment, ddb, logger }) {
     const it = result.Item;
     if (!it) return null;
     const s = (v) => (typeof v === 'string' ? v : undefined);
-    return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html), sms: s(it.sms_text) };
+    // On/off toggle; absent → enabled (a disabled moment has an explicit stored row).
+    return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html), sms: s(it.sms_text), enabled: it.enabled !== false };
   } catch (error) {
     // error.name (not .message): SDK messages can embed the role ARN / account id / table
     // ARN — keep CloudWatch reconnaissance-free; the code (e.g. AccessDeniedException) is
@@ -478,6 +479,13 @@ export async function dispatch(event, deps) {
         : null;
     } catch (error) {
       deps.logger.warn(`template override load threw (${message_id}): ${error.message} (using default copy)`);
+    }
+    // On/off toggle: an admin who turned this reminder OFF in "Messages we send" → suppress it.
+    // Fail-safe: a null override (miss/error) → send the default.
+    if (override && override.enabled === false) {
+      deps.logger.log(`🚫 Moment ${overrideMoment} disabled by tenant — suppressing scheduled message ${message_id}`);
+      await updateMessageStatus(deps.ddb, pk, sk, 'suppressed');
+      return { success: true, suppressed: true };
     }
     content = buildReminderContent(overrideMoment, templateVars, override);
   } else {

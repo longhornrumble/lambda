@@ -253,6 +253,22 @@ describe('dispatchVolunteerNotice — agent-of-CoR guard (§5.1)', () => {
   });
 });
 
+// ─── dispatchVolunteerNotice — moment on/off toggle ───────────────────────────────────
+
+describe('dispatchVolunteerNotice — moment on/off toggle', () => {
+  test('suppresses a moment toggled OFF (enabled:false) — no invoke', async () => {
+    const invokeEmail = jest.fn();
+    const invokeSms = jest.fn();
+    const res = await dispatchVolunteerNotice(
+      { kind: 'reschedule_link', tenantId: TENANT, booking: baseBooking },
+      { invokeEmail, invokeSms, loadTemplateOverride: async () => ({ enabled: false }), log: quietLog() }
+    );
+    expect(res).toEqual({ kind: 'reschedule_link', suppressed: true, reason: 'moment_disabled', dispatched: {} });
+    expect(invokeEmail).not.toHaveBeenCalled();
+    expect(invokeSms).not.toHaveBeenCalled();
+  });
+});
+
 // ─── dispatchVolunteerNotice — email kinds ────────────────────────────────────────────
 
 describe('dispatchVolunteerNotice — email dispatch', () => {
