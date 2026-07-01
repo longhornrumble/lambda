@@ -123,6 +123,39 @@ describe('buildEmailPayload/buildSmsPayload — universal whenLabel + programNam
   });
 });
 
+describe('link tokens — raw URL in text/SMS, clickable <a> in html', () => {
+  const booking = baseBooking({ join_url: 'https://meet.example/j/1', cancel_url: 'https://sched.example/c/3' });
+
+  test('email: text is raw, html is a clickable anchor', () => {
+    const p = buildEmailPayload({
+      kind: 'reschedule_link',
+      booking,
+      templateOverride: {
+        text: 'join {{joinUrl}} r {{rescheduleUrl}} c {{cancelUrl}}',
+        html: '<p>{{joinUrl}} {{rescheduleUrl}} {{cancelUrl}}</p>',
+      },
+    });
+    expect(p.text_body).toContain('join https://meet.example/j/1 r https://example.com/r/abc c https://sched.example/c/3');
+    expect(p.html_body).toContain('<a href="https://example.com/r/abc">https://example.com/r/abc</a>');
+    expect(p.html_body).toContain('<a href="https://meet.example/j/1">https://meet.example/j/1</a>');
+  });
+
+  test('SMS: raw URLs', () => {
+    const p = buildSmsPayload({ kind: 'reschedule_link', booking, smsOverride: 'r {{rescheduleUrl}} j {{joinUrl}}' });
+    expect(p.body).toContain('r https://example.com/r/abc j https://meet.example/j/1');
+  });
+
+  test('a non-https link renders empty in html (scheme guard), no dangling anchor', () => {
+    const p = buildEmailPayload({
+      kind: 'cancel_notice',
+      booking: baseBooking({ cancel_url: 'javascript:alert(1)' }),
+      templateOverride: { html: '<p>[{{cancelUrl}}]</p>' },
+    });
+    expect(p.html_body).not.toContain('javascript:');
+    expect(p.html_body).toContain('[]');
+  });
+});
+
 // --------------------------------------------------------------------------- #
 // dispatch wiring + fail-safe
 // --------------------------------------------------------------------------- #

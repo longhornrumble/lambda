@@ -496,11 +496,31 @@ test('universal whenLabel + programName render in reminder content (text/html/sm
     'reminder_24h',
     { first_name: 'Sam', organization_name: 'Austin Angels', appointment_type: 'interview', program_name: 'Family Support' },
     { text: '{{whenLabel}} — {{programName}}', html: '<p>{{whenLabel}} — {{programName}}</p>', sms: '{{whenLabel}} / {{programName}}' },
-    'Mon, Jun 22 at 9:00 AM', // whenLabel from the row (message.when_label)
+    { whenLabel: 'Mon, Jun 22 at 9:00 AM' }, // whenLabel from the row (message.when_label)
   );
   assert.ok(content.text.includes('Mon, Jun 22 at 9:00 AM — Family Support'));
   assert.ok(content.html.includes('Mon, Jun 22 at 9:00 AM — Family Support'));
   assert.ok(content.sms.includes('Mon, Jun 22 at 9:00 AM / Family Support'));
+});
+
+test('reminder link tokens: raw URL in text/sms, clickable <a> in html; non-https dropped', () => {
+  const content = buildReminderContent(
+    'reminder_24h',
+    { first_name: 'Sam', organization_name: 'Austin Angels', appointment_type: 'interview' },
+    {
+      text: 'join {{joinUrl}} resched {{rescheduleUrl}}',
+      html: '<p>{{joinUrl}} · {{rescheduleUrl}} · {{cancelUrl}}</p>',
+      sms: 'r {{rescheduleUrl}}',
+    },
+    { joinUrl: 'https://meet.example/j/1', rescheduleUrl: 'https://sched.example/r/2', cancelUrl: 'javascript:alert(1)' },
+  );
+  // text/sms → raw URL
+  assert.ok(content.text.includes('join https://meet.example/j/1 resched https://sched.example/r/2'));
+  assert.ok(content.sms.includes('r https://sched.example/r/2'));
+  // html → clickable anchor
+  assert.ok(content.html.includes('<a href="https://sched.example/r/2">https://sched.example/r/2</a>'));
+  // non-https cancelUrl dropped everywhere (scheme guard)
+  assert.ok(!content.html.includes('javascript:'));
 });
 
 test('whitespace-only override field falls back to the default', () => {

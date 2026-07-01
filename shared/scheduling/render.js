@@ -20,4 +20,31 @@ function render(template, vars) {
   );
 }
 
-module.exports = { render };
+function escapeHtmlEntities(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[c]));
+}
+
+/**
+ * linkHtml(url) — render a link token as a clickable anchor for the HTML body.
+ *
+ * A bare URL is NOT auto-linked by HTML email clients, so the link tokens
+ * ({{joinUrl}}/{{rescheduleUrl}}/{{cancelUrl}}) are passed to the html render as an
+ * <a> element while the text/SMS render gets the raw URL. https-only (matches the
+ * senders' safeUrl scheme guard) — a non-https / empty url renders '' so a hostile or
+ * missing link can never become an executable href, and an absent link leaves no dangling
+ * anchor. The href + visible text are both entity-escaped.
+ */
+function linkHtml(url) {
+  const u = typeof url === 'string' ? url.trim() : '';
+  if (!/^https:\/\//i.test(u)) return '';
+  const e = escapeHtmlEntities(u);
+  return `<a href="${e}">${e}</a>`;
+}
+
+module.exports = { render, linkHtml };

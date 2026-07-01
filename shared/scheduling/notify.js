@@ -69,8 +69,8 @@ const {
   STOP_MARKER_RE: _STOP_MARKER_RE,
   appendStopOnce,
 } = require('./notif-defaults');
-// Single-source {{var}} substitution (was a local copy — see render.js header).
-const { render } = require('./render');
+// Single-source {{var}} substitution + the clickable link-token helper (see render.js).
+const { render, linkHtml } = require('./render');
 
 // Created once at module load; reused across warm invocations.
 const lambda = new LambdaClient({});
@@ -207,6 +207,9 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
   // optional cancel-notice rebook). No hostile scheme can reach an href.
   const rescheduleUrl = safeUrl(pick(booking, 'rescheduleUrl', 'reschedule_url'));
   const reofferUrl = safeUrl(pick(booking, 'reofferUrl', 'reoffer_url'));
+  // Universal link tokens (raw URL in text/SMS, clickable <a> in html via linkHtml).
+  const joinUrl = safeUrl(pick(booking, 'joinUrl', 'join_url'));
+  const cancelUrl = safeUrl(pick(booking, 'cancelUrl', 'cancel_url'));
 
   let actionUrl;
   if (kind === 'reschedule_link') {
@@ -246,6 +249,9 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
     apptType,
     whenLabel: whenLabel || '',
     programName,
+    joinUrl,
+    rescheduleUrl,
+    cancelUrl,
     whenSuffix,
     actionUrl,
     rebookText,
@@ -256,6 +262,10 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
     apptType: escapeHtml(apptType),
     whenLabel: escapeHtml(whenLabel || ''),
     programName: escapeHtml(programName),
+    // Link tokens render as clickable anchors in html (linkHtml is https-only + escapes).
+    joinUrl: linkHtml(joinUrl),
+    rescheduleUrl: linkHtml(rescheduleUrl),
+    cancelUrl: linkHtml(cancelUrl),
     whenSuffix: escapeHtml(whenSuffix),
     actionUrl: escapeHtml(actionUrl),
     rebookHtml,
@@ -296,6 +306,8 @@ function buildSmsPayload({ kind, booking, smsOverride }) {
   const whenSuffix = whenLabel ? ` on ${whenLabel}` : '';
   const rescheduleUrl = safeUrl(pick(booking, 'rescheduleUrl', 'reschedule_url'));
   const reofferUrl = safeUrl(pick(booking, 'reofferUrl', 'reoffer_url'));
+  const joinUrl = safeUrl(pick(booking, 'joinUrl', 'join_url'));
+  const cancelUrl = safeUrl(pick(booking, 'cancelUrl', 'cancel_url'));
 
   let actionUrl = '';
   if (kind === 'reschedule_link') actionUrl = rescheduleUrl;
@@ -318,7 +330,7 @@ function buildSmsPayload({ kind, booking, smsOverride }) {
   // `org` is rendered because the §E14 SMS editor advertises {{org}} as an available variable
   // (ADA _SCHED_NOTIF_SMS_VARS) — a tenant override using it must not silently render empty.
   const body = appendStopOnce(
-    render(template, { firstName, org, apptType, whenLabel: whenLabel || '', programName, whenSuffix, actionUrl, rebookText }),
+    render(template, { firstName, org, apptType, whenLabel: whenLabel || '', programName, joinUrl, rescheduleUrl, cancelUrl, whenSuffix, actionUrl, rebookText }),
     SMS_STOP_FOOTER
   );
   return { to: attendeePhone, body };
