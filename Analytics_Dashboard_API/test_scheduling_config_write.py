@@ -16,6 +16,7 @@ import lambda_function as lf
 from lambda_function import (
     _validate_tag_conditions,
     handle_scheduling_appointment_type_write,
+    handle_scheduling_appointment_type_delete,
     handle_scheduling_routing_policy_write,
     handle_scheduling_appointment_types_get,
     handle_scheduling_routing_policies_get,
@@ -421,6 +422,35 @@ def test_appointment_type_write_allows_super_admin(mock_ddb):
     mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
     resp = handle_scheduling_appointment_type_write(TENANT, None, _at_body(), 'super_admin', EMAIL, None)
     assert resp['statusCode'] == 201
+
+
+# --------------------------------------------------------------------------- #
+# AppointmentType delete — leaf record, optimistic-locked, admin-only
+# --------------------------------------------------------------------------- #
+
+@patch('lambda_function.dynamodb')
+def test_appointment_type_delete_200(mock_ddb):
+    resp = handle_scheduling_appointment_type_delete(TENANT, 'at_1', ADMIN, EMAIL, '2026-07-01T00:00:00Z')
+    assert resp['statusCode'] == 200
+    kw = mock_ddb.delete_item.call_args.kwargs
+    assert kw['TableName'] == lf.APPOINTMENT_TYPE_TABLE
+    # deleted under the optimistic lock (row must exist + modified_at matches)
+    assert kw['ConditionExpression'] == 'attribute_exists(#pk) AND attribute_exists(#mod) AND #mod.#at = :ifmatch'
+
+
+@patch('lambda_function.dynamodb')
+def test_appointment_type_delete_missing_if_match_428(mock_ddb):
+    resp = handle_scheduling_appointment_type_delete(TENANT, 'at_1', ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 428
+    mock_ddb.delete_item.assert_not_called()
+
+
+@pytest.mark.parametrize('role', ['member', None, 'viewer'])
+@patch('lambda_function.dynamodb')
+def test_appointment_type_delete_requires_admin(mock_ddb, role):
+    resp = handle_scheduling_appointment_type_delete(TENANT, 'at_1', role, EMAIL, '*')
+    assert resp['statusCode'] == 403
+    mock_ddb.delete_item.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

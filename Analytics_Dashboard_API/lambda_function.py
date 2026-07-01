@@ -477,6 +477,9 @@ def lambda_handler(event, context):
             at_id = path.split('/scheduling/appointment-types/')[1].split('/')[0]
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_scheduling_appointment_type_write(tenant_id, at_id, body, user_role, user_email, if_match)
+        elif '/scheduling/appointment-types/' in path and method == 'DELETE':
+            at_id = path.split('/scheduling/appointment-types/')[1].split('/')[0]
+            return handle_scheduling_appointment_type_delete(tenant_id, at_id, user_role, user_email, if_match)
         elif path.endswith('/scheduling/routing-policies') and method == 'GET':
             return handle_scheduling_routing_policies_get(tenant_id, user_role)
         elif path.endswith('/scheduling/routing-policies') and method == 'POST':
@@ -4660,6 +4663,29 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
         return err
     logger.info(f"[appointment-type] updated {appointment_type_id} tenant={redact_tenant_id(tenant_id)} by={user_email}")
     return cors_response(200, {'appointment_type': updated})
+
+
+def handle_scheduling_appointment_type_delete(tenant_id: str, appointment_type_id: str,
+                                              user_role: Optional[str], user_email: Optional[str],
+                                              if_match: Optional[str]) -> Dict[str, Any]:
+    """
+    DELETE /scheduling/appointment-types/{id}  — ADMIN-only. Removes an appointment type.
+    Optimistic-locked via If-Match. A leaf record: routing policies don't reference it, and any
+    existing bookings keep their own snapshot (appointment_type_id/name), so deletion only stops
+    NEW bookings of this type — no cascade needed.
+    """
+    guard = _require_write_role(user_role)
+    if guard:
+        return guard
+    if not appointment_type_id or not _SCHED_ID_RE.match(appointment_type_id):
+        return cors_response(400, {'error': 'invalid appointment_type_id'})
+    key = {'tenantId': {'S': tenant_id}, 'appointment_type_id': {'S': appointment_type_id}}
+    err = _delete_scheduling_row(APPOINTMENT_TYPE_TABLE, key, if_match, 'appointment type')
+    if err:
+        return err
+    logger.info(f"[appointment-type] deleted {appointment_type_id} tenant={redact_tenant_id(tenant_id)} "
+                f"by={redact_email(user_email or '')}")
+    return cors_response(200, {'deleted': True, 'appointment_type_id': appointment_type_id})
 
 
 def _cascade_staff_tag_change(tenant_id: str, old_names: Set[str], new_names: Set[str]) -> int:
