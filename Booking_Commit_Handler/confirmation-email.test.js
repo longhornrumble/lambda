@@ -195,6 +195,80 @@ describe('sendConfirmationEmail — AC #7', () => {
   });
 });
 
+describe('{{programName}} token (§E14 confirmation)', () => {
+  it('renders the program name when the template uses it', () => {
+    const { textBody, htmlBody } = email.buildBodies({
+      firstName: 'Alex', orgName: 'Foster Village', apptTypeName: 'Intro Call',
+      whenLabel: 'tomorrow', programName: 'Foster Care',
+      templateOverride: { subject: 's', text: 'Program: {{programName}}', html: '<p>Program: {{programName}}</p>' },
+    });
+    expect(textBody).toContain('Program: Foster Care');
+    expect(htmlBody).toContain('Program: Foster Care');
+  });
+
+  it('renders empty for a legacy appt type (no made-up program name)', () => {
+    const { textBody } = email.buildBodies({
+      firstName: 'Alex', orgName: 'Foster Village', apptTypeName: 'Intro Call',
+      whenLabel: 'tomorrow', programName: '',
+      templateOverride: { subject: 's', text: 'P:[{{programName}}]', html: '<p>x</p>' },
+    });
+    expect(textBody).toContain('P:[]');
+  });
+
+  it('HTML-escapes the program name in the html body (injection safety)', () => {
+    const { htmlBody } = email.buildBodies({
+      firstName: 'Alex', orgName: 'Org', apptTypeName: 'Call', whenLabel: 'soon',
+      programName: '<script>evil()</script>',
+      templateOverride: { subject: 's', text: 't', html: '<p>{{programName}}</p>' },
+    });
+    expect(htmlBody).toContain('&lt;script&gt;');
+    expect(htmlBody).not.toMatch(/<script>evil/);
+  });
+});
+
+// Anti-drift guard: the ADA editor advertises per-moment available_variables; this asserts
+// every var the confirmation editor offers is one the confirmation SENDER actually resolves,
+// so a chip can never render '' in a volunteer's inbox. Mirrors the notif-defaults-parity
+// discipline (which pins the default COPY) for the VARS list.
+describe('ADA confirmation available_variables <-> sender parity', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const ADA_PATH = path.resolve(__dirname, '../Analytics_Dashboard_API/lambda_function.py');
+  const src = fs.readFileSync(ADA_PATH, 'utf8');
+
+  // The confirmation entry of _SCHED_NOTIF_MOMENT_VARS (email vars), as bare token names.
+  function adaConfirmationVars() {
+    const start = src.indexOf('_SCHED_NOTIF_MOMENT_VARS');
+    const dict = src.slice(start, src.indexOf('_SCHED_NOTIF_SMS', start)); // email vars only
+    const i = dict.indexOf("'confirmation'");
+    const entry = dict.slice(i, dict.indexOf(']', i) + 1);
+    return [...entry.matchAll(/\{\{(\w+)\}\}/g)].map((m) => m[1]);
+  }
+
+  // The sentinel each advertised token's SOURCE param is fed below. A newly-advertised
+  // token with no entry here has no sender source → the test fails loudly (forces wiring).
+  const SENTINEL = { firstName: 'F', org: 'O', apptType: 'A', whenLabel: 'W', programName: 'P' };
+
+  it('advertises {{programName}} (the token is in the catalog)', () => {
+    expect(adaConfirmationVars()).toContain('programName');
+  });
+
+  it('every advertised confirmation var is resolved by the sender (no editor lie)', () => {
+    const advertised = adaConfirmationVars();
+    expect(advertised.length).toBeGreaterThan(3); // truncation guard vs a parse miss
+    const overrideText = advertised.map((v) => `[${v}={{${v}}}]`).join('');
+    const { textBody } = email.buildBodies({
+      firstName: SENTINEL.firstName, orgName: SENTINEL.org, apptTypeName: SENTINEL.apptType,
+      whenLabel: SENTINEL.whenLabel, programName: SENTINEL.programName,
+      templateOverride: { subject: 'x', text: overrideText, html: '<p>x</p>' },
+    });
+    for (const v of advertised) {
+      expect(SENTINEL[v]).toBeDefined(); // advertised token the sender has no source for
+      expect(textBody).toContain(`[${v}=${SENTINEL[v]}]`); // resolved, not ''
+    }
+  });
+});
+
 describe('helper edge cases (branch coverage)', () => {
   it('escapers tolerate null/undefined', () => {
     expect(email.escapeHtml(null)).toBe('');

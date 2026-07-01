@@ -261,18 +261,22 @@ function sanitizeOverrideHtml(s) {
  * compliance/functionality invariant (like STOP): no override can drop them. The .ics
  * attachment is likewise untouched by overrides (assembled in sendConfirmationEmail).
  */
-function buildBodies({ firstName, orgName, apptTypeName, whenLabel, joinUrl, rescheduleUrl, cancelUrl, templateOverride }) {
+function buildBodies({ firstName, orgName, apptTypeName, whenLabel, programName, joinUrl, rescheduleUrl, cancelUrl, templateOverride }) {
   const vars = {
     firstName: firstName || 'there',
     org: orgName || 'the team',
     apptType: apptTypeName || 'appointment',
     whenLabel: whenLabel || '',
+    // No filler default: a legacy appt type without a program_id resolves '' (the §E14
+    // unknown-var contract), never a made-up program name.
+    programName: programName || '',
   };
   const htmlVars = {
     firstName: escapeHtml(vars.firstName),
     org: escapeHtml(vars.org),
     apptType: escapeHtml(vars.apptType),
     whenLabel: escapeHtml(vars.whenLabel),
+    programName: escapeHtml(vars.programName),
   };
   const pickField = (k) =>
     templateOverride && typeof templateOverride[k] === 'string' && templateOverride[k].trim()
@@ -315,6 +319,7 @@ ${(isHttpsUrl(rescheduleUrl) || isHttpsUrl(cancelUrl)) ? `<p>
  *   args = {
  *     tenantId, bookingId, attendeeEmail, attendeeFirstName,
  *     appointmentTypeName, orgName, coordinatorEmail,
+ *     programName?,          // booking's program name ({{programName}}); '' for legacy appt types
  *     start, end, whenLabel, joinUrl, deepLink,
  *     startAt, cancellationWindowHours,
  *     agenda?,               // G2: optional plain-text from AppointmentType.agenda
@@ -332,7 +337,7 @@ ${(isHttpsUrl(rescheduleUrl) || isHttpsUrl(cancelUrl)) ? `<p>
 async function sendConfirmationEmail(args, opts = {}) {
   const {
     tenantId, bookingId, attendeeEmail, attendeeFirstName,
-    appointmentTypeName, orgName, coordinatorEmail,
+    appointmentTypeName, orgName, programName, coordinatorEmail,
     start, end, whenLabel, joinUrl, deepLink,
     startAt, cancellationWindowHours,
     agenda,
@@ -395,6 +400,7 @@ async function sendConfirmationEmail(args, opts = {}) {
     orgName,
     apptTypeName: appointmentTypeName,
     whenLabel,
+    programName,
     joinUrl,
     rescheduleUrl,
     cancelUrl,

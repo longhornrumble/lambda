@@ -402,6 +402,7 @@ async function commitAgainstResource({
         attendeeFirstName: ctx.attendee.first_name,
         appointmentTypeName: ctx.appointmentTypeName,
         orgName: ctx.orgName,
+        programName: ctx.programName, // G4: {{programName}} token; '' for legacy appt types
         coordinatorName: ctx.coordinatorName,
         coordinatorEmail: calendarId,
         start: ctx.start, end: ctx.end,
@@ -683,13 +684,15 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
 
   // G3: resolve orgName from event → tenant config → ''. Load config only when the
   // caller did NOT pass org_name (surgical — no extra S3 read on the common path).
-  // Fail-safe: any config-load error → {} → '' (downstream shows the literal default).
+  // Fail-safe: any config-load error → '' (downstream shows the literal default). The
+  // loaded config is memoised in `tenantCfg` and reused by G4 (programName) below.
+  const _loadConfig = injected.loadTenantConfig || featureGate.loadTenantConfig;
+  let tenantCfg = null;
   let resolvedOrgName = event.org_name || '';
   if (!resolvedOrgName) {
     try {
-      const _loadConfig = injected.loadTenantConfig || featureGate.loadTenantConfig;
-      const _tenantCfg = await _loadConfig(tenantId);
-      resolvedOrgName = (_tenantCfg && (_tenantCfg.organization_name || _tenantCfg.chat_title)) || '';
+      tenantCfg = await _loadConfig(tenantId);
+      resolvedOrgName = (tenantCfg && (tenantCfg.organization_name || tenantCfg.chat_title)) || '';
     } catch (_) {
       // fail-safe: config unreadable → orgName stays ''.
     }
@@ -698,16 +701,42 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
   // G2: resolve agenda from the event's appointment_type first. If absent, best-effort
   // load the appointment-type row from DynamoDB (the IAM grant exists; BCH already reads
   // this table on the propose route). Fail-safe: any error or missing agenda → undefined.
+  // The loaded row is memoised in `apptRow` and reused by G4 (programName) below.
+  const _getApptType = injected.getAppointmentType ||
+    require('../shared/scheduling/candidate-resolver').defaultGetAppointmentType;
+  let apptRow = null;
   let resolvedAgenda = appt.agenda || undefined;
   if (resolvedAgenda === undefined && appt.id) {
     try {
-      const _getApptType = injected.getAppointmentType ||
-        require('../shared/scheduling/candidate-resolver').defaultGetAppointmentType;
-      const _apptRow = await _getApptType({ tenantId, appointmentTypeId: appt.id });
-      resolvedAgenda = (_apptRow && _apptRow.agenda) || undefined;
+      apptRow = await _getApptType({ tenantId, appointmentTypeId: appt.id });
+      resolvedAgenda = (apptRow && apptRow.agenda) || undefined;
     } catch (_) {
       // fail-safe: agenda stays undefined.
     }
+  }
+
+  // G4: the booking's program name for the {{programName}} confirmation token — the
+  // appointment type's program_id resolved against config.programs (both read straight
+  // from the tenant config hub). Reuses the G3 config + G2 appt-type row when already
+  // loaded, else loads best-effort. Fail-safe: a legacy appt type without a program_id,
+  // an unknown program, or unreadable config → '' (the §E14 unknown-var contract).
+  let resolvedProgramName = '';
+  try {
+    let programId = appt.program_id || event.program_id || (apptRow && apptRow.program_id) || '';
+    if (!programId && appt.id) {
+      apptRow = apptRow || (await _getApptType({ tenantId, appointmentTypeId: appt.id }));
+      programId = (apptRow && apptRow.program_id) || '';
+    }
+    if (programId) {
+      if (tenantCfg === null) tenantCfg = await _loadConfig(tenantId);
+      // config.programs is keyed by program_id (the shared widget taxonomy id the appt
+      // type stores) — mirrors ADA get_programs keying.
+      const programs = (tenantCfg && tenantCfg.programs) || {};
+      const prog = programs[programId];
+      resolvedProgramName = (prog && prog.program_name) || '';
+    }
+  } catch (_) {
+    // fail-safe: programName stays ''.
   }
 
   // shared context threaded through the attempt loop.
@@ -723,6 +752,7 @@ exports.handler = async function handler(event, _lambdaCtx, injected = {}) {
     coordinatorEmails: event.coordinator_emails || {},
     coordinatorName: event.coordinator_name || '',
     orgName: resolvedOrgName,
+    programName: resolvedProgramName,
     agenda: resolvedAgenda,
     deepLinkBase: event.deep_link_base || '',
     tieBreaker: event.tie_breaker,
