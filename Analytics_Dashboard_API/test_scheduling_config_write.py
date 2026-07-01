@@ -19,11 +19,29 @@ from lambda_function import (
     handle_scheduling_routing_policy_write,
     handle_scheduling_appointment_types_get,
     handle_scheduling_routing_policies_get,
+    handle_scheduling_programs_get,
+    get_programs,
 )
 
 TENANT = 'TEN1'
 ADMIN = 'admin'
 EMAIL = 'admin@example.com'
+
+# The program the appointment-type FK check must find in config.programs. Appointment-type
+# write tests patch get_programs to return this so the program_id FK passes.
+_PROGRAMS = [{'program_id': 'prog_x', 'program_name': 'Program X'}]
+
+
+@pytest.fixture(autouse=True)
+def _default_config_with_programs():
+    """Appointment-type writes now FK-check `program_id` against config.programs. Default the
+    config read so write tests that don't care about programs still pass the FK. Tests that
+    assert on the config read (the /scheduling/programs projection) or on program validation
+    override get_tenant_config / get_programs with their own @patch, which wins in the body."""
+    with patch('lambda_function.get_tenant_config',
+               return_value={'programs': {'prog_x': {'program_id': 'prog_x',
+                                                      'program_name': 'Program X'}}}):
+        yield
 
 
 def _conditional_failed(op='PutItem'):
@@ -212,11 +230,13 @@ def test_routing_policy_update_star_if_match_no_unused_names(mock_ddb, _cfg):
 # --------------------------------------------------------------------------- #
 
 def _at_body(**over):
-    base = {'name': 'Intro Call', 'duration_minutes': 30, 'routing_policy_id': 'rp_x'}
+    base = {'name': 'Intro Call', 'duration_minutes': 30, 'routing_policy_id': 'rp_x',
+            'program_id': 'prog_x'}
     base.update(over)
     return base
 
 
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
 @patch('lambda_function.dynamodb')
 def test_appointment_type_create_201_with_fk_ok(mock_ddb):
     mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}  # FK exists
@@ -226,8 +246,29 @@ def test_appointment_type_create_201_with_fk_ok(mock_ddb):
     assert at['appointment_type_id'].startswith('at_')
     assert at['duration_minutes'] == 30
     assert at['buffer_before_minutes'] == 0 and at['lead_time_minutes'] == 0  # defaults
+    assert at['program_id'] == 'prog_x'  # the program binding is persisted
     kw = mock_ddb.put_item.call_args.kwargs
     assert 'attribute_not_exists(appointment_type_id)' in kw['ConditionExpression']
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_program_id_required_400(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}  # routing FK ok
+    no_prog = {k: v for k, v in _at_body().items() if k != 'program_id'}
+    resp = handle_scheduling_appointment_type_write(TENANT, None, no_prog, ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 400
+    mock_ddb.put_item.assert_not_called()
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_unknown_program_422(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}  # routing FK ok
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, None, _at_body(program_id='ghost'), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 422
+    mock_ddb.put_item.assert_not_called()
 
 
 @patch('lambda_function.dynamodb')
@@ -249,6 +290,7 @@ def test_appointment_type_field_validation(mock_ddb):
     assert handle_scheduling_appointment_type_write(TENANT, None, no_fk, ADMIN, EMAIL, None)['statusCode'] == 400
 
 
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
 @patch('lambda_function.dynamodb')
 def test_appointment_type_update_uses_updateitem(mock_ddb):
     mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
@@ -304,11 +346,43 @@ def test_routing_policy_write_allows_super_admin(mock_ddb, _cfg):
     assert resp['statusCode'] == 201
 
 
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
 @patch('lambda_function.dynamodb')
 def test_appointment_type_write_allows_super_admin(mock_ddb):
     mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
     resp = handle_scheduling_appointment_type_write(TENANT, None, _at_body(), 'super_admin', EMAIL, None)
     assert resp['statusCode'] == 201
+
+
+# --------------------------------------------------------------------------- #
+# GET /scheduling/programs — projection of config.programs (forward-compatible)
+# --------------------------------------------------------------------------- #
+
+@patch('lambda_function.get_tenant_config')
+def test_get_programs_projects_config_programs(mock_cfg):
+    # A real config keys programs by a slug and carries a nested program_id; a program without
+    # a nested program_id falls back to its object key (schema-discipline).
+    mock_cfg.return_value = {'programs': {
+        'love_box_application': {'program_id': 'love_box_request', 'program_name': 'Love Box Request'},
+        'no_pid': {'program_name': 'Fallback To Key'},
+    }}
+    resp = handle_scheduling_programs_get(TENANT, ADMIN)
+    assert resp['statusCode'] == 200
+    progs = json.loads(resp['body'])['programs']
+    assert {'program_id': 'love_box_request', 'program_name': 'Love Box Request'} in progs
+    assert {'program_id': 'no_pid', 'program_name': 'Fallback To Key'} in progs
+
+
+@patch('lambda_function.get_tenant_config', return_value=None)
+def test_get_programs_no_config_is_empty(_cfg):
+    assert json.loads(handle_scheduling_programs_get(TENANT, ADMIN)['body'])['programs'] == []
+
+
+@pytest.mark.parametrize('role', ['member', None, 'viewer'])
+@patch('lambda_function.get_tenant_config')
+def test_get_programs_requires_admin(mock_cfg, role):
+    assert handle_scheduling_programs_get(TENANT, role)['statusCode'] == 403
+    mock_cfg.assert_not_called()
 
 
 # --- B2: GET endpoints are admin-gated --------------------------------------- #
@@ -720,6 +794,25 @@ def test_delete_team_stale_if_match_409(mock_ddb):
     mock_ddb.delete_item.side_effect = _conditional_failed('DeleteItem')
     resp = lf.handle_scheduling_routing_policy_delete(TENANT, 'rp_x', ADMIN, EMAIL, 'stale')
     assert resp['statusCode'] == 409
+
+
+@patch('lambda_function.dynamodb')
+def test_routing_policy_write_uniqueness_query_error_502(mock_ddb):
+    # The name-uniqueness load failing aborts the write (no create/update) with a 502.
+    mock_ddb.query.side_effect = ClientError({'Error': {'Code': 'X', 'Message': 'y'}}, 'Query')
+    resp = handle_scheduling_routing_policy_write(
+        TENANT, None, {'tag_conditions': [{'operator': 'in_any', 'values': ['ESL']}]}, ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 502
+    mock_ddb.put_item.assert_not_called()
+
+
+@patch('lambda_function.dynamodb')
+def test_delete_team_fk_query_error_502(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': _rp_row('rp_x', ['Mentors'])}
+    mock_ddb.query.side_effect = ClientError({'Error': {'Code': 'X', 'Message': 'y'}}, 'Query')
+    resp = lf.handle_scheduling_routing_policy_delete(TENANT, 'rp_x', ADMIN, EMAIL, 'tok')
+    assert resp['statusCode'] == 502
+    mock_ddb.delete_item.assert_not_called()
 
 
 @patch('lambda_function.dynamodb')
