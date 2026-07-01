@@ -116,6 +116,34 @@ describe('buildRawMime', () => {
     expect(raw).toContain('Subject: Hi Bcc: evil@x');
     expect(raw).not.toContain('Subject: Hi\r\nBcc');
   });
+
+  it('emits a Reply-To header when provided, and omits it when absent', () => {
+    const withReply = email.buildRawMime({
+      from: 'f@x', to: 't@x', subject: 's', textBody: 't', htmlBody: 'h',
+      icsContent: 'x', icsFilename: 'invite.ics', replyTo: 'coach@org.org',
+    });
+    expect(withReply).toContain('Reply-To: coach@org.org');
+    const noReply = email.buildRawMime({
+      from: 'f@x', to: 't@x', subject: 's', textBody: 't', htmlBody: 'h',
+      icsContent: 'x', icsFilename: 'invite.ics',
+    });
+    expect(noReply).not.toContain('Reply-To:');
+  });
+});
+
+describe('formatFromHeader — org display name, verified mailbox', () => {
+  it('renders "Org" <addr> for an ASCII org name', () => {
+    expect(email.formatFromHeader('Atlanta Angels', 'notify@myrecruiter.ai'))
+      .toBe('"Atlanta Angels" <notify@myrecruiter.ai>');
+  });
+  it('falls back to the bare address when the name is blank', () => {
+    expect(email.formatFromHeader('', 'notify@myrecruiter.ai')).toBe('notify@myrecruiter.ai');
+    expect(email.formatFromHeader('   ', 'notify@myrecruiter.ai')).toBe('notify@myrecruiter.ai');
+  });
+  it('escapes quotes/backslashes and RFC 2047-encodes non-ASCII names', () => {
+    expect(email.formatFromHeader('A "B" \\C', 'n@x')).toBe('"A \\"B\\" \\\\C" <n@x>');
+    expect(email.formatFromHeader('Café', 'n@x')).toBe(`=?UTF-8?B?${Buffer.from('Café', 'utf8').toString('base64')}?= <n@x>`);
+  });
 });
 
 describe('sendConfirmationEmail — AC #7', () => {
