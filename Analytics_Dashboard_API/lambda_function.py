@@ -5191,20 +5191,19 @@ _SCHED_NOTIF_DEFAULTS = {
         'body_html': "<p>Hi {{firstName}},</p><p>You're confirmed for your {{apptType}} {{whenLabel}}.</p>",
     },
 }
-# Variables are PER-MOMENT (notify.js renders different vars per kind): a var used in the
-# wrong moment renders as an empty string. {{rebookText}} is text-only, {{rebookHtml}}
-# html-only — so the editor must scope them to the right field; the UI surfaces this list.
+# The 5 CONTEXT tokens ({{firstName}} {{org}} {{apptType}} {{whenLabel}} {{programName}}) are
+# UNIVERSAL — available in every moment, email + SMS (they describe the booking). The rest are
+# moment-scoped: {{whenSuffix}} is the " on <time>" form, {{actionUrl}} the reschedule/reoffer
+# link, {{rebookText}}/{{rebookHtml}} the cancel rebook (text-/html-only). A var used where its
+# source is absent renders '' (never a literal {{...}}). programName is carried on the booking/
+# reminder row (stamped at commit) so the config-less senders resolve it too.
 _SCHED_NOTIF_MOMENT_VARS = {
-    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}',
+    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{whenSuffix}}',
                       '{{rebookText}}', '{{rebookHtml}}'],
-    'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
-    'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
-    # {{programName}} = the booking's program name, resolved by Booking_Commit_Handler
-    # from the appointment type's program_id -> config.programs (legacy appt types without
-    # a program_id render ''). Confirmation-only in v1 — the reschedule/reminder/cancel
-    # senders don't load config, so advertising it there would render empty.
+    'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
+    'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
     'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
 }
 
@@ -5224,12 +5223,12 @@ _SCHED_NOTIF_SMS_DEFAULTS = {
     'confirmation': "Hi {{firstName}}, you're confirmed for your {{apptType}} with {{org}}.",
 }
 _SCHED_NOTIF_SMS_VARS = {
-    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenSuffix}}', '{{rebookText}}'],
-    'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
-    'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
-    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}'],
+    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{whenSuffix}}', '{{actionUrl}}'],
+    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{whenSuffix}}', '{{rebookText}}'],
+    'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
+    'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
+    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
 }
 
 

@@ -321,7 +321,7 @@ async function loadTemplateOverride({ tenantId, moment, ddb, logger }) {
  * render — plain values into subject/text/sms, HTML-escaped values into html (firstName
  * is attendee-supplied; unescaped it would be an HTML-injection vector in the email body).
  */
-function buildReminderContent(moment, templateVars, override) {
+function buildReminderContent(moment, templateVars, override, whenLabel = '') {
   const tpl = REMINDER_TEMPLATES[moment];
   const pickField = (k) =>
     override && typeof override[k] === 'string' && override[k].trim() ? override[k] : tpl[k];
@@ -329,11 +329,17 @@ function buildReminderContent(moment, templateVars, override) {
     firstName: templateVars.first_name || '',
     org: templateVars.organization_name || '',
     apptType: templateVars.appointment_type || '',
+    // Universal context tokens: whenLabel from the row (message.when_label); programName
+    // from template_vars (stamped at commit). Absent → '' (the §E14 unknown-var contract).
+    whenLabel: whenLabel || '',
+    programName: templateVars.program_name || '',
   };
   const htmlVars = {
     firstName: escapeHtml(vars.firstName),
     org: escapeHtml(vars.org),
     apptType: escapeHtml(vars.apptType),
+    whenLabel: escapeHtml(vars.whenLabel),
+    programName: escapeHtml(vars.programName),
   };
   return {
     subject: render(pickField('subject'), vars),
@@ -481,7 +487,7 @@ export async function dispatch(event, deps) {
       await updateMessageStatus(deps.ddb, pk, sk, 'suppressed');
       return { success: true, suppressed: true };
     }
-    content = buildReminderContent(overrideMoment, templateVars, override);
+    content = buildReminderContent(overrideMoment, templateVars, override, message.when_label || '');
   } else {
     content = {
       subject: message.subject || `Reminder from ${templateVars.organization_name || tenantId}`,
