@@ -396,6 +396,8 @@ async function defaultLoadTemplateOverride({ tenantId, kind, log = console } = {
       text: s(it.body_text),
       html: s(it.body_html),
       sms: s(it.sms_text),
+      // On/off toggle; absent → enabled (a disabled moment has an explicit stored row).
+      enabled: !(it.enabled && it.enabled.BOOL === false),
     };
   } catch (err) {
     (log || console).warn(
@@ -480,6 +482,13 @@ async function dispatchVolunteerNotice(
     } catch (err) {
       log.warn(`[notify] template override load threw kind=${kind}: ${err.name || 'error'} (using default)`);
     }
+  }
+
+  // On/off toggle: an admin who turned this moment OFF in "Messages we send" → suppress both
+  // channels. Fail-safe: a null override (miss/error/non-overridable) → send the default.
+  if (templateOverride && templateOverride.enabled === false) {
+    log.info(`[notify] suppressed kind=${kind} (moment disabled by tenant)`);
+    return { kind, suppressed: true, reason: 'moment_disabled', dispatched: {} };
   }
 
   if (attemptEmail) {

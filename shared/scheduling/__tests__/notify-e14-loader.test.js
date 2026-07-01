@@ -37,6 +37,7 @@ test('HIT: a stored override row maps to {subject,text,html,sms} (G7b projects s
     text: 'Custom text',
     html: '<p>Custom html</p>',
     sms: 'Custom SMS {{firstName}}',
+    enabled: true,
   });
   // keyed correctly (tenantId, moment)
   const call = ddbMock.commandCalls(GetItemCommand)[0].args[0].input;
@@ -47,7 +48,7 @@ test('HIT: a stored override row maps to {subject,text,html,sms} (G7b projects s
 test('HIT partial: only the stored fields map; absent fields (incl. sms) are undefined', async () => {
   ddbMock.on(GetItemCommand).resolves({ Item: { subject: { S: 'Only subject' } } });
   const r = await defaultLoadTemplateOverride({ tenantId: 'T', kind: 'reoffer', log: silent });
-  expect(r).toEqual({ subject: 'Only subject', text: undefined, html: undefined, sms: undefined });
+  expect(r).toEqual({ subject: 'Only subject', text: undefined, html: undefined, sms: undefined, enabled: true });
 });
 
 test('MISS: no Item → null (defaults used downstream)', async () => {
@@ -58,7 +59,13 @@ test('MISS: no Item → null (defaults used downstream)', async () => {
 test('MALFORMED: a non-string (N) attribute is ignored (undefined), never throws', async () => {
   ddbMock.on(GetItemCommand).resolves({ Item: { subject: { N: '42' }, body_text: { S: 'ok' } } });
   const r = await defaultLoadTemplateOverride({ tenantId: 'T', kind: 'reschedule_link', log: silent });
-  expect(r).toEqual({ subject: undefined, text: 'ok', html: undefined });
+  expect(r).toEqual({ subject: undefined, text: 'ok', html: undefined, enabled: true });
+});
+
+test('DISABLED: enabled:false is surfaced from the row', async () => {
+  ddbMock.on(GetItemCommand).resolves({ Item: { subject: { S: 's' }, enabled: { BOOL: false } } });
+  const r = await defaultLoadTemplateOverride({ tenantId: 'T', kind: 'cancel_notice', log: silent });
+  expect(r.enabled).toBe(false);
 });
 
 test('FAIL-SAFE: a DDB error returns null AND logs a warn (operator visibility)', async () => {

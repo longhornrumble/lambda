@@ -230,7 +230,11 @@ async function loadTemplateOverride({ tenantId, log = console } = {}) {
     const it = res.Item;
     if (!it) return null;
     const s = (a) => (a && typeof a.S === 'string' ? a.S : undefined);
-    return { subject: s(it.subject), text: s(it.body_text), html: s(it.body_html) };
+    // `enabled` is the on/off toggle; absent → enabled (a moment turned off has a stored row).
+    return {
+      subject: s(it.subject), text: s(it.body_text), html: s(it.body_html),
+      enabled: !(it.enabled && it.enabled.BOOL === false),
+    };
   } catch (err) {
     // err.name (not .message): SDK messages can embed the role/table ARN.
     (log || console).warn(`[confirmation] template override load failed: ${err.name || 'error'} (using default copy)`);
@@ -363,6 +367,13 @@ async function sendConfirmationEmail(args, opts = {}) {
         return null;
       }),
   ]);
+
+  // On/off toggle: an admin who turned the confirmation OFF in "Messages we send" → skip the
+  // send (the booking is already committed; this is best-effort). Fail-safe defaults send.
+  if (templateOverride && templateOverride.enabled === false) {
+    (opts.log || console).info('[confirmation] moment disabled for tenant — skipping send');
+    return { messageId: null, skipped: true };
+  }
 
   const summary = `${appointmentTypeName || 'Appointment'}${attendeeFirstName ? ` — ${attendeeFirstName}` : ''}`;
   // G2: compose .ics DESCRIPTION = agenda (when present) + the existing "Manage this

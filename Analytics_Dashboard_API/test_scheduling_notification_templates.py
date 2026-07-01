@@ -87,6 +87,7 @@ def test_get_no_overrides_returns_defaults(mock_ddb):
     assert set(body['moments'].keys()) == set(lf._SCHED_NOTIF_MOMENTS)
     rl = body['moments']['reschedule_link']
     assert rl['is_override'] is False
+    assert rl['enabled'] is True  # no stored row → enabled by default
     assert rl['subject'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['subject']
     assert rl['body_html'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['body_html']  # GAP-6
     assert rl['default']['subject'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['subject']
@@ -130,6 +131,17 @@ def test_get_blank_override_field_falls_back_to_default(mock_ddb):
     assert rf['subject'] == lf._SCHED_NOTIF_DEFAULTS['reoffer']['subject']
 
 
+@patch('lambda_function.dynamodb')
+def test_get_disabled_moment_reports_enabled_false(mock_ddb):
+    mock_ddb.query.return_value = {'Items': [{
+        'tenantId': {'S': TENANT}, 'moment': {'S': 'reminder_1h'}, 'enabled': {'BOOL': False},
+    }]}
+    m = json.loads(handle_scheduling_notification_templates_get(TENANT, ADMIN)['body'])['moments']['reminder_1h']
+    assert m['enabled'] is False
+    # other moments (no row) stay enabled
+    assert json.loads(handle_scheduling_notification_templates_get(TENANT, ADMIN)['body'])['moments']['confirmation']['enabled'] is True
+
+
 @pytest.mark.parametrize('role', ['member', None, 'viewer'])
 def test_get_non_admin_403(role):
     assert handle_scheduling_notification_templates_get(TENANT, role)['statusCode'] == 403
@@ -164,6 +176,24 @@ def test_patch_admin_sets_subject_200(mock_ddb):
     assert 'SET' in kw['UpdateExpression']
     # modified_at always written
     assert any(n == 'modified_at' for n in kw['ExpressionAttributeNames'].values())
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_enabled_false_toggles_moment_off(mock_ddb):
+    # a partial save with ONLY {enabled:false} is valid (turning a moment off with no copy edit)
+    mock_ddb.update_item.return_value = {'Attributes': {
+        'tenantId': {'S': TENANT}, 'moment': {'S': 'reminder_1h'}, 'enabled': {'BOOL': False}}}
+    r = handle_scheduling_notification_template_write(TENANT, 'reminder_1h', {'enabled': False}, ADMIN, EMAIL)
+    assert r['statusCode'] == 200
+    assert 'enabled' in mock_ddb.update_item.call_args.kwargs['ExpressionAttributeNames'].values()
+    assert {'BOOL': False} in mock_ddb.update_item.call_args.kwargs['ExpressionAttributeValues'].values()
+
+
+@patch('lambda_function.dynamodb')
+def test_patch_bad_enabled_400(mock_ddb):
+    r = handle_scheduling_notification_template_write(TENANT, 'reminder_1h', {'enabled': 'yes'}, ADMIN, EMAIL)
+    assert r['statusCode'] == 400
+    mock_ddb.update_item.assert_not_called()
 
 
 @patch('lambda_function.dynamodb')

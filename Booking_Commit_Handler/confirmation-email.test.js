@@ -335,6 +335,16 @@ describe('sendConfirmationEmail — §E14 override wiring (fail-safe on the 60s 
     const raw = Buffer.from(sesMock.commandCalls(SendRawEmailCommand)[0].args[0].input.RawMessage.Data).toString();
     expect(raw).toContain("You're confirmed for your Volunteer intake");
   });
+
+  it('skips the send entirely when the confirmation moment is toggled OFF (enabled:false)', async () => {
+    sesMock.on(SendRawEmailCommand).resolves({ MessageId: 'msg-3' });
+    const res = await email.sendConfirmationEmail(ARGS, {
+      loadTemplateOverride: async () => ({ enabled: false }),
+    });
+    expect(res.skipped).toBe(true);
+    expect(res.messageId).toBeNull();
+    expect(sesMock.commandCalls(SendRawEmailCommand).length).toBe(0); // nothing dispatched
+  });
 });
 
 describe('loadTemplateOverride — fail-safe loader', () => {
@@ -366,7 +376,7 @@ describe('loadTemplateOverride — fail-safe loader', () => {
       Item: { subject: { S: 'S' }, body_text: { S: 'T' }, body_html: { S: '<p>H</p>' } },
     });
     const hit = await isolated.loadTemplateOverride({ tenantId: 'AUS123957' });
-    expect(hit).toEqual({ subject: 'S', text: 'T', html: '<p>H</p>' });
+    expect(hit).toEqual({ subject: 'S', text: 'T', html: '<p>H</p>', enabled: true });
     const call = ddbMock.commandCalls(GetItemCommand)[0].args[0].input;
     expect(call.TableName).toBe('picasso-scheduling-notif-template-test');
     expect(call.Key).toEqual({ tenantId: { S: 'AUS123957' }, moment: { S: 'confirmation' } });
@@ -399,7 +409,7 @@ describe('loadTemplateOverride — fail-safe loader', () => {
     });
     ddbMock.on(GetItemCommand).resolves({ Item: { subject: { N: '42' }, body_text: { S: 'T' } } });
     expect(await isolated.loadTemplateOverride({ tenantId: 'T1' })).toEqual({
-      subject: undefined, text: 'T', html: undefined,
+      subject: undefined, text: 'T', html: undefined, enabled: true,
     });
     ddbMock.restore();
   });

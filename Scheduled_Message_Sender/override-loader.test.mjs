@@ -39,7 +39,7 @@ test('queries the template table with the {tenantId, moment} key and maps the §
   assert.equal(ddb.calls[0].name, 'GetCommand');
   assert.equal(ddb.calls[0].input.TableName, 'picasso-scheduling-notif-template-test');
   assert.deepEqual(ddb.calls[0].input.Key, { tenantId: 'AUS123957', moment: 'reminder_24h' });
-  assert.deepEqual(result, { subject: 'S', text: 'T', html: '<p>H</p>', sms: 'M' });
+  assert.deepEqual(result, { subject: 'S', text: 'T', html: '<p>H</p>', sms: 'M', enabled: true });
 });
 
 test('miss (no Item) → null', async () => {
@@ -50,7 +50,13 @@ test('miss (no Item) → null', async () => {
 test('non-string stored fields are dropped (schema discipline), not coerced', async () => {
   const ddb = recordingDdb({ Item: { subject: 42, body_text: 'T', body_html: null } });
   const result = await loadTemplateOverride({ tenantId: 'T1', moment: 'reminder_1h', ddb, logger: noopLogger });
-  assert.deepEqual(result, { subject: undefined, text: 'T', html: undefined, sms: undefined });
+  assert.deepEqual(result, { subject: undefined, text: 'T', html: undefined, sms: undefined, enabled: true });
+});
+
+test('enabled:false is surfaced from the row (moment toggled off)', async () => {
+  const ddb = recordingDdb({ Item: { subject: 'S', enabled: false } });
+  const result = await loadTemplateOverride({ tenantId: 'T1', moment: 'reminder_24h', ddb, logger: noopLogger });
+  assert.equal(result.enabled, false);
 });
 
 test('DDB error → null (fail-safe, warns)', async () => {
