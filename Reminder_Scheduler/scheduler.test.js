@@ -372,6 +372,19 @@ describe('G1 — reminder row enrichment (action links + whenLabel)', () => {
     expect(row).not.toHaveProperty('when_label');
   });
 
+  test('program_name carries into reminder-row template_vars for the {{programName}} token', () => {
+    const rowArgs = {
+      tier: 't24h', fireAtMs: Date.now() + 86400000,
+      tenantPrefsSnap: { notificationPrefs: { sms: false }, sms_quiet_hours: null },
+      config: { fromNumber: '' }, rescheduleUrl: '', cancelUrl: '', joinUrl: '', whenLabel: '',
+    };
+    const withProgram = scheduler.buildReminderRow({ b: scheduler.readBooking(baseBooking({ program_name: 'Family Support' })), ...rowArgs });
+    expect(withProgram.template_vars.program_name).toBe('Family Support');
+    // Old-shape booking without program_name → '' (forward-compatible, never a crash).
+    const withoutProgram = scheduler.buildReminderRow({ b: scheduler.readBooking(baseBooking()), ...rowArgs });
+    expect(withoutProgram.template_vars.program_name).toBe('');
+  });
+
   test('G1: attendance row does NOT get action-link fields (coordinator-facing, not attendee)', async () => {
     const { deps, ddbCalls } = makeG1Deps();
     await scheduler.scheduleReminders(
