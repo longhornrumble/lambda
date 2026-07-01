@@ -5191,16 +5191,16 @@ _SCHED_NOTIF_DEFAULTS = {
         'body_html': "<p>Hi {{firstName}},</p><p>You're confirmed for your {{apptType}} {{whenLabel}}.</p>",
     },
 }
-# UNIVERSAL tokens (email + SMS): the 5 CONTEXT tokens ({{firstName}} {{org}} {{apptType}}
-# {{whenLabel}} {{programName}}) plus the 3 LINK tokens ({{joinUrl}} {{rescheduleUrl}}
-# {{cancelUrl}}) — raw URL in text/SMS, a clickable <a> in html (linkHtml). Link tokens are
-# advertised on every moment EXCEPT confirmation: the confirmation editable region is
-# deliberately copy-only (it carries signed action tokens; sanitizeOverrideHtml strips <a> to
-# block admin-authored phishing), so its links stay the appended signed ones. Remaining tokens
-# are legacy/moment-scoped, kept resolving for back-compat: {{whenSuffix}} (" on <time>"),
-# {{actionUrl}} (= rescheduleUrl), {{rebookText}}/{{rebookHtml}} (cancel rebook). A var whose
-# source is absent renders '' (never a literal {{...}}); programName is carried on the booking/
-# reminder row (stamped at commit) so the config-less senders resolve it too.
+# UNIVERSAL tokens (email + SMS), available on EVERY moment: the 5 CONTEXT tokens
+# ({{firstName}} {{org}} {{apptType}} {{whenLabel}} {{programName}}) plus the 3 LINK tokens
+# ({{joinUrl}} {{rescheduleUrl}} {{cancelUrl}}) — raw URL in text/SMS, a clickable <a> in html
+# (linkHtml). Confirmation carries the link tokens too: they render as the platform's own
+# signed <a> AFTER sanitizeOverrideHtml strips any admin-authored <a> (order matters — see
+# buildBodies), so an operator can place the real links without opening a phishing hole.
+# Remaining tokens are legacy/moment-scoped, kept resolving for back-compat: {{whenSuffix}}
+# (" on <time>"), {{actionUrl}} (= rescheduleUrl), {{rebookText}}/{{rebookHtml}} (cancel rebook).
+# A var whose source is absent renders '' (never a literal {{...}}); programName is carried on
+# the booking/reminder row (stamped at commit) so the config-less senders resolve it too.
 _SCHED_NOTIF_MOMENT_VARS = {
     'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{actionUrl}}'],
     'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{actionUrl}}'],
@@ -5208,7 +5208,7 @@ _SCHED_NOTIF_MOMENT_VARS = {
                       '{{rebookText}}', '{{rebookHtml}}'],
     'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
-    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
+    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
 }
 
 # G7a (E14 SMS EDITOR surface — items 1-3 only): the SMS override field + its editor-display
@@ -5232,7 +5232,7 @@ _SCHED_NOTIF_SMS_VARS = {
     'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{rebookText}}'],
     'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
-    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
+    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
 }
 
 

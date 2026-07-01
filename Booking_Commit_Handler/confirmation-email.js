@@ -24,8 +24,8 @@ const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
 
 const { sign } = require('../shared/scheduling/tokens');
 const { CONFIRMATION_DEFAULTS } = require('../shared/scheduling/notif-defaults');
-// Single-source {{var}} substitution (was a local `renderVars` copy — see render.js header).
-const { render: renderVars } = require('../shared/scheduling/render');
+// Single-source {{var}} substitution + clickable link-token helper (see render.js header).
+const { render: renderVars, linkHtml } = require('../shared/scheduling/render');
 const { sdkConfig } = require('./aws-client-config');
 
 const SES_REGION = process.env.AWS_REGION || 'us-east-1';
@@ -243,8 +243,10 @@ async function loadTemplateOverride({ tenantId, log = console } = {}) {
  *  - <style> blocks (could display:none the real links),
  *  - <a> opening tags (an admin-authored fake cancel/reschedule link could phish the
  *    volunteer's signed-token click; inner text is preserved, stray </a> is harmless).
- * Deliberately stricter than the notify.js §E14 kinds: the confirmation carries signed
- * action tokens, so the editable region is copy-only here.
+ * This runs on the RAW override template BEFORE render (see buildBodies) — so an
+ * admin-typed <a> is stripped, but the platform's own link tokens ({{rescheduleUrl}} etc.)
+ * inject their safe signed <a> AFTER this strip and are preserved. The confirmation stays
+ * free of admin-authored links while still letting the operator place the real ones.
  */
 function sanitizeOverrideHtml(s) {
   return String(s)
@@ -262,6 +264,10 @@ function sanitizeOverrideHtml(s) {
  * attachment is likewise untouched by overrides (assembled in sendConfirmationEmail).
  */
 function buildBodies({ firstName, orgName, apptTypeName, whenLabel, programName, joinUrl, rescheduleUrl, cancelUrl, templateOverride }) {
+  // Raw https URLs for text/subject; the same links become clickable <a> in html (linkHtml).
+  const joinRaw = isHttpsUrl(joinUrl) ? joinUrl : '';
+  const reschedRaw = isHttpsUrl(rescheduleUrl) ? rescheduleUrl : '';
+  const cancelRaw = isHttpsUrl(cancelUrl) ? cancelUrl : '';
   const vars = {
     firstName: firstName || 'there',
     org: orgName || 'the team',
@@ -270,6 +276,9 @@ function buildBodies({ firstName, orgName, apptTypeName, whenLabel, programName,
     // No filler default: a legacy appt type without a program_id resolves '' (the §E14
     // unknown-var contract), never a made-up program name.
     programName: programName || '',
+    joinUrl: joinRaw,
+    rescheduleUrl: reschedRaw,
+    cancelUrl: cancelRaw,
   };
   const htmlVars = {
     firstName: escapeHtml(vars.firstName),
@@ -277,6 +286,9 @@ function buildBodies({ firstName, orgName, apptTypeName, whenLabel, programName,
     apptType: escapeHtml(vars.apptType),
     whenLabel: escapeHtml(vars.whenLabel),
     programName: escapeHtml(vars.programName),
+    joinUrl: linkHtml(joinRaw),
+    rescheduleUrl: linkHtml(reschedRaw),
+    cancelUrl: linkHtml(cancelRaw),
   };
   const pickField = (k) =>
     templateOverride && typeof templateOverride[k] === 'string' && templateOverride[k].trim()
@@ -285,8 +297,10 @@ function buildBodies({ firstName, orgName, apptTypeName, whenLabel, programName,
 
   const subject = stripCrlf(renderVars(pickField('subject'), vars));
   const editableText = renderVars(pickField('text'), vars);
-  // sanitize is a no-op for the shared default (no comments/styles/links by construction).
-  const editableHtml = sanitizeOverrideHtml(renderVars(pickField('html'), htmlVars));
+  // ORDER MATTERS: sanitize the RAW template FIRST (strips any admin-authored <a>/<style>),
+  // THEN render — so the platform link tokens ({{rescheduleUrl}} etc.) inject their safe,
+  // signed <a> AFTER the strip and survive, while an admin-typed <a> is still removed.
+  const editableHtml = renderVars(sanitizeOverrideHtml(pickField('html')), htmlVars);
 
   // FIX 9 + FIX 10: only render links when present AND https (blocks javascript:/data: XSS
   // and suppresses empty "Reschedule: " / empty <a href=""> lines).
