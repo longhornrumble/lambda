@@ -182,6 +182,46 @@ describe('idempotency gate', () => {
   });
 });
 
+// ─── G4: {{programName}} confirmation token resolution ──────────────────────────────────
+
+describe('G4 programName resolution (appt-type program_id -> config.programs)', () => {
+  beforeEach(() => {
+    pool.lockSlot.mockResolvedValue({ status: 'LOCKED', resourceId: 'res-a', lockKey: 'lk', format: 'one_to_one' });
+  });
+
+  it('resolves the program name from the appt-type row program_id', async () => {
+    // Realistic path: program_id lives on the appt-type ROW (not the event); config.programs
+    // maps it to a name. Both come from injected seams so nothing leaks to other tests.
+    const getAppointmentType = jest.fn().mockResolvedValue({ agenda: undefined, program_id: 'PROG1' });
+    const loadTenantConfig = jest.fn().mockResolvedValue({
+      feature_flags: { scheduling_enabled: true },
+      programs: { PROG1: { program_name: 'Foster Care' } },
+    });
+    const res = await handler(baseEvent(), {}, { ...nullInjection(), getAppointmentType, loadTenantConfig });
+    expect(res.status).toBe('BOOKED');
+    expect(confirmationEmail.sendConfirmationEmail.mock.calls[0][0].programName).toBe('Foster Care');
+  });
+
+  it('resolves empty for a legacy appt type with no program_id', async () => {
+    // Default baseEvent appt has no program_id; the mocked resolver returns null → '' (never
+    // a made-up name), consistent with the §E14 unknown-var contract.
+    const res = await handler(baseEvent(), {}, nullInjection());
+    expect(res.status).toBe('BOOKED');
+    expect(confirmationEmail.sendConfirmationEmail.mock.calls[0][0].programName).toBe('');
+  });
+
+  it('resolves empty when the program_id is not in config.programs (FK miss)', async () => {
+    const loadTenantConfig = jest.fn().mockResolvedValue({
+      feature_flags: { scheduling_enabled: true },
+      programs: { PROG1: { program_name: 'Foster Care' } },
+    });
+    const ev = baseEvent({ appointment_type: { ...baseEvent().appointment_type, program_id: 'GHOST' } });
+    const res = await handler(ev, {}, { ...nullInjection(), loadTenantConfig });
+    expect(res.status).toBe('BOOKED');
+    expect(confirmationEmail.sendConfirmationEmail.mock.calls[0][0].programName).toBe('');
+  });
+});
+
 // ─── step 1: live freeBusy re-check ─────────────────────────────────────────────────────
 
 describe('live freeBusy re-check (§5.4 layer 2)', () => {

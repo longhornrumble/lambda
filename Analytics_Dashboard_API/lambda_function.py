@@ -5201,7 +5201,11 @@ _SCHED_NOTIF_MOMENT_VARS = {
                       '{{rebookText}}', '{{rebookHtml}}'],
     'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
     'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}'],
-    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}'],
+    # {{programName}} = the booking's program name, resolved by Booking_Commit_Handler
+    # from the appointment type's program_id -> config.programs (legacy appt types without
+    # a program_id render ''). Confirmation-only in v1 — the reschedule/reminder/cancel
+    # senders don't load config, so advertising it there would render empty.
+    'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}'],
 }
 
 # G7a (E14 SMS EDITOR surface — items 1-3 only): the SMS override field + its editor-display
