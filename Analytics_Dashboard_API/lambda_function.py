@@ -4086,6 +4086,7 @@ _TIE_BREAKERS = {'round_robin', 'first_available'}
 _TAG_OPERATORS = {'in_any', 'equals'}
 _AT_DURATION_MAX = 480  # minutes — scheduling_config_schema.md appointmentTypeSchema
 _AT_NAME_MAX = 200      # appointment-type display-name length cap (app-level guard)
+_AT_AGENDA_MAX = 2000   # free-text "Comments"/agenda — flows into the calendar-invite description
 _SCHED_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 # §B18b meeting-location ("conference_type") provider a booking joins. Phase 1 = the two LIVE
 # providers in Booking_Commit_Handler/conference-providers.js (resolveProvider THROWS on
@@ -4639,6 +4640,15 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
     if program_id not in {p['program_id'] for p in get_programs(tenant_id)}:
         return cors_response(422, {'error': f'program_id {program_id!r} does not exist in config.programs'})
 
+    # Optional free-text "Comments" (agenda). Booking_Commit_Handler reads appointment_type.agenda
+    # and prepends it to the calendar-invite description + the .ics, so it reaches the guest on
+    # both Google Meet and Zoom bookings. Absent → unchanged (PATCH) / not set (create).
+    agenda = body.get('agenda')
+    if agenda is not None:
+        if not isinstance(agenda, str) or len(agenda) > _AT_AGENDA_MAX:
+            return cors_response(400, {'error': f'agenda must be a string (<= {_AT_AGENDA_MAX} characters)'})
+        agenda = agenda.strip()
+
     fields = {
         'name': name.strip(),
         'duration_minutes': duration,
@@ -4650,6 +4660,8 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
         'program_id': program_id,
         'modified_at': _modified_at(user_email),
     }
+    if agenda is not None:
+        fields['agenda'] = agenda
     if is_create:
         row = {'tenantId': tenant_id, 'appointment_type_id': appointment_type_id, **fields}
         created, err = _create_scheduling_row(APPOINTMENT_TYPE_TABLE, 'appointment_type_id', row, 'appointment type')

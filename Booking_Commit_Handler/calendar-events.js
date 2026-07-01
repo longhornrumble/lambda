@@ -78,6 +78,10 @@ function buildEventBody({
     start: { dateTime: start, timeZone: timezone || 'UTC' },
     end: { dateTime: end, timeZone: timezone || 'UTC' },
     attendees: attendeeEmail ? [{ email: clean(attendeeEmail) }] : [],
+    // Our platform owns booking reminders (Reminder_Scheduler + the §E14 templates). Opt out of
+    // Google Calendar's own default reminders so the guest/coordinator don't get a second,
+    // conflicting set of nudges. Applies to Google Meet AND Zoom bookings (both create this event).
+    reminders: { useDefault: false, overrides: [] },
     // Ownership tag — load-bearing for the B2 listener (FROZEN §A).
     extendedProperties: {
       private: { booking_id: String(bookingId) },

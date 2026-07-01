@@ -323,6 +323,27 @@ def test_appointment_type_create_201_with_fk_ok(mock_ddb):
 
 @patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
 @patch('lambda_function.dynamodb')
+def test_appointment_type_agenda_persisted(mock_ddb):
+    """Optional 'Comments' (agenda) is stored so Booking_Commit_Handler can put it in the invite."""
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, None, _at_body(agenda='Bring your questions.'), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 201
+    assert json.loads(resp['body'])['appointment_type']['agenda'] == 'Bring your questions.'
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_agenda_too_long_400(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, None, _at_body(agenda='x' * 2001), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 400
+    mock_ddb.put_item.assert_not_called()
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
 def test_appointment_type_program_id_required_400(mock_ddb):
     mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}  # routing FK ok
     no_prog = {k: v for k, v in _at_body().items() if k != 'program_id'}

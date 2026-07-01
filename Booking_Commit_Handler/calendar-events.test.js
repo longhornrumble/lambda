@@ -54,6 +54,11 @@ describe('buildEventBody — §5.7 PII boundary + ownership tag', () => {
     expect(body.extendedProperties.private.booking_id).toBe('booking#abc123');
   });
 
+  it('opts out of Google default reminders (our platform owns booking reminders)', () => {
+    const body = ce.buildEventBody({ ...base, conference: {} });
+    expect(body.reminders).toEqual({ useDefault: false, overrides: [] });
+  });
+
   it('title carries type + FIRST name only (no last name)', () => {
     const body = ce.buildEventBody({ ...base, conference: {} });
     expect(body.summary).toBe('Volunteer intake — Sam');
