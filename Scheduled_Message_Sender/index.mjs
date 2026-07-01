@@ -41,9 +41,9 @@ import {
   SMS_STOP_FOOTER,
   appendStopOnce,
 } from '../shared/scheduling/notif-defaults.js';
-// Single-source {{var}} substitution for editor-authored copy (unknown → '').
+// Single-source {{var}} substitution + clickable link-token helper for editor-authored copy.
 // NB: `renderTemplate` below is the DIFFERENT baked-row renderer and stays local.
-import { render } from '../shared/scheduling/render.js';
+import { render, linkHtml } from '../shared/scheduling/render.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const ddbClient = new DynamoDBClient({ region });
@@ -321,10 +321,14 @@ async function loadTemplateOverride({ tenantId, moment, ddb, logger }) {
  * render — plain values into subject/text/sms, HTML-escaped values into html (firstName
  * is attendee-supplied; unescaped it would be an HTML-injection vector in the email body).
  */
-function buildReminderContent(moment, templateVars, override, whenLabel = '') {
+function buildReminderContent(moment, templateVars, override, { whenLabel = '', joinUrl = '', rescheduleUrl = '', cancelUrl = '' } = {}) {
   const tpl = REMINDER_TEMPLATES[moment];
   const pickField = (k) =>
     override && typeof override[k] === 'string' && override[k].trim() ? override[k] : tpl[k];
+  // Link tokens: https-only raw URL in text/SMS, clickable <a> in html (linkHtml).
+  const rawJoin = isHttpsUrl(joinUrl) ? joinUrl : '';
+  const rawResched = isHttpsUrl(rescheduleUrl) ? rescheduleUrl : '';
+  const rawCancel = isHttpsUrl(cancelUrl) ? cancelUrl : '';
   const vars = {
     firstName: templateVars.first_name || '',
     org: templateVars.organization_name || '',
@@ -333,6 +337,9 @@ function buildReminderContent(moment, templateVars, override, whenLabel = '') {
     // from template_vars (stamped at commit). Absent → '' (the §E14 unknown-var contract).
     whenLabel: whenLabel || '',
     programName: templateVars.program_name || '',
+    joinUrl: rawJoin,
+    rescheduleUrl: rawResched,
+    cancelUrl: rawCancel,
   };
   const htmlVars = {
     firstName: escapeHtml(vars.firstName),
@@ -340,6 +347,9 @@ function buildReminderContent(moment, templateVars, override, whenLabel = '') {
     apptType: escapeHtml(vars.apptType),
     whenLabel: escapeHtml(vars.whenLabel),
     programName: escapeHtml(vars.programName),
+    joinUrl: linkHtml(rawJoin),
+    rescheduleUrl: linkHtml(rawResched),
+    cancelUrl: linkHtml(rawCancel),
   };
   return {
     subject: render(pickField('subject'), vars),
@@ -487,7 +497,12 @@ export async function dispatch(event, deps) {
       await updateMessageStatus(deps.ddb, pk, sk, 'suppressed');
       return { success: true, suppressed: true };
     }
-    content = buildReminderContent(overrideMoment, templateVars, override, message.when_label || '');
+    content = buildReminderContent(overrideMoment, templateVars, override, {
+      whenLabel: message.when_label || '',
+      joinUrl: message.join_url,
+      rescheduleUrl: message.reschedule_url,
+      cancelUrl: message.cancel_url,
+    });
   } else {
     content = {
       subject: message.subject || `Reminder from ${templateVars.organization_name || tenantId}`,

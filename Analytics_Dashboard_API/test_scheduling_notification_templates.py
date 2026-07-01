@@ -49,13 +49,17 @@ def test_get_includes_reminder_and_confirmation_moments(mock_ddb):
         assert body['moments'][m]['is_override'] is False
         assert body['moments'][m]['subject'] == lf._SCHED_NOTIF_DEFAULTS[m]['subject']
         assert body['moments'][m]['sms_text'] == lf._SCHED_NOTIF_SMS_DEFAULTS[m]
-    # Universal context tokens are available in every moment (incl. reminders); reminders
-    # carry ONLY the context set (no action-link tokens like actionUrl / rebook).
+    # Universal tokens (context + links) are available on reminders; no legacy action tokens.
     assert body['moments']['reminder_24h']['available_variables'] == [
-        '{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}']
+        '{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}',
+        '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}']
     assert '{{whenLabel}}' in body['moments']['confirmation']['available_variables']
     assert '{{programName}}' in body['moments']['reminder_1h']['available_variables']
     assert '{{actionUrl}}' not in body['moments']['reminder_1h']['available_variables']
+    # Link tokens are universal EXCEPT confirmation (copy-only: it carries signed action
+    # tokens, so the editable body stays link-free — see sanitizeOverrideHtml).
+    assert '{{rescheduleUrl}}' in body['moments']['reminder_1h']['available_variables']
+    assert '{{rescheduleUrl}}' not in body['moments']['confirmation']['available_variables']
 
 
 @patch('lambda_function.dynamodb')
