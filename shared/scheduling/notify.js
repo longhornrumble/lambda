@@ -176,6 +176,9 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
     'us';
   const apptType =
     pick(booking, 'appointmentTypeName', 'appointment_type_name') || 'appointment';
+  // Universal context tokens (available in every moment). programName is carried on the
+  // booking row (stamped at commit) since this primitive never loads tenant config.
+  const programName = pick(booking, 'programName', 'program_name') || '';
 
   // reengagement (§E8): WS-E-COPY's reengagement.js generates the diplomatic body WITH the
   // reschedule CTA already embedded (its compliance invariant). notify owns ONLY the STOP
@@ -241,6 +244,8 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
     firstName,
     org,
     apptType,
+    whenLabel: whenLabel || '',
+    programName,
     whenSuffix,
     actionUrl,
     rebookText,
@@ -249,6 +254,8 @@ function buildEmailPayload({ kind, booking, templateOverride }) {
     firstName: escapeHtml(firstName),
     org: escapeHtml(org),
     apptType: escapeHtml(apptType),
+    whenLabel: escapeHtml(whenLabel || ''),
+    programName: escapeHtml(programName),
     whenSuffix: escapeHtml(whenSuffix),
     actionUrl: escapeHtml(actionUrl),
     rebookHtml,
@@ -284,6 +291,7 @@ function buildSmsPayload({ kind, booking, smsOverride }) {
     'us';
   const apptType =
     pick(booking, 'appointmentTypeName', 'appointment_type_name') || 'appointment';
+  const programName = pick(booking, 'programName', 'program_name') || '';
   const whenLabel = pick(booking, 'whenLabel', 'when_label');
   const whenSuffix = whenLabel ? ` on ${whenLabel}` : '';
   const rescheduleUrl = safeUrl(pick(booking, 'rescheduleUrl', 'reschedule_url'));
@@ -310,7 +318,7 @@ function buildSmsPayload({ kind, booking, smsOverride }) {
   // `org` is rendered because the §E14 SMS editor advertises {{org}} as an available variable
   // (ADA _SCHED_NOTIF_SMS_VARS) — a tenant override using it must not silently render empty.
   const body = appendStopOnce(
-    render(template, { firstName, org, apptType, whenSuffix, actionUrl, rebookText }),
+    render(template, { firstName, org, apptType, whenLabel: whenLabel || '', programName, whenSuffix, actionUrl, rebookText }),
     SMS_STOP_FOOTER
   );
   return { to: attendeePhone, body };

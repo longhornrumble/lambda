@@ -491,6 +491,18 @@ test('unknown {{vars}} in an override render as empty string (editor contract)',
   assert.equal(content.text, 'Hi Sam, see you .');
 });
 
+test('universal whenLabel + programName render in reminder content (text/html/sms)', () => {
+  const content = buildReminderContent(
+    'reminder_24h',
+    { first_name: 'Sam', organization_name: 'Austin Angels', appointment_type: 'interview', program_name: 'Family Support' },
+    { text: '{{whenLabel}} — {{programName}}', html: '<p>{{whenLabel}} — {{programName}}</p>', sms: '{{whenLabel}} / {{programName}}' },
+    'Mon, Jun 22 at 9:00 AM', // whenLabel from the row (message.when_label)
+  );
+  assert.ok(content.text.includes('Mon, Jun 22 at 9:00 AM — Family Support'));
+  assert.ok(content.html.includes('Mon, Jun 22 at 9:00 AM — Family Support'));
+  assert.ok(content.sms.includes('Mon, Jun 22 at 9:00 AM / Family Support'));
+});
+
 test('whitespace-only override field falls back to the default', () => {
   const content = buildReminderContent('reminder_24h', s4bVars, { subject: '   ' });
   assert.equal(content.subject, 'Reminder: your mentor interview is tomorrow — Austin Angels');

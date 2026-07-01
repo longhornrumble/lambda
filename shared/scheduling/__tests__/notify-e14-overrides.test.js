@@ -10,6 +10,7 @@
 const {
   dispatchVolunteerNotice,
   buildEmailPayload,
+  buildSmsPayload,
   mergeNoticeTemplate,
   defaultLoadTemplateOverride,
   OVERRIDABLE_MOMENTS,
@@ -79,6 +80,46 @@ describe('buildEmailPayload override + STOP invariant', () => {
     const p = buildEmailPayload({ kind: 'reschedule_link', booking: baseBooking() });
     expect(p.text_body).toContain(STOP_TEXT);
     expect(p.html_body).toContain(STOP_TEXT);
+  });
+});
+
+// --------------------------------------------------------------------------- #
+// Universal context tokens ({{whenLabel}} + {{programName}}) on the notice moments
+// --------------------------------------------------------------------------- #
+
+describe('buildEmailPayload/buildSmsPayload — universal whenLabel + programName', () => {
+  const booking = baseBooking({ when_label: 'Mon, Jun 22 at 9:00 AM', program_name: 'Family Support' });
+
+  test('render in a notice EMAIL (text + html)', () => {
+    const p = buildEmailPayload({
+      kind: 'reschedule_link',
+      booking,
+      templateOverride: {
+        text: '{{apptType}} — {{whenLabel}} — {{programName}}',
+        html: '<p>{{whenLabel}} · {{programName}}</p>',
+      },
+    });
+    expect(p.text_body).toContain('intake — Mon, Jun 22 at 9:00 AM — Family Support');
+    expect(p.html_body).toContain('Mon, Jun 22 at 9:00 AM · Family Support');
+  });
+
+  test('render in a notice SMS', () => {
+    const p = buildSmsPayload({
+      kind: 'reschedule_link',
+      booking,
+      smsOverride: 'When {{whenLabel}} / {{programName}}',
+    });
+    expect(p.body).toContain('When Mon, Jun 22 at 9:00 AM / Family Support');
+  });
+
+  test('absent on a legacy booking → empty, never a literal token', () => {
+    const p = buildEmailPayload({
+      kind: 'reschedule_link',
+      booking: baseBooking(), // no when_label / program_name
+      templateOverride: { text: 'X{{whenLabel}}{{programName}}Y' },
+    });
+    expect(p.text_body).toContain('XY');
+    expect(p.text_body).not.toContain('{{');
   });
 });
 

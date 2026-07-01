@@ -49,9 +49,12 @@ def test_get_includes_reminder_and_confirmation_moments(mock_ddb):
         assert body['moments'][m]['is_override'] is False
         assert body['moments'][m]['subject'] == lf._SCHED_NOTIF_DEFAULTS[m]['subject']
         assert body['moments'][m]['sms_text'] == lf._SCHED_NOTIF_SMS_DEFAULTS[m]
-    # reminder vars are the plain trio (no actionUrl / rebook); confirmation adds whenLabel.
-    assert body['moments']['reminder_24h']['available_variables'] == ['{{firstName}}', '{{org}}', '{{apptType}}']
+    # Universal context tokens are available in every moment (incl. reminders); reminders
+    # carry ONLY the context set (no action-link tokens like actionUrl / rebook).
+    assert body['moments']['reminder_24h']['available_variables'] == [
+        '{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}']
     assert '{{whenLabel}}' in body['moments']['confirmation']['available_variables']
+    assert '{{programName}}' in body['moments']['reminder_1h']['available_variables']
     assert '{{actionUrl}}' not in body['moments']['reminder_1h']['available_variables']
 
 
