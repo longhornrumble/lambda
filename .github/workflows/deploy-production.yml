@@ -34,6 +34,7 @@ on:
           - Analytics_Dashboard_API
           - Master_Function
           - Bedrock_Streaming_Handler
+          - Picasso_Config_Manager
       git_ref:
         description: Git ref to deploy (default = main HEAD)
         type: string
@@ -157,6 +158,25 @@ jobs:
             # widget check / the BSH ops alarms).
             smoke_url: 'https://chat.myrecruiter.ai/stream'
             smoke_path: ''
+            smoke_expect_status: '200'
+          - source_dir: Picasso_Config_Manager
+            prod_function: Picasso_Config_Manager
+            # Config-builder backend. Node.js — no esbuild: `npm run package`
+            # vendors node_modules into the zip (see the deploy-staging.yml
+            # entry). $LATEST model like BSH: no alias — the Function URL
+            # serves $LATEST; the published version is the rollback snapshot.
+            #
+            # IAM pre-req: GitHubActions-PicassoDeploy's PicassoDeployPolicy
+            # enumerates function ARNs — Picasso_Config_Manager (+ :*) must be
+            # in the LambdaDeploy statement or this dispatch AccessDenieds.
+            runtime: nodejs
+            include_globs: ''
+            alias: ''
+            # Smokes its own Function URL (looked up at deploy time), like
+            # ADA. GET /health is unauthenticated by design (returns before
+            # the Clerk JWT check).
+            smoke_url: ''
+            smoke_path: /health
             smoke_expect_status: '200'
     steps:
       - name: Guard — only handle the selected Lambda
