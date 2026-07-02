@@ -5191,21 +5191,21 @@ _SCHED_NOTIF_DEFAULTS = {
         'body_html': "<p>Hi {{firstName}},</p><p>You're confirmed for your {{apptType}} {{whenLabel}}.</p>",
     },
 }
-# UNIVERSAL tokens (email + SMS), available on EVERY moment: the 5 CONTEXT tokens
-# ({{firstName}} {{org}} {{apptType}} {{whenLabel}} {{programName}}) plus the 3 LINK tokens
+# The UNIVERSAL token set — the SAME 8 on every moment, email + SMS: the 5 CONTEXT tokens
+# ({{firstName}} {{org}} {{apptType}} {{whenLabel}} {{programName}}) + the 3 LINK tokens
 # ({{joinUrl}} {{rescheduleUrl}} {{cancelUrl}}) — raw URL in text/SMS, a clickable <a> in html
-# (linkHtml). Confirmation carries the link tokens too: they render as the platform's own
-# signed <a> AFTER sanitizeOverrideHtml strips any admin-authored <a> (order matters — see
-# buildBodies), so an operator can place the real links without opening a phishing hole.
-# Remaining tokens are legacy/moment-scoped, kept resolving for back-compat: {{whenSuffix}}
-# (" on <time>"), {{actionUrl}} (= rescheduleUrl), {{rebookText}}/{{rebookHtml}} (cancel rebook).
-# A var whose source is absent renders '' (never a literal {{...}}); programName is carried on
-# the booking/reminder row (stamped at commit) so the config-less senders resolve it too.
+# (linkHtml). Confirmation carries the link tokens too: they render as the platform's own signed
+# <a> AFTER sanitizeOverrideHtml strips any admin-authored <a> (order matters — see buildBodies).
+# The legacy moment-scoped tokens ({{whenSuffix}}, {{actionUrl}} = rescheduleUrl,
+# {{rebookText}}/{{rebookHtml}}) are RETIRED from the editor palette here, but the senders still
+# RESOLVE them (back-compat with existing tenant overrides + the platform default copy, which
+# still uses the nicer labelled-link form). A var whose source is absent renders '' (never a
+# literal {{...}}); programName is carried on the booking/reminder row (stamped at commit) so the
+# config-less senders resolve it too.
 _SCHED_NOTIF_MOMENT_VARS = {
-    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}',
-                      '{{rebookText}}', '{{rebookHtml}}'],
+    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
+    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
+    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
@@ -5227,9 +5227,9 @@ _SCHED_NOTIF_SMS_DEFAULTS = {
     'confirmation': "Hi {{firstName}}, you're confirmed for your {{apptType}} with {{org}}.",
 }
 _SCHED_NOTIF_SMS_VARS = {
-    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{actionUrl}}'],
-    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}', '{{whenSuffix}}', '{{rebookText}}'],
+    'reschedule_link': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
+    'reoffer': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
+    'cancel_notice': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'reminder_24h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'reminder_1h': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
     'confirmation': ['{{firstName}}', '{{org}}', '{{apptType}}', '{{whenLabel}}', '{{programName}}', '{{joinUrl}}', '{{rescheduleUrl}}', '{{cancelUrl}}'],
