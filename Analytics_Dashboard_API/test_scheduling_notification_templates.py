@@ -99,14 +99,15 @@ def test_get_no_overrides_returns_defaults(mock_ddb):
     assert rl['body_html'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['body_html']  # GAP-6
     assert rl['default']['subject'] == lf._SCHED_NOTIF_DEFAULTS['reschedule_link']['subject']
     assert rl['modified_at'] is None
-    # per-moment available_variables (reschedule has actionUrl, NOT rebook*)
+    # available_variables is the universal set on every moment; legacy tokens
+    # (actionUrl/whenSuffix/rebook*) are RETIRED from the palette.
     assert '{{firstName}}' in rl['available_variables']
-    assert '{{actionUrl}}' in rl['available_variables']
+    assert '{{rescheduleUrl}}' in rl['available_variables']
+    assert '{{actionUrl}}' not in rl['available_variables']
     assert '{{rebookHtml}}' not in rl['available_variables']
-    # cancel_notice exposes the rebook vars, not actionUrl
     cn = body['moments']['cancel_notice']
-    assert '{{rebookHtml}}' in cn['available_variables']
-    assert '{{actionUrl}}' not in cn['available_variables']
+    assert cn['available_variables'] == rl['available_variables']  # identical universal set
+    assert '{{rebookHtml}}' not in cn['available_variables']
     assert 'cannot be removed' in body['stop_footer_note']  # GAP-6 compliance signal
 
 
@@ -319,7 +320,8 @@ def test_get_exposes_sms_surface_defaults(mock_ddb):
     assert rl['sms_is_override'] is False
     assert rl['sms_text'] == lf._SCHED_NOTIF_SMS_DEFAULTS['reschedule_link']
     assert rl['sms_default'] == lf._SCHED_NOTIF_SMS_DEFAULTS['reschedule_link']
-    assert '{{actionUrl}}' in rl['sms_available_variables']
+    assert '{{rescheduleUrl}}' in rl['sms_available_variables']  # retired actionUrl -> rescheduleUrl
+    assert '{{actionUrl}}' not in rl['sms_available_variables']
     assert '{{rebookHtml}}' not in rl['sms_available_variables']
 
 
