@@ -7428,8 +7428,17 @@ def handle_notification_event_detail(tenant_id: str, message_id: str) -> Dict[st
         logger.error(f"DynamoDB error querying ByMessageId GSI: {e}")
         return cors_response(500, {'error': 'Failed to query notification event detail'})
 
+    # IDOR guard: the ByMessageId GSI is keyed on message_id ONLY, so a foreign
+    # message_id returns another tenant's rows (recipient IP/UA/link/SMTP detail).
+    # All events for one message share one owner, so reject if the first row's pk
+    # isn't the caller's tenant. Uniform 404 (not 403) matches the cross-tenant
+    # "simply not found" house style and avoids an existence oracle.
+    items = resp.get('Items', [])
+    if items and items[0].get('pk', {}).get('S', '') != f'TENANT#{tenant_id}':
+        return cors_response(404, {'error': 'Message not found'})
+
     events = []
-    for item in resp.get('Items', []):
+    for item in items:
         event_type = item.get('event_type', {}).get('S', '')
 
         # detail is a free-form Map attribute
