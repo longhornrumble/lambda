@@ -16,11 +16,18 @@ import pytest
 from lambda_function import handle_notification_event_detail, handle_notification_events
 
 
-def _ddb_event(event_type, sk_timestamp=None, **detail_fields):
-    """Build a DynamoDB-shaped Item for picasso-notification-events."""
+def _ddb_event(event_type, sk_timestamp=None, owner='AUS123957', **detail_fields):
+    """Build a DynamoDB-shaped Item for picasso-notification-events.
+
+    Includes `pk` (TENANT#<owner>) because the ByMessageId GSI projects ALL
+    attributes, so a real query result carries the owning tenant's pk — that
+    is what the IDOR guard checks. Defaults to the tenant the detail tests
+    query as, so those remain same-tenant (200) cases.
+    """
     sk_ts = sk_timestamp if sk_timestamp is not None else '2026-04-26T20:00:00.000Z'
     detail_map = {k: {'S': v} for k, v in detail_fields.items()}
     return {
+        'pk': {'S': f'TENANT#{owner}'},
         'event_type': {'S': event_type},
         'event_type_timestamp': {'S': f'{event_type}#{sk_ts}'},
         'detail': {'M': detail_map},
@@ -73,6 +80,7 @@ def test_falls_back_to_sk_timestamp_when_detail_lacks_per_event_ts(mock_ddb, _vf
     mock_ddb.query.return_value = {
         'Items': [
             {
+                'pk': {'S': 'TENANT#AUS123957'},
                 'event_type': {'S': 'send'},
                 'event_type_timestamp': {'S': 'send#2026-04-26T20:00:00.000Z'},
                 'detail': {'M': {}},
@@ -159,6 +167,64 @@ def test_invalid_message_id_rejected(_vf):
     body = json.loads(result['body'])
     assert result['statusCode'] == 400
     assert 'invalid' in body['error'].lower()
+
+
+# -----------------------------------------------------------------------------
+# C3 IDOR guard: the ByMessageId GSI is keyed on message_id only, so a foreign
+# message_id returns another tenant's rows. The handler must reject on a pk
+# (TENANT#<owner>) mismatch before exposing recipient PII in `detail`.
+# -----------------------------------------------------------------------------
+
+
+@patch('lambda_function.validate_feature_access', return_value=None)
+@patch('lambda_function.dynamodb')
+def test_cross_tenant_message_id_returns_404_and_leaks_no_pii(mock_ddb, _vf):
+    """A caller querying another tenant's message_id gets 404 and no detail PII."""
+    # Rows owned by OWNER_A carry recipient IP / UA / clicked link in detail.
+    mock_ddb.query.return_value = {
+        'Items': [
+            _ddb_event(
+                'click',
+                owner='OWNER_A',
+                click_timestamp='2026-04-27T09:30:00.000Z',
+                recipient_ip='203.0.113.7',
+                user_agent='Mozilla/5.0 (victim-device)',
+                clicked_link='https://victim.example/secret-token',
+            ),
+        ]
+    }
+
+    # A different tenant asks for that message_id.
+    result = handle_notification_event_detail('TENANT_B', 'msg-foreign')
+    body = json.loads(result['body'])
+
+    assert result['statusCode'] == 404
+    assert body == {'error': 'Message not found'}
+    # No cross-tenant PII may appear anywhere in the response.
+    serialized = result['body']
+    assert '203.0.113.7' not in serialized
+    assert 'victim-device' not in serialized
+    assert 'secret-token' not in serialized
+
+
+@patch('lambda_function.validate_feature_access', return_value=None)
+@patch('lambda_function.dynamodb')
+def test_same_tenant_still_returns_events(mock_ddb, _vf):
+    """The guard must not over-block: the owning tenant still sees its events."""
+    mock_ddb.query.return_value = {
+        'Items': [
+            _ddb_event('send', owner='AUS123957',
+                       send_timestamp='2026-04-26T20:00:00.000Z'),
+            _ddb_event('delivery', owner='AUS123957',
+                       delivery_timestamp='2026-04-26T20:01:30.000Z'),
+        ]
+    }
+
+    result = handle_notification_event_detail('AUS123957', 'msg-own')
+    body = json.loads(result['body'])
+
+    assert result['statusCode'] == 200
+    assert [e['event_type'] for e in body['events']] == ['send', 'delivery']
 
 
 # -----------------------------------------------------------------------------
