@@ -154,6 +154,30 @@ describe('propose', () => {
     expect(payload.date_window).toEqual({ start: '2026-06-18T00:00:00', end: '2026-06-18T23:59:59' });
   });
 
+  test('strips candidateResourceIds (coordinator identity) from the browser response — §10.4 leak regression, 2026-07-03', async () => {
+    lambdaMock.on(InvokeCommand).resolves(
+      bchPayload({
+        outcome: 'ok',
+        slots: [
+          {
+            slotId: 's1',
+            label: '1:00 PM',
+            start: 'x',
+            end: 'y',
+            candidateResourceIds: ['coordinator@org.example'],
+          },
+        ],
+        context: { duration_minutes: 30 },
+      })
+    );
+    const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.slots).toEqual([{ slotId: 's1', label: '1:00 PM', start: 'x', end: 'y' }]);
+    expect(res.body).not.toContain('candidateResourceIds');
+    expect(res.body).not.toContain('coordinator@org.example');
+  });
+
   test('no date → propose without date_window (whole horizon)', async () => {
     const res = await handler(evt({ action: 'propose', t: HASH, session: SESSION }));
     expect(res.statusCode).toBe(200);

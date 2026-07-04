@@ -45,6 +45,7 @@ const { EMAIL_SHAPE, resolveQualifyingContext } = require('./newBookingEntry');
 // §B16e shipped helpers: model-supplied `date` → the propose route's date_window;
 // localDateString resolves TODAY for date-less day-part bounds (deps.nowMs clock).
 const { dateWindowForDay, localDateString } = require('./dayPicker');
+const { slotsForClient } = require('./slotWire');
 // Shipped DST-correct civil-time resolver (native Intl, no tz lib): 'HH:MM' day-part
 // bounds → UTC instants in the appointment timezone (2026-06-12 daypart amendment).
 const { zonedWallTimeToUtc } = require('../../shared/scheduling/slots');
@@ -451,7 +452,7 @@ async function executeGetAvailableTimes({
   // §B18b: forward context when the propose result carries it (ADDITIVE; omit when absent —
   // old-shape tolerant per CLAUDE.md schema discipline).
   if (typeof write === 'function') {
-    const sseEvent = { type: 'scheduling_slots', slots, session_id: sessionId };
+    const sseEvent = { type: 'scheduling_slots', slots: slotsForClient(slots), session_id: sessionId };
     if (res.context != null) sseEvent.context = res.context;
     write(`data: ${JSON.stringify(sseEvent)}\n\n`);
   }

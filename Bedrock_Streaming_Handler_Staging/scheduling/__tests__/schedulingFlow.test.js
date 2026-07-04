@@ -513,6 +513,9 @@ describe('§B16e trigger (b) — proposing self-loop >= 2 → day picker emitted
     });
     expect(writes.some((w) => w.includes('"type":"scheduling_day_picker"'))).toBe(false);
     expect(writes.some((w) => w.includes('"type":"scheduling_slots"'))).toBe(true);
+    // Leak regression (found live 2026-07-03): coordinator identity never rides
+    // the SSE to the browser — §10.4 / slotWire.slotsForClient.
+    expect(writes.some((w) => w.includes('candidateResourceIds'))).toBe(false);
     expect(res.state).toBe('proposing');
   });
 

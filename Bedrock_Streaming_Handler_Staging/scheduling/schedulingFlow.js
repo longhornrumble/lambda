@@ -35,6 +35,7 @@ const { resolveBinding: realResolveBinding } = require('../../shared/scheduling/
 const { executeReschedule: realExecuteReschedule } = require('../../shared/scheduling/reschedule');
 const { executeCancel: realExecuteCancel } = require('../../shared/scheduling/cancel');
 const { generateSlots: realGenerateSlots } = require('../../shared/scheduling/slots');
+const { slotsForClient } = require('./slotWire');
 const { buildCalendarFacade: realBuildCalendarFacade } = require('../../shared/scheduling/calendarFacade');
 // NOTE (packaging): the shared/scheduling modules above bundle into BSH cleanly because
 // their only npm deps are AWS-SDK packages marked external in esbuild.config.mjs. The
@@ -363,7 +364,7 @@ async function _presentSlots({ tenantId, sessionId, binding, booking, config, de
     await deps.saveState({ tenantId, sessionId, state: 'proposing', candidate_slots: slots });
   }
   if (typeof write === 'function') {
-    write(`data: ${JSON.stringify({ type: 'scheduling_slots', slots, session_id: sessionId })}\n\n`);
+    write(`data: ${JSON.stringify({ type: 'scheduling_slots', slots: slotsForClient(slots), session_id: sessionId })}\n\n`);
   }
   return { handled: true, executed: false, state: next.state, slots };
 }

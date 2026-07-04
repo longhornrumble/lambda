@@ -178,6 +178,12 @@ describe('runNewBookingTurn — qualifying entry: propose + advance on ok', () =
     }));
     expect(write).toHaveBeenCalledTimes(1);
     expect(write.mock.calls[0][0]).toContain('scheduling_slots');
+    // Leak regression (found live 2026-07-03): the persisted candidate_slots keep the
+    // FULL chips (the commit's lock walk needs the pool), but the SSE to the browser
+    // must strip candidateResourceIds — coordinator identity is revealed at
+    // confirmation, never at proposal (§10.4 / slotWire.slotsForClient).
+    expect(write.mock.calls[0][0]).not.toContain('candidateResourceIds');
+    expect(write.mock.calls[0][0]).not.toContain('maya@org.example');
   });
 
   test('forwards windowStart/windowEnd from qualifyingContext when present (camel + snake)', async () => {

@@ -30,6 +30,10 @@ const SLOTS_3 = [
   { slotId: 's3', start: '2026-06-16T14:30:00Z', end: '2026-06-16T15:00:00Z', label: 'Tue Jun 16 9:30', candidateResourceIds: ['r2'] },
 ];
 
+// The client-boundary shape (slotWire.slotsForClient): candidateResourceIds is
+// SERVER-INTERNAL (§10.4) — persisted in state, never emitted over SSE.
+const SLOTS_3_WIRE = SLOTS_3.map(({ slotId, start, end, label }) => ({ slotId, start, end, label }));
+
 const OK_RESULT = { outcome: 'ok', slots: SLOTS_3, poolSize: 2, tieBreaker: 'tb', roundRobinCursor: 1 };
 
 function makeDeps(overrides = {}) {
@@ -75,9 +79,12 @@ describe('postFormOffer — success (outcome:ok)', () => {
     expect(deps.emitSse).toHaveBeenCalledTimes(1);
     expect(deps.emitSse).toHaveBeenCalledWith({
       type: 'scheduling_slots',
-      slots: SLOTS_3,
+      slots: SLOTS_3_WIRE,
       session_id: 'sess-1',
     });
+    // Leak regression (found live 2026-07-03): coordinator identity must never
+    // reach the browser at proposal time.
+    expect(JSON.stringify(deps.emitSse.mock.calls)).not.toContain('candidateResourceIds');
   });
 
   test('persists attendee_email on the session row in the SAME saveState that stages proposing (§B16b ordering + D3 pre-fill)', async () => {
