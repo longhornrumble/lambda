@@ -1,0 +1,7 @@
+{
+  "prompt_versions": {
+    "conversation": "v4-conv.v1",
+    "action_selector": "v4-selector.v1"
+  },
+  "scenarios": {}
+}

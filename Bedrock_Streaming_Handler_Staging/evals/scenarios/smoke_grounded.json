@@ -1,0 +1,25 @@
+{
+  "id": "smoke_grounded_orientation",
+  "description": "Harness smoke (1.3 placeholder): a grounded answer stays inside KB facts and invents no URL absent from the KB. Real grounding pack lands in 1.4.",
+  "run_action_selector": true,
+  "config": {
+    "tenant_id": "EVAL_SMOKE",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer info", "action": "send_query", "ai_available": true },
+      "apply_volunteer": { "label": "Apply to volunteer", "action": "start_form", "ai_available": true }
+    }
+  },
+  "kb_context": "Helping Hands volunteer orientation runs on the first Saturday of each month at 9:00 AM. Orientation lasts about two hours and is held at the community center.",
+  "conversation_history": [],
+  "user_input": "When is volunteer orientation?",
+  "assertions": [
+    { "type": "response_contains", "value": "Saturday" },
+    { "type": "response_urls_subset_of_kb" },
+    { "type": "ctas_valid" },
+    { "type": "ctas_subset_of", "value": ["learn_volunteer", "apply_volunteer"] }
+  ]
+}
