@@ -949,17 +949,26 @@ jobs:
   # therefore all-checks-passed → the PR). The only sanctioned way to turn a
   # stale_baseline green is a PR-reviewed `node evals/run.js --update-baseline`.
   #
-  # Creds: OIDC into the staging GitHubActionsDeployRole (already trusts
-  # pull_request; PowerUserAccess covers bedrock:InvokeModel; staging acct 525
-  # has Haiku 4.5 enabled in us-east-1 — all verified 2026-07-04). A dedicated
-  # least-privilege eval role (bedrock:InvokeModel only) is a possible future
-  # hardening; reusing the existing role follows the roadmap's "existing pattern".
+  # Creds: `environment: staging` scopes AWS_DEPLOY_ROLE_ARN to the STAGING (525)
+  # GitHubActionsDeployRole — NOT the repo-level secret, which is the prod (614)
+  # deploy role with no Bedrock access. The staging role has PowerUserAccess
+  # (covers bedrock:InvokeModel), its trust policy allows the
+  # `...:environment:staging` sub, staging acct 525 has Haiku 4.5 enabled in
+  # us-east-1, and the staging environment has no protection rules / branch policy
+  # (so PR runs aren't gated) — all verified 2026-07-04. This mirrors how
+  # deploy-staging.yml reaches the staging account; the eval never touches prod.
+  # A dedicated least-privilege eval role (bedrock:InvokeModel only) is a possible
+  # future hardening.
   # ---------------------------------------------------------------------------
   chat-eval-net:
     name: Chat Eval Net — Bedrock_Streaming_Handler_Staging
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: detect-changes
+    # Scopes AWS_DEPLOY_ROLE_ARN to the staging-account (525) role via the GitHub
+    # Environment-scoped secret. Without this the job would get the repo-level
+    # prod (614) role and fail (wrong account + no bedrock:InvokeModel).
+    environment: staging
     # workflow_dispatch has no diff base, so paths-filter reports false — allow a
     # manual run to force the eval net regardless.
     if: |
