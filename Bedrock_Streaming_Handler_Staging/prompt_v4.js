@@ -40,8 +40,12 @@
 //   ACTION_SELECTOR_PROMPT_VERSION → selectActionsV4() selector prompt (2.5)
 //
 // v1 (2026-07-04): baseline — first versioning of today's prompts (no text change).
+// v4-selector.v2 (2026-07-04, sub-phase 2.5): CTA restraint. Selector may now
+//   return an empty array on ANY turn (was: only the first message); softened the
+//   "LEARNING FIRST / always include LEARN" bias to "restraint first — most turns
+//   need none". Commitment gate (APPLY/VISIT only when committed) unchanged.
 const V4_CONVERSATION_PROMPT_VERSION = 'v4-conv.v1';
-const ACTION_SELECTOR_PROMPT_VERSION = 'v4-selector.v1';
+const ACTION_SELECTOR_PROMPT_VERSION = 'v4-selector.v2';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 2: Conversational Response Prompt
@@ -943,11 +947,11 @@ AVAILABLE ACTIONS:
 ${vocabulary}
 
 RULES:
-- Select 1-4 actions. Each action is labeled LEARN, APPLY, VISIT, or INFO.
-- LEARNING FIRST: Most selections should be LEARN actions — they help the user discover details, FAQs, and specifics about the programs being discussed. Always include LEARN actions when available.
-- APPLY/VISIT ONLY WHEN COMMITTED: Only select APPLY or VISIT actions when the user has unprompted said "I want to apply", "sign me up", "I'm ready", "let's donate", or similar. Answering the bot's question or expressing general interest is NOT commitment — keep showing LEARN actions.
-- If multiple programs are mentioned in the response, include a LEARN action for each.
-- Only return an empty array on the very first message when the user hasn't indicated any direction.
+- Select 0-4 actions. Each action is labeled LEARN, APPLY, VISIT, or INFO.
+- RESTRAINT FIRST: Only surface an action when it genuinely helps the user take a next step they are reaching for. Most turns need NONE — a normal answer, a thank-you, a clarification, or small talk should return []. Do not add actions just to fill a menu under every response.
+- When the user is actively exploring a specific program, one focused, relevant LEARN action can help them go deeper. One well-chosen action beats a list.
+- APPLY/VISIT ONLY WHEN COMMITTED: Only select APPLY or VISIT actions when the user has unprompted said "I want to apply", "sign me up", "I'm ready", "let's donate", or similar. Answering the bot's question or expressing general interest is NOT commitment.
+- Returning an empty array [] is a valid, common answer — prefer it whenever no single action clearly fits right now.
 
 Return ONLY a raw JSON array of action IDs. No explanation, no markdown, no code fences.`;
 
