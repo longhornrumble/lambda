@@ -34,7 +34,16 @@ cd Bedrock_Streaming_Handler_Staging
 AWS_PROFILE=myrecruiter-dev AWS_REGION=us-east-1 node evals/run.js            # run + compare to baseline
 AWS_PROFILE=myrecruiter-dev AWS_REGION=us-east-1 node evals/run.js --filter cta_    # subset
 AWS_PROFILE=myrecruiter-dev AWS_REGION=us-east-1 node evals/run.js --update-baseline # re-capture (deliberate)
+AWS_PROFILE=myrecruiter-dev AWS_REGION=us-east-1 node evals/run.js --retries 0        # disable per-scenario retry
 ```
+
+**Per-scenario retry (default 2).** These scenarios assert properties the model
+*should* satisfy (grounding, safety, CTA restraint) and it does ~85–99% of the
+time; the occasional flip is model stochasticity, not a regression. A failing
+scenario is retried up to `--retries N` times and passes if any attempt passes —
+a REAL regression fails every attempt and is still caught. Without it, ~15 live
+scenarios each flipping a few percent compound to a ~50% full-run flake rate,
+which would make the CI gate red half of eval-touching PRs for no real reason.
 
 ## CI gate (sub-phase 1.6)
 

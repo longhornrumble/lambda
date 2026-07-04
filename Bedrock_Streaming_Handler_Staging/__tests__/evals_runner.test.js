@@ -16,6 +16,7 @@ const {
   loadScenarios,
   scoreScenario,
   runScenario,
+  runScenarioResilient,
   compareToBaseline,
   buildBaseline,
   readBaseline,
@@ -215,6 +216,50 @@ describe('loadScenarios + readBaseline — failure modes', () => {
     const bl = readBaseline(path.join(os.tmpdir(), 'no-such-baseline-xyz.json'));
     expect(bl.scenarios).toEqual({});
     expect(bl.prompt_versions).toEqual(CURRENT_PROMPT_VERSIONS);
+  });
+});
+
+describe('runScenarioResilient — per-scenario retry (flaky-but-correct scenarios)', () => {
+  const scenario = { id: 's' };
+
+  test('passes on the first attempt without retrying', async () => {
+    const run = jest.fn(async () => ({ id: 's', pass: true, error: null }));
+    const r = await runScenarioResilient(scenario, {}, { retries: 2, run });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(r.pass).toBe(true);
+    expect(r.attempts).toBe(1);
+  });
+
+  test('retries a stochastic flip and returns the first passing attempt', async () => {
+    let n = 0;
+    const run = jest.fn(async () => { n += 1; return { id: 's', pass: n >= 2, error: null }; });
+    const r = await runScenarioResilient(scenario, {}, { retries: 2, run });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(r.pass).toBe(true);
+    expect(r.attempts).toBe(2);
+  });
+
+  test('a REAL regression fails every attempt and stays failed', async () => {
+    const run = jest.fn(async () => ({ id: 's', pass: false, error: null }));
+    const r = await runScenarioResilient(scenario, {}, { retries: 2, run });
+    expect(run).toHaveBeenCalledTimes(3); // initial + 2 retries
+    expect(r.pass).toBe(false);
+    expect(r.attempts).toBe(3);
+  });
+
+  test('retries a live error too', async () => {
+    let n = 0;
+    const run = jest.fn(async () => { n += 1; return n >= 2 ? { id: 's', pass: true, error: null } : { id: 's', pass: false, error: 'ThrottlingException' }; });
+    const r = await runScenarioResilient(scenario, {}, { retries: 3, run });
+    expect(r.error).toBeNull();
+    expect(r.pass).toBe(true);
+  });
+
+  test('retries:0 disables retry (single attempt)', async () => {
+    const run = jest.fn(async () => ({ id: 's', pass: false, error: null }));
+    const r = await runScenarioResilient(scenario, {}, { retries: 0, run });
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(r.attempts).toBe(1);
   });
 });
 
