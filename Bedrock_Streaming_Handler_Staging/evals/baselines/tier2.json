@@ -1,7 +1,7 @@
 {
   "prompt_versions": {
     "conversation": "v4-conv.v1",
-    "action_selector": "v4-selector.v1",
+    "action_selector": "v4-selector.v2",
     "groundedness_judge": "v1"
   },
   "scenarios": {
@@ -9,7 +9,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -27,7 +27,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -49,7 +49,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -64,16 +64,16 @@
       ]
     },
     "cta_04_conversational_turn_allows_empty": {
-      "pass": false,
+      "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
         {
           "type": "ctas_empty",
-          "pass": false
+          "pass": true
         },
         {
           "type": "ctas_valid",
@@ -85,7 +85,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -111,7 +111,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -137,7 +137,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -159,7 +159,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -181,7 +181,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -207,7 +207,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -233,7 +233,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -259,7 +259,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -281,7 +281,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -299,7 +299,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
@@ -321,7 +321,7 @@
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v1",
-        "action_selector": "v4-selector.v1",
+        "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1"
       },
       "assertions": [
