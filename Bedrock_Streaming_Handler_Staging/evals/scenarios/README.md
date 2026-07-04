@@ -5,9 +5,12 @@ builds the **real** Step-2 prompt (`buildV4ConversationPrompt`) from the scenari
 fixture config + recorded KB, invokes **live** Bedrock, optionally runs the real
 `selectActionsV4`, then applies the scenario's deterministic assertions.
 
-> **Skeleton note (sub-phase 1.3):** only `smoke_grounded.json` ships here as a
-> harness placeholder. The real packs land next — grounding + anti-fabrication (1.4)
-> and CTA quality + safety (1.5). The Haiku groundedness *judge* is added in 1.4.
+Packs on disk:
+- **Grounding + anti-fabrication (1.4)** — `grounding_*.json`, plus the
+  `grounded_in_kb` Haiku judge (see below).
+- **CTA quality + safety (1.5)** — `cta_*` / `safety_*` scenarios (deterministic
+  assertions only).
+- `smoke_grounded.json` — the 1.3 harness placeholder, kept as a minimal example.
 
 ## Scenario schema
 
@@ -50,8 +53,28 @@ conversation_history, config, client)` exactly as in `index.js`.
 | `ctas_equal` | `value: []` | selected CTAs equal the set exactly |
 | `ctas_empty` | — | no CTAs selected |
 | `ctas_valid` | — | every selected CTA id exists in `config.cta_definitions` |
+| `grounded_in_kb` | — | the Haiku groundedness judge (see below) rules the reply GROUNDED |
 
 An unknown assertion type fails loudly (so typos surface).
+
+## Groundedness judge (`grounded_in_kb`)
+
+Deterministic regex catches fabricated URLs, forbidden phrases, and bad CTA ids;
+it cannot catch a fluent invented *fact*. The `grounded_in_kb` assertion routes
+the reply to a focused Haiku call (temperature 0, `evals/judge.js`) that decides
+whether every factual claim is supported by `kb_context`:
+
+- **GROUNDED** → assertion passes.
+- **UNGROUNDED** → assertion fails (a claim isn't in the KB).
+- **UNSURE** → **routes to human review**; it does NOT auto-pass or auto-fail.
+  The scenario stays non-failing but is flagged (`⚠️ … need human review`) in the
+  report and marked `(review)` in the run log.
+
+The judge runs behind the injectable `invokeJudge` seam (mirroring
+`invokeResponse`), so the jest suite drives the scoring path with no live call.
+It carries its own `GROUNDEDNESS_JUDGE_PROMPT_VERSION`, stamped into results and
+baselines — changing the judge wording stales judge-dependent baselines exactly
+like a product-prompt bump (see `../baselines/README.md`).
 
 ## Running
 

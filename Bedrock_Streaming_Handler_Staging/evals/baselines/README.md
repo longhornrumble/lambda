@@ -9,12 +9,13 @@ run against it and **fails** (exit 1) on a `regression` or a `stale_baseline`.
 {
   "prompt_versions": {                 // versions at last --update-baseline
     "conversation": "v4-conv.v1",      // from prompt_v4.js (sub-phase 1.1)
-    "action_selector": "v4-selector.v1"
+    "action_selector": "v4-selector.v1",
+    "groundedness_judge": "v1"         // from evals/judge.js (sub-phase 1.4)
   },
   "scenarios": {
     "<scenario id>": {
-      "pass": true,                    // did the deterministic assertions pass?
-      "prompt_versions": { "conversation": "v4-conv.v1", "action_selector": "v4-selector.v1" },
+      "pass": true,                    // did the assertions pass? (judge UNSURE is non-failing)
+      "prompt_versions": { "conversation": "v4-conv.v1", "action_selector": "v4-selector.v1", "groundedness_judge": "v1" },
       "assertions": [ { "type": "response_contains", "pass": true } ]
     }
   }
@@ -37,5 +38,11 @@ run against it and **fails** (exit 1) on a `regression` or a `stale_baseline`.
 the old baseline is invalidated and the PR must commit a fresh one
 (`node evals/run.js --update-baseline`) — a deliberate, reviewed act.
 
-> **Skeleton note (1.3):** `scenarios` ships empty; real baselines are committed
-> alongside the 1.4/1.5 scenario packs. The CI job that enforces this lands in 1.6.
+The `groundedness_judge` version (from `evals/judge.js`) works the same way, but
+only stales scenarios that actually ran the judge (mirrors the action-selector
+rule): change the judge wording → bump `GROUNDEDNESS_JUDGE_PROMPT_VERSION` → those
+scenarios re-baseline. Judge `UNSURE` verdicts are recorded as `pass: true` (they
+route to human review, they don't fail the run).
+
+> **Note:** the 1.4 grounding pack and 1.5 CTA+safety pack commit their baselines
+> here. The CI job that enforces them (path-gated + `workflow_dispatch`) lands in 1.6.

@@ -35,6 +35,14 @@ const {
   V4_CONVERSATION_PROMPT_VERSION,
   ACTION_SELECTOR_PROMPT_VERSION,
 } = require('../prompt_v4');
+const {
+  GROUNDEDNESS_JUDGE_PROMPT_VERSION,
+  buildGroundednessJudgePrompt,
+  parseJudgeVerdict,
+} = require('./judge');
+
+// The assertion type that routes to the Haiku groundedness judge (sub-phase 1.4).
+const JUDGE_ASSERTION_TYPE = 'grounded_in_kb';
 
 // Haiku 4.5 — the program's default model (config.model_id / BEDROCK_MODEL_ID override).
 const DEFAULT_MODEL_ID =
@@ -44,6 +52,7 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const CURRENT_PROMPT_VERSIONS = Object.freeze({
   conversation: V4_CONVERSATION_PROMPT_VERSION,
   action_selector: ACTION_SELECTOR_PROMPT_VERSION,
+  groundedness_judge: GROUNDEDNESS_JUDGE_PROMPT_VERSION,
 });
 
 const DEFAULT_SCENARIOS_DIR = path.join(__dirname, 'scenarios');
@@ -78,16 +87,28 @@ function includesCI(haystack, needle) {
 }
 
 /**
- * Apply a scenario's deterministic assertions to the produced output.
- * PURE — given (scenario, { responseText, ctas, kbContext, config }).
- * Returns { pass, assertions: [{ type, pass, detail }] }.
+ * Apply a scenario's assertions to the produced output. PURE — the groundedness
+ * judge (async, live) is run upstream in runScenario and its verdict is passed
+ * in as `judgeVerdict`, mirroring how `ctas` are pre-computed by the async
+ * selector and then scored here.
+ *
+ * Returns { pass, review, assertions: [{ type, pass, detail, review? }] }.
+ * A `grounded_in_kb` assertion with an UNSURE verdict is non-failing (pass:true)
+ * but carries review:true — it routes to human review, it does not auto-pass/fail.
  */
-function scoreScenario(scenario, { responseText = '', ctas = [], kbContext = null, config = {} } = {}) {
+function scoreScenario(scenario, { responseText = '', ctas = [], kbContext = null, config = {}, judgeVerdict = null } = {}) {
   const ctaSet = new Set(ctas);
   const vocab = new Set(Object.keys(config.cta_definitions || {}));
   const assertions = (scenario.assertions || []).map((a) => {
     const val = a.value;
     switch (a.type) {
+      case JUDGE_ASSERTION_TYPE: {
+        if (judgeVerdict === 'grounded') return mk(a, true, 'groundedness judge: GROUNDED');
+        if (judgeVerdict === 'ungrounded') return mk(a, false, 'groundedness judge: UNGROUNDED — reply contains a claim not supported by the KB');
+        if (judgeVerdict === 'unsure') return { type: a.type, pass: true, review: true, detail: 'groundedness judge: UNSURE — routed to human review (non-blocking)' };
+        // No verdict computed at all — a harness wiring bug; surface it loudly.
+        return mk(a, false, 'groundedness judge did not run (no verdict) — harness error');
+      }
       case 'response_contains':
         return mk(a, includesCI(responseText, val), `expected response to contain "${val}"`);
       case 'response_not_contains':
@@ -130,7 +151,11 @@ function scoreScenario(scenario, { responseText = '', ctas = [], kbContext = nul
         return { type: a.type, pass: false, detail: `unknown assertion type "${a.type}"` };
     }
   });
-  return { pass: assertions.every((a) => a.pass), assertions };
+  return {
+    pass: assertions.every((a) => a.pass),
+    review: assertions.some((a) => a.review === true),
+    assertions,
+  };
 
   function mk(a, pass, detail) {
     return { type: a.type, pass, detail };
@@ -143,15 +168,19 @@ function scoreScenario(scenario, { responseText = '', ctas = [], kbContext = nul
 // ── one scenario run (live seam is injected) ─────────────────────────────────────
 
 /**
- * Run a single scenario. `deps.invokeResponse(prompt, {modelId, params})` is the
- * live Bedrock seam (injected so the jest suite can drive the loop deterministically);
- * `deps.bedrockClient` is passed straight to the real selectActionsV4.
+ * Run a single scenario. Injected seams (so the jest suite drives the loop with
+ * no live calls):
+ *   deps.invokeResponse(prompt, {modelId, params}) — the Step-2 model call.
+ *   deps.bedrockClient — passed straight to the real selectActionsV4.
+ *   deps.invokeJudge(judgePrompt, {modelId}) — the groundedness judge call
+ *     (only used when the scenario has a `grounded_in_kb` assertion).
  */
 async function runScenario(scenario, deps) {
   const config = scenario.config || {};
   const kbContext = scenario.kb_context == null ? null : scenario.kb_context;
   const history = scenario.conversation_history || [];
   const ranSelector = scenario.run_action_selector === true;
+  const usesJudge = (scenario.assertions || []).some((a) => a.type === JUDGE_ASSERTION_TYPE);
   const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
 
   const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
@@ -159,6 +188,8 @@ async function runScenario(scenario, deps) {
 
   let responseText = '';
   let ctas = [];
+  let judgeVerdict = null;
+  let ranJudge = false;
   let error = null;
   try {
     responseText = await deps.invokeResponse(prompt, {
@@ -169,20 +200,34 @@ async function runScenario(scenario, deps) {
       // Mirrors index.js: (responseText, priorHistory, config, client).
       ctas = await selectActionsV4(responseText, history, config, deps.bedrockClient);
     }
+    if (usesJudge) {
+      if (typeof deps.invokeJudge !== 'function') {
+        throw new Error(`scenario "${scenario.id}" uses ${JUDGE_ASSERTION_TYPE} but no invokeJudge seam was provided`);
+      }
+      const judgePrompt = buildGroundednessJudgePrompt(kbContext, scenario.user_input, responseText);
+      const rawVerdict = await deps.invokeJudge(judgePrompt, { modelId });
+      judgeVerdict = parseJudgeVerdict(rawVerdict);
+      ranJudge = true;
+    }
   } catch (e) {
     error = e && e.message ? e.message : String(e);
   }
 
-  const score = error ? { pass: false, assertions: [] } : scoreScenario(scenario, { responseText, ctas, kbContext, config });
+  const score = error
+    ? { pass: false, review: false, assertions: [] }
+    : scoreScenario(scenario, { responseText, ctas, kbContext, config, judgeVerdict });
   return {
     id: scenario.id,
     description: scenario.description || '',
     ranSelector,
+    ranJudge,
+    judgeVerdict,
     prompt_versions: { ...CURRENT_PROMPT_VERSIONS },
     responseText,
     ctas,
     error,
     pass: score.pass,
+    review: score.review,
     assertions: score.assertions,
   };
 }
@@ -204,7 +249,9 @@ function compareToBaseline(results, baseline, currentVersions = CURRENT_PROMPT_V
     const bv = base.prompt_versions || {};
     const conversationChanged = bv.conversation !== currentVersions.conversation;
     const selectorChanged = r.ranSelector && bv.action_selector !== currentVersions.action_selector;
-    if (conversationChanged || selectorChanged) {
+    // Only scenarios that actually ran the judge are invalidated by a judge bump.
+    const judgeChanged = r.ranJudge && bv.groundedness_judge !== currentVersions.groundedness_judge;
+    if (conversationChanged || selectorChanged || judgeChanged) {
       return item(r, 'stale_baseline', base.pass, 'prompt version changed — baseline no longer valid, re-baseline deliberately');
     }
     if (r.pass && !base.pass) return item(r, 'fixed', base.pass, 'now passing — update baseline to lock it in');
@@ -223,8 +270,11 @@ function buildReportItem(r) {
     id: r.id,
     description: r.description,
     ranSelector: r.ranSelector,
+    ranJudge: r.ranJudge,
+    judgeVerdict: r.judgeVerdict,
     prompt_versions: r.prompt_versions,
     pass: r.pass,
+    review: r.review === true,
     error: r.error,
     assertions: r.assertions,
     ctas: r.ctas,
@@ -261,6 +311,10 @@ function buildBaseline(results, currentVersions = CURRENT_PROMPT_VERSIONS) {
 function makeBedrockInvokers({ region = AWS_REGION } = {}) {
   const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
   const client = new BedrockRuntimeClient({ region });
+  function textOf(res) {
+    const payload = JSON.parse(new TextDecoder().decode(res.body));
+    return (payload.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+  }
   async function invokeResponse(prompt, { modelId, params }) {
     const command = new InvokeModelCommand({
       modelId,
@@ -273,11 +327,24 @@ function makeBedrockInvokers({ region = AWS_REGION } = {}) {
         temperature: params.temperature,
       }),
     });
-    const res = await client.send(command);
-    const payload = JSON.parse(new TextDecoder().decode(res.body));
-    return (payload.content || []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+    return textOf(await client.send(command));
   }
-  return { bedrockClient: client, invokeResponse };
+  // Groundedness judge: temperature 0, tiny cap — it returns a single verdict word.
+  async function invokeJudge(judgePrompt, { modelId }) {
+    const command = new InvokeModelCommand({
+      modelId,
+      accept: 'application/json',
+      contentType: 'application/json',
+      body: JSON.stringify({
+        anthropic_version: 'bedrock-2023-05-31',
+        messages: [{ role: 'user', content: [{ type: 'text', text: judgePrompt }] }],
+        max_tokens: 16,
+        temperature: 0,
+      }),
+    });
+    return textOf(await client.send(command));
+  }
+  return { bedrockClient: client, invokeResponse, invokeJudge };
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
@@ -320,7 +387,8 @@ async function main(argv = process.argv.slice(2)) {
   for (const { scenario } of loaded) {
     process.stdout.write(`  • ${scenario.id} … `);
     const r = await runScenario(scenario, invokers);
-    process.stdout.write(r.error ? `error\n` : `${r.pass ? 'pass' : 'FAIL'}\n`);
+    const mark = r.error ? 'error' : `${r.pass ? 'pass' : 'FAIL'}${r.review ? ' (review)' : ''}`;
+    process.stdout.write(`${mark}\n`);
     results.push(r);
   }
 
