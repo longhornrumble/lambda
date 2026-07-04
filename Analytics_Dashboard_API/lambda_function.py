@@ -4093,6 +4093,86 @@ _SCHED_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 # anything else). phone/in_person are a planned future provider — intentionally NOT yet writable.
 _CONFERENCE_TYPES = {'google_meet', 'zoom'}
 
+# Bookable hours (P1, 2026-07-04 — docs/roadmap/SCHEDULING_BOOKABLE_HOURS.md): the weekly
+# availability grid + timezone that shared/scheduling/slots.js generateSlots REQUIRES on
+# every appointment type (it throws without them — the 2026-07-03 dead-air root cause was
+# that no product surface wrote either field). Day-key vocabulary = slots.js DAY_KEYS.
+_AT_DAY_KEYS = ('sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat')
+_AT_WINDOW_RANGES_MAX = 4  # ranges per day (split shifts); UI sends 1 today, schema allows more
+_AT_HHMM_RE = re.compile(r'^([01]\d|2[0-3]):[0-5]\d$')
+_AT_TZ_SHAPE_RE = re.compile(r'^[A-Za-z0-9_+\-/]{1,64}$')
+# Create-time defaults — "never born unbookable". The dashboard always sends explicit values
+# (timezone prefilled from the admin's browser); these cover any other caller.
+_AT_DEFAULT_WINDOWS = {d: [{'start': '09:00', 'end': '17:00'}] for d in ('mon', 'tue', 'wed', 'thu', 'fri')}
+_AT_DEFAULT_TIMEZONE = 'America/New_York'
+
+_TZDATA_OK = None  # cached probe: does this runtime carry the IANA tz database?
+
+
+def _is_valid_iana_tz(tz: Any) -> bool:
+    """
+    IANA zone validation. Shape check always; strict zoneinfo lookup only when the runtime
+    demonstrably has tzdata (probed once with a known-good zone) — a runtime without tzdata
+    must not 400 legitimate zones. Defense in depth: the Node engine re-validates via Intl at
+    propose time and a bad zone degrades to the propose-failure fallback copy, never a crash.
+    """
+    global _TZDATA_OK
+    if not isinstance(tz, str) or not _AT_TZ_SHAPE_RE.match(tz):
+        return False
+    try:
+        import zoneinfo
+    except ImportError:
+        return True
+    if _TZDATA_OK is None:
+        try:
+            zoneinfo.ZoneInfo('America/New_York')
+            _TZDATA_OK = True
+        except Exception:
+            _TZDATA_OK = False
+    if not _TZDATA_OK:
+        return True
+    try:
+        zoneinfo.ZoneInfo(tz)
+        return True
+    except Exception:
+        return False
+
+
+def _validate_availability_windows(windows: Any):
+    """
+    Validate + normalize the weekly bookable-hours grid to the exact slots.js shape:
+    { mon: [{start:'09:00', end:'17:00'}], ... } — keys from _AT_DAY_KEYS, HH:MM wall-clock
+    strings, per-day ranges sorted and non-overlapping. Omitted day = not bookable that day
+    (an explicit empty list is rejected — omit the key instead). Returns
+    (normalized, error_response_or_None).
+    """
+    if not isinstance(windows, dict) or not windows:
+        return None, cors_response(400, {'error': 'availability_windows must be a non-empty object keyed by day (sun..sat)'})
+    normalized = {}
+    for day, ranges in windows.items():
+        if day not in _AT_DAY_KEYS:
+            return None, cors_response(400, {'error': f'availability_windows: unknown day key {day!r} (use sun..sat)'})
+        if not isinstance(ranges, list) or not ranges or len(ranges) > _AT_WINDOW_RANGES_MAX:
+            return None, cors_response(400, {'error': f'availability_windows.{day} must be a list of 1..{_AT_WINDOW_RANGES_MAX} ranges'})
+        prev_end = -1
+        day_out = []
+        for r in ranges:
+            start = r.get('start') if isinstance(r, dict) else None
+            end = r.get('end') if isinstance(r, dict) else None
+            if not isinstance(start, str) or not isinstance(end, str) \
+                    or not _AT_HHMM_RE.match(start) or not _AT_HHMM_RE.match(end):
+                return None, cors_response(400, {'error': f'availability_windows.{day}: each range needs start and end as HH:MM'})
+            start_min = int(start[:2]) * 60 + int(start[3:])
+            end_min = int(end[:2]) * 60 + int(end[3:])
+            if end_min <= start_min:
+                return None, cors_response(400, {'error': f'availability_windows.{day}: end must be after start'})
+            if start_min < prev_end:
+                return None, cors_response(400, {'error': f'availability_windows.{day}: ranges must be sorted and non-overlapping'})
+            prev_end = end_min
+            day_out.append({'start': start, 'end': end})
+        normalized[day] = day_out
+    return normalized, None
+
 
 def _marshal(item: Dict[str, Any]) -> Dict[str, Any]:
     """Python dict -> DynamoDB AttributeValue map (nested-safe via TypeSerializer)."""
@@ -4598,6 +4678,24 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
     if conference_type not in _CONFERENCE_TYPES:
         return cors_response(400, {'error': f"conference_type must be one of {sorted(_CONFERENCE_TYPES)}"})
 
+    # Bookable hours (P1): the weekly grid + timezone slots.js REQUIRES to generate slots.
+    # Create without them → defaults (M–F 9–5, _AT_DEFAULT_TIMEZONE) so no appointment type
+    # is ever born unbookable (the 2026-07-03 dead-air class). PATCH without them → unchanged
+    # (same conditional-include pattern as agenda below).
+    availability_windows = body.get('availability_windows')
+    if availability_windows is not None:
+        availability_windows, err = _validate_availability_windows(availability_windows)
+        if err:
+            return err
+    elif is_create:
+        availability_windows = _AT_DEFAULT_WINDOWS
+    at_timezone = body.get('timezone')
+    if at_timezone is not None:
+        if not _is_valid_iana_tz(at_timezone):
+            return cors_response(400, {'error': 'timezone must be a valid IANA zone id (e.g. America/Chicago)'})
+    elif is_create:
+        at_timezone = _AT_DEFAULT_TIMEZONE
+
     routing_policy_id = body.get('routing_policy_id')
     if not isinstance(routing_policy_id, str) or not routing_policy_id.strip():
         return cors_response(400, {'error': 'routing_policy_id is required (FK to a routing policy)'})
@@ -4662,6 +4760,10 @@ def handle_scheduling_appointment_type_write(tenant_id: str, appointment_type_id
     }
     if agenda is not None:
         fields['agenda'] = agenda
+    if availability_windows is not None:
+        fields['availability_windows'] = availability_windows
+    if at_timezone is not None:
+        fields['timezone'] = at_timezone
     if is_create:
         row = {'tenantId': tenant_id, 'appointment_type_id': appointment_type_id, **fields}
         created, err = _create_scheduling_row(APPOINTMENT_TYPE_TABLE, 'appointment_type_id', row, 'appointment type')
