@@ -35,6 +35,11 @@ jobs:
     outputs:
       # Node.js Lambdas with tests
       bedrock:     ${{ steps.filter.outputs.bedrock }}
+      # Chat-experience eval net (sub-phase 1.6). Gated NARROWLY on the files that
+      # change eval outcomes — the two prompt sources + the eval harness/scenarios —
+      # NOT all of Bedrock_Streaming_Handler_Staging/**, so unrelated BSH changes
+      # (e.g. form_handler.js) don't spend live Bedrock calls.
+      eval_gate:   ${{ steps.filter.outputs.eval_gate }}
       meta_webhook:   ${{ steps.filter.outputs.meta_webhook }}
       meta_response:  ${{ steps.filter.outputs.meta_response }}
       calendar_watch_listener: ${{ steps.filter.outputs.calendar_watch_listener }}
@@ -96,6 +101,10 @@ jobs:
           filters: |
             bedrock:
               - 'Bedrock_Streaming_Handler_Staging/**'
+            eval_gate:
+              - 'Bedrock_Streaming_Handler_Staging/prompt_v4.js'
+              - 'Bedrock_Streaming_Handler_Staging/scheduling/agentTurn.js'
+              - 'Bedrock_Streaming_Handler_Staging/evals/**'
             meta_webhook:
               - 'Meta_Webhook_Handler/**'
             meta_response:
@@ -930,11 +939,92 @@ jobs:
   # Branch protection rules should require this job — not the individual matrix
   # jobs — so the required check never disappears when a Lambda is skipped.
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Job 6: Chat-experience Tier-2 eval net (sub-phase 1.6)
+  #
+  # Runs the LIVE-Bedrock regression net (evals/run.js) whenever a file that
+  # affects eval outcomes changes — the conversation prompt, the scheduling
+  # narration prompt, or the eval harness/scenarios/baselines. `run.js` exits 1
+  # on any regression / stale_baseline / live error, which fails this job (and
+  # therefore all-checks-passed → the PR). The only sanctioned way to turn a
+  # stale_baseline green is a PR-reviewed `node evals/run.js --update-baseline`.
+  #
+  # Creds: `environment: staging` scopes AWS_DEPLOY_ROLE_ARN to the STAGING (525)
+  # GitHubActionsDeployRole — NOT the repo-level secret, which is the prod (614)
+  # deploy role with no Bedrock access. The staging role has PowerUserAccess
+  # (covers bedrock:InvokeModel), its trust policy allows the
+  # `...:environment:staging` sub, staging acct 525 has Haiku 4.5 enabled in
+  # us-east-1, and the staging environment has no protection rules / branch policy
+  # (so PR runs aren't gated) — all verified 2026-07-04. This mirrors how
+  # deploy-staging.yml reaches the staging account; the eval never touches prod.
+  # A dedicated least-privilege eval role (bedrock:InvokeModel only) is a possible
+  # future hardening.
+  # ---------------------------------------------------------------------------
+  chat-eval-net:
+    name: Chat Eval Net — Bedrock_Streaming_Handler_Staging
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: detect-changes
+    # Scopes AWS_DEPLOY_ROLE_ARN to the staging-account (525) role via the GitHub
+    # Environment-scoped secret. Without this the job would get the repo-level
+    # prod (614) role and fail (wrong account + no bedrock:InvokeModel).
+    environment: staging
+    # workflow_dispatch has no diff base, so paths-filter reports false — allow a
+    # manual run to force the eval net regardless.
+    if: |
+      needs.detect-changes.outputs.eval_gate == 'true' ||
+      github.event_name == 'workflow_dispatch'
+    permissions:
+      id-token: write   # OIDC token to assume the AWS role
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Bedrock_Streaming_Handler_Staging/package-lock.json
+
+      - name: Configure AWS credentials (staging OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Install dependencies
+        working-directory: Bedrock_Streaming_Handler_Staging
+        run: npm install
+
+      - name: Run Tier-2 eval net (live Bedrock — Haiku 4.5)
+        working-directory: Bedrock_Streaming_Handler_Staging
+        run: |
+          set +e
+          node evals/run.js --report eval-report.md
+          code=$?
+          if [ -f eval-report.md ]; then cat eval-report.md >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ "$code" -ne 0 ]; then
+            echo "::error::Tier-2 eval net failed (regression / stale_baseline / live error). See the job summary."
+          fi
+          exit $code
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chat-eval-report
+          path: Bedrock_Streaming_Handler_Staging/eval-report.md
+          retention-days: 7
+          if-no-files-found: ignore
+
   all-checks-passed:
     name: All Lambda Checks Passed
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [node-tests, applier-tests, python-tests, security, build]
+    needs: [node-tests, applier-tests, python-tests, security, build, chat-eval-net]
     # Run even when upstream jobs were skipped (no changes detected).
     if: always()
 
@@ -946,6 +1036,7 @@ jobs:
           echo "python-tests:   ${{ needs.python-tests.result }}"
           echo "security:       ${{ needs.security.result }}"
           echo "build:          ${{ needs.build.result }}"
+          echo "chat-eval-net:  ${{ needs.chat-eval-net.result }}"
 
           # Acceptable terminal states: success or skipped.
           # Any failure or cancellation is a hard stop.
@@ -954,7 +1045,8 @@ jobs:
             "${{ needs.applier-tests.result }}" \
             "${{ needs.python-tests.result }}" \
             "${{ needs.security.result }}" \
-            "${{ needs.build.result }}"; do
+            "${{ needs.build.result }}" \
+            "${{ needs.chat-eval-net.result }}"; do
             if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
               echo "FAILED: one or more jobs did not pass (result: $result)"
               exit 1

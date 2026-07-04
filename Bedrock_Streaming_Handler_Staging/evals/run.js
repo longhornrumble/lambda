@@ -307,6 +307,37 @@ function buildBaseline(results, currentVersions = CURRENT_PROMPT_VERSIONS) {
 
 // ── live Bedrock seam ─────────────────────────────────────────────────────────────
 
+/**
+ * Is a Bedrock error worth retrying? Throttling / 5xx / timeouts are transient;
+ * everything else (AccessDenied, Validation, model-not-found) is a real failure
+ * that MUST still fail the run. PURE. Keeps a single transient throttle among the
+ * ~30 live calls per run from red-flagging an eval-touching PR in CI.
+ */
+function isTransientError(e) {
+  if (!e) return false;
+  const name = String(e.name || e.Code || e.code || '');
+  const status = e.$metadata && e.$metadata.httpStatusCode;
+  if (typeof status === 'number' && (status === 429 || status >= 500)) return true;
+  return /Throttl|TooManyRequests|ServiceUnavailable|Timeout|InternalServer|ModelNotReady/i.test(name);
+}
+
+const defaultSleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Run `fn`, retrying only transient errors with exponential backoff. Testable via `sleep`. */
+async function withRetry(fn, { retries = 3, baseDelayMs = 250, sleep = defaultSleep } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      if (attempt === retries || !isTransientError(e)) throw e;
+      await sleep(baseDelayMs * 2 ** attempt);
+    }
+  }
+  throw lastErr;
+}
+
 /** Real Bedrock invokers. Lazy-requires the SDK so the pure helpers import cleanly. */
 function makeBedrockInvokers({ region = AWS_REGION } = {}) {
   const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -327,7 +358,7 @@ function makeBedrockInvokers({ region = AWS_REGION } = {}) {
         temperature: params.temperature,
       }),
     });
-    return textOf(await client.send(command));
+    return textOf(await withRetry(() => client.send(command)));
   }
   // Groundedness judge: temperature 0, tiny cap — it returns a single verdict word.
   async function invokeJudge(judgePrompt, { modelId }) {
@@ -342,7 +373,7 @@ function makeBedrockInvokers({ region = AWS_REGION } = {}) {
         temperature: 0,
       }),
     });
-    return textOf(await client.send(command));
+    return textOf(await withRetry(() => client.send(command)));
   }
   return { bedrockClient: client, invokeResponse, invokeJudge };
 }
@@ -438,6 +469,8 @@ module.exports = {
   buildBaseline,
   readBaseline,
   makeBedrockInvokers,
+  withRetry,
+  isTransientError,
   parseArgs,
   main,
   extractUrls,
