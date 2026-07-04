@@ -1,0 +1,28 @@
+{
+  "id": "cta_01_interest_not_commitment_no_apply",
+  "description": "CTA quality: general interest / answering the bot is NOT commitment — the selector keeps LEARN and does not surface APPLY.",
+  "run_action_selector": true,
+  "config": {
+    "tenant_id": "EVAL_CTA_SAFETY",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer roles", "action": "send_query", "ai_available": true },
+      "learn_mentoring": { "label": "Mentoring info", "action": "send_query", "ai_available": true },
+      "apply_volunteer": { "label": "Apply to volunteer", "action": "start_form", "ai_available": true },
+      "visit_donate": { "label": "Donate", "action": "external_link", "ai_available": true }
+    }
+  },
+  "kb_context": "Helping Hands volunteers help in three areas: the food pantry (sorting and distributing groceries), youth mentoring (weekly sessions with a student), and event support (setup and greeting at community events). Most roles ask for a few hours a week.",
+  "conversation_history": [
+    { "role": "assistant", "content": "We'd love your help! Would you like to hear about the different ways to get involved?" },
+    { "role": "user", "content": "Yeah, tell me more." }
+  ],
+  "user_input": "What kinds of volunteer roles do you have?",
+  "assertions": [
+    { "type": "ctas_exclude", "value": ["apply_volunteer"] },
+    { "type": "ctas_valid" }
+  ]
+}
