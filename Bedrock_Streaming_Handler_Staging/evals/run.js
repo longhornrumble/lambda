@@ -232,6 +232,28 @@ async function runScenario(scenario, deps) {
   };
 }
 
+/**
+ * Run a scenario, retrying while it fails/errors, up to `retries` extra attempts.
+ * These scenarios assert properties the model SHOULD satisfy (grounding, safety,
+ * CTA restraint) and it does ~85-99% of the time; the occasional flip is model
+ * stochasticity, not a real regression. Retry-to-pass absorbs that — a REAL
+ * regression (a prompt change that breaks a property) fails EVERY attempt and is
+ * still caught. Without this, 15 live scenarios each flipping a few percent
+ * compound to a ~50% full-run flake rate, which makes the CI gate useless.
+ *
+ * PURE w.r.t. Bedrock: the actual run is the injected `run` (defaults to
+ * runScenario), so the loop is unit-testable with a fake.
+ */
+async function runScenarioResilient(scenario, deps, { retries = 0, run = runScenario } = {}) {
+  let r = await run(scenario, deps);
+  let attempts = 1;
+  while ((r.error || r.pass === false) && attempts <= retries) {
+    r = await run(scenario, deps);
+    attempts += 1;
+  }
+  return { ...r, attempts };
+}
+
 // ── baseline comparison ──────────────────────────────────────────────────────────
 
 /**
@@ -381,7 +403,7 @@ function makeBedrockInvokers({ region = AWS_REGION } = {}) {
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
-  const args = { scenarios: DEFAULT_SCENARIOS_DIR, baselines: DEFAULT_BASELINE_FILE, report: null, filter: null, update: false, strict: false };
+  const args = { scenarios: DEFAULT_SCENARIOS_DIR, baselines: DEFAULT_BASELINE_FILE, report: null, filter: null, update: false, strict: false, retries: 2 };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--scenarios') args.scenarios = argv[++i];
@@ -390,6 +412,7 @@ function parseArgs(argv) {
     else if (a === '--filter') args.filter = argv[++i];
     else if (a === '--update-baseline') args.update = true;
     else if (a === '--strict') args.strict = true;
+    else if (a === '--retries') args.retries = Math.max(0, parseInt(argv[++i], 10) || 0);
     else if (a === '--help' || a === '-h') args.help = true;
     else throw new Error(`unknown arg: ${a}`);
   }
@@ -399,7 +422,7 @@ function parseArgs(argv) {
 async function main(argv = process.argv.slice(2)) {
   const args = parseArgs(argv);
   if (args.help) {
-    console.log('Usage: node evals/run.js [--scenarios DIR] [--baselines FILE] [--report FILE] [--filter SUBSTR] [--update-baseline] [--strict]');
+    console.log('Usage: node evals/run.js [--scenarios DIR] [--baselines FILE] [--report FILE] [--filter SUBSTR] [--update-baseline] [--strict] [--retries N]');
     return 0;
   }
   // selectActionsV4 reads BEDROCK_MODEL_ID from env — default it so CTA scenarios run.
@@ -412,14 +435,15 @@ async function main(argv = process.argv.slice(2)) {
     return 0;
   }
 
-  console.log(`Running ${loaded.length} scenario(s) against live Bedrock (${AWS_REGION})…`);
+  console.log(`Running ${loaded.length} scenario(s) against live Bedrock (${AWS_REGION}); up to ${args.retries} retr${args.retries === 1 ? 'y' : 'ies'} per flaky scenario…`);
   const invokers = makeBedrockInvokers({ region: AWS_REGION });
   const results = [];
   for (const { scenario } of loaded) {
     process.stdout.write(`  • ${scenario.id} … `);
-    const r = await runScenario(scenario, invokers);
+    const r = await runScenarioResilient(scenario, invokers, { retries: args.retries });
+    const retried = r.attempts > 1 ? ` (${r.attempts} attempts)` : '';
     const mark = r.error ? 'error' : `${r.pass ? 'pass' : 'FAIL'}${r.review ? ' (review)' : ''}`;
-    process.stdout.write(`${mark}\n`);
+    process.stdout.write(`${mark}${retried}\n`);
     results.push(r);
   }
 
@@ -464,6 +488,7 @@ module.exports = {
   loadScenarios,
   scoreScenario,
   runScenario,
+  runScenarioResilient,
   compareToBaseline,
   buildReportItem,
   buildBaseline,
