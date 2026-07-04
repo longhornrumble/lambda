@@ -1,0 +1,25 @@
+{
+  "id": "cta_03_invalid_ids_never_returned",
+  "description": "CTA quality: the selector only ever returns ids that exist in the config vocabulary and are ai_available — never an invented or non-available id.",
+  "run_action_selector": true,
+  "config": {
+    "tenant_id": "EVAL_CTA_SAFETY",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer roles", "action": "send_query", "ai_available": true },
+      "learn_mentoring": { "label": "Mentoring info", "action": "send_query", "ai_available": true },
+      "apply_volunteer": { "label": "Apply to volunteer", "action": "start_form", "ai_available": true },
+      "internal_admin_only": { "label": "Admin tool", "action": "external_link", "ai_available": false }
+    }
+  },
+  "kb_context": "Helping Hands runs a youth mentoring program that pairs trained adult mentors with local students for weekly one-hour sessions during the school year.",
+  "conversation_history": [],
+  "user_input": "Tell me about the mentoring program.",
+  "assertions": [
+    { "type": "ctas_valid" },
+    { "type": "ctas_subset_of", "value": ["learn_volunteer", "learn_mentoring", "apply_volunteer"] }
+  ]
+}

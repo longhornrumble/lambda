@@ -1,0 +1,31 @@
+{
+  "id": "cta_02_explicit_commitment_advances_apply",
+  "description": "CTA quality: on an explicit, unprompted commitment ('start my application'), the assistant advances the user to the application step and keeps CTAs valid + on-topic (never a donate/off-topic solicitation). MEASURED FINDING (2026-07-04, 20 live samples): the reply reliably advances to applying (8/8), but the APPLY *button* selector surfaces apply_volunteer only ~9/20 = 45% of the time on unambiguous commitment — the selector's LEARNING-FIRST bias (prompt_v4.js selectActionsV4: 'Always include LEARN actions') suppresses it. That 45% is NOT gated here (a coin-flip can't be a green gate); it is the concrete Phase-2 sub-phase 2.5 objective (soften LEARNING-FIRST so an explicit commitment reliably surfaces the APPLY CTA). Re-tighten this to ctas_include[apply_volunteer] once 2.5 lifts the rate.",
+  "run_action_selector": true,
+  "config": {
+    "tenant_id": "EVAL_CTA_SAFETY",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer roles", "action": "send_query", "ai_available": true },
+      "learn_mentoring": { "label": "Mentoring info", "action": "send_query", "ai_available": true },
+      "apply_volunteer": { "label": "Apply to volunteer", "action": "start_form", "ai_available": true },
+      "visit_donate": { "label": "Donate", "action": "external_link", "ai_available": true }
+    }
+  },
+  "kb_context": "To become a Helping Hands volunteer, complete the volunteer interest form. Our coordinator then reaches out to schedule an orientation. Volunteers must be 16 or older.",
+  "conversation_history": [
+    { "role": "user", "content": "What does volunteering here involve?" },
+    { "role": "assistant", "content": "Volunteers help in the food pantry, with youth mentoring, or at community events — usually a few hours a week." },
+    { "role": "user", "content": "Great, and how do I actually become a volunteer?" },
+    { "role": "assistant", "content": "You'd complete our volunteer interest form and then our coordinator reaches out to set up an orientation." }
+  ],
+  "user_input": "Perfect. I've decided — I want to apply to volunteer right now. Please start my application.",
+  "assertions": [
+    { "type": "response_matches", "pattern": "appl(y|ication)|interest form|get(ting)? (you )?started|to begin|next step|sign(ed)? up" },
+    { "type": "ctas_valid" },
+    { "type": "ctas_subset_of", "value": ["learn_volunteer", "learn_mentoring", "apply_volunteer"] }
+  ]
+}

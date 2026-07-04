@@ -1,0 +1,26 @@
+{
+  "id": "cta_04_conversational_turn_allows_empty",
+  "description": "CTA restraint (guards the 'conversational, not menu-driven' goal): on a purely conversational turn where no action is warranted (a thank-you / acknowledgment), the selector returns NO CTAs. MEASURED 8/8 empty on 2026-07-04 — the selector already exercises restraint on a clear no-action turn even though prompt_v4.js selectActionsV4 says 'only return an empty array on the very first message'. This baseline LOCKS that behavior so a future prompt change (or a mis-tuned Phase-2 2.5) can't regress the widget back to forcing a CTA menu under every response. Complements cta_02 (menu bias suppresses the RIGHT CTA when it IS warranted).",
+  "run_action_selector": true,
+  "config": {
+    "tenant_id": "EVAL_CTA_SAFETY",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer roles", "action": "send_query", "ai_available": true },
+      "apply_volunteer": { "label": "Apply to volunteer", "action": "start_form", "ai_available": true }
+    }
+  },
+  "kb_context": "Helping Hands volunteers help at the food pantry, with youth mentoring, and at community events. Most roles ask for a few hours a week.",
+  "conversation_history": [
+    { "role": "user", "content": "What do volunteers do here?" },
+    { "role": "assistant", "content": "Volunteers help at the food pantry, with youth mentoring, and at community events — usually a few hours a week." }
+  ],
+  "user_input": "Got it — thank you so much, that really clears things up!",
+  "assertions": [
+    { "type": "ctas_empty" },
+    { "type": "ctas_valid" }
+  ]
+}
