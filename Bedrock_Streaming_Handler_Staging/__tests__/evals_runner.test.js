@@ -21,6 +21,8 @@ const {
   readBaseline,
   parseArgs,
   extractUrls,
+  withRetry,
+  isTransientError,
   CURRENT_PROMPT_VERSIONS,
 } = require('../evals/run');
 const { renderReport } = require('../evals/report');
@@ -213,6 +215,51 @@ describe('loadScenarios + readBaseline — failure modes', () => {
     const bl = readBaseline(path.join(os.tmpdir(), 'no-such-baseline-xyz.json'));
     expect(bl.scenarios).toEqual({});
     expect(bl.prompt_versions).toEqual(CURRENT_PROMPT_VERSIONS);
+  });
+});
+
+describe('withRetry + isTransientError — live-seam resilience (CI gate reliability)', () => {
+  const noSleep = async () => {};
+
+  test('isTransientError: throttling / 5xx / timeouts are transient; real errors are not', () => {
+    expect(isTransientError({ name: 'ThrottlingException' })).toBe(true);
+    expect(isTransientError({ name: 'TooManyRequestsException' })).toBe(true);
+    expect(isTransientError({ name: 'InternalServerException' })).toBe(true);
+    expect(isTransientError({ $metadata: { httpStatusCode: 429 } })).toBe(true);
+    expect(isTransientError({ $metadata: { httpStatusCode: 503 } })).toBe(true);
+    expect(isTransientError({ name: 'AccessDeniedException' })).toBe(false);
+    expect(isTransientError({ name: 'ValidationException' })).toBe(false);
+    expect(isTransientError({ $metadata: { httpStatusCode: 400 } })).toBe(false);
+    expect(isTransientError(null)).toBe(false);
+  });
+
+  test('returns on first success without retrying', async () => {
+    const fn = jest.fn(async () => 'ok');
+    expect(await withRetry(fn, { sleep: noSleep })).toBe('ok');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  test('retries a transient error, then succeeds', async () => {
+    let calls = 0;
+    const fn = jest.fn(async () => {
+      calls += 1;
+      if (calls < 3) throw Object.assign(new Error('slow down'), { name: 'ThrottlingException' });
+      return 'recovered';
+    });
+    expect(await withRetry(fn, { sleep: noSleep })).toBe('recovered');
+    expect(fn).toHaveBeenCalledTimes(3);
+  });
+
+  test('does NOT retry a non-transient error — fails fast', async () => {
+    const fn = jest.fn(async () => { throw Object.assign(new Error('nope'), { name: 'AccessDeniedException' }); });
+    await expect(withRetry(fn, { sleep: noSleep })).rejects.toThrow('nope');
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  test('exhausts retries on a persistent transient error and throws the last one', async () => {
+    const fn = jest.fn(async () => { throw Object.assign(new Error('still throttled'), { name: 'ThrottlingException' }); });
+    await expect(withRetry(fn, { retries: 2, sleep: noSleep })).rejects.toThrow('still throttled');
+    expect(fn).toHaveBeenCalledTimes(3); // initial + 2 retries
   });
 });
 
