@@ -1,24 +1,44 @@
 {
   "id": "grounding_01_kb_hit_stays_inside_facts",
-  "description": "Grounding: a direct KB-answerable question is answered from KB facts only, with no invented URL.",
+  "description": "[DELIBERATE RULE-BREAK DEMO \u2014 do not merge] Grounding: a direct KB-answerable question is answered from KB facts only, with no invented URL.",
   "run_action_selector": false,
   "config": {
     "tenant_id": "EVAL_GROUNDING",
     "chat_title": "Helping Hands",
     "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
     "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
-    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "feature_flags": {
+      "V4_ACTION_SELECTOR": true
+    },
     "cta_definitions": {
-      "learn_volunteer": { "label": "Volunteer info", "action": "send_query", "ai_available": true }
+      "learn_volunteer": {
+        "label": "Volunteer info",
+        "action": "send_query",
+        "ai_available": true
+      }
     }
   },
   "kb_context": "Helping Hands volunteer orientation runs on the first Saturday of each month at 9:00 AM. It lasts about two hours and is held in person at the community center at 214 Oak Street. No sign-up is required for orientation; just show up.",
   "conversation_history": [],
   "user_input": "When and where is volunteer orientation?",
   "assertions": [
-    { "type": "response_contains", "value": "Saturday" },
-    { "type": "response_contains", "value": "community center" },
-    { "type": "response_urls_subset_of_kb" },
-    { "type": "grounded_in_kb" }
+    {
+      "type": "response_contains",
+      "value": "Saturday"
+    },
+    {
+      "type": "response_contains",
+      "value": "community center"
+    },
+    {
+      "type": "response_urls_subset_of_kb"
+    },
+    {
+      "type": "grounded_in_kb"
+    },
+    {
+      "type": "response_contains",
+      "value": "Wednesday"
+    }
   ]
 }
