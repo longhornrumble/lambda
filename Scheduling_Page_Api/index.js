@@ -319,7 +319,13 @@ exports.handler = async (event) => {
     });
     return json(200, {
       outcome: (res && res.outcome) || 'failed',
-      slots: (res && res.slots) || [],
+      // Client-boundary allowlist (§10.4 / §5.7): BCH chips carry
+      // candidateResourceIds (coordinator email) — SERVER-INTERNAL only;
+      // identity is revealed at confirmation, never at proposal. Only the
+      // four documented §B3 chip fields reach the browser.
+      slots: ((res && res.slots) || [])
+        .filter((s) => s && typeof s === 'object')
+        .map(({ slotId, start, end, label }) => ({ slotId, start, end, label })),
       context: (res && res.context) || null,
       ...hero,
     });

@@ -70,6 +70,7 @@ const { isSchedulingEnabled } = require('./bindingContext');
 // appointment-type / timezone resolution from the tenant `scheduling` config block — reuse,
 // never re-implement.
 const { EMAIL_SHAPE, resolveQualifyingContext } = require('./newBookingEntry');
+const { slotsForClient } = require('./slotWire');
 
 // Warm templated copy (§B17e voice rule: warm and honest, never robotic; no guarantee
 // language about offered times).
@@ -222,7 +223,7 @@ async function postFormOffer({ tenantConfig, sessionId, attendee, postBookingQue
       if (typeof deps.emitSse === 'function') {
         // §B18b: forward context when the propose result carries it (ADDITIVE; omit when absent —
         // old-shape tolerant per CLAUDE.md schema discipline).
-        const sseEvent = { type: 'scheduling_slots', slots, session_id: sessionId };
+        const sseEvent = { type: 'scheduling_slots', slots: slotsForClient(slots), session_id: sessionId };
         if (slotsResult.context != null) sseEvent.context = slotsResult.context;
         deps.emitSse(sseEvent);
       }

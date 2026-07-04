@@ -96,6 +96,10 @@ const SLOT = Object.freeze({
 
 const PROPOSE_OK = Object.freeze({ outcome: 'ok', slots: [SLOT], poolSize: 1 });
 
+// Client-boundary shape (slotWire): candidateResourceIds is SERVER-INTERNAL
+// (§10.4) — persisted in state, never emitted over SSE (leak found 2026-07-03).
+const SLOT_WIRE = { slotId: SLOT.slotId, start: SLOT.start, end: SLOT.end, label: SLOT.label };
+
 const CONFIG = Object.freeze({
   tenant_id: 'TEN',
   model_id: 'anthropic.claude-haiku-4-5',
@@ -263,7 +267,7 @@ describe('agentTurn — §B17b loop', () => {
 
     // the tool's UI SSE event was emitted mid-turn
     const slotEvents = frames(write).filter((f) => f.type === 'scheduling_slots');
-    expect(slotEvents).toEqual([{ type: 'scheduling_slots', slots: [SLOT], session_id: 'sess-1' }]);
+    expect(slotEvents).toEqual([{ type: 'scheduling_slots', slots: [SLOT_WIRE], session_id: 'sess-1' }]);
 
     // call 2 received assistant tool_use + user tool_result (the loop re-entered)
     const body2 = JSON.parse(bedrock.send.mock.calls[1][0].input.body);

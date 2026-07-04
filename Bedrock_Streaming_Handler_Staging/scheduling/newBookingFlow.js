@@ -47,6 +47,7 @@ const {
 } = require('../../shared/scheduling/stateMachine');
 
 const { isSchedulingEnabled } = require('./bindingContext');
+const { slotsForClient } = require('./slotWire');
 
 // §B16e: day-picker helpers (WS-T3-DAYPICK-BE).
 const {
@@ -300,7 +301,7 @@ async function _handleDaySelected({ tenantId, sessionId, state, prior, qctx, day
       });
     }
     if (typeof write === 'function') {
-      write(`data: ${JSON.stringify({ type: 'scheduling_slots', slots, session_id: sessionId })}\n\n`);
+      write(`data: ${JSON.stringify({ type: 'scheduling_slots', slots: slotsForClient(slots), session_id: sessionId })}\n\n`);
     }
     (logger || console).info(
       JSON.stringify({ event: 'day_selected_slots_presented', tenant_id: tenantId, session_id: sessionId, day: daySelected, slot_count: slots.length })
@@ -515,7 +516,7 @@ async function _propose({ tenantId, sessionId, fromState, prior, qctx, config, d
   if (typeof write === 'function') {
     // §B18b: forward context when the propose result carries it (ADDITIVE; omit when absent —
     // old-shape tolerant per CLAUDE.md schema discipline).
-    const sseEvent = { type: 'scheduling_slots', slots, session_id: sessionId };
+    const sseEvent = { type: 'scheduling_slots', slots: slotsForClient(slots), session_id: sessionId };
     if (res.context != null) sseEvent.context = res.context;
     write(`data: ${JSON.stringify(sseEvent)}\n\n`);
   }

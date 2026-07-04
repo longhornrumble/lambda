@@ -47,6 +47,11 @@ const PROPOSE_OK = Object.freeze({
   roundRobinCursor: 'cur-7',
 });
 
+// The client-boundary shape (slotWire.slotsForClient): candidateResourceIds is
+// SERVER-INTERNAL (§10.4) — persisted in state (candidate_slots keeps the FULL
+// chips), never emitted over SSE. Leak found live 2026-07-03.
+const wire = ({ slotId, start, end, label }) => ({ slotId, start, end, label });
+
 const QCTX = Object.freeze({
   appointmentTypeId: 'apt_intro',
   userTimeZone: 'America/Chicago',
@@ -158,7 +163,8 @@ describe('executeGetAvailableTimes', () => {
     // emits the SHIPPED scheduling_slots SSE (unchanged widget contract)
     const slotEvents = frames(args.write).filter((f) => f.type === 'scheduling_slots');
     expect(slotEvents).toHaveLength(1);
-    expect(slotEvents[0]).toEqual({ type: 'scheduling_slots', slots: [SLOT, SLOT2], session_id: 'sess-1' });
+    expect(slotEvents[0]).toEqual({ type: 'scheduling_slots', slots: [wire(SLOT), wire(SLOT2)], session_id: 'sess-1' });
+    expect(JSON.stringify(slotEvents)).not.toContain('candidateResourceIds');
 
     // §B17c output to model: slot_id + label + starts_at_iso; GENERIC (no coordinator identity)
     expect(result).toEqual({
@@ -383,7 +389,7 @@ describe('executeGetAvailableTimes', () => {
       // SSE + model result stay PER-CALL (the widget merges; the model asked about THIS day)
       const slotEvents = frames(args.write).filter((f) => f.type === 'scheduling_slots');
       expect(slotEvents).toHaveLength(1);
-      expect(slotEvents[0].slots).toEqual([SLOT, SLOT2]);
+      expect(slotEvents[0].slots).toEqual([wire(SLOT), wire(SLOT2)]);
       expect(result.slots.map((s) => s.slot_id)).toEqual(['s1', 's2']);
     });
 
