@@ -399,6 +399,121 @@ def test_appointment_type_update_uses_updateitem(mock_ddb):
 
 
 # --------------------------------------------------------------------------- #
+# Bookable hours (P1) — availability_windows + timezone
+# (slots.js generateSlots REQUIRES both; the 2026-07-03 dead-air root cause was
+#  that no product surface wrote either field.)
+# --------------------------------------------------------------------------- #
+
+_WINDOWS = {'mon': [{'start': '10:00', 'end': '15:00'}], 'thu': [{'start': '09:00', 'end': '12:00'}]}
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_create_defaults_windows_and_timezone(mock_ddb):
+    """Never born unbookable: create without hours/timezone stamps M-F 9-5 + the default zone."""
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(TENANT, None, _at_body(), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 201
+    at = json.loads(resp['body'])['appointment_type']
+    assert at['timezone'] == 'America/New_York'
+    assert set(at['availability_windows'].keys()) == {'mon', 'tue', 'wed', 'thu', 'fri'}
+    assert at['availability_windows']['mon'] == [{'start': '09:00', 'end': '17:00'}]
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_create_explicit_windows_and_timezone_persisted(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, None, _at_body(availability_windows=_WINDOWS, timezone='America/Chicago'), ADMIN, EMAIL, None)
+    assert resp['statusCode'] == 201
+    at = json.loads(resp['body'])['appointment_type']
+    assert at['availability_windows'] == _WINDOWS
+    assert at['timezone'] == 'America/Chicago'
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_windows_validation_400s(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+
+    def write(windows):
+        return handle_scheduling_appointment_type_write(
+            TENANT, None, _at_body(availability_windows=windows), ADMIN, EMAIL, None)['statusCode']
+
+    assert write({}) == 400                                                     # empty grid
+    assert write({'monday': [{'start': '09:00', 'end': '17:00'}]}) == 400       # bad day key
+    assert write({'mon': []}) == 400                                            # empty day (omit instead)
+    assert write({'mon': [{'start': '9:00', 'end': '17:00'}]}) == 400           # not HH:MM
+    assert write({'mon': [{'start': '09:00', 'end': '24:00'}]}) == 400          # out-of-range clock
+    assert write({'mon': [{'start': '17:00', 'end': '09:00'}]}) == 400          # end before start
+    assert write({'mon': [{'start': '09:00', 'end': '12:00'},
+                          {'start': '11:00', 'end': '15:00'}]}) == 400          # overlap
+    assert write({'mon': [{'start': f'{h:02d}:00', 'end': f'{h:02d}:30'}
+                          for h in range(9, 14)]}) == 400                       # > ranges cap
+    assert write('not-a-dict') == 400
+    # sorted, non-overlapping split shift is FINE
+    assert write({'mon': [{'start': '09:00', 'end': '12:00'},
+                          {'start': '13:00', 'end': '17:00'}]}) == 201
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_timezone_validation(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+
+    def write(tz):
+        return handle_scheduling_appointment_type_write(
+            TENANT, None, _at_body(timezone=tz), ADMIN, EMAIL, None)['statusCode']
+
+    assert write('America/Chicago') == 201
+    assert write('Not A Zone!') == 400   # fails the shape check everywhere
+    assert write(42) == 400
+    assert write('Definitely/Bogus_Zone') == 400  # strict zoneinfo check (tzdata present locally)
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_patch_without_hours_leaves_them_unchanged(mock_ddb):
+    """PATCH absent → the update expression must NOT touch availability_windows/timezone
+    (same conditional-include contract as agenda)."""
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    mock_ddb.update_item.return_value = {'Attributes': {
+        'appointment_type_id': {'S': 'at_1'}, 'tenantId': {'S': TENANT},
+        'name': {'S': 'Intro Call'}, 'duration_minutes': {'N': '30'},
+        'routing_policy_id': {'S': 'rp_x'},
+        'modified_at': {'M': {'at': {'S': 'now'}, 'by': {'S': EMAIL}}},
+    }}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, 'at_1', _at_body(), ADMIN, EMAIL, '2026-06-06T00:00:00Z')
+    assert resp['statusCode'] == 200
+    # Field names ride ExpressionAttributeNames (#f{i} placeholders), NOT the
+    # UpdateExpression string — assert on the names map, not the expression.
+    kw = mock_ddb.update_item.call_args.kwargs
+    assert 'availability_windows' not in kw['ExpressionAttributeNames'].values()
+    assert 'timezone' not in kw['ExpressionAttributeNames'].values()
+
+
+@patch('lambda_function.get_programs', new=lambda _t: _PROGRAMS)
+@patch('lambda_function.dynamodb')
+def test_appointment_type_patch_with_hours_updates_them(mock_ddb):
+    mock_ddb.get_item.return_value = {'Item': {'routing_policy_id': {'S': 'rp_x'}}}
+    mock_ddb.update_item.return_value = {'Attributes': {
+        'appointment_type_id': {'S': 'at_1'}, 'tenantId': {'S': TENANT},
+        'name': {'S': 'Intro Call'}, 'duration_minutes': {'N': '30'},
+        'routing_policy_id': {'S': 'rp_x'},
+        'modified_at': {'M': {'at': {'S': 'now'}, 'by': {'S': EMAIL}}},
+    }}
+    resp = handle_scheduling_appointment_type_write(
+        TENANT, 'at_1', _at_body(availability_windows=_WINDOWS, timezone='America/Denver'),
+        ADMIN, EMAIL, '2026-06-06T00:00:00Z')
+    assert resp['statusCode'] == 200
+    kw = mock_ddb.update_item.call_args.kwargs
+    assert 'availability_windows' in kw['ExpressionAttributeNames'].values()
+    assert 'timezone' in kw['ExpressionAttributeNames'].values()
+
+
+# --------------------------------------------------------------------------- #
 # GET list handlers
 # --------------------------------------------------------------------------- #
 
