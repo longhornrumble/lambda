@@ -215,6 +215,29 @@ describe('start_scheduling deterministic entry bypass', () => {
     expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(0);
   });
 
+  it('writes the honest fallback line when the flow reports handled:true with propose_failed_outcome (dead-air regression, 2026-07-03)', async () => {
+    // newBookingFlow returns handled:true + reason:'propose_failed_outcome' when the
+    // propose seam reports outcome:'failed' (its "non-fatal, no picker" branch). On a
+    // click turn there is no streamed chat text to fall back on, so without the reason
+    // check the user got the entry copy and then silence — observed live on staging
+    // when every appointment type lacked availability_windows.
+    runNewBookingEntry.mockResolvedValue({
+      handled: true,
+      executed: false,
+      state: 'qualifying',
+      reason: 'propose_failed_outcome',
+    });
+
+    const responseStream = mockResponseStream();
+    await indexModule.handler(clickEvent(), responseStream, {});
+
+    const chunks = responseStream.getChunks().join('');
+    expect(chunks).toContain(ENTRY_COPY);
+    expect(chunks).toContain(FALLBACK_COPY);
+    expect(chunks).toContain('[DONE]');
+    expect(bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)).toHaveLength(0);
+  });
+
   it('survives an entry-hook throw with the fallback line (no crash, stream ends)', async () => {
     runNewBookingEntry.mockRejectedValue(new Error('DDB exploded'));
 

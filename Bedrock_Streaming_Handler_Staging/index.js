@@ -602,8 +602,15 @@ const streamingHandler = async (event, responseStream, context) => {
           else if (entry?.reason === 'identity_required') copy = SCHEDULING_EMAIL_ASK_COPY;
           else if (entry?.reason === 'slot_unavailable') copy = SCHEDULING_SLOT_GONE_COPY;
           else copy = SCHEDULING_ENTRY_FALLBACK_COPY;
-        } else if (!entry || entry.handled !== true) {
+        } else if (!entry || entry.handled !== true || entry.reason === 'propose_failed_outcome') {
           // Entry click: never leave it in dead air (propose seam down, entry error, etc.)
+          // `handled:true` alone is NOT enough — the flow returns handled:true with
+          // reason:'propose_failed_outcome' when the propose seam reports outcome:'failed'
+          // (newBookingFlow's "non-fatal, no picker" branch), which on a CLICK turn has
+          // no streamed chat text to fall back on. Without this reason check the user
+          // got the entry copy and then silence (staging, 2026-07-03: every appointment
+          // type lacked availability_windows, so propose failed universally and the
+          // widget dead-aired instead of saying we'll follow up).
           copy = SCHEDULING_ENTRY_FALLBACK_COPY;
         }
         if (copy) {
