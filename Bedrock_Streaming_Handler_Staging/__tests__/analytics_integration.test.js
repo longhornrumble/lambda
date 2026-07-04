@@ -13,6 +13,14 @@
  * with hand-rolled factories that return controllable spy functions.
  */
 
+// prompt_v4 is not mocked in the isolated registries — its version constants are
+// plain deterministic strings, so the top-level require yields the same values
+// index.js stamps into the QA_COMPLETE log (sub-phase 1.1 assertion below).
+const {
+  V4_CONVERSATION_PROMPT_VERSION,
+  ACTION_SELECTOR_PROMPT_VERSION,
+} = require('../prompt_v4');
+
 // ─────────────────────────────────────────────────────────────────────
 // Gap 1: handleAnalyticsEvent no-op guard
 // ─────────────────────────────────────────────────────────────────────
@@ -392,5 +400,32 @@ describe('Gap 3 — buffered handler: writeSessionSummary called after QA_COMPLE
     // Bedrock answer (Bedrock-generated) can echo prompt PII — also redacted
     expect(parsed.answer).not.toMatch(/jane\.doe@example\.com/);
     expect(parsed.answer).toMatch(/\[EMAIL\]/);
+  });
+
+  // ─── Sub-phase 1.1: QA_COMPLETE log stamps both prompt versions ───
+  // Eval baselines key on the prompt text version a response was produced under.
+  test('QA_COMPLETE structured log stamps both prompt versions', async () => {
+    console.log.mockClear();
+    const event = {
+      body: JSON.stringify({
+        tenant_hash: 'my87674d777bf9',
+        user_input: 'What programs do you offer?',
+        session_id: 'sess_prompt_version',
+        client_timestamp: '2026-05-04T20:00:00.000Z',
+      }),
+    };
+
+    await handler(event, { awsRequestId: 'req-prompt-version-1' });
+
+    const qaLog = console.log.mock.calls
+      .map((c) => c[0])
+      .find((s) => typeof s === 'string' && s.includes('"QA_COMPLETE"'));
+
+    expect(qaLog).toBeDefined();
+    const parsed = JSON.parse(qaLog);
+    expect(parsed.prompt_versions).toEqual({
+      conversation: V4_CONVERSATION_PROMPT_VERSION,
+      action_selector: ACTION_SELECTOR_PROMPT_VERSION,
+    });
   });
 });
