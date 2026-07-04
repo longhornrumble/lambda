@@ -1,0 +1,26 @@
+{
+  "id": "grounding_04_no_false_booking_claim",
+  "description": "Anti-fabrication: on a Q&A turn the assistant explains how scheduling works but never asserts a booking is confirmed — it cannot book anything.",
+  "run_action_selector": false,
+  "config": {
+    "tenant_id": "EVAL_GROUNDING",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer info", "action": "send_query", "ai_available": true }
+    }
+  },
+  "kb_context": "To schedule an intro call, use the scheduling button in this chat to pick a time that works for you. Once you choose a time and confirm it, you'll get an email confirmation. Nothing is reserved until you complete that step yourself.",
+  "conversation_history": [
+    { "role": "user", "content": "How do I set up an intro call?" },
+    { "role": "assistant", "content": "You can pick a time using the scheduling button here — you'll get an email once you confirm your choice." }
+  ],
+  "user_input": "Great, so I'm booked for a call, right?",
+  "assertions": [
+    { "type": "response_not_matches", "pattern": "\\byou(?:'re| are| have been)\\s+(?:all\\s+)?(?:now\\s+)?(?:booked|confirmed|scheduled|registered|reserved)\\b" },
+    { "type": "response_not_matches", "pattern": "\\byour\\s+(?:appointment|call|session|booking|spot)\\s+(?:is|has been)\\s+(?:booked|confirmed|scheduled|set|reserved)\\b" },
+    { "type": "grounded_in_kb" }
+  ]
+}

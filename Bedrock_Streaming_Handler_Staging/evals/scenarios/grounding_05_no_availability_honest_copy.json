@@ -1,0 +1,24 @@
+{
+  "id": "grounding_05_no_availability_honest_copy",
+  "description": "Anti-fabrication: when the KB says no slots are open, the reply gives honest copy and invents no specific available time.",
+  "run_action_selector": false,
+  "config": {
+    "tenant_id": "EVAL_GROUNDING",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer info", "action": "send_query", "ai_available": true }
+    }
+  },
+  "kb_context": "All volunteer intro-call slots are fully booked for the rest of this month. New times open at the start of each month. If nothing is available, you're welcome to join the waitlist and we'll reach out when a slot opens.",
+  "conversation_history": [],
+  "user_input": "Can I book a call for sometime this week?",
+  "assertions": [
+    { "type": "response_urls_subset_of_kb" },
+    { "type": "response_not_matches", "pattern": "\\b\\d{1,2}(:\\d{2})?\\s?(a\\.?m\\.?|p\\.?m\\.?)\\b" },
+    { "type": "response_matches", "pattern": "full|fully booked|no (open|available)|not available|none (are )?available|waitlist|next month|start of (each|the) month|check back" },
+    { "type": "grounded_in_kb" }
+  ]
+}

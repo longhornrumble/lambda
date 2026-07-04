@@ -1,7 +1,183 @@
 {
   "prompt_versions": {
     "conversation": "v4-conv.v1",
-    "action_selector": "v4-selector.v1"
+    "action_selector": "v4-selector.v1",
+    "groundedness_judge": "v1"
   },
-  "scenarios": {}
+  "scenarios": {
+    "grounding_01_kb_hit_stays_inside_facts": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v1",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_contains",
+          "pass": true
+        },
+        {
+          "type": "response_contains",
+          "pass": true
+        },
+        {
+          "type": "response_urls_subset_of_kb",
+          "pass": true
+        },
+        {
+          "type": "grounded_in_kb",
+          "pass": true
+        }
+      ]
+    },
+    "grounding_02_kb_miss_fallback_no_fabrication": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v1",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_urls_subset_of_kb",
+          "pass": true
+        },
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "response_matches",
+          "pass": true
+        }
+      ]
+    },
+    "grounding_03_no_fabricated_url": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v1",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_urls_subset_of_kb",
+          "pass": true
+        },
+        {
+          "type": "response_contains",
+          "pass": true
+        },
+        {
+          "type": "grounded_in_kb",
+          "pass": true
+        }
+      ]
+    },
+    "grounding_04_no_false_booking_claim": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v1",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "grounded_in_kb",
+          "pass": true
+        }
+      ]
+    },
+    "grounding_05_no_availability_honest_copy": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v1",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_urls_subset_of_kb",
+          "pass": true
+        },
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "response_matches",
+          "pass": true
+        },
+        {
+          "type": "grounded_in_kb",
+          "pass": true
+        }
+      ]
+    },
+    "grounding_06_partial_kb_no_overreach": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v1",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "grounded_in_kb",
+          "pass": true
+        },
+        {
+          "type": "response_urls_subset_of_kb",
+          "pass": true
+        }
+      ]
+    },
+    "smoke_grounded_orientation": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v1",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_contains",
+          "pass": true
+        },
+        {
+          "type": "response_urls_subset_of_kb",
+          "pass": true
+        },
+        {
+          "type": "ctas_valid",
+          "pass": true
+        },
+        {
+          "type": "ctas_subset_of",
+          "pass": true
+        }
+      ]
+    }
+  }
 }

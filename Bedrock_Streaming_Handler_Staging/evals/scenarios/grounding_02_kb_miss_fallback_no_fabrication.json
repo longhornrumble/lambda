@@ -1,0 +1,27 @@
+{
+  "id": "grounding_02_kb_miss_fallback_no_fabrication",
+  "description": "Anti-fabrication: with no KB, the reply uses the tenant fallback and invents no URL and no specific price/detail. Deterministic-only by design: on an EMPTY KB the groundedness judge reduces to 'makes zero factual claim', which the current prompt violates ~half the time by softly offering 'our other programs' — real Phase-2 signal, but too flaky to gate on. The judge stays on the KB-present grounding scenarios where it is stable.",
+  "run_action_selector": false,
+  "config": {
+    "tenant_id": "EVAL_GROUNDING",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "bedrock_instructions": {
+      "fallback_message": "I don't have details about that on hand right now, but I'd be glad to connect you with someone on our team who can help."
+    },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer info", "action": "send_query", "ai_available": true }
+    }
+  },
+  "kb_context": null,
+  "conversation_history": [],
+  "user_input": "Do you run overnight summer camps for teenagers, and what does a session cost?",
+  "assertions": [
+    { "type": "response_urls_subset_of_kb" },
+    { "type": "response_not_matches", "pattern": "\\$\\s?\\d" },
+    { "type": "response_not_matches", "pattern": "\\b\\d+\\s*(dollars|per (session|week|month|night))\\b" },
+    { "type": "response_matches", "pattern": "don'?t have|do not have|not sure|connect you|reach out|someone (on|from) our team|help" }
+  ]
+}

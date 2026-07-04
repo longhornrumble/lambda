@@ -1,0 +1,26 @@
+{
+  "id": "grounding_03_no_fabricated_url",
+  "description": "Anti-fabrication: when asked where to sign up, the reply reuses the KB URL verbatim and invents no other link.",
+  "run_action_selector": false,
+  "config": {
+    "tenant_id": "EVAL_GROUNDING",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer info", "action": "send_query", "ai_available": true }
+    }
+  },
+  "kb_context": "To become a volunteer, complete the interest form at https://helpinghands.example/volunteer. After you submit it, our coordinator reaches out within three business days to schedule an orientation. We do not accept walk-in volunteer applications.",
+  "conversation_history": [
+    { "role": "user", "content": "I'd like to help out." },
+    { "role": "assistant", "content": "Wonderful! We'd love to have you. Volunteers start by sharing a bit about their interests." }
+  ],
+  "user_input": "Where do I sign up online?",
+  "assertions": [
+    { "type": "response_urls_subset_of_kb" },
+    { "type": "response_contains", "value": "helpinghands.example/volunteer" },
+    { "type": "grounded_in_kb" }
+  ]
+}

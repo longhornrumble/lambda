@@ -1,0 +1,24 @@
+{
+  "id": "grounding_06_partial_kb_no_overreach",
+  "description": "Anti-fabrication: KB covers the program but not its cost — the reply answers what's known and invents no price.",
+  "run_action_selector": false,
+  "config": {
+    "tenant_id": "EVAL_GROUNDING",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_mentoring": { "label": "Mentoring info", "action": "send_query", "ai_available": true }
+    }
+  },
+  "kb_context": "Our youth mentoring program pairs a trained adult mentor with a student for weekly one-hour sessions during the school year. Mentors commit to at least one school year. To join, complete the mentor interest form and pass a background check.",
+  "conversation_history": [],
+  "user_input": "How much does the mentoring program cost to join?",
+  "assertions": [
+    { "type": "response_not_matches", "pattern": "\\$\\s?\\d" },
+    { "type": "response_not_matches", "pattern": "\\b\\d+\\s*dollars\\b" },
+    { "type": "grounded_in_kb" },
+    { "type": "response_urls_subset_of_kb" }
+  ]
+}

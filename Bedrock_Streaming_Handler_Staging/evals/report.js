@@ -39,12 +39,14 @@ function renderReport(items, meta = {}) {
   lines.push('');
   if (meta.generatedAt) lines.push(`- Generated: ${meta.generatedAt}`);
   if (meta.promptVersions) {
-    lines.push(`- Prompt versions: conversation \`${meta.promptVersions.conversation}\`, action_selector \`${meta.promptVersions.action_selector}\``);
+    lines.push(`- Prompt versions: ${versionLine(meta.promptVersions)}`);
   }
   if (meta.baselineVersions) {
-    lines.push(`- Baseline versions: conversation \`${meta.baselineVersions.conversation}\`, action_selector \`${meta.baselineVersions.action_selector}\``);
+    lines.push(`- Baseline versions: ${versionLine(meta.baselineVersions)}`);
   }
+  const reviewItems = items.filter((it) => it.review === true);
   lines.push(`- Scenarios: ${items.length} — ${order.filter((s) => counts[s]).map((s) => `${STATUS_ICON[s]} ${counts[s]} ${s}`).join(', ') || 'none'}`);
+  if (reviewItems.length) lines.push(`- ⚠️ ${reviewItems.length} scenario(s) need human review (groundedness judge UNSURE — non-blocking)`);
   lines.push('');
 
   lines.push('| Scenario | Status | Assertions | Notes |');
@@ -73,7 +75,28 @@ function renderReport(items, meta = {}) {
     }
   }
 
+  if (reviewItems.length) {
+    lines.push('## Needs human review');
+    lines.push('_Groundedness judge returned UNSURE — these do not fail the run; a human confirms grounding._');
+    lines.push('');
+    for (const it of reviewItems) {
+      lines.push(`### ⚠️ ${it.id} — ${it.status}`);
+      if (it.description) lines.push(`_${it.description}_`);
+      if (it.responsePreview) lines.push(`- response: \`${truncate(it.responsePreview, 200)}\``);
+      lines.push('');
+    }
+  }
+
   return lines.join('\n');
 }
 
-module.exports = { renderReport, truncate, STATUS_ICON };
+/** Render a prompt-versions object into a compact backtick-quoted line. */
+function versionLine(v = {}) {
+  const parts = [];
+  if (v.conversation) parts.push(`conversation \`${v.conversation}\``);
+  if (v.action_selector) parts.push(`action_selector \`${v.action_selector}\``);
+  if (v.groundedness_judge) parts.push(`groundedness_judge \`${v.groundedness_judge}\``);
+  return parts.join(', ');
+}
+
+module.exports = { renderReport, truncate, STATUS_ICON, versionLine };
