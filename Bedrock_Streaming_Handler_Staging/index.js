@@ -27,6 +27,8 @@ const {
   validateTopicDefinitions,
   V4_STEP2_INFERENCE_PARAMS,
   sanitizeTonePromptV4,
+  V4_CONVERSATION_PROMPT_VERSION,
+  ACTION_SELECTOR_PROMPT_VERSION,
 } = require('./prompt_v4');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 // WS-C2 (scheduling §5.6): same-session form-data injection. Read-only fetch +
@@ -891,6 +893,10 @@ const streamingHandler = async (event, responseStream, context) => {
         tenant_hash: tenantHash,
         tenant_id: config?.tenant_id || null,  // Add tenant_id from config
         conversation_id: body.conversation_id || sessionId,  // Add conversation_id
+        prompt_versions: {  // sub-phase 1.1 — eval baselines key on prompt text version
+          conversation: V4_CONVERSATION_PROMPT_VERSION,
+          action_selector: ACTION_SELECTOR_PROMPT_VERSION,
+        },
         question: questionRedacted,
         answer: answerRedacted,
         metrics: {
@@ -1347,6 +1353,10 @@ const bufferedHandler = async (event, context) => {
         tenant_hash: tenantHash,
         tenant_id: config?.tenant_id || null,  // Add tenant_id from config
         conversation_id: body.conversation_id || sessionId,  // Add conversation_id
+        prompt_versions: {  // sub-phase 1.1 — eval baselines key on prompt text version
+          conversation: V4_CONVERSATION_PROMPT_VERSION,
+          action_selector: ACTION_SELECTOR_PROMPT_VERSION,
+        },
         question: questionRedacted,
         answer: answerRedacted,
         metrics: {

@@ -28,6 +28,21 @@
 
 'use strict';
 
+// ─── Prompt version stamps (chat-experience eval net, sub-phase 1.1) ──────────
+// Stamped into the QA_COMPLETE structured log (index.js) so eval baselines can key
+// on the exact prompt text a response was produced under. Follows the changelog-
+// comment convention of scheduling/agentTurn.js PROMPT_VERSION ('b17e.v6').
+//
+// Bump the relevant constant (and add a dated line here) whenever the governed
+// prompt TEXT changes — this is the Phase 2 naturalness sub-phases' contract:
+//   V4_CONVERSATION_PROMPT_VERSION → buildV4ConversationPrompt() + its locked
+//     rules / formatting rules / final instruction (bumped by sub-phases 2.1–2.4)
+//   ACTION_SELECTOR_PROMPT_VERSION → selectActionsV4() selector prompt (2.5)
+//
+// v1 (2026-07-04): baseline — first versioning of today's prompts (no text change).
+const V4_CONVERSATION_PROMPT_VERSION = 'v4-conv.v1';
+const ACTION_SELECTOR_PROMPT_VERSION = 'v4-selector.v1';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // STEP 2: Conversational Response Prompt
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1002,6 +1017,10 @@ Return ONLY a raw JSON array of action IDs. No explanation, no markdown, no code
 // ─────────────────────────────────────────────────────────────────────────────
 
 module.exports = {
+  // Prompt version stamps (sub-phase 1.1) — carried in the QA_COMPLETE log
+  V4_CONVERSATION_PROMPT_VERSION,
+  ACTION_SELECTOR_PROMPT_VERSION,
+
   // Step 2: Conversational Response (streaming)
   buildV4ConversationPrompt,
 
