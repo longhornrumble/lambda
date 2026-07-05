@@ -679,6 +679,94 @@ describe('selectCTAsFromPool', () => {
 // selectActionsV4 — V4.0 Action Selector
 // ─────────────────────────────────────────────────────────────────────────────
 
+describe('selectCTAsFromPool — session alignment (design doc §10 step 1b)', () => {
+  const cta = (overrides) => ({
+    label: 'CTA',
+    action: 'send_query',
+    ai_available: true,
+    selection_metadata: { topic_tags: ['volunteer'], depth_level: 'info', priority: 50 },
+    ...overrides,
+  });
+
+  // Mirrors the 2026-07-04 incident shape: a program-ambiguous topic whose tags
+  // span two programs, in a session that already signaled one of them.
+  const twoProgramConfig = {
+    topic_definitions: [
+      { name: 'mentoring_learn', tags: ['mentoring'] },
+      { name: 'carebox_learn', tags: ['care_box'] },
+      { name: 'volunteer_general', tags: ['mentoring', 'care_box', 'volunteer'] },
+    ],
+    cta_definitions: {
+      mentor_discovery: cta({ selection_metadata: { topic_tags: ['mentoring', 'volunteer'], depth_level: 'action' } }),
+      volunteer_process: cta({ selection_metadata: { topic_tags: ['mentoring', 'care_box', 'volunteer'], depth_level: 'info' } }),
+      carebox_info: cta({ selection_metadata: { topic_tags: ['care_box'], depth_level: 'info' } }),
+      carebox_contents: cta({ selection_metadata: { topic_tags: ['care_box'], depth_level: 'lateral' } }),
+    },
+  };
+
+  it('narrows an ambiguous pool to session-aligned CTAs instead of padding with the other program', () => {
+    const result = selectCTAsFromPool('volunteer_general', twoProgramConfig, {
+      accumulated_topics: ['mentoring'],
+    });
+    const ids = result.ctaButtons.map((c) => c.id);
+    expect(ids).toContain('mentor_discovery');
+    expect(ids).toContain('volunteer_process');
+    expect(ids).not.toContain('carebox_info');
+    expect(ids).not.toContain('carebox_contents');
+    expect(result.metadata.session_aligned).toBe(true);
+  });
+
+  it('cold start (no session tags): unchanged behavior, both programs eligible', () => {
+    const result = selectCTAsFromPool('volunteer_general', twoProgramConfig, {});
+    const ids = result.ctaButtons.map((c) => c.id);
+    expect(ids).toContain('carebox_info');
+    expect(result.metadata.session_aligned).toBe(false);
+  });
+
+  it('explicit pivot (current topic disjoint from session tags): pivot wins, no alignment', () => {
+    const result = selectCTAsFromPool('carebox_learn', twoProgramConfig, {
+      accumulated_topics: ['mentoring'],
+    });
+    const ids = result.ctaButtons.map((c) => c.id);
+    expect(ids).toContain('carebox_info');
+    expect(ids).toContain('carebox_contents');
+    expect(result.metadata.session_aligned).toBe(false);
+  });
+
+  it('never empties the pool: session tags intersecting the topic but matching no CTA leave the pool unchanged', () => {
+    const config = {
+      topic_definitions: [
+        { name: 'broad', tags: ['volunteer', 'special'] },
+      ],
+      cta_definitions: {
+        general_a: cta({}),
+        general_b: cta({ selection_metadata: { topic_tags: ['volunteer'], depth_level: 'action' } }),
+      },
+    };
+    const result = selectCTAsFromPool('broad', config, { accumulated_topics: ['special'] });
+    expect(result.ctaButtons.length).toBe(2);
+    expect(result.metadata.session_aligned).toBe(false);
+  });
+
+  it('no-op when every pooled CTA is already aligned (flag stays false)', () => {
+    const result = selectCTAsFromPool('mentoring_learn', twoProgramConfig, {
+      accumulated_topics: ['mentoring'],
+    });
+    const ids = result.ctaButtons.map((c) => c.id);
+    expect(ids).toEqual(expect.arrayContaining(['mentor_discovery', 'volunteer_process']));
+    expect(result.metadata.session_aligned).toBe(false);
+  });
+
+  it('ignores non-string entries in accumulated_topics', () => {
+    const result = selectCTAsFromPool('volunteer_general', twoProgramConfig, {
+      accumulated_topics: [null, 42, 'mentoring'],
+    });
+    const ids = result.ctaButtons.map((c) => c.id);
+    expect(ids).not.toContain('carebox_info');
+    expect(result.metadata.session_aligned).toBe(true);
+  });
+});
+
 describe('selectActionsV4', () => {
   const baseConfig = {
     cta_definitions: {

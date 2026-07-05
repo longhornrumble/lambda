@@ -35,6 +35,46 @@
         }
       ]
     },
+    "context_02_session_aligned_cta_no_bleed": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "ctas_exclude",
+          "pass": true
+        },
+        {
+          "type": "ctas_include",
+          "pass": true
+        },
+        {
+          "type": "ctas_valid",
+          "pass": true
+        }
+      ]
+    },
+    "context_03_cold_start_both_programs": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "ctas_include",
+          "pass": true
+        },
+        {
+          "type": "ctas_valid",
+          "pass": true
+        }
+      ]
+    },
     "cta_01_interest_not_commitment_no_apply": {
       "pass": true,
       "prompt_versions": {

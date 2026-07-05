@@ -1,0 +1,35 @@
+{
+  "id": "context_02_session_aligned_cta_no_bleed",
+  "description": "V4.1 pool selection, session alignment (design doc §10 step 1b): in a session that already engaged on mentoring, a program-ambiguous 'volunteer process' turn must NOT pad the CTA selection with the other program's CTAs (the 2026-07-04 Love-Box-bleed incident shape). Live classifier + real selectCTAsFromPool. Assertions hold under any plausible classification: volunteer_general → session alignment narrows the pool; mentoring_learn → care-box CTAs never pool; null → fallback_tags ['volunteer'] pools only the aligned pair.",
+  "run_pool_selection": true,
+  "config": {
+    "tenant_id": "EVAL_CONTEXT",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "topic_definitions": [
+      { "name": "mentoring_learn", "description": "User wants to learn about the youth mentoring program — what it is, how it works, who it serves, the matching process.", "tags": ["mentoring"] },
+      { "name": "carebox_learn", "description": "User wants to learn about the family care box program — what a care box provides, how families receive support.", "tags": ["care_box"] },
+      { "name": "volunteer_general", "description": "User wants to volunteer or asks about the volunteer process without specifying which program — how to get started, application steps, discovery sessions, difference between programs.", "tags": ["mentoring", "care_box", "volunteer"] }
+    ],
+    "cta_definitions": {
+      "attend_discovery": { "label": "Attend a discovery session", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["mentoring", "volunteer"], "depth_level": "action" } },
+      "volunteer_process_info": { "label": "Learn about the volunteer process", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["mentoring", "care_box", "volunteer"], "depth_level": "info" } },
+      "carebox_info": { "label": "Learn about care boxes", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["care_box"], "depth_level": "info" } },
+      "carebox_contents": { "label": "What's in a care box?", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["care_box"], "depth_level": "lateral" } }
+    },
+    "cta_settings": { "fallback_tags": ["volunteer"] }
+  },
+  "kb_context": "Becoming a Helping Hands volunteer: 1) Complete the volunteer application form online. 2) Attend a 30-minute phone interview with our volunteer coordinator. 3) Pass a background check (we cover the cost). 4) Attend one in-person orientation and training session.",
+  "conversation_history": [
+    { "role": "user", "content": "Tell me about your mentoring program." },
+    { "role": "assistant", "content": "Our mentoring program pairs a caring adult with a young person who has experienced foster care, meeting weekly to build confidence and trust." }
+  ],
+  "user_input": "Learn about the volunteer process",
+  "session_context": { "accumulated_topics": ["mentoring"] },
+  "assertions": [
+    { "type": "ctas_exclude", "value": ["carebox_info", "carebox_contents"] },
+    { "type": "ctas_include", "value": ["attend_discovery"] },
+    { "type": "ctas_valid" }
+  ]
+}
