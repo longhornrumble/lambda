@@ -52,10 +52,11 @@ describe('buildActionCatalogBlock', () => {
     expect(block).not.toContain('contact_us');
   });
 
-  test('carries the transferred V4.0 selector rules', () => {
+  test('carries the selector rules (v5-turn.v2: sustained-interest advance)', () => {
     const block = buildActionCatalogBlock(CONFIG);
     expect(block).toContain('RESTRAINT FIRST');
-    expect(block).toContain('APPLY/VISIT ONLY WHEN COMMITTED');
+    expect(block).toContain('SUSTAINED INTEREST → ADVANCE');
+    expect(block).toContain('APPLY/VISIT need real intent');
     expect(block).toContain('COHERENCE');
   });
 
@@ -134,7 +135,7 @@ describe('buildV5TurnPrompt', () => {
 
 describe('V5 constants', () => {
   test('version stamp and inference params are exported', () => {
-    expect(V5_TURN_PROMPT_VERSION).toBe('v5-turn.v1');
+    expect(V5_TURN_PROMPT_VERSION).toBe('v5-turn.v2');
     expect(V5_TURN_INFERENCE_PARAMS).toEqual({ temperature: 0.35, max_tokens: 700 });
   });
 });
