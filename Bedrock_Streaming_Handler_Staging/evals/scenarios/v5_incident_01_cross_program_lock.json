@@ -1,0 +1,303 @@
+{
+  "id": "v5_incident_01_cross_program_lock",
+  "description": "V5 re-expression of the 2026-07-04 two-message incident lock: mid-mentoring conversation, 'Learn about the volunteer process' must stay mentoring-anchored — no Love Box (cross-program) buttons, reply names the mentoring program.",
+  "run_single_pass": true,
+  "config": {
+    "_provenance": "Trimmed snapshot of s3://myrecruiter-picasso-staging/tenants/MYR384719/MYR384719-config.json (staging 525, Atlanta Angels copy), 2026-07-05. Only the keys the V4/V5 prompt builders and selectActionsV4 read. For V5 evidence runs — NOT a served config.",
+    "tenant_id": "MYR384719_EVIDENCE",
+    "chat_title": "Atlanta Angels",
+    "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "",
+    "bedrock_instructions": {
+      "_version": "1.0",
+      "_updated": "2026-02-17T19:42:48.401Z",
+      "role_instructions": "You are a caring, knowledgeable team member at Atlanta Angels, a foster care support organization serving the Atlanta, Georgia area. You speak as part of the team — say \"we\" and \"our\" instead of \"they\" and \"their.\" You genuinely believe that every child, youth, and family experiencing foster care deserves community support, and that belief comes through in how you talk about our programs. You're approachable and encouraging without being pushy — people are exploring how they might help, and your job is to meet them where they are. You know our programs well — Love Box, Dare to Dream, Angel Alliance — and you help visitors understand which one fits their interests. You're honest about commitments and expectations. When you don't know something, you say so and offer to connect them with our team.",
+      "formatting_preferences": {
+        "emoji_usage": "moderate",
+        "max_emojis_per_response": 3,
+        "response_style": "warm_conversational",
+        "detail_level": "concise"
+      },
+      "custom_constraints": [
+        "Ask a follow-up question at the end of every response but NEVER ask a question that doesn't have an answer in Bedrock. When you ask a follow-up question and the user affirms with 'yes', 'sure', 'okay', etc., ANSWER that question directly. Never say 'I noticed you said yes' - just provide the answer."
+      ],
+      "fallback_message": "I don't have details on that one, but I'd love to help with anything about our programs, volunteering, or ways to get involved. What else can I help you with?"
+    },
+    "cta_definitions": {
+      "love_box_learn": {
+        "label": "Learn about Love Box",
+        "action": "send_query",
+        "type": "bedrock_query",
+        "query": "Tell me about Love Box",
+        "program_id": "lovebox_volunteer",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "love_box",
+            "programs"
+          ],
+          "depth_level": "info",
+          "role_axis": "learn",
+          "core_learning": true
+        }
+      },
+      "learn_dare_to_dream": {
+        "label": "Learn about Dare to Dream",
+        "action": "send_query",
+        "type": "bedrock_query",
+        "query": "Tell me about Dare to Dream",
+        "program_id": "daretodream_volunteer",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "dare_to_dream",
+            "mentor",
+            "programs"
+          ],
+          "depth_level": "info",
+          "role_axis": "learn",
+          "core_learning": true
+        }
+      },
+      "contact_us": {
+        "label": "Contact  Us",
+        "action": "start_form",
+        "type": "form_trigger",
+        "query": "How do I contact Atlanta Angels?",
+        "ai_available": false,
+        "selection_metadata": {
+          "topic_tags": [
+            "contact"
+          ],
+          "depth_level": "lateral",
+          "role_axis": "connect"
+        },
+        "formId": "form_contact"
+      },
+      "aboutus": {
+        "label": "About Atlanta Angels",
+        "action": "send_query",
+        "type": "bedrock_query",
+        "query": "What is Atlanta Angels?",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "programs",
+            "contact"
+          ],
+          "depth_level": "info",
+          "role_axis": "learn",
+          "core_learning": true
+        }
+      },
+      "donate_generic": {
+        "label": "Make a Donation",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://myrctr.link/XzT3ChR",
+        "program_id": "donate",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "donate"
+          ],
+          "depth_level": "action",
+          "role_axis": "give"
+        }
+      },
+      "lovebox_contents": {
+        "label": "What's in a Love Box?",
+        "action": "send_query",
+        "type": "bedrock_query",
+        "query": "What's typically included in a Love Box?",
+        "program_id": "lovebox_volunteer",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "love_box"
+          ],
+          "depth_level": "info",
+          "role_axis": "learn"
+        }
+      },
+      "lovebox_matching": {
+        "label": "How are Love Box families matched?",
+        "action": "send_query",
+        "type": "bedrock_query",
+        "query": "How are Love Box families matched?",
+        "program_id": "lovebox_volunteer",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "love_box"
+          ],
+          "depth_level": "info",
+          "role_axis": "learn"
+        }
+      },
+      "general_giving": {
+        "label": "Other Ways to Give",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://myrctr.link/GN91nNJ",
+        "program_id": "donate",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "donate"
+          ],
+          "depth_level": "lateral",
+          "role_axis": "give"
+        }
+      },
+      "query_process": {
+        "label": "Learn about the volunteer process",
+        "action": "send_query",
+        "type": "bedrock_query",
+        "query": "Tell me about the volunteer process",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "dare_to_dream",
+            "love_box",
+            "volunteer"
+          ],
+          "depth_level": "info",
+          "role_axis": "give"
+        }
+      },
+      "query_discoverysession": {
+        "label": "Attend a volunteering discovery session",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://myrctr.link/UIBz7Zn",
+        "program_id": "daretodream_volunteer",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "dare_to_dream",
+            "volunteer"
+          ],
+          "depth_level": "action",
+          "role_axis": "give"
+        }
+      },
+      "lb_process": {
+        "label": "Learn about the Love Box volunteer process",
+        "action": "send_query",
+        "type": "bedrock_query",
+        "query": "Tell me about the Love Box volunteer process",
+        "program_id": "lovebox_volunteer",
+        "ai_available": false
+      },
+      "request_dare2dream": {
+        "label": "Request a Youth Mentor",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://myrctr.link/D1vo2fS",
+        "program_id": "daretodream_request",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "dare_to_dream",
+            "enroll"
+          ],
+          "depth_level": "action",
+          "role_axis": "receive"
+        }
+      },
+      "love_box_referral": {
+        "label": "Request support for your family (Love Box)",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://myrctr.link/W7RPqa6",
+        "program_id": "love_box_request",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "love_box",
+            "enroll"
+          ],
+          "depth_level": "action",
+          "role_axis": "receive"
+        }
+      },
+      "apply_lovebox_volunteer": {
+        "label": "Apply to be a Love Box volunteer",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://myrctr.link/EXpyOzN",
+        "program_id": "lovebox_volunteer",
+        "ai_available": true
+      },
+      "apply_daretodream_volunteer": {
+        "label": "Apply to be a Dare to Dream mentor",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://myrctr.link/H6F5sHL",
+        "program_id": "daretodream_volunteer",
+        "ai_available": true
+      },
+      "cta_golf_learn": {
+        "label": "Learn about the golf tournament",
+        "action": "external_link",
+        "type": "external_link",
+        "url": "https://www.atlantaangels.org/golf-tournament",
+        "program_id": "program_events"
+      },
+      "schedule_intro_call": {
+        "label": "📅 Schedule a Call",
+        "action": "start_scheduling",
+        "ai_available": true,
+        "selection_metadata": {
+          "topic_tags": [
+            "contact",
+            "scheduling"
+          ],
+          "depth_level": "action",
+          "role_axis": "act"
+        },
+        "type": "scheduling_trigger"
+      }
+    }
+  },
+  "kb_context": "Atlanta Angels supports children, youth, and families experiencing foster care. The Love Box program matches volunteer groups with a foster family — monthly Love Boxes, intentional relationship building, and a 12-month commitment. The Dare to Dream program matches adult mentors one-on-one with youth ages 11-22 in foster care; mentors meet their youth twice a month and commit to at least one year. Both programs require an application, a background check (we cover the cost), and program training. We host discovery sessions throughout the month where prospective volunteers can learn about both programs and meet our staff — [Discovery Session registration](https://www.atlantaangels.org/discovery). Applications: [Love Box](https://www.atlantaangels.org/lovebox-apply) · [Dare to Dream mentor](https://www.atlantaangels.org/dare-to-dream-apply). Other ways to help: [Donate](https://www.atlantaangels.org/donate), corporate partnerships, and our annual golf tournament.",
+  "conversation_history": [
+    {
+      "role": "user",
+      "content": "Tell me about your mentoring program."
+    },
+    {
+      "role": "assistant",
+      "content": "Our Dare to Dream program pairs a caring adult mentor with a young person in foster care, ages 11-22. Mentors meet with their youth twice a month to build life skills and confidence. Would you like to hear what being a mentor looks like?"
+    }
+  ],
+  "user_input": "Learn about the volunteer process",
+  "session_context": {
+    "accumulated_topics": [
+      "mentoring",
+      "dare_to_dream"
+    ]
+  },
+  "assertions": [
+    {
+      "type": "tail_status",
+      "value": "actions"
+    },
+    {
+      "type": "ctas_exclude",
+      "value": [
+        "love_box_learn",
+        "lovebox_contents",
+        "lovebox_matching",
+        "apply_lovebox_volunteer",
+        "love_box_referral",
+        "lb_process"
+      ]
+    },
+    {
+      "type": "response_matches",
+      "pattern": "dare to dream|mentor"
+    }
+  ]
+}

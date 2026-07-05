@@ -2,7 +2,8 @@
   "prompt_versions": {
     "conversation": "v4-conv.v2",
     "action_selector": "v4-selector.v2",
-    "groundedness_judge": "v1"
+    "groundedness_judge": "v1",
+    "single_pass": "v5-turn.v1"
   },
   "scenarios": {
     "context_01_new_topic_followup_no_drift": {
@@ -10,7 +11,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -40,7 +42,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -62,7 +65,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -80,7 +84,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -102,7 +107,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -120,7 +126,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -142,7 +149,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -160,7 +168,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -178,7 +187,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -204,7 +214,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -230,7 +241,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -252,7 +264,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -274,7 +287,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -300,7 +314,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -326,7 +341,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -352,7 +368,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -374,7 +391,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -392,7 +410,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -414,7 +433,8 @@
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
-        "groundedness_judge": "v1"
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
       },
       "assertions": [
         {
@@ -431,6 +451,94 @@
         },
         {
           "type": "ctas_subset_of",
+          "pass": true
+        }
+      ]
+    },
+    "v5_commitment_01_first_interest_no_apply": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v2",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
+      },
+      "assertions": [
+        {
+          "type": "tail_status",
+          "pass": true
+        },
+        {
+          "type": "ctas_exclude",
+          "pass": true
+        },
+        {
+          "type": "ctas_valid",
+          "pass": true
+        }
+      ]
+    },
+    "v5_funnel_01_hard_kb_advance": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v2",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
+      },
+      "assertions": [
+        {
+          "type": "tail_status",
+          "pass": true
+        },
+        {
+          "type": "ctas_include_any",
+          "pass": true
+        },
+        {
+          "type": "ctas_valid",
+          "pass": true
+        }
+      ]
+    },
+    "v5_incident_01_cross_program_lock": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v2",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
+      },
+      "assertions": [
+        {
+          "type": "tail_status",
+          "pass": true
+        },
+        {
+          "type": "ctas_exclude",
+          "pass": true
+        },
+        {
+          "type": "response_matches",
+          "pass": true
+        }
+      ]
+    },
+    "v5_restraint_01_thankyou_at_scale": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v2",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v1"
+      },
+      "assertions": [
+        {
+          "type": "tail_status",
+          "pass": true
+        },
+        {
+          "type": "ctas_empty",
           "pass": true
         }
       ]
