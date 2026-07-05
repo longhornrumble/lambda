@@ -89,20 +89,34 @@ function parseBlockContent(content) {
  *   feed(chunk: string): string
  *     Text safe to forward to the client now (possibly '').
  *
- *   end(): { remainingText: string, actionIds: string[]|null, status: string }
+ *   end(): { remainingText, actionIds, status, trailingAfterClose }
  *     remainingText — held text that turned out to be prose; forward it.
- *     actionIds     — parsed ids when a valid sentinel was found (possibly
- *                     []); null otherwise.
- *     status        — 'actions'     a valid sentinel was parsed
+ *     actionIds     — parsed ids when the LAST marker attempt was valid
+ *                     (possibly []); null otherwise.
+ *     status        — 'actions'     the last marker attempt parsed cleanly
  *                     'no_sentinel' the open marker never appeared
- *                     'malformed'   marker(s) appeared but none parsed
+ *                     'malformed'   the last marker attempt failed to parse
  *                     (drives the V5.5 fail-soft ladder + failure counter)
+ *     trailingAfterClose — true when non-whitespace prose followed a valid
+ *                     close (out-of-spec model output, forwarded to the user;
+ *                     invisible to `status`, surfaced separately so the
+ *                     staging health counter can see this defect class).
+ *
+ * THE LAST MARKER ATTEMPT DECIDES (2026-07-05 retrospective review, blocker
+ * #1). If a valid sentinel is followed by a second, malformed attempt (e.g.
+ * a self-correction cut off by max_tokens), the earlier capture is discarded
+ * and status is 'malformed' — serving the model's abandoned first draft while
+ * reporting success would blind the fail-soft counter to exactly the failures
+ * it exists to catch. Symmetrically, malformed-then-valid means the model
+ * corrected itself: the valid final attempt is served.
  */
 function createTailParser() {
   let pending = '';       // text not yet released (prose suffix or block content)
   let inBlock = false;    // saw the full open marker; `pending` is block content
-  let actionIds = null;   // last validly parsed array (last sentinel wins)
+  let actionIds = null;   // decided by the LAST marker attempt (null = it failed)
   let sawMarker = false;  // any open marker seen (distinguishes malformed/no_sentinel)
+  let afterValidClose = false;    // a valid close happened; later prose is out-of-spec
+  let trailingAfterClose = false; // non-whitespace prose actually followed one
 
   // Scan `pending`, releasing everything provably prose. Loops because one
   // chunk can close a block AND contain trailing prose or another marker.
@@ -113,11 +127,15 @@ function createTailParser() {
         const i = pending.indexOf(SENTINEL_OPEN);
         if (i === -1) {
           const hold = atEnd ? 0 : liveMarkerPrefixLen(pending);
-          out += pending.slice(0, pending.length - hold);
+          const release = pending.slice(0, pending.length - hold);
+          if (afterValidClose && /\S/.test(release)) trailingAfterClose = true;
+          out += release;
           pending = pending.slice(pending.length - hold);
           return out;
         }
-        out += pending.slice(0, i);
+        const release = pending.slice(0, i);
+        if (afterValidClose && /\S/.test(release)) trailingAfterClose = true;
+        out += release;
         pending = pending.slice(i + SENTINEL_OPEN.length);
         inBlock = true;
         sawMarker = true;
@@ -125,22 +143,27 @@ function createTailParser() {
         const close = pending.indexOf(SENTINEL_CLOSE);
         const nl = pending.indexOf('\n');
         if (close !== -1 && (nl === -1 || close < nl)) {
-          // Block closed on a single line — parse it.
-          const parsed = parseBlockContent(pending.slice(0, close));
-          if (parsed !== null) actionIds = parsed;
+          // Block closed on a single line — parse it. A failed parse NULLS
+          // any earlier capture (the last attempt decides).
+          actionIds = parseBlockContent(pending.slice(0, close));
+          if (actionIds !== null) afterValidClose = true;
           pending = pending.slice(close + SENTINEL_CLOSE.length);
           inBlock = false;
           continue; // trailing text is prose — re-scan
         }
         if (nl !== -1) {
           // Newline before any close: not a sentinel (spec is single-line).
-          // Drop the marker + garbage, resume prose from the newline.
+          // Drop the marker + garbage, resume prose from the newline. This
+          // was a failed attempt — it invalidates any earlier capture.
+          actionIds = null;
           pending = pending.slice(nl);
           inBlock = false;
           continue;
         }
         if (atEnd) {
-          // Stream ended inside a block — drop it, never leak it.
+          // Stream ended inside a block — drop it, never leak it. A block
+          // that never closed is a failed attempt (the last attempt decides).
+          actionIds = null;
           pending = '';
           inBlock = false;
         }
@@ -157,7 +180,7 @@ function createTailParser() {
     end() {
       const remainingText = drain(true);
       const status = actionIds !== null ? 'actions' : sawMarker ? 'malformed' : 'no_sentinel';
-      return { remainingText, actionIds, status };
+      return { remainingText, actionIds, status, trailingAfterClose };
     },
   };
 }
