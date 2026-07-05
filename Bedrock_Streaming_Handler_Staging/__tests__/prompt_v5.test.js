@@ -22,6 +22,7 @@ const {
   buildV5TurnPrompt,
   buildActionCatalogBlock,
   buildActionTailInstruction,
+  buildTurnCheckBlock,
   validateActionIds,
 } = require('../prompt_v5');
 const { buildV4ConversationPrompt } = require('../prompt_v4');
@@ -135,8 +136,60 @@ describe('buildV5TurnPrompt', () => {
 
 describe('V5 constants', () => {
   test('version stamp and inference params are exported', () => {
-    expect(V5_TURN_PROMPT_VERSION).toBe('v5-turn.v2');
+    expect(V5_TURN_PROMPT_VERSION).toBe('v5-turn.v3');
     expect(V5_TURN_INFERENCE_PARAMS).toEqual({ temperature: 0.35, max_tokens: 700 });
+  });
+});
+
+describe('buildTurnCheckBlock — server-counted funnel turn check (v5-turn.v3)', () => {
+  const q = (content) => ({ role: 'assistant', content });
+  const u = (content) => ({ role: 'user', content });
+
+  test('empty below the threshold (fewer than 2 assistant questions)', () => {
+    expect(buildTurnCheckBlock([])).toBe('');
+    expect(buildTurnCheckBlock(undefined)).toBe('');
+    expect(buildTurnCheckBlock([u('hi'), q('Welcome! How can I help?')])).toBe('');
+    // Non-question assistant turns don't count.
+    expect(buildTurnCheckBlock([q('Here is info.'), q('More info.'), q('Still telling, not asking.')])).toBe('');
+  });
+
+  test('emits at the threshold with the server-computed count', () => {
+    const history = [u('a'), q('What draws you to mentoring?'), u('b'), q('Which area matters most?')];
+    const block = buildTurnCheckBlock(history);
+    expect(block).toContain('TURN CHECK');
+    expect(block).toContain('asked this user 2 questions');
+    expect(block).toContain('NO actions');
+  });
+
+  test('counts m.text-shaped messages and trailing whitespace question marks', () => {
+    const history = [
+      { role: 'assistant', text: 'What draws you to mentoring?  ' },
+      { role: 'assistant', content: 'Which feels most important? ' },
+    ];
+    expect(buildTurnCheckBlock(history)).toContain('asked this user 2 questions');
+  });
+
+  test('the turn check sits between USER MESSAGE and ACTION TAIL in the built prompt', () => {
+    const history = [u('a'), q('One?'), u('b'), q('Two?')];
+    const prompt = buildV5TurnPrompt('Understanding money', KB, '', history, CONFIG, {});
+    const userAt = prompt.indexOf(USER_MESSAGE_MARKER);
+    const checkAt = prompt.indexOf('━━━ TURN CHECK ━━━');
+    const tailAt = prompt.indexOf('━━━ ACTION TAIL');
+    expect(checkAt).toBeGreaterThan(userAt);
+    expect(tailAt).toBeGreaterThan(checkAt);
+  });
+
+  test('below threshold the built prompt carries NO turn check (early funnel unchanged)', () => {
+    const prompt = buildV5TurnPrompt('Hi', KB, '', [u('a'), q('One question?')], CONFIG, {});
+    expect(prompt).not.toContain('TURN CHECK');
+  });
+
+  test('empty catalog still returns the bare V4 prompt (no turn check either)', () => {
+    const noCatalog = { cta_definitions: { x: { label: 'X', action: 'send_query' } } };
+    const history = [u('a'), q('One?'), u('b'), q('Two?')];
+    const prompt = buildV5TurnPrompt('Hi', KB, '', history, noCatalog, {});
+    expect(prompt).not.toContain('TURN CHECK');
+    expect(prompt).not.toContain('ACTION TAIL');
   });
 });
 
