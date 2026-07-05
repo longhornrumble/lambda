@@ -1,0 +1,23 @@
+{
+  "id": "context_04_session_block_no_program_pivot",
+  "description": "Session-state step 1a lock: in a mentoring session, a program-ambiguous 'volunteer process' turn with session_context topics must NOT pivot the RESPONSE (including its closing question) to the other program. This is the response-prose half of the 2026-07-04 incident — the widget kept asking 'Are you interested in becoming a Love Box volunteer, or...?' after mentoring turns. Live A/B (2026-07-05): off-program closing 5/6 without the SESSION CONTEXT block, 0/6 with it. The KB fixture deliberately mentions both programs (mirrors the monolithic KB) — the block, not the KB, must anchor the framing. DETERMINISTIC-ONLY by design (grounding_02 precedent): the groundedness judge sees only KB+input, so session-anchored framing of generic KB steps ('as a youth mentor you will...') reads UNGROUNDED to it ~100% despite being correct. Extending the judge with conversation context is a known follow-up — do NOT re-add grounded_in_kb here until that lands.",
+  "run_pool_selection": false,
+  "config": {
+    "tenant_id": "EVAL_CONTEXT",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know."
+  },
+  "kb_context": "Becoming a Helping Hands volunteer: 1) Complete the volunteer application form online. 2) Attend a 30-minute phone interview with our volunteer coordinator. 3) Pass a background check (we cover the cost). 4) Attend one in-person orientation and training session. Volunteers serve either as youth mentors (weekly one-on-one time with a young person) or as Care Box volunteers (monthly support boxes for families). Care Box volunteers are matched with a family; mentors are matched with a youth.",
+  "conversation_history": [
+    { "role": "user", "content": "Tell me about your mentoring program." },
+    { "role": "assistant", "content": "Our mentoring program pairs a caring adult with a young person who has experienced foster care, meeting weekly to build confidence and trust." }
+  ],
+  "user_input": "Learn about the volunteer process",
+  "session_context": { "accumulated_topics": ["mentoring", "youth_mentor"] },
+  "assertions": [
+    { "type": "response_matches", "pattern": "application|interview|background check|orientation|training" },
+    { "type": "response_not_matches", "pattern": "[Cc]are [Bb]ox" },
+    { "type": "response_urls_subset_of_kb" }
+  ]
+}

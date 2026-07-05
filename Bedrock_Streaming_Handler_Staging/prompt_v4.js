@@ -44,7 +44,12 @@
 //   return an empty array on ANY turn (was: only the first message); softened the
 //   "LEARNING FIRST / always include LEARN" bias to "restraint first — most turns
 //   need none". Commitment gate (APPLY/VISIT only when committed) unchanged.
-const V4_CONVERSATION_PROMPT_VERSION = 'v4-conv.v1';
+// v4-conv.v2 (2026-07-05, session-state step 1a): SESSION CONTEXT block — when the
+//   request carries session_context.accumulated_topics, name the session focus and
+//   anchor the answer + closing question to it (live A/B: off-program closing
+//   question 5/6 → 0/6 on the incident turn). Absent topics → block omitted →
+//   prompt byte-identical to v4-conv.v1.
+const V4_CONVERSATION_PROMPT_VERSION = 'v4-conv.v2';
 const ACTION_SELECTOR_PROMPT_VERSION = 'v4-selector.v2';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,9 +64,12 @@ const ACTION_SELECTOR_PROMPT_VERSION = 'v4-selector.v2';
  * @param {string} tonePrompt - Sanitized persona/tone from tenant config
  * @param {Array} conversationHistory - [{role, content}] — all prior messages
  * @param {Object} config - Full tenant config object
+ * @param {Object} [sessionContext] - Client-carried session context; only
+ *   accumulated_topics (tag strings from prior turns' classifications) is read.
+ *   Missing/empty → the SESSION CONTEXT block is omitted (fail-open to v1 shape).
  * @returns {string} Complete prompt string for the streaming Bedrock call
  */
-function buildV4ConversationPrompt(userInput, kbContext, tonePrompt, conversationHistory, config) {
+function buildV4ConversationPrompt(userInput, kbContext, tonePrompt, conversationHistory, config, sessionContext = {}) {
   console.log('[V4] Building Step 2 conversational prompt');
 
   const chatTitle = config?.chat_title || 'our organization';
@@ -118,6 +126,26 @@ ${lines.join('\n')}`;
     }
   }
 
+  // ── SESSION CONTEXT BLOCK (session-state step 1a) ────────────────────────
+  // Names the session's focus from the client-carried accumulated topic tags so
+  // the answer AND the closing question stay anchored to it — the KB content for
+  // broad queries spans programs, and without a named focus the model pivots to
+  // the other program (~5/6 on the incident turn; 0/6 with this block).
+  // Empty/missing topics → no block → prompt identical to the pre-1a shape.
+  let sessionBlock = '';
+  const rawTopics = sessionContext && sessionContext.accumulated_topics;
+  const sessionTopics = (Array.isArray(rawTopics) ? rawTopics : [])
+    // Client-controlled strings entering the prompt: allow only short machine-token
+    // tags (the topic-tag vocabulary shape) so this can't be an injection carrier.
+    .filter(t => typeof t === 'string' && /^[a-z0-9_ -]{1,40}$/i.test(t.trim()) && t.trim())
+    .slice(0, 8)
+    .map(t => t.trim().replace(/_/g, ' '));
+  if (sessionTopics.length > 0) {
+    sessionBlock = `━━━ SESSION CONTEXT ━━━
+This session so far is about: ${sessionTopics.join(', ')}.
+Keep your answer and your closing question anchored to this session focus. Do not offer or ask about other programs unless the user asks.`;
+  }
+
   // ── LOCKED RULES ──────────────────────────────────────────────────────────
   // These are NEVER removed or overridden by tenant config.
   // Each rule addresses a documented, observed failure mode in V3.5 testing.
@@ -138,6 +166,11 @@ ${lines.join('\n')}`;
 
   if (historyBlock) {
     sections.push(historyBlock);
+    sections.push('');
+  }
+
+  if (sessionBlock) {
+    sections.push(sessionBlock);
     sections.push('');
   }
 
@@ -732,7 +765,7 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
   // Deliberately inert for: cold start (no session tags), an explicit pivot
   // (current tags disjoint from session tags — the pivot wins outright), and
   // pools with no aligned CTA (bias narrows an ambiguous pool, never empties it).
-  const sessionTags = (ctx.accumulated_topics || []).filter(t => typeof t === 'string');
+  const sessionTags = (Array.isArray(ctx.accumulated_topics) ? ctx.accumulated_topics : []).filter(t => typeof t === 'string');
   let sessionAligned = false;
   if (sessionTags.length > 0 && resolvedTags.some(t => sessionTags.includes(t))) {
     const aligned = pool.filter(cta =>

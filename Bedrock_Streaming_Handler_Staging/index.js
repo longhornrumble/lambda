@@ -767,7 +767,7 @@ const streamingHandler = async (event, responseStream, context) => {
     }
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {});
     // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
     // <user_application_context> block so the LLM can skip re-qualification.
     // Non-fatal — returns basePrompt unchanged when there's no form data.
@@ -1259,7 +1259,7 @@ const bufferedHandler = async (event, context) => {
     const kbContext = await retrieveKB(sanitizedInput, config);
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config);
+    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {});
     // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
     // <user_application_context> block so the LLM can skip re-qualification.
     // Non-fatal — returns basePrompt unchanged when there's no form data.
