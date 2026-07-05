@@ -1345,6 +1345,62 @@ describe('Index.js Integration Tests', () => {
       expect(prompt).toContain('John');
     });
 
+    it('should thread session_context.accumulated_topics into the prompt as a SESSION CONTEXT block', async () => {
+      bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(
+        createBedrockStream(['The volunteer process starts with an application.'])
+      );
+
+      const event = {
+        body: JSON.stringify({
+          tenant_hash: 'abc123',
+          user_input: 'Learn about the volunteer process',
+          conversation_history: [
+            { role: 'user', content: 'Tell me about your mentoring program.' },
+            { role: 'assistant', content: 'Our mentoring program pairs adults with youth.' }
+          ],
+          session_context: { accumulated_topics: ['dare_to_dream', 'mentor'] }
+        })
+      };
+
+      const responseStream = createMockResponseStream();
+      await indexModule.handler(event, responseStream, {});
+
+      const bedrockCall = bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)[0];
+      const prompt = JSON.parse(bedrockCall.args[0].input.body).messages[0].content[0].text;
+      expect(prompt).toContain('This session so far is about: dare to dream, mentor.');
+    });
+
+    it('threads session_context at BOTH duplicated prompt call sites (streaming + buffered)', () => {
+      // index.js has two near-identical handler blocks; the buffered one is only
+      // reachable when awslambda.streamifyResponse is absent, which the mocked
+      // runtime can't exercise. Contract-pin the duplicated call sites instead:
+      // both must pass session_context to the prompt builder.
+      const fs = require('fs');
+      const source = fs.readFileSync(require.resolve('../index.js'), 'utf8');
+      const callSites = source.match(/buildV4ConversationPrompt\(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body\.session_context \|\| \{\}\)/g) || [];
+      expect(callSites).toHaveLength(2);
+    });
+
+    it('should build the pre-1a prompt shape when session_context is absent', async () => {
+      bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(
+        createBedrockStream(['Hello!'])
+      );
+
+      const event = {
+        body: JSON.stringify({
+          tenant_hash: 'abc123',
+          user_input: 'Tell me about volunteering'
+        })
+      };
+
+      const responseStream = createMockResponseStream();
+      await indexModule.handler(event, responseStream, {});
+
+      const bedrockCall = bedrockMock.commandCalls(InvokeModelWithResponseStreamCommand)[0];
+      const prompt = JSON.parse(bedrockCall.args[0].input.body).messages[0].content[0].text;
+      expect(prompt).not.toContain('SESSION CONTEXT');
+    });
+
     it('should handle conversation_context.recentMessages format', async () => {
       bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(
         createBedrockStream(['Continuing our conversation...'])

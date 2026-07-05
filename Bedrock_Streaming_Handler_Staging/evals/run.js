@@ -187,7 +187,7 @@ async function runScenario(scenario, deps) {
   const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
 
   const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-  const prompt = buildV4ConversationPrompt(scenario.user_input, kbContext, tonePrompt, history, config);
+  const prompt = buildV4ConversationPrompt(scenario.user_input, kbContext, tonePrompt, history, config, scenario.session_context || {});
 
   let responseText = '';
   let ctas = [];
