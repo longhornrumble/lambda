@@ -20,6 +20,7 @@ module.exports = {
     'index.js',
     'clerk_helper.js',
     'prompt_v4.js',
+    'streamTail.js',
     '!node_modules/**',
     '!coverage/**',
     '!__tests__/**'
@@ -49,6 +50,16 @@ module.exports = {
     // the floor per this config's convention.
     './prompt_v4.js': {
       branches: 88,
+      functions: 95,
+      lines: 95,
+      statements: 95,
+    },
+    // streamTail.js: V5.1 pure tail parser — exhaustive suite in
+    // __tests__/stream_tail.test.js; the chunking-invariance sweeps exercise
+    // every boundary path. Ratchet just below the measured floor per this
+    // config's convention.
+    './streamTail.js': {
+      branches: 95,
       functions: 95,
       lines: 95,
       statements: 95,
