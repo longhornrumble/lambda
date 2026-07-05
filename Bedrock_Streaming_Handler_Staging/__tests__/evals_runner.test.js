@@ -90,6 +90,28 @@ describe('scoreScenario — deterministic assertions', () => {
     expect(r.pass).toBe(false);
     expect(r.assertions[0].detail).toMatch(/unknown assertion type/);
   });
+
+  test('ctas_include_any passes when ANY listed id is present, fails when none is', () => {
+    const ctx = { ctas: ['learn_volunteer'], config: CONFIG };
+    expect(scoreScenario({ assertions: [{ type: 'ctas_include_any', value: ['apply_volunteer', 'learn_volunteer'] }] }, ctx).pass).toBe(true);
+    expect(scoreScenario({ assertions: [{ type: 'ctas_include_any', value: ['apply_volunteer'] }] }, ctx).pass).toBe(false);
+    expect(scoreScenario({ assertions: [{ type: 'ctas_include_any', value: ['apply_volunteer'] }] }, { ctas: [], config: CONFIG }).pass).toBe(false);
+  });
+
+  test('tail_status pins the V5 format outcome — restraint [] vs malformed [] are distinguishable', () => {
+    const sp = { run_single_pass: true, assertions: [{ type: 'tail_status', value: 'actions' }, { type: 'ctas_empty' }] };
+    // Deliberate restraint: valid empty tail.
+    expect(scoreScenario(sp, { ctas: [], config: CONFIG, tailStatus: 'actions' }).pass).toBe(true);
+    // Format break: ctas also [] but the tail was malformed — MUST fail.
+    expect(scoreScenario(sp, { ctas: [], config: CONFIG, tailStatus: 'malformed' }).pass).toBe(false);
+    expect(scoreScenario(sp, { ctas: [], config: CONFIG, tailStatus: 'no_sentinel' }).pass).toBe(false);
+  });
+
+  test('tail_status on a non-single-pass scenario fails loudly (harness misuse)', () => {
+    const r = scoreScenario({ assertions: [{ type: 'tail_status', value: 'actions' }] }, { tailStatus: null });
+    expect(r.pass).toBe(false);
+    expect(r.assertions[0].detail).toMatch(/requires run_single_pass/);
+  });
 });
 
 describe('compareToBaseline — status derivation', () => {

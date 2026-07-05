@@ -64,11 +64,13 @@ prompt splices the V4 conversation prompt).
 | `response_not_matches` | `pattern`, `flags?` | regex does not match |
 | `response_urls_subset_of_kb` | — | every URL in the response appears in `kb_context` (anti-fabrication) |
 | `ctas_include` | `value: []` | all listed CTA ids were selected |
+| `ctas_include_any` | `value: []` | at least ONE of the listed CTA ids was selected (OR — e.g. the V5 funnel lock accepts discovery-session OR application) |
 | `ctas_exclude` | `value: []` | none of the listed CTA ids were selected |
 | `ctas_subset_of` | `value: []` | selected CTAs are all within the allowed set |
 | `ctas_equal` | `value: []` | selected CTAs equal the set exactly |
 | `ctas_empty` | — | no CTAs selected |
 | `ctas_valid` | — | every selected CTA id exists in `config.cta_definitions` |
+| `tail_status` | `value` | (`run_single_pass` only) the V5 tail parser's status equals value — `actions` pins format; `ctas_empty` alone can't tell restraint (`<<<ACTIONS []>>>`) from a malformed tail (both yield `ctas: []`) |
 | `grounded_in_kb` | — | the Haiku groundedness judge (see below) rules the reply GROUNDED |
 
 An unknown assertion type fails loudly (so typos surface).

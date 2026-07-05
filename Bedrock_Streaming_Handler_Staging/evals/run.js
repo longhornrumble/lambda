@@ -105,7 +105,7 @@ function includesCI(haystack, needle) {
  * A `grounded_in_kb` assertion with an UNSURE verdict is non-failing (pass:true)
  * but carries review:true — it routes to human review, it does not auto-pass/fail.
  */
-function scoreScenario(scenario, { responseText = '', ctas = [], kbContext = null, config = {}, judgeVerdict = null } = {}) {
+function scoreScenario(scenario, { responseText = '', ctas = [], kbContext = null, config = {}, judgeVerdict = null, tailStatus = null } = {}) {
   const ctaSet = new Set(ctas);
   const vocab = new Set(Object.keys(config.cta_definitions || {}));
   const assertions = (scenario.assertions || []).map((a) => {
@@ -138,6 +138,21 @@ function scoreScenario(scenario, { responseText = '', ctas = [], kbContext = nul
       }
       case 'ctas_include':
         return mk(a, toArr(val).every((id) => ctaSet.has(id)), `expected ctas to include [${toArr(val).join(', ')}]; got [${ctas.join(', ')}]`);
+      case 'ctas_include_any':
+        // OR-inclusion (V5.6): the funnel-advance lock accepts EITHER concrete
+        // next-step action (discovery session or application) — requiring one
+        // specific id would fail correct behavior.
+        return mk(a, toArr(val).some((id) => ctaSet.has(id)), `expected ctas to include at least one of [${toArr(val).join(', ')}]; got [${ctas.join(', ')}]`);
+      case 'tail_status': {
+        // V5 single-pass format lock (V5.6): pins how the ctas were produced.
+        // ctas_empty alone can't distinguish deliberate restraint (valid
+        // `<<<ACTIONS []>>>` tail → status 'actions') from a format break
+        // (malformed/no_sentinel → ctas default to []) — this can.
+        if (scenario.run_single_pass !== true) {
+          return mk(a, false, 'tail_status assertion requires run_single_pass: true');
+        }
+        return mk(a, tailStatus === val, `expected tail status "${val}"; got "${tailStatus}"`);
+      }
       case 'ctas_exclude':
         return mk(a, toArr(val).every((id) => !ctaSet.has(id)), `expected ctas to exclude [${toArr(val).join(', ')}]; got [${ctas.join(', ')}]`);
       case 'ctas_subset_of': {
@@ -267,7 +282,7 @@ async function runScenario(scenario, deps) {
 
   const score = error
     ? { pass: false, review: false, assertions: [] }
-    : scoreScenario(scenario, { responseText, ctas, kbContext, config, judgeVerdict });
+    : scoreScenario(scenario, { responseText, ctas, kbContext, config, judgeVerdict, tailStatus });
   return {
     id: scenario.id,
     description: scenario.description || '',
