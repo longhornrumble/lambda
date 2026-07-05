@@ -124,6 +124,21 @@ function buildV5TurnPrompt(userInput, kbContext, tonePrompt, conversationHistory
   );
 }
 
+/**
+ * Validate tail-parsed action ids against the tenant config — the SAME
+ * semantics as selectActionsV4's inline validation (prompt_v4.js: known-ids
+ * filter + cap 4), extracted here so both index.js handler blocks share one
+ * implementation instead of drifting copies. Unknown ids drop silently.
+ *
+ * @param {string[]|null|undefined} ids - ids from the stream tail
+ * @param {Object} config - tenant config (cta_definitions is the vocabulary)
+ * @returns {string[]} validated ids, capped at 4
+ */
+function validateActionIds(ids, config) {
+  const knownIds = new Set(Object.keys(config?.cta_definitions || {}));
+  return (ids || []).filter((id) => knownIds.has(id)).slice(0, 4);
+}
+
 module.exports = {
   V5_TURN_PROMPT_VERSION,
   V5_TURN_INFERENCE_PARAMS,
@@ -131,4 +146,5 @@ module.exports = {
   buildV5TurnPrompt,
   buildActionCatalogBlock,
   buildActionTailInstruction,
+  validateActionIds,
 };
