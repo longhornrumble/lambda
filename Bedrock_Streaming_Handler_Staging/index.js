@@ -30,6 +30,18 @@ const {
   V4_CONVERSATION_PROMPT_VERSION,
   ACTION_SELECTOR_PROMPT_VERSION,
 } = require('./prompt_v4');
+// V5 single-pass turn (feature_flags.V5_SINGLE_PASS, V5.5): ONE streaming call
+// produces the reply AND selects actions via a machine-read stream tail. The
+// tail parser strips the sentinel before anything reaches the client or
+// responseBuffer; ids validate exactly like selectActionsV4's output.
+const {
+  buildV5TurnPrompt,
+  buildActionCatalogBlock,
+  validateActionIds,
+  V5_TURN_PROMPT_VERSION,
+  V5_TURN_INFERENCE_PARAMS,
+} = require('./prompt_v5');
+const { createTailParser } = require('./streamTail');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 // WS-C2 (scheduling §5.6): same-session form-data injection. Read-only fetch +
 // sanitize + <user_application_context> block. Prompt-injection surface.
@@ -767,10 +779,21 @@ const streamingHandler = async (event, responseStream, context) => {
     }
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {});
+    // V5 single-pass (flag-gated): swap the base prompt builder AND parse the
+    // stream tail — UNCONDITIONALLY of which post-stream branch owns CTAs, else
+    // a scheduling-handled/click-routed turn on a V5 tenant would stream the
+    // literal sentinel to the widget. With no ai_available CTAs the V5 prompt is
+    // V4-identical (no tail asked): no_sentinel is then CORRECT, so the fail-soft
+    // ladder + the V5_TAIL_STATUS counter are skipped (v5CatalogEmpty).
+    const v5Active = !!config.feature_flags?.V5_SINGLE_PASS;
+    const v5CatalogEmpty = v5Active && buildActionCatalogBlock(config) === '';
+    const basePrompt = v5Active
+      ? buildV5TurnPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {})
+      : buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {});
     // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
     // <user_application_context> block so the LLM can skip re-qualification.
     // Non-fatal — returns basePrompt unchanged when there's no form data.
+    // (Both injectors PREPEND, so the V5 action tail stays last in the prompt.)
     const formPrompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
     // WS-CONVO (B3): prepend <scheduling_context> when a §B10 reschedule/cancel binding
     // governs this session (WS-D4 redemption). No-op (prompt unchanged) for normal chat.
@@ -789,8 +812,8 @@ const streamingHandler = async (event, responseStream, context) => {
         })
       : formPrompt;
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-    const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
-    const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
+    const maxTokens = v5Active ? V5_TURN_INFERENCE_PARAMS.max_tokens : V4_STEP2_INFERENCE_PARAMS.max_tokens;
+    const temperature = v5Active ? V5_TURN_INFERENCE_PARAMS.temperature : V4_STEP2_INFERENCE_PARAMS.temperature;
 
     console.log(`🚀 Invoking Bedrock with model: ${modelId}`);
     
@@ -810,12 +833,41 @@ const streamingHandler = async (event, responseStream, context) => {
     
     let firstTokenTime = null;
     let tokenCount = 0;
-    
+
+    // V5: holdback tail parser — feed() returns only text provably not part of
+    // the action sentinel; flag off ⇒ null ⇒ deltas pass through byte-identically.
+    const tailParser = v5Active ? createTailParser() : null;
+    // Single emit path for client-visible text (loop deltas AND the V5 end-flush):
+    // firstTokenTime fires on the first NON-EMPTY forwarded text (holdback can
+    // make early feeds return ''), and responseBuffer only ever sees forwarded
+    // (sentinel-stripped) text — its five downstream consumers (QA_COMPLETE,
+    // runSchedulingTurn, runNewBookingEntry, enhanceResponse, selectActionsV4
+    // fail-soft) must never ingest the sentinel.
+    const emitText = (text) => {
+      if (!text) return;
+      if (!firstTokenTime) {
+        firstTokenTime = Date.now() - startTime;
+        write(`: x-first-token-ms=${firstTokenTime}\n\n`);
+        console.log(`⚡ First token in ${firstTokenTime}ms`);
+      }
+
+      // Stream to client immediately - NO DELAY
+      const sseData = JSON.stringify({
+        type: 'text',
+        content: text,
+        session_id: sessionId
+      });
+      write(`data: ${sseData}\n\n`);
+
+      // Also append to buffer in parallel (microseconds, no blocking)
+      responseBuffer += text;
+    };
+
     // Stream the response - NO BUFFERING!
     for await (const event of response.body) {
       if (event.chunk?.bytes) {
         const chunkData = JSON.parse(new TextDecoder().decode(event.chunk.bytes));
-        
+
         if (chunkData.type === 'content_block_start') {
           // Nudge client: ensure at least one data frame precedes first text delta
           write('data: {"type":"stream_start"}\n\n');
@@ -823,22 +875,7 @@ const streamingHandler = async (event, responseStream, context) => {
           const delta = chunkData.delta;
           if (delta?.type === 'text_delta' && delta.text) {
             tokenCount++;
-            if (!firstTokenTime) {
-              firstTokenTime = Date.now() - startTime;
-              write(`: x-first-token-ms=${firstTokenTime}\n\n`);
-              console.log(`⚡ First token in ${firstTokenTime}ms`);
-            }
-            
-            // Stream to client immediately - NO DELAY
-            const sseData = JSON.stringify({
-              type: 'text',
-              content: delta.text,
-              session_id: sessionId
-            });
-            write(`data: ${sseData}\n\n`);
-            
-            // Also append to buffer in parallel (microseconds, no blocking)
-            responseBuffer += delta.text;
+            emitText(tailParser ? tailParser.feed(delta.text) : delta.text);
           }
         } else if (chunkData.type === 'message_stop') {
           console.log('✅ Bedrock stream complete');
@@ -846,7 +883,27 @@ const streamingHandler = async (event, responseStream, context) => {
         }
       }
     }
-    
+
+    // V5: end-of-stream flush — held text that turned out to be prose is
+    // forwarded; the tail (LAST marker attempt) decides the actions.
+    let v5Tail = null;
+    if (tailParser) {
+      v5Tail = tailParser.end();
+      emitText(v5Tail.remainingText);
+      if (!v5CatalogEmpty) {
+        // Staging health counter (V5.7 watches malformed ~0, trailing ~0).
+        // Skipped when the catalog is empty: no tail was asked for, so
+        // no_sentinel would be a false failure signal.
+        console.log(JSON.stringify({
+          type: 'V5_TAIL_STATUS',
+          status: v5Tail.status,
+          trailing_after_close: v5Tail.trailingAfterClose,
+          tenant_hash: tenantHash,
+          session_id: sessionId,
+        }));
+      }
+    }
+
     // Send completion metadata
     const totalTime = Date.now() - startTime;
     write(`: x-total-tokens=${tokenCount}\n`);
@@ -879,6 +936,10 @@ const streamingHandler = async (event, responseStream, context) => {
         prompt_versions: {  // sub-phase 1.1 — eval baselines key on prompt text version
           conversation: V4_CONVERSATION_PROMPT_VERSION,
           action_selector: ACTION_SELECTOR_PROMPT_VERSION,
+          // V5 turns also stamp the single-pass version: prompt_v4 text changes
+          // reach live V5 traffic through the splice-reuse, and CloudWatch needs
+          // to attribute an answer to the exact prompt that produced it.
+          ...(v5Active ? { single_pass: V5_TURN_PROMPT_VERSION } : {}),
         },
         question: questionRedacted,
         answer: answerRedacted,
@@ -976,6 +1037,47 @@ const streamingHandler = async (event, responseStream, context) => {
             metadata: enhancedData.metadata,
             session_id: sessionId
           })}\n\n`);
+        }
+
+      } else if (v5Active) {
+        // V5 single-pass: the actions came from the SAME call that wrote the
+        // prose (v5Tail). Sits BEFORE V4_ACTION_SELECTOR — tenants may carry
+        // both flags, and V5 must win. Validation = selectActionsV4's semantics
+        // (known-ids filter + cap 4, shared via validateActionIds).
+        let selectedIds;
+        if (v5Tail && v5Tail.actionIds !== null) {
+          selectedIds = validateActionIds(v5Tail.actionIds, config);
+        } else if (v5CatalogEmpty) {
+          // No ai_available CTAs ⇒ the prompt asked for no tail; nothing to
+          // select and no fallback (selectActionsV4 has no empty-vocabulary
+          // early-return — it would burn a guaranteed-empty live call).
+          selectedIds = [];
+        } else {
+          // Fail-soft ladder: no/bad tail → ONE selectActionsV4 call → else no
+          // buttons. Never an error to the user.
+          console.log(`[V5 SinglePass] tail ${v5Tail ? v5Tail.status : 'missing'} — fail-soft selectActionsV4`);
+          selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
+        }
+
+        if (selectedIds.length > 0) {
+          const ctaButtons = selectedIds.map((id, idx) => {
+            const { style, ...cleanCta } = config.cta_definitions[id] || {};
+            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
+          });
+
+          write(`data: ${JSON.stringify({
+            type: 'cta_buttons',
+            ctaButtons,
+            metadata: {
+              routing_tier: 'v5_single_pass',
+              selected_ids: selectedIds,
+              conversation_context: { selected_ctas: selectedIds }
+            },
+            session_id: sessionId
+          })}\n\n`);
+          console.log(`🎯 [V5 SinglePass] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
+        } else {
+          console.log('[V5 SinglePass] No CTAs selected');
         }
 
       } else if (config.feature_flags?.V4_ACTION_SELECTOR) {
@@ -1259,10 +1361,19 @@ const bufferedHandler = async (event, context) => {
     const kbContext = await retrieveKB(sanitizedInput, config);
 
     const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-    const basePrompt = buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {});
+    // V5 single-pass (flag-gated) — mirrors the streaming block exactly: the
+    // prompt-swap + tail parse run UNCONDITIONALLY of which post-stream branch
+    // owns CTAs, and an empty catalog (no ai_available CTAs) means no tail was
+    // asked for (skip the ladder + the failure counter).
+    const v5Active = !!config.feature_flags?.V5_SINGLE_PASS;
+    const v5CatalogEmpty = v5Active && buildActionCatalogBlock(config) === '';
+    const basePrompt = v5Active
+      ? buildV5TurnPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {})
+      : buildV4ConversationPrompt(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body.session_context || {});
     // WS-C2 (scheduling §5.6): prepend sanitized same-session form data as a
     // <user_application_context> block so the LLM can skip re-qualification.
     // Non-fatal — returns basePrompt unchanged when there's no form data.
+    // (Both injectors PREPEND, so the V5 action tail stays last in the prompt.)
     const formPrompt = await injectFormContext(basePrompt, { tenantId: config?.tenant_id, sessionId });
     // WS-CONVO (B3): prepend <scheduling_context> when a §B10 reschedule/cancel binding
     // governs this session (WS-D4 redemption). No-op (prompt unchanged) for normal chat.
@@ -1272,8 +1383,8 @@ const bufferedHandler = async (event, context) => {
       ? await injectSchedulingContext(formPrompt, { tenantId: config?.tenant_id, sessionId, bindingSessionId })
       : formPrompt;
     const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
-    const maxTokens = V4_STEP2_INFERENCE_PARAMS.max_tokens;
-    const temperature = V4_STEP2_INFERENCE_PARAMS.temperature;
+    const maxTokens = v5Active ? V5_TURN_INFERENCE_PARAMS.max_tokens : V4_STEP2_INFERENCE_PARAMS.max_tokens;
+    const temperature = v5Active ? V5_TURN_INFERENCE_PARAMS.temperature : V4_STEP2_INFERENCE_PARAMS.temperature;
 
     // Invoke Bedrock
     const response = await bedrock.send(new InvokeModelWithResponseStreamCommand({
@@ -1290,31 +1401,57 @@ const bufferedHandler = async (event, context) => {
     
     let firstTokenTime = null;
     let tokenCount = 0;
-    
+
+    // V5: holdback tail parser (mirrors the streaming block; flag off ⇒ null ⇒
+    // byte-identical pass-through). emitText is the single path for client-
+    // visible text: firstTokenTime fires on the first NON-EMPTY forwarded text,
+    // and responseBuffer only ever holds sentinel-stripped text.
+    const tailParser = v5Active ? createTailParser() : null;
+    const emitText = (text) => {
+      if (!text) return;
+      if (!firstTokenTime) {
+        firstTokenTime = Date.now() - startTime;
+        chunks.push(`: x-first-token-ms=${firstTokenTime}\n\n`);
+      }
+
+      chunks.push(`data: {"type": "text", "content": ${JSON.stringify(text)}, "session_id": "${sessionId}"}\n\n`);
+      responseBuffer += text;
+    };
+
     // Process stream (buffered)
     for await (const event of response.body) {
       if (event.chunk?.bytes) {
         const chunkData = JSON.parse(new TextDecoder().decode(event.chunk.bytes));
-        
+
         if (chunkData.type === 'content_block_delta') {
           const text = chunkData.delta?.text;
           if (text) {
             tokenCount++;
-            
-            if (!firstTokenTime) {
-              firstTokenTime = Date.now() - startTime;
-              chunks.push(`: x-first-token-ms=${firstTokenTime}\n\n`);
-            }
-            
-            chunks.push(`data: {"type": "text", "content": ${JSON.stringify(text)}, "session_id": "${sessionId}"}\n\n`);
-            responseBuffer += text;
+            emitText(tailParser ? tailParser.feed(text) : text);
           }
         } else if (chunkData.type === 'message_stop') {
           break;
         }
       }
     }
-    
+
+    // V5: end-of-stream flush — MUST land before the [DONE] push below so held
+    // prose keeps SSE ordering (the CTA chain later splices before [DONE]).
+    let v5Tail = null;
+    if (tailParser) {
+      v5Tail = tailParser.end();
+      emitText(v5Tail.remainingText);
+      if (!v5CatalogEmpty) {
+        console.log(JSON.stringify({
+          type: 'V5_TAIL_STATUS',
+          status: v5Tail.status,
+          trailing_after_close: v5Tail.trailingAfterClose,
+          tenant_hash: tenantHash,
+          session_id: sessionId,
+        }));
+      }
+    }
+
     // Add completion
     const totalTime = Date.now() - startTime;
     chunks.push(`: x-total-tokens=${tokenCount}\n`);
@@ -1339,6 +1476,8 @@ const bufferedHandler = async (event, context) => {
         prompt_versions: {  // sub-phase 1.1 — eval baselines key on prompt text version
           conversation: V4_CONVERSATION_PROMPT_VERSION,
           action_selector: ACTION_SELECTOR_PROMPT_VERSION,
+          // V5 turns also stamp the single-pass version (mirrors streaming block).
+          ...(v5Active ? { single_pass: V5_TURN_PROMPT_VERSION } : {}),
         },
         question: questionRedacted,
         answer: answerRedacted,
@@ -1422,6 +1561,40 @@ const bufferedHandler = async (event, context) => {
           });
           chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
         }
+      } else if (v5Active) {
+        // V5 single-pass (buffered path) — mirrors the streaming block: actions
+        // come from the same call that wrote the prose; sits BEFORE
+        // V4_ACTION_SELECTOR so V5 wins when a tenant carries both flags.
+        let selectedIds;
+        if (v5Tail && v5Tail.actionIds !== null) {
+          selectedIds = validateActionIds(v5Tail.actionIds, config);
+        } else if (v5CatalogEmpty) {
+          // No tail was asked for (no ai_available CTAs) — no fallback call.
+          selectedIds = [];
+        } else {
+          console.log(`[V5 SinglePass buffered] tail ${v5Tail ? v5Tail.status : 'missing'} — fail-soft selectActionsV4`);
+          selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
+        }
+
+        if (selectedIds.length > 0) {
+          const ctaButtons = selectedIds.map((id, idx) => {
+            const { style, ...cleanCta } = config.cta_definitions[id] || {};
+            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
+          });
+
+          const ctaData = JSON.stringify({
+            type: 'cta_buttons', ctaButtons,
+            metadata: {
+              routing_tier: 'v5_single_pass',
+              selected_ids: selectedIds,
+              conversation_context: { selected_ctas: selectedIds }
+            },
+            session_id: sessionId
+          });
+          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
+          console.log(`🎯 [V5 SinglePass buffered] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
+        }
+
       } else if (config.feature_flags?.V4_ACTION_SELECTOR) {
         // V4.0 Action Selector (buffered path)
         console.log('[V4 ActionSelector buffered] Using LLM-based CTA selection');

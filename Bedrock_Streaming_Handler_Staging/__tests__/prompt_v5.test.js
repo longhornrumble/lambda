@@ -9,7 +9,10 @@
  *   - section ordering (catalog before USER MESSAGE, tail instruction last),
  *   - the no-catalog degenerate case (byte-identical to the V4 prompt),
  *   - the V5.1 sentinel constants as the single source of truth,
- *   - the unwired contract (index.js does not import prompt_v5 until V5.5).
+ *   - the wired contract (V5.5: index.js builds the V5 prompt at BOTH
+ *     duplicated handler call sites, V5 branch before V4_ACTION_SELECTOR),
+ *   - validateActionIds (selectActionsV4's known-ids + cap-4 semantics, shared
+ *     by both handler blocks).
  */
 
 const {
@@ -19,6 +22,7 @@ const {
   buildV5TurnPrompt,
   buildActionCatalogBlock,
   buildActionTailInstruction,
+  validateActionIds,
 } = require('../prompt_v5');
 const { buildV4ConversationPrompt } = require('../prompt_v4');
 const { SENTINEL_OPEN, SENTINEL_CLOSE } = require('../streamTail');
@@ -135,10 +139,45 @@ describe('V5 constants', () => {
   });
 });
 
-describe('V5.2 unwired contract', () => {
-  test('index.js does not import prompt_v5 (nothing on the request path)', () => {
+describe('validateActionIds — selectActionsV4-mirroring validation (V5.5)', () => {
+  test('keeps known ids (ai_available NOT required — same as selectActionsV4), drops unknown', () => {
+    expect(validateActionIds(['love_box_learn', 'ghost_cta', 'contact_us'], CONFIG))
+      .toEqual(['love_box_learn', 'contact_us']);
+  });
+
+  test('caps at 4', () => {
+    const config = { cta_definitions: Object.fromEntries(['a', 'b', 'c', 'd', 'e'].map((id) => [id, { label: id }])) };
+    expect(validateActionIds(['a', 'b', 'c', 'd', 'e'], config)).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  test('null/undefined ids and missing config degrade to []', () => {
+    expect(validateActionIds(null, CONFIG)).toEqual([]);
+    expect(validateActionIds(undefined, CONFIG)).toEqual([]);
+    expect(validateActionIds(['love_box_learn'], {})).toEqual([]);
+    expect(validateActionIds(['love_box_learn'], undefined)).toEqual([]);
+  });
+});
+
+describe('V5.5 wired contract (1a source-pin pattern)', () => {
+  // V5.5 wired the merged prompt into the request path. Pin BOTH duplicated
+  // prompt call sites (streaming + buffered handler blocks): each must build
+  // the V5 prompt behind the flag with the exact V4-mirroring signature, and
+  // the V5 branch must sit BEFORE V4_ACTION_SELECTOR in both CTA chains
+  // (tenants carry both flags — appended-after would make the V5 flip a no-op).
+  test('index.js builds the V5 prompt at BOTH handler call sites', () => {
     const fs = require('fs');
     const source = fs.readFileSync(require.resolve('../index.js'), 'utf8');
-    expect(source).not.toContain('prompt_v5');
+    expect(source).toContain("require('./prompt_v5')");
+    const v5Sites = source.match(/buildV5TurnPrompt\(sanitizedInput, kbContext, tonePrompt, conversationHistory, config, body\.session_context \|\| \{\}\)/g) || [];
+    expect(v5Sites).toHaveLength(2);
+  });
+
+  test('the V5 CTA branch precedes V4_ACTION_SELECTOR in BOTH chains', () => {
+    const fs = require('fs');
+    const source = fs.readFileSync(require.resolve('../index.js'), 'utf8');
+    // In each CTA chain the v5Active arm must appear before the V4 flag check:
+    // `else if (v5Active) { ... } else if (config.feature_flags?.V4_ACTION_SELECTOR)`.
+    const ordered = source.match(/} else if \(v5Active\) \{[\s\S]*?} else if \(config\.feature_flags\?\.V4_ACTION_SELECTOR\) \{/g) || [];
+    expect(ordered).toHaveLength(2);
   });
 });
