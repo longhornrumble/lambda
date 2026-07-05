@@ -37,7 +37,16 @@ const { SENTINEL_OPEN, SENTINEL_CLOSE } = require('./streamTail');
 //   catalog (`id — label [INTENT]`, ai_available CTAs) + transferred V4.0
 //   selector rules (restraint-first, commitment gate) reworded inline + a
 //   reply/action coherence rule + machine-read ACTION TAIL instruction.
-const V5_TURN_PROMPT_VERSION = 'v5-turn.v1';
+// v5-turn.v2 (2026-07-05, V5.7 tune, operator-directed): advance EARLIER on
+//   sustained interest — the v1 commitment gate waited for explicit "sign me
+//   up" words, so multi-turn engaged users got a 5th exploration question
+//   instead of the next step (the ~12% intake-loop residual; live soak verdict:
+//   "apply could have been offered 1–2 turns earlier"). New SUSTAINED
+//   INTEREST → ADVANCE rule; commitment line reworded to admit sustained
+//   interest; COHERENCE now demands the action that TAKES a proposed step
+//   (not a learn-more chip next to "ready to take the next step?"). First
+//   contact / idle curiosity still gets no APPLY/VISIT (cta_01 lock).
+const V5_TURN_PROMPT_VERSION = 'v5-turn.v2';
 
 // Like V4_STEP2_INFERENCE_PARAMS but with headroom for the action tail: at
 // max_tokens the tail would be truncated mid-sentinel → malformed → fallback
@@ -75,8 +84,9 @@ ACTION RULES:
 - Choose 0-4 actions. Each action is labeled LEARN, APPLY, VISIT, INFO, or SCHEDULE.
 - RESTRAINT FIRST: only offer an action when it genuinely helps the user take a next step they are reaching for. Most turns need NONE — a normal answer, a thank-you, a clarification, or small talk gets no actions. Never add actions just to fill a menu under every reply.
 - When the user is actively exploring a specific program, one focused, relevant LEARN action can help them go deeper. One well-chosen action beats a list.
-- APPLY/VISIT ONLY WHEN COMMITTED: only offer APPLY or VISIT actions when the user has unprompted said "I want to apply", "sign me up", "I'm ready", "let's donate", or similar. Answering your question or expressing general interest is NOT commitment.
-- COHERENCE: the actions must match what your reply just said. If your reply proposes a concrete next step, attach that step's action. Never attach an action your reply gives no reason for.`;
+- SUSTAINED INTEREST → ADVANCE: when the user has stayed engaged with ONE specific program across several turns and signals personal fit or readiness ("I think I'd be good at this", "I just want to be there for them"), stop exploring — propose the concrete next step in your reply and attach that step's action. Do not wait for the exact words "sign me up".
+- APPLY/VISIT need real intent: a first question or general curiosity is NOT enough. Explicit commitment ("I want to apply", "I'm ready", "let's donate") or sustained interest (above) is.
+- COHERENCE: the actions must match what your reply just said. If your reply proposes a concrete next step or asks whether they're ready to proceed, attach the action that TAKES that step — not a learn-more action. Never attach an action your reply gives no reason for.`;
 }
 
 /**
