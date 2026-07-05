@@ -1,0 +1,28 @@
+{
+  "id": "context_01_new_topic_followup_no_drift",
+  "description": "Multi-turn coherence: after a mentoring exchange, the user pivots to 'Learn about the volunteer process' (the 2026-07-04 staging drift repro — CONVERSATION_SESSION_STATE_DESIGN.md §2). With retrieval now on the clean current query, the reply must answer from the volunteer-process KB passage: no importing of mentoring-history details that aren't in the KB, and no drifting into generic cause-matching ('animals, the environment, seniors') like the incident. Locks the response half of Step 0; the query half is locked by index.test.js ('clean current input for substantive follow-up turns').",
+  "run_action_selector": false,
+  "config": {
+    "tenant_id": "EVAL_CONTEXT",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "feature_flags": { "V4_ACTION_SELECTOR": true },
+    "cta_definitions": {
+      "learn_volunteer": { "label": "Volunteer roles", "action": "send_query", "ai_available": true }
+    }
+  },
+  "kb_context": "Becoming a Helping Hands volunteer: 1) Complete the volunteer application form online. 2) Attend a 30-minute phone interview with our volunteer coordinator. 3) Pass a background check (we cover the cost). 4) Attend one in-person orientation and training session. Most volunteers finish all four steps within three weeks and are then matched to a program.",
+  "conversation_history": [
+    { "role": "user", "content": "Tell me about your mentoring program." },
+    { "role": "assistant", "content": "Our mentoring program pairs a caring adult with a young person who has experienced foster care. Mentors and mentees meet weekly and often share activities like board-game nights and art projects, building confidence and trust over time." }
+  ],
+  "user_input": "Learn about the volunteer process",
+  "assertions": [
+    { "type": "response_matches", "pattern": "application|interview|background check|orientation|training" },
+    { "type": "response_not_matches", "pattern": "board.?game|art project" },
+    { "type": "response_not_matches", "pattern": "\\b(animals|the environment|seniors)\\b" },
+    { "type": "grounded_in_kb" },
+    { "type": "response_urls_subset_of_kb" }
+  ]
+}
