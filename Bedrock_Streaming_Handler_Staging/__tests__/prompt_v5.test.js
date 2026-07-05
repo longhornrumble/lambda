@@ -1,0 +1,144 @@
+/**
+ * prompt_v5 unit tests — V5 single-pass turn prompt (V5.2, unwired).
+ *
+ * The module composes buildV4ConversationPrompt + action catalog + selector
+ * rules + machine-read tail instruction. These tests pin:
+ *   - the splice contract (V4 prompt carries the USER MESSAGE marker exactly
+ *     once — a V4 refactor that renames it must fail here, not silently
+ *     produce a promptless catalog),
+ *   - section ordering (catalog before USER MESSAGE, tail instruction last),
+ *   - the no-catalog degenerate case (byte-identical to the V4 prompt),
+ *   - the V5.1 sentinel constants as the single source of truth,
+ *   - the unwired contract (index.js does not import prompt_v5 until V5.5).
+ */
+
+const {
+  V5_TURN_PROMPT_VERSION,
+  V5_TURN_INFERENCE_PARAMS,
+  USER_MESSAGE_MARKER,
+  buildV5TurnPrompt,
+  buildActionCatalogBlock,
+  buildActionTailInstruction,
+} = require('../prompt_v5');
+const { buildV4ConversationPrompt } = require('../prompt_v4');
+const { SENTINEL_OPEN, SENTINEL_CLOSE } = require('../streamTail');
+
+const CONFIG = {
+  chat_title: 'Atlanta Angels',
+  cta_definitions: {
+    love_box_learn: { label: 'Learn about Love Box', action: 'send_query', ai_available: true },
+    apply_daretodream_volunteer: { label: 'Apply to be a Dare to Dream mentor', action: 'external_link', ai_available: true },
+    contact_us: { label: 'Contact Us', action: 'start_form', ai_available: false },
+    schedule_intro_call: { label: 'Schedule a Call', action: 'start_scheduling', ai_available: true },
+  },
+};
+
+const KB = 'The Dare to Dream program pairs youth with mentors.';
+const HISTORY = [
+  { role: 'user', content: 'Tell me about mentoring.' },
+  { role: 'assistant', content: 'Our program pairs youth with mentors.' },
+];
+
+describe('buildActionCatalogBlock', () => {
+  test('lists only ai_available CTAs in `id — label [INTENT]` format', () => {
+    const block = buildActionCatalogBlock(CONFIG);
+    expect(block).toContain('love_box_learn — Learn about Love Box [LEARN]');
+    expect(block).toContain('apply_daretodream_volunteer — Apply to be a Dare to Dream mentor [VISIT]');
+    expect(block).toContain('schedule_intro_call — Schedule a Call [SCHEDULE]');
+    expect(block).not.toContain('contact_us');
+  });
+
+  test('carries the transferred V4.0 selector rules', () => {
+    const block = buildActionCatalogBlock(CONFIG);
+    expect(block).toContain('RESTRAINT FIRST');
+    expect(block).toContain('APPLY/VISIT ONLY WHEN COMMITTED');
+    expect(block).toContain('COHERENCE');
+  });
+
+  test('returns empty string when no CTA is ai_available', () => {
+    expect(buildActionCatalogBlock({ cta_definitions: { x: { label: 'X', action: 'send_query' } } })).toBe('');
+    expect(buildActionCatalogBlock({})).toBe('');
+    expect(buildActionCatalogBlock(undefined)).toBe('');
+  });
+});
+
+describe('buildActionTailInstruction', () => {
+  test('uses the streamTail sentinel constants (single source of truth)', () => {
+    const tail = buildActionTailInstruction();
+    expect(tail).toContain(`${SENTINEL_OPEN} ["action_id","action_id"]${SENTINEL_CLOSE}`);
+    expect(tail).toContain(`${SENTINEL_OPEN} []${SENTINEL_CLOSE}`);
+  });
+});
+
+describe('buildV5TurnPrompt', () => {
+  test('V4 prompt carries the USER MESSAGE marker exactly once (splice contract)', () => {
+    const base = buildV4ConversationPrompt('Hi', KB, '', HISTORY, CONFIG, {});
+    expect(base.split(USER_MESSAGE_MARKER)).toHaveLength(2);
+  });
+
+  test('contains the V4 base sections plus catalog and tail', () => {
+    const prompt = buildV5TurnPrompt('What is Love Box?', KB, '', HISTORY, CONFIG, {});
+    expect(prompt).toContain('━━━ KNOWLEDGE BASE ━━━');
+    expect(prompt).toContain('━━━ CONVERSATION SO FAR ━━━');
+    expect(prompt).toContain('━━━ ACTIONS ━━━');
+    expect(prompt).toContain('━━━ ACTION TAIL (machine-read, required) ━━━');
+    expect(prompt).toContain('USER: What is Love Box?');
+  });
+
+  test('catalog sits before the USER MESSAGE section; tail instruction is last', () => {
+    const prompt = buildV5TurnPrompt('Hi', KB, '', HISTORY, CONFIG, {});
+    const catalogAt = prompt.indexOf('━━━ ACTIONS ━━━');
+    const userAt = prompt.indexOf(USER_MESSAGE_MARKER);
+    const tailAt = prompt.indexOf('━━━ ACTION TAIL');
+    expect(catalogAt).toBeGreaterThan(-1);
+    expect(catalogAt).toBeLessThan(userAt);
+    expect(tailAt).toBeGreaterThan(userAt);
+    // Tail instruction is the absolute end (recency bias).
+    expect(prompt.trimEnd().endsWith(`never mention it, the IDs, or "actions" in your prose.`)).toBe(true);
+  });
+
+  test('no ai_available CTAs → byte-identical to the V4 prompt (no tail asked for)', () => {
+    const bare = { chat_title: 'X', cta_definitions: {} };
+    const v4 = buildV4ConversationPrompt('Hi', KB, '', HISTORY, bare, {});
+    const v5 = buildV5TurnPrompt('Hi', KB, '', HISTORY, bare, {});
+    expect(v5).toBe(v4);
+  });
+
+  test('sessionContext is optional (defaults to no SESSION CONTEXT block)', () => {
+    const prompt = buildV5TurnPrompt('Hi', KB, '', HISTORY, CONFIG);
+    expect(prompt).not.toContain('SESSION CONTEXT');
+    expect(prompt).toContain('━━━ ACTIONS ━━━');
+  });
+
+  test('threads session_context through to the V4 base', () => {
+    const prompt = buildV5TurnPrompt('Hi', KB, '', HISTORY, CONFIG, { accumulated_topics: ['mentoring'] });
+    expect(prompt).toContain('This session so far is about: mentoring.');
+  });
+
+  test('fails loud if the V4 marker ever disappears', () => {
+    jest.isolateModules(() => {
+      jest.doMock('../prompt_v4', () => ({
+        buildV4ConversationPrompt: () => 'a V4 prompt without the marker',
+        intentLabel: (a) => a,
+      }));
+      const v5 = require('../prompt_v5');
+      expect(() => v5.buildV5TurnPrompt('Hi', KB, '', [], CONFIG, {})).toThrow(/USER MESSAGE marker/);
+    });
+    jest.dontMock('../prompt_v4');
+  });
+});
+
+describe('V5 constants', () => {
+  test('version stamp and inference params are exported', () => {
+    expect(V5_TURN_PROMPT_VERSION).toBe('v5-turn.v1');
+    expect(V5_TURN_INFERENCE_PARAMS).toEqual({ temperature: 0.35, max_tokens: 700 });
+  });
+});
+
+describe('V5.2 unwired contract', () => {
+  test('index.js does not import prompt_v5 (nothing on the request path)', () => {
+    const fs = require('fs');
+    const source = fs.readFileSync(require.resolve('../index.js'), 'utf8');
+    expect(source).not.toContain('prompt_v5');
+  });
+});
