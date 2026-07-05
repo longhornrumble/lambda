@@ -27,6 +27,8 @@ const {
   CURRENT_PROMPT_VERSIONS,
 } = require('../evals/run');
 const { renderReport } = require('../evals/report');
+const { V5_TURN_PROMPT_VERSION, V5_TURN_INFERENCE_PARAMS } = require('../prompt_v5');
+const { SENTINEL_OPEN } = require('../streamTail');
 
 const CONFIG = {
   cta_definitions: {
@@ -258,6 +260,155 @@ describe('runScenario — V4.1 pool-selection path (run_pool_selection)', () => 
     const r = await runScenario(both, { invokeResponse, bedrockClient: classifierClient('volunteer_general') });
     expect(r.error).toMatch(/pick one path/);
     expect(r.pass).toBe(false);
+  });
+});
+
+describe('runScenario — V5 single-pass path (run_single_pass, V5.4)', () => {
+  const singlePassScenario = {
+    id: 'single_pass_fixture',
+    run_single_pass: true,
+    config: {
+      tenant_id: 'EVAL_V5',
+      cta_definitions: {
+        learn_volunteer: { label: 'Volunteer info', action: 'send_query', ai_available: true },
+        apply_volunteer: { label: 'Apply', action: 'start_form', ai_available: true },
+      },
+    },
+    kb_context: 'Volunteer orientation is the first Saturday of each month.',
+    conversation_history: [],
+    user_input: 'How do I learn about volunteering?',
+    assertions: [
+      { type: 'ctas_include', value: ['learn_volunteer'] },
+      { type: 'response_not_contains', value: SENTINEL_OPEN },
+    ],
+  };
+
+  test('builds the V5 merged prompt with V5 inference params and parses the tail', async () => {
+    const invokeResponse = jest.fn(async () => `Orientation is the first Saturday of each month.\n${SENTINEL_OPEN} ["learn_volunteer"]>>>`);
+    const bedrockClient = { send: jest.fn() };
+    const r = await runScenario(singlePassScenario, { invokeResponse, bedrockClient });
+    expect(r.error).toBeNull();
+    expect(r.ranSinglePass).toBe(true);
+    const [prompt, opts] = invokeResponse.mock.calls[0];
+    expect(prompt).toContain('ACTION TAIL');
+    expect(prompt).toContain('learn_volunteer — Volunteer info');
+    expect(opts.params).toEqual({
+      max_tokens: V5_TURN_INFERENCE_PARAMS.max_tokens,
+      temperature: V5_TURN_INFERENCE_PARAMS.temperature,
+    });
+    expect(r.ctas).toEqual(['learn_volunteer']);
+    expect(r.tailStatus).toBe('actions');
+    // The scored text is the stripped prose — assertions never see the sentinel.
+    expect(r.responseText).not.toContain(SENTINEL_OPEN);
+    expect(r.pass).toBe(true);
+    // Single pass means ONE model call: no selector, no classifier.
+    expect(bedrockClient.send).not.toHaveBeenCalled();
+  });
+
+  test('empty tail [] is deliberate restraint: ctas [], status actions', async () => {
+    const invokeResponse = jest.fn(async () => `Happy to help!\n${SENTINEL_OPEN} []>>>`);
+    const scenario = { ...singlePassScenario, assertions: [{ type: 'ctas_empty' }] };
+    const r = await runScenario(scenario, { invokeResponse, bedrockClient: { send: jest.fn() } });
+    expect(r.error).toBeNull();
+    expect(r.ctas).toEqual([]);
+    expect(r.tailStatus).toBe('actions');
+    expect(r.pass).toBe(true);
+  });
+
+  test('malformed tail scores strictly — NO selectActionsV4 rescue in the harness', async () => {
+    const invokeResponse = jest.fn(async () => `Some reply.\n${SENTINEL_OPEN} [not json>>>`);
+    const bedrockClient = { send: jest.fn() };
+    const r = await runScenario(singlePassScenario, { invokeResponse, bedrockClient });
+    expect(r.error).toBeNull();
+    expect(r.ctas).toEqual([]);
+    expect(r.tailStatus).toBe('malformed');
+    // The production fail-soft ladder must never run here — a rescue would
+    // mask exactly the format regressions these scenarios exist to catch.
+    expect(bedrockClient.send).not.toHaveBeenCalled();
+    expect(r.pass).toBe(false); // the format regression is VISIBLE, not rescued
+  });
+
+  test('missing tail → no_sentinel, ctas []', async () => {
+    const invokeResponse = jest.fn(async () => 'A reply with no tail at all.');
+    const r = await runScenario(singlePassScenario, { invokeResponse, bedrockClient: { send: jest.fn() } });
+    expect(r.error).toBeNull();
+    expect(r.ctas).toEqual([]);
+    expect(r.tailStatus).toBe('no_sentinel');
+    expect(r.pass).toBe(false);
+  });
+
+  test('run_single_pass + run_action_selector is an error result', async () => {
+    const both = { ...singlePassScenario, run_action_selector: true };
+    const r = await runScenario(both, { invokeResponse: jest.fn(async () => 'text'), bedrockClient: { send: jest.fn() } });
+    expect(r.error).toMatch(/pick one path/);
+    expect(r.error).toMatch(/run_action_selector and run_single_pass/);
+    expect(r.pass).toBe(false);
+  });
+
+  test('run_single_pass + run_pool_selection is an error result', async () => {
+    const both = { ...singlePassScenario, run_pool_selection: true };
+    const r = await runScenario(both, { invokeResponse: jest.fn(async () => 'text'), bedrockClient: { send: jest.fn() } });
+    expect(r.error).toMatch(/pick one path/);
+    expect(r.pass).toBe(false);
+  });
+
+  test('non-single-pass scenarios keep the V4 prompt and params (unchanged behavior)', async () => {
+    const invokeResponse = jest.fn(async () => 'plain V4 reply');
+    const classic = { ...singlePassScenario, run_single_pass: false, assertions: [] };
+    const r = await runScenario(classic, { invokeResponse, bedrockClient: { send: jest.fn() } });
+    expect(r.error).toBeNull();
+    expect(r.ranSinglePass).toBe(false);
+    expect(r.tailStatus).toBeNull();
+    const [prompt] = invokeResponse.mock.calls[0];
+    expect(prompt).not.toContain('ACTION TAIL');
+  });
+});
+
+describe('compareToBaseline — single_pass staleness (V5.4 comparator branch)', () => {
+  const cur = CURRENT_PROMPT_VERSIONS;
+
+  test('CURRENT_PROMPT_VERSIONS carries the V5 turn-prompt constant', () => {
+    expect(cur.single_pass).toBe(V5_TURN_PROMPT_VERSION);
+  });
+
+  test('single_pass version change stales ONLY scenarios that ran single-pass', () => {
+    const oldVersions = { ...cur, single_pass: 'v5-turn.v0' };
+    const baseline = { scenarios: {
+      sp: { pass: true, prompt_versions: oldVersions },
+      classic: { pass: true, prompt_versions: oldVersions },
+    } };
+    const results = [
+      { id: 'sp', ranSinglePass: true, ranSelector: false, pass: true, error: null, assertions: [], ctas: [], responseText: '', prompt_versions: cur },
+      { id: 'classic', ranSinglePass: false, ranSelector: false, pass: true, error: null, assertions: [], ctas: [], responseText: '', prompt_versions: cur },
+    ];
+    const byId = Object.fromEntries(compareToBaseline(results, baseline, cur).map((i) => [i.id, i.status]));
+    expect(byId.sp).toBe('stale_baseline');
+    expect(byId.classic).toBe('ok');
+  });
+
+  test('pre-V5.4 baselines (no single_pass key) do NOT go stale for classic scenarios', () => {
+    // The name-gating property the plan verified: adding the single_pass key
+    // to CURRENT_PROMPT_VERSIONS must not force a re-capture of the existing
+    // 19-scenario baseline.
+    const legacy = {
+      conversation: cur.conversation,
+      action_selector: cur.action_selector,
+      groundedness_judge: cur.groundedness_judge,
+    };
+    const baseline = { scenarios: { classic: { pass: true, prompt_versions: legacy } } };
+    const results = [
+      { id: 'classic', ranSelector: true, ranJudge: true, ranSinglePass: false, pass: true, error: null, assertions: [], ctas: [], responseText: '', prompt_versions: cur },
+    ];
+    expect(compareToBaseline(results, baseline, cur)[0].status).toBe('ok');
+  });
+
+  test('a single-pass scenario against a baseline lacking the single_pass stamp is stale', () => {
+    const legacy = { conversation: cur.conversation, action_selector: cur.action_selector };
+    const baseline = { scenarios: { sp: { pass: true, prompt_versions: legacy } } };
+    const results = [
+      { id: 'sp', ranSinglePass: true, ranSelector: false, pass: true, error: null, assertions: [], ctas: [], responseText: '', prompt_versions: cur },
+    ];
+    expect(compareToBaseline(results, baseline, cur)[0].status).toBe('stale_baseline');
   });
 });
 

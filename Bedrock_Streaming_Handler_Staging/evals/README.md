@@ -14,7 +14,7 @@ it ships — the gate for the Phase-2 naturalness work in
 
 | Path | What |
 |---|---|
-| `run.js` | Plain-Node runner: discover scenarios → build the **real** Step-2 prompt from a fixture config + recorded KB → **live** Bedrock invoke → optional real `selectActionsV4` → optional groundedness judge → deterministic scoring → baseline compare → markdown report. Exit 1 on regression / stale_baseline / live error. |
+| `run.js` | Plain-Node runner: discover scenarios → build the **real** prompt (V4 conversation prompt, or the V5 single-pass turn prompt for `run_single_pass` scenarios) from a fixture config + recorded KB → **live** Bedrock invoke → optional real `selectActionsV4` / pool selection / V5 tail parse → optional groundedness judge → deterministic scoring → baseline compare → markdown report. Exit 1 on regression / stale_baseline / live error. |
 | `judge.js` | Haiku groundedness judge (temp 0), own `GROUNDEDNESS_JUDGE_PROMPT_VERSION`. GROUNDED→pass, UNGROUNDED→fail, UNSURE→human review (non-blocking). |
 | `report.js` | Pure markdown report renderer. |
 | `scenarios/` | One JSON per scenario (grounding + CTA + safety packs). See `scenarios/README.md`. |
@@ -49,8 +49,9 @@ which would make the CI gate red half of eval-touching PRs for no real reason.
 
 The `chat-eval-net` job in [`.github/workflows/pr-checks.yml`](../../../.github/workflows/pr-checks.yml):
 
-- **Path-gated** — runs only when `prompt_v4.js`, `scheduling/agentTurn.js`, or
-  `evals/**` change (so unrelated PRs stay deterministic and spend no Bedrock).
+- **Path-gated** — runs only when `prompt_v4.js`, `prompt_v5.js`, `streamTail.js`,
+  `scheduling/agentTurn.js`, or `evals/**` change (so unrelated PRs stay
+  deterministic and spend no Bedrock).
 - **Live Bedrock** via OIDC into the staging `GitHubActionsDeployRole` (Haiku 4.5,
   `us-east-1`).
 - **Fails the PR** (through `all-checks-passed`) on any `regression`,
@@ -58,8 +59,20 @@ The `chat-eval-net` job in [`.github/workflows/pr-checks.yml`](../../../.github/
 - Also runnable on demand via **`workflow_dispatch`**.
 
 **The one sanctioned way to turn a red gate green is a reviewed re-baseline.** When a
-Phase-2 sub-phase changes prompt text it bumps the matching version constant
+prompt-text change bumps the matching version constant
 (`V4_CONVERSATION_PROMPT_VERSION` / `ACTION_SELECTOR_PROMPT_VERSION` in `prompt_v4.js`,
-or `GROUNDEDNESS_JUDGE_PROMPT_VERSION` in `judge.js`); every baseline captured under
-the old version then reports `stale_baseline` until the PR commits a fresh
-`node evals/run.js --update-baseline`. That coupling **is** the eval gate.
+`V5_TURN_PROMPT_VERSION` in `prompt_v5.js`, or `GROUNDEDNESS_JUDGE_PROMPT_VERSION`
+in `judge.js`), every baseline captured under the old version then reports
+`stale_baseline` until the PR commits a fresh `node evals/run.js --update-baseline`.
+That coupling **is** the eval gate. Staleness is name-gated: a `single_pass` bump
+stales only `run_single_pass` scenarios, exactly as a selector/judge bump stales
+only scenarios that ran the selector/judge. (A `conversation` bump stales
+everything — including single-pass scenarios, whose prompt splices the V4
+conversation prompt.)
+
+**V5 single-pass scenarios score strictly on the tail parser's output**
+(`streamTail.js`): `ctas` = the parsed action ids, or `[]` when the tail is
+missing/malformed. The production fail-soft ladder (malformed tail → one
+`selectActionsV4` rescue call, V5.5) deliberately does NOT run in the harness —
+rescuing here would mask exactly the format regressions the V5 scenarios exist
+to catch.

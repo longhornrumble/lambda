@@ -36,8 +36,9 @@ jobs:
       # Node.js Lambdas with tests
       bedrock:     ${{ steps.filter.outputs.bedrock }}
       # Chat-experience eval net (sub-phase 1.6). Gated NARROWLY on the files that
-      # change eval outcomes — the two prompt sources + the eval harness/scenarios —
-      # NOT all of Bedrock_Streaming_Handler_Staging/**, so unrelated BSH changes
+      # change eval outcomes — the prompt sources (V4 + V5), the V5 tail parser,
+      # and the eval harness/scenarios — NOT all of
+      # Bedrock_Streaming_Handler_Staging/**, so unrelated BSH changes
       # (e.g. form_handler.js) don't spend live Bedrock calls.
       eval_gate:   ${{ steps.filter.outputs.eval_gate }}
       meta_webhook:   ${{ steps.filter.outputs.meta_webhook }}
@@ -103,6 +104,8 @@ jobs:
               - 'Bedrock_Streaming_Handler_Staging/**'
             eval_gate:
               - 'Bedrock_Streaming_Handler_Staging/prompt_v4.js'
+              - 'Bedrock_Streaming_Handler_Staging/prompt_v5.js'
+              - 'Bedrock_Streaming_Handler_Staging/streamTail.js'
               - 'Bedrock_Streaming_Handler_Staging/scheduling/agentTurn.js'
               - 'Bedrock_Streaming_Handler_Staging/evals/**'
             meta_webhook:
