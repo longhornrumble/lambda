@@ -365,6 +365,94 @@ describe('Index.js Integration Tests', () => {
       );
     });
 
+    it('should retrieve on the clean current input for substantive follow-up turns (no prior-answer enrichment)', async () => {
+      // Regression lock: a removed "enrichment" step used to rewrite follow-up
+      // queries to "<input> — details beyond: <last assistant answer>", so a
+      // new-topic turn after a mentoring exchange retrieved mentoring-flavored
+      // passages and drifted (CONVERSATION_SESSION_STATE_DESIGN.md §2).
+      bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(
+        createBedrockStream(['The volunteer process starts with an application.'])
+      );
+
+      const event = {
+        body: JSON.stringify({
+          tenant_hash: 'abc123',
+          user_input: 'Learn about the volunteer process',
+          conversation_history: [
+            { role: 'user', content: 'Tell me about your mentoring program.' },
+            { role: 'assistant', content: 'Our mentoring program pairs caring adults with youth who have experienced foster care, helping them build confidence and trust over weekly visits.' }
+          ]
+        })
+      };
+
+      const responseStream = createMockResponseStream();
+      await indexModule.handler(event, responseStream, {});
+
+      // The KB query is exactly the sanitized current input — nothing appended.
+      expect(retrieveKB).toHaveBeenCalledWith(
+        'Learn about the volunteer process',
+        expect.objectContaining({ tenant_id: 'TEST123' })
+      );
+      const kbQueryArg = retrieveKB.mock.calls[0][0];
+      expect(kbQueryArg).not.toContain('details beyond');
+      expect(kbQueryArg).not.toContain('mentoring program pairs');
+    });
+
+    it('should retrieve on the last substantive user message for short continuation turns', async () => {
+      // The continuation fallback ("tell me more" → last real user question)
+      // survives the enrichment removal: vague inputs still get a usable query,
+      // built from the user's own words rather than the bot's prior answer.
+      bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(
+        createBedrockStream(['Mentors meet weekly with their mentee.'])
+      );
+
+      const event = {
+        body: JSON.stringify({
+          tenant_hash: 'abc123',
+          user_input: 'Tell me more',
+          conversation_history: [
+            { role: 'user', content: 'What is the Dare to Dream mentoring program?' },
+            { role: 'assistant', content: 'Dare to Dream matches a mentor with a young person leaving foster care for weekly one-on-one time.' }
+          ]
+        })
+      };
+
+      const responseStream = createMockResponseStream();
+      await indexModule.handler(event, responseStream, {});
+
+      expect(retrieveKB).toHaveBeenCalledWith(
+        'What is the Dare to Dream mentoring program?',
+        expect.objectContaining({ tenant_id: 'TEST123' })
+      );
+      expect(retrieveKB.mock.calls[0][0]).not.toContain('details beyond');
+    });
+
+    it('should fall back to the raw input for continuation turns with no substantive prior user message', async () => {
+      bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(
+        createBedrockStream(['Happy to help!'])
+      );
+
+      const event = {
+        body: JSON.stringify({
+          tenant_hash: 'abc123',
+          user_input: 'Tell me more',
+          conversation_history: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: 'Hello! How can I help you today?' }
+          ]
+        })
+      };
+
+      const responseStream = createMockResponseStream();
+      await indexModule.handler(event, responseStream, {});
+
+      // No prior user message is substantive (>10 chars), so the query is the raw input.
+      expect(retrieveKB).toHaveBeenCalledWith(
+        'Tell me more',
+        expect.objectContaining({ tenant_id: 'TEST123' })
+      );
+    });
+
     it('should cache KB results', async () => {
       bedrockMock.on(InvokeModelWithResponseStreamCommand).resolves(
         createBedrockStream(['Hello'])

@@ -5,6 +5,36 @@
     "groundedness_judge": "v1"
   },
   "scenarios": {
+    "context_01_new_topic_followup_no_drift": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v1",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1"
+      },
+      "assertions": [
+        {
+          "type": "response_matches",
+          "pass": true
+        },
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "response_not_matches",
+          "pass": true
+        },
+        {
+          "type": "grounded_in_kb",
+          "pass": true
+        },
+        {
+          "type": "response_urls_subset_of_kb",
+          "pass": true
+        }
+      ]
+    },
     "cta_01_interest_not_commitment_no_apply": {
       "pass": true,
       "prompt_versions": {

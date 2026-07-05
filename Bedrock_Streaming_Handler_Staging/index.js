@@ -752,28 +752,11 @@ const streamingHandler = async (event, responseStream, context) => {
       }
     }
 
-    // Enrich KB query for follow-up turns to pull deeper content.
-    // If the user is asking about the same topic again ("tell me more", "what else"),
-    // append what the bot already covered so retrieval targets uncovered content.
-    if (conversationHistory && conversationHistory.length >= 2) {
-      const lastAssistantMsg = [...conversationHistory].reverse().find(m => m.role === 'assistant');
-      if (lastAssistantMsg) {
-        const covered = (lastAssistantMsg.content || lastAssistantMsg.text || '').trim();
-        // If the user is asking for more detail on the same topic, enrich the query
-        const morePatterns = /more|else|detail|learn|what about|tell me|specifics|information|further|deeper|everything/i;
-        if (morePatterns.test(sanitizedInput)) {
-          // Append topic keywords from the last response to diversify retrieval
-          const topicKeywords = covered
-            .split(/[.!?\n]/)
-            .filter(s => s.trim().length > 20)
-            .slice(0, 2)
-            .map(s => s.trim().substring(0, 80))
-            .join(' ');
-          kbQuery = `${sanitizedInput} — details beyond: ${topicKeywords}`;
-          console.log(`🔍 Enriched KB query for follow-up: "${kbQuery.substring(0, 120)}..."`);
-        }
-      }
-    }
+    // NOTE: substantive follow-ups retrieve on the clean current input only. A prior
+    // "enrichment" step appended the last assistant answer to any input matching a broad
+    // follow-up regex; new-topic turns ("Learn about the volunteer process" after a
+    // mentoring exchange) got polluted with the prior topic and retrieval drifted
+    // cross-program. See docs/roadmap/CONVERSATION_SESSION_STATE_DESIGN.md §2/§10 step 0.
 
     // Get KB context — errors are handled gracefully so Bedrock can still respond
     let kbContext = '';
