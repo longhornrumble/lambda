@@ -33,8 +33,8 @@ function run(input, size = Infinity) {
       forwarded += parser.feed(input.slice(i, i + size));
     }
   }
-  const { remainingText, actionIds, status } = parser.end();
-  return { text: forwarded + remainingText, forwarded, remainingText, actionIds, status };
+  const { remainingText, actionIds, status, trailingAfterClose } = parser.end();
+  return { text: forwarded + remainingText, forwarded, remainingText, actionIds, status, trailingAfterClose };
 }
 
 /** Run `input` at every chunk size from 1..len and assert identical results. */
@@ -292,17 +292,31 @@ describe('streamTail — malformed blocks (fail-soft signals)', () => {
 });
 
 describe('streamTail — trailing content after a sentinel', () => {
-  test('trailing garbage after a valid sentinel is forwarded as prose, ids kept', () => {
+  test('trailing garbage after a valid sentinel is forwarded as prose, ids kept, flagged', () => {
     const result = run('Done.<<<ACTIONS ["a"]>>> trailing words');
     expect(result.text).toBe('Done. trailing words');
     expect(result.actionIds).toEqual(['a']);
     expect(result.status).toBe('actions');
+    expect(result.trailingAfterClose).toBe(true);
   });
 
-  test('over-closed marker (>>>>) leaves the extra > as prose', () => {
+  test('clean sentinel at the tail → trailingAfterClose false', () => {
+    const result = run('Done.\n<<<ACTIONS ["a"]>>>');
+    expect(result.trailingAfterClose).toBe(false);
+  });
+
+  test('whitespace-only after the close does not flag trailing prose', () => {
+    const result = run('Done.<<<ACTIONS ["a"]>>>\n');
+    expect(result.text).toBe('Done.\n');
+    expect(result.actionIds).toEqual(['a']);
+    expect(result.trailingAfterClose).toBe(false);
+  });
+
+  test('over-closed marker (>>>>) leaves the extra > as prose, flagged', () => {
     const result = run('Done.<<<ACTIONS ["a"]>>>>');
     expect(result.text).toBe('Done.>');
     expect(result.actionIds).toEqual(['a']);
+    expect(result.trailingAfterClose).toBe(true);
   });
 
   test('close before a later newline in one chunk → block parses, newline is prose', () => {
@@ -310,6 +324,7 @@ describe('streamTail — trailing content after a sentinel', () => {
     expect(result.text).toBe('X\nmore prose');
     expect(result.actionIds).toEqual(['a']);
     expect(result.status).toBe('actions');
+    expect(result.trailingAfterClose).toBe(true);
   });
 
   test('newline before a later close in one chunk → divergence wins, stray >>> is prose', () => {
@@ -319,17 +334,48 @@ describe('streamTail — trailing content after a sentinel', () => {
     expect(result.status).toBe('malformed');
   });
 
-  test('two sentinels → last one wins, both stripped', () => {
+  test('two valid sentinels → last one wins, both stripped', () => {
     const result = run('A.<<<ACTIONS ["first"]>>> mid <<<ACTIONS ["second"]>>>');
     expect(result.text).toBe('A. mid ');
     expect(result.actionIds).toEqual(['second']);
     expect(result.status).toBe('actions');
   });
+});
 
-  test('valid sentinel followed by a malformed one → ids kept, status actions', () => {
+describe('streamTail — the LAST marker attempt decides (retrospective blocker #1)', () => {
+  test('valid sentinel then a malformed attempt → malformed, earlier capture discarded', () => {
+    // The later attempt is the model's final decision; if it is corrupted
+    // (self-correction cut off by max_tokens), serving the abandoned first
+    // draft while reporting success would blind the fail-soft counter.
     const result = run('A.<<<ACTIONS ["keep"]>>><<<ACTIONS [junk>>>');
-    expect(result.actionIds).toEqual(['keep']);
+    expect(result.actionIds).toBeNull();
+    expect(result.status).toBe('malformed');
+  });
+
+  test('malformed attempt then a valid sentinel → the correction is served', () => {
+    const result = run('A.<<<ACTIONS [junk>>><<<ACTIONS ["good"]>>>');
+    expect(result.actionIds).toEqual(['good']);
     expect(result.status).toBe('actions');
+  });
+
+  test('valid sentinel then an unclosed attempt at stream end → malformed', () => {
+    const result = run('A.<<<ACTIONS ["keep"]>>><<<ACTIONS ["cut');
+    expect(result.actionIds).toBeNull();
+    expect(result.status).toBe('malformed');
+  });
+
+  test('valid sentinel then a newline-diverged attempt → malformed', () => {
+    const result = run('A.<<<ACTIONS ["keep"]>>><<<ACTIONS\nafter');
+    expect(result.actionIds).toBeNull();
+    expect(result.status).toBe('malformed');
+  });
+
+  test('last-attempt-decides is chunking-invariant', () => {
+    assertChunkingInvariant('A.<<<ACTIONS ["keep"]>>><<<ACTIONS [junk>>>', {
+      text: 'A.',
+      actionIds: null,
+      status: 'malformed',
+    });
   });
 });
 
