@@ -723,6 +723,28 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
 
   console.log(`[V4.1 Step3b] Pool after filter: ${pool.length} CTAs`);
 
+  // ── 4b. SESSION ALIGNMENT (design doc §10 step 1b) ──────────────────────
+  // When the session has already signaled specific topics (accumulated_topics
+  // carries the tags of earlier turns) AND the current topic's tags intersect
+  // them, keep only session-aligned CTAs instead of padding the selection with
+  // unaligned ones — a program-ambiguous turn ("the volunteer process") in a
+  // mentoring session should not surface the other program's CTAs.
+  // Deliberately inert for: cold start (no session tags), an explicit pivot
+  // (current tags disjoint from session tags — the pivot wins outright), and
+  // pools with no aligned CTA (bias narrows an ambiguous pool, never empties it).
+  const sessionTags = (ctx.accumulated_topics || []).filter(t => typeof t === 'string');
+  let sessionAligned = false;
+  if (sessionTags.length > 0 && resolvedTags.some(t => sessionTags.includes(t))) {
+    const aligned = pool.filter(cta =>
+      (cta.selection_metadata?.topic_tags || []).some(t => sessionTags.includes(t))
+    );
+    if (aligned.length > 0 && aligned.length < pool.length) {
+      console.log(`[V4.1 Step3b] Session alignment: ${pool.length} → ${aligned.length} CTAs (session tags: [${sessionTags.join(', ')}])`);
+      pool = aligned;
+      sessionAligned = true;
+    }
+  }
+
   // ── 5. SORT ──────────────────────────────────────────────────────────────
   // Sort by priority → tag overlap → insertion order (deterministic)
   pool.sort((a, b) => {
@@ -801,6 +823,7 @@ function selectCTAsFromPool(topicName, config, sessionContext = {}) {
       routing_tier: 'v4_pool',
       classified_topic: topicName || null,
       depth,
+      session_aligned: sessionAligned,
       routing_method: topicName ? 'pool_selection' : 'fallback_tags',
       pool_size: Object.keys(ctaDefs).length,
       filtered_count: pool.length,

@@ -197,6 +197,70 @@ describe('runScenario — end-to-end with injected seams (no live Bedrock)', () 
   });
 });
 
+describe('runScenario — V4.1 pool-selection path (run_pool_selection)', () => {
+  // Two-program fixture mirroring the 2026-07-04 incident shape.
+  const poolScenario = {
+    id: 'pool_fixture',
+    run_pool_selection: true,
+    config: {
+      tenant_id: 'EVAL_POOL',
+      topic_definitions: [
+        { name: 'mentoring_learn', description: 'mentoring program', tags: ['mentoring'] },
+        { name: 'volunteer_general', description: 'volunteering, program unspecified', tags: ['mentoring', 'care_box', 'volunteer'] },
+      ],
+      cta_definitions: {
+        mentor_discovery: { label: 'Discovery session', action: 'send_query', ai_available: true, selection_metadata: { topic_tags: ['mentoring', 'volunteer'], depth_level: 'action' } },
+        carebox_info: { label: 'About care boxes', action: 'send_query', ai_available: true, selection_metadata: { topic_tags: ['care_box'], depth_level: 'info' } },
+      },
+    },
+    kb_context: 'Volunteers complete an application and a background check.',
+    conversation_history: [
+      { role: 'user', content: 'Tell me about your mentoring program.' },
+      { role: 'assistant', content: 'Our mentoring program pairs adults with youth.' },
+    ],
+    user_input: 'Tell me about the volunteer process',
+    session_context: { accumulated_topics: ['mentoring'] },
+    assertions: [
+      { type: 'ctas_include', value: ['mentor_discovery'] },
+      { type: 'ctas_exclude', value: ['carebox_info'] },
+    ],
+  };
+  const classifierClient = (topicText) => ({
+    send: jest.fn(async () => ({
+      body: new TextEncoder().encode(JSON.stringify({ content: [{ type: 'text', text: topicText }] })),
+    })),
+  });
+
+  test('classifies live, runs the real pool selection with session_context, scores ctas_* on id strings', async () => {
+    const invokeResponse = jest.fn(async () => 'The volunteer process starts with an application.');
+    const bedrockClient = classifierClient('volunteer_general');
+    const r = await runScenario(poolScenario, { invokeResponse, bedrockClient });
+    expect(r.error).toBeNull();
+    expect(bedrockClient.send).toHaveBeenCalledTimes(1); // classifier ran
+    expect(r.classifiedTopic).toBe('volunteer_general');
+    expect(r.sessionAligned).toBe(true);
+    expect(r.ctas).toEqual(['mentor_discovery']);
+    expect(r.ranPool).toBe(true);
+    expect(r.pass).toBe(true);
+  });
+
+  test('null classification falls through to pool fallback behavior without error', async () => {
+    const invokeResponse = jest.fn(async () => 'Happy to help.');
+    const r = await runScenario(poolScenario, { invokeResponse, bedrockClient: classifierClient('null') });
+    expect(r.error).toBeNull();
+    expect(r.classifiedTopic).toBeNull();
+    expect(Array.isArray(r.ctas)).toBe(true);
+  });
+
+  test('setting both run_action_selector and run_pool_selection is an error result', async () => {
+    const both = { ...poolScenario, run_action_selector: true };
+    const invokeResponse = jest.fn(async () => 'text');
+    const r = await runScenario(both, { invokeResponse, bedrockClient: classifierClient('volunteer_general') });
+    expect(r.error).toMatch(/pick one path/);
+    expect(r.pass).toBe(false);
+  });
+});
+
 describe('loadScenarios + readBaseline — failure modes', () => {
   test('loadScenarios returns [] for a missing directory', () => {
     expect(loadScenarios(path.join(os.tmpdir(), 'no-such-evals-dir-xyz'))).toEqual([]);

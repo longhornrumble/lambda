@@ -30,6 +30,8 @@ const path = require('path');
 const {
   buildV4ConversationPrompt,
   selectActionsV4,
+  classifyTopic,
+  selectCTAsFromPool,
   sanitizeTonePromptV4,
   V4_STEP2_INFERENCE_PARAMS,
   V4_CONVERSATION_PROMPT_VERSION,
@@ -180,6 +182,7 @@ async function runScenario(scenario, deps) {
   const kbContext = scenario.kb_context == null ? null : scenario.kb_context;
   const history = scenario.conversation_history || [];
   const ranSelector = scenario.run_action_selector === true;
+  const ranPool = scenario.run_pool_selection === true;
   const usesJudge = (scenario.assertions || []).some((a) => a.type === JUDGE_ASSERTION_TYPE);
   const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
 
@@ -188,10 +191,15 @@ async function runScenario(scenario, deps) {
 
   let responseText = '';
   let ctas = [];
+  let classifiedTopic = null;
+  let sessionAligned = null;
   let judgeVerdict = null;
   let ranJudge = false;
   let error = null;
   try {
+    if (ranSelector && ranPool) {
+      throw new Error(`scenario "${scenario.id}" sets both run_action_selector and run_pool_selection — pick one path`);
+    }
     responseText = await deps.invokeResponse(prompt, {
       modelId,
       params: { max_tokens: V4_STEP2_INFERENCE_PARAMS.max_tokens, temperature: V4_STEP2_INFERENCE_PARAMS.temperature },
@@ -199,6 +207,16 @@ async function runScenario(scenario, deps) {
     if (ranSelector) {
       // Mirrors index.js: (responseText, priorHistory, config, client).
       ctas = await selectActionsV4(responseText, history, config, deps.bedrockClient);
+    }
+    if (ranPool) {
+      // V4.1 path, mirrors index.js: live topic classification (current input +
+      // history), then the deterministic pool selection with the scenario's
+      // session_context. ctas normalizes to id strings so the ctas_* assertions
+      // work identically on both selector paths.
+      classifiedTopic = await classifyTopic(scenario.user_input, history, config, deps.bedrockClient);
+      const poolResult = selectCTAsFromPool(classifiedTopic, config, scenario.session_context || {});
+      ctas = (poolResult.ctaButtons || []).map((c) => c.id);
+      sessionAligned = poolResult.metadata?.session_aligned ?? null;
     }
     if (usesJudge) {
       if (typeof deps.invokeJudge !== 'function') {
@@ -220,6 +238,9 @@ async function runScenario(scenario, deps) {
     id: scenario.id,
     description: scenario.description || '',
     ranSelector,
+    ranPool,
+    classifiedTopic,
+    sessionAligned,
     ranJudge,
     judgeVerdict,
     prompt_versions: { ...CURRENT_PROMPT_VERSIONS },

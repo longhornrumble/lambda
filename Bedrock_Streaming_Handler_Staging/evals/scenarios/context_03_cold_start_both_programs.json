@@ -1,0 +1,31 @@
+{
+  "id": "context_03_cold_start_both_programs",
+  "description": "V4.1 pool selection, cold-start guard for session alignment (design doc §10 step 1b): a fresh session with NO accumulated topics asking a program-unspecified volunteering question must still see BOTH programs' CTAs — the alignment bias must be inert without a session signal. Locks the boundary so 1b never overreaches into cold-start behavior. fallback_tags include both programs so a null classification also keeps the assertion meaningful.",
+  "run_pool_selection": true,
+  "config": {
+    "tenant_id": "EVAL_CONTEXT",
+    "chat_title": "Helping Hands",
+    "model_id": "global.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "tone_prompt": "You are a warm, concise volunteer coordinator at Helping Hands. Only answer from what you actually know.",
+    "topic_definitions": [
+      { "name": "mentoring_learn", "description": "User wants to learn about the youth mentoring program — what it is, how it works, who it serves, the matching process.", "tags": ["mentoring"] },
+      { "name": "carebox_learn", "description": "User wants to learn about the family care box program — what a care box provides, how families receive support.", "tags": ["care_box"] },
+      { "name": "volunteer_general", "description": "User wants to volunteer or asks about the volunteer process without specifying which program — how to get started, application steps, discovery sessions, difference between programs.", "tags": ["mentoring", "care_box", "volunteer"] }
+    ],
+    "cta_definitions": {
+      "attend_discovery": { "label": "Attend a discovery session", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["mentoring", "volunteer"], "depth_level": "action" } },
+      "volunteer_process_info": { "label": "Learn about the volunteer process", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["mentoring", "care_box", "volunteer"], "depth_level": "info" } },
+      "carebox_info": { "label": "Learn about care boxes", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["care_box", "volunteer"], "depth_level": "info" } },
+      "carebox_contents": { "label": "What's in a care box?", "action": "send_query", "ai_available": true, "selection_metadata": { "topic_tags": ["care_box"], "depth_level": "lateral" } }
+    },
+    "cta_settings": { "fallback_tags": ["volunteer"] }
+  },
+  "kb_context": "Becoming a Helping Hands volunteer: 1) Complete the volunteer application form online. 2) Attend a 30-minute phone interview with our volunteer coordinator. 3) Pass a background check (we cover the cost). 4) Attend one in-person orientation and training session.",
+  "conversation_history": [],
+  "user_input": "How can I get involved as a volunteer?",
+  "session_context": {},
+  "assertions": [
+    { "type": "ctas_include", "value": ["attend_discovery", "carebox_info"] },
+    { "type": "ctas_valid" }
+  ]
+}
