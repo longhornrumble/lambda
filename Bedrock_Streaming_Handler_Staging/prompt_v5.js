@@ -46,7 +46,20 @@ const { SENTINEL_OPEN, SENTINEL_CLOSE } = require('./streamTail');
 //   interest; COHERENCE now demands the action that TAKES a proposed step
 //   (not a learn-more chip next to "ready to take the next step?"). First
 //   contact / idle curiosity still gets no APPLY/VISIT (cta_01 lock).
-const V5_TURN_PROMPT_VERSION = 'v5-turn.v2';
+// v5-turn.v3 (2026-07-05, V5.7 soak round 2): kill the BOT-manufactured menu
+//   loop. Live failure: the model asked a taxonomy question every turn
+//   ("academics, career, or presence?" → "which feels most important?"), the
+//   user answered tersely ("life skills", "understanding money"), and v2's
+//   phrasing-keyed rule discounted those as mere answers — 5 turns, no
+//   advance, no buttons. v3 = (a) rules: terse answers to the bot's own
+//   questions ARE engagement + max-two-exploration-questions budget;
+//   (b) SERVER-COUNTED TURN CHECK block injected after the user message once
+//   the bot has asked >= 2 questions (the model cannot count its own
+//   questions from history — A/B: count-it-yourself 0-6/15, server-counted
+//   15/15), conditioned on the user still engaging (a goodbye/thank-you gets
+//   warmth and NO actions — measured 0/10 pushy after conditioning, 10/10
+//   before).
+const V5_TURN_PROMPT_VERSION = 'v5-turn.v3';
 
 // Like V4_STEP2_INFERENCE_PARAMS but with headroom for the action tail: at
 // max_tokens the tail would be truncated mid-sentinel → malformed → fallback
@@ -84,9 +97,38 @@ ACTION RULES:
 - Choose 0-4 actions. Each action is labeled LEARN, APPLY, VISIT, INFO, or SCHEDULE.
 - RESTRAINT FIRST: only offer an action when it genuinely helps the user take a next step they are reaching for. Most turns need NONE — a normal answer, a thank-you, a clarification, or small talk gets no actions. Never add actions just to fill a menu under every reply.
 - When the user is actively exploring a specific program, one focused, relevant LEARN action can help them go deeper. One well-chosen action beats a list.
-- SUSTAINED INTEREST → ADVANCE: when the user has stayed engaged with ONE specific program across several turns and signals personal fit or readiness ("I think I'd be good at this", "I just want to be there for them"), stop exploring — propose the concrete next step in your reply and attach that step's action. Do not wait for the exact words "sign me up".
+- SUSTAINED INTEREST → ADVANCE: when the user stays engaged with ONE specific program across several turns, stop exploring — propose the concrete next step in your reply (e.g. a discovery session or the application) and attach that step's action. Short answers to YOUR OWN questions ("life skills", "always wanted to be one") ARE engagement — do not discount them, and do not wait for the words "sign me up".
+- DO NOT MANUFACTURE INTAKE: ask at most TWO exploration questions per program in a conversation. After that, every reply must move the user toward the concrete next step — not drill deeper into program details they did not ask about.
 - APPLY/VISIT need real intent: a first question or general curiosity is NOT enough. Explicit commitment ("I want to apply", "I'm ready", "let's donate") or sustained interest (above) is.
 - COHERENCE: the actions must match what your reply just said. If your reply proposes a concrete next step or asks whether they're ready to proceed, attach the action that TAKES that step — not a learn-more action. Never attach an action your reply gives no reason for.`;
+}
+
+/**
+ * The funnel turn-check. Placed AFTER the user message (v5-turn.v3): the
+ * mid-prompt ACTION RULES lose to the conversation prompt's answer-from-KB +
+ * closing-question habits — live soak showed the model happily asking a 5th
+ * taxonomy question while an engaged user gave terse answers.
+ *
+ * The question count is computed SERVER-SIDE (assistant messages ending with
+ * a question mark) and the block is emitted only at/after the threshold — the
+ * model proved unable to count its own questions from history (A/B: a
+ * count-it-yourself block moved the terse-answer shape from 0/15 to only
+ * 6/15). Returns '' below the threshold so early-funnel turns carry no extra
+ * instruction at all.
+ */
+const TURN_CHECK_QUESTION_THRESHOLD = 2;
+
+function countAssistantQuestions(conversationHistory) {
+  return (conversationHistory || []).filter(
+    (m) => m && m.role === 'assistant' && String(m.content || m.text || '').trim().endsWith('?')
+  ).length;
+}
+
+function buildTurnCheckBlock(conversationHistory) {
+  const asked = countAssistantQuestions(conversationHistory);
+  if (asked < TURN_CHECK_QUESTION_THRESHOLD) return '';
+  return `━━━ TURN CHECK ━━━
+You have already asked this user ${asked} questions. If their latest message continues the conversation, do NOT end this reply with another exploration question — answer briefly, then END with one short sentence inviting them to the concrete next step (attending a discovery session or starting the application) and attach that step's action. If they are wrapping up (a goodbye, a thank-you, a sign-off), respond warmly with NO actions.`;
 }
 
 /**
@@ -124,11 +166,13 @@ function buildV5TurnPrompt(userInput, kbContext, tonePrompt, conversationHistory
     throw new Error('buildV5TurnPrompt: USER MESSAGE marker not found in V4 prompt');
   }
 
+  const turnCheck = buildTurnCheckBlock(conversationHistory);
   return (
     base.slice(0, markerAt) +
     catalogBlock +
     '\n\n' +
     base.slice(markerAt) +
+    (turnCheck ? '\n\n' + turnCheck : '') +
     '\n\n' +
     buildActionTailInstruction()
   );
@@ -156,5 +200,6 @@ module.exports = {
   buildV5TurnPrompt,
   buildActionCatalogBlock,
   buildActionTailInstruction,
+  buildTurnCheckBlock,
   validateActionIds,
 };

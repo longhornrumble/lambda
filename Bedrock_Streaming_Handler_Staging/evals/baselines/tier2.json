@@ -3,7 +3,7 @@
     "conversation": "v4-conv.v2",
     "action_selector": "v4-selector.v2",
     "groundedness_judge": "v1",
-    "single_pass": "v5-turn.v2"
+    "single_pass": "v5-turn.v3"
   },
   "scenarios": {
     "context_01_new_topic_followup_no_drift": {
@@ -12,7 +12,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -43,7 +43,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -66,7 +66,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -85,7 +85,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -108,7 +108,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -127,7 +127,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -150,7 +150,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -169,7 +169,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -188,7 +188,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -215,7 +215,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -242,7 +242,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -265,7 +265,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -288,7 +288,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -315,7 +315,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -342,7 +342,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -369,7 +369,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -392,7 +392,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -411,7 +411,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -434,7 +434,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -461,7 +461,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -484,7 +484,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -507,7 +507,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -524,13 +524,40 @@
         }
       ]
     },
+    "v5_funnel_03_menu_loop_advance": {
+      "pass": true,
+      "prompt_versions": {
+        "conversation": "v4-conv.v2",
+        "action_selector": "v4-selector.v2",
+        "groundedness_judge": "v1",
+        "single_pass": "v5-turn.v3"
+      },
+      "assertions": [
+        {
+          "type": "tail_status",
+          "pass": true
+        },
+        {
+          "type": "ctas_include_any",
+          "pass": true
+        },
+        {
+          "type": "response_matches",
+          "pass": true
+        },
+        {
+          "type": "ctas_valid",
+          "pass": true
+        }
+      ]
+    },
     "v5_incident_01_cross_program_lock": {
       "pass": true,
       "prompt_versions": {
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
@@ -553,7 +580,7 @@
         "conversation": "v4-conv.v2",
         "action_selector": "v4-selector.v2",
         "groundedness_judge": "v1",
-        "single_pass": "v5-turn.v2"
+        "single_pass": "v5-turn.v3"
       },
       "assertions": [
         {
