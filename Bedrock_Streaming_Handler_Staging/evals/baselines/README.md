@@ -44,5 +44,11 @@ rule): change the judge wording → bump `GROUNDEDNESS_JUDGE_PROMPT_VERSION` →
 scenarios re-baseline. Judge `UNSURE` verdicts are recorded as `pass: true` (they
 route to human review, they don't fail the run).
 
+The `single_pass` version (`V5_TURN_PROMPT_VERSION` from `prompt_v5.js`, V5.4)
+follows the same name-gated rule: it stales only `run_single_pass` scenarios.
+Baselines captured before V5.4 lack the key entirely — that does NOT stale them
+for classic scenarios (the check is gated on the scenario having run
+single-pass), so adding the constant forced no blanket re-capture.
+
 > **Note:** the 1.4 grounding pack and 1.5 CTA+safety pack commit their baselines
 > here. The CI job that enforces them (path-gated + `workflow_dispatch`) lands in 1.6.

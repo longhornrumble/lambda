@@ -19,6 +19,9 @@ Packs on disk:
   "id": "unique_scenario_id",              // required; keys the baseline
   "description": "what this checks",
   "run_action_selector": true,             // run selectActionsV4 for CTA assertions
+  // Alternatives (mutually exclusive with each other and the above):
+  // "run_pool_selection": true,           // V4.1 topic classification + pool filtering
+  // "run_single_pass": true,              // V5: merged turn prompt + tail parse (below)
   "config": {                              // fixture tenant config (not a live tenant)
     "tenant_id": "EVAL_SMOKE",
     "chat_title": "Helping Hands",
@@ -37,6 +40,19 @@ Packs on disk:
 `conversation_history` is the **prior** turns (mirrors production: the current turn
 is `user_input`, passed separately). `selectActionsV4` receives `(responseText,
 conversation_history, config, client)` exactly as in `index.js`.
+
+## V5 single-pass scenarios (`run_single_pass`)
+
+Sets the runner on the V5 architecture (one call produces prose + actions): the
+prompt is `buildV5TurnPrompt` (`prompt_v5.js`) with `V5_TURN_INFERENCE_PARAMS`,
+and the full response runs through the `streamTail.js` parser. `ctas` = the
+parsed tail ids (`[]` when the tail is missing/malformed — **strict scoring, no
+production fail-soft rescue in the harness**), and the `response_*` /
+`grounded_in_kb` assertions score the STRIPPED prose (the sentinel never reaches
+them). `run_single_pass` is mutually exclusive with `run_action_selector` and
+`run_pool_selection`. Baselines for these scenarios go `stale_baseline` when
+`V5_TURN_PROMPT_VERSION` bumps (or `V4_CONVERSATION_PROMPT_VERSION` — the V5
+prompt splices the V4 conversation prompt).
 
 ## Deterministic assertion types
 

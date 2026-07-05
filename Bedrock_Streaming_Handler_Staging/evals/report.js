@@ -71,6 +71,7 @@ function renderReport(items, meta = {}) {
       }
       if (it.responsePreview) lines.push(`- response: \`${truncate(it.responsePreview, 200)}\``);
       if (Array.isArray(it.ctas)) lines.push(`- ctas: [${it.ctas.join(', ')}]`);
+      if (it.tailStatus) lines.push(`- tail: \`${it.tailStatus}\``);
       lines.push('');
     }
   }
@@ -96,6 +97,7 @@ function versionLine(v = {}) {
   if (v.conversation) parts.push(`conversation \`${v.conversation}\``);
   if (v.action_selector) parts.push(`action_selector \`${v.action_selector}\``);
   if (v.groundedness_judge) parts.push(`groundedness_judge \`${v.groundedness_judge}\``);
+  if (v.single_pass) parts.push(`single_pass \`${v.single_pass}\``);
   return parts.join(', ');
 }
 

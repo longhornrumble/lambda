@@ -38,6 +38,12 @@ const {
   ACTION_SELECTOR_PROMPT_VERSION,
 } = require('../prompt_v4');
 const {
+  buildV5TurnPrompt,
+  V5_TURN_PROMPT_VERSION,
+  V5_TURN_INFERENCE_PARAMS,
+} = require('../prompt_v5');
+const { createTailParser } = require('../streamTail');
+const {
   GROUNDEDNESS_JUDGE_PROMPT_VERSION,
   buildGroundednessJudgePrompt,
   parseJudgeVerdict,
@@ -55,6 +61,7 @@ const CURRENT_PROMPT_VERSIONS = Object.freeze({
   conversation: V4_CONVERSATION_PROMPT_VERSION,
   action_selector: ACTION_SELECTOR_PROMPT_VERSION,
   groundedness_judge: GROUNDEDNESS_JUDGE_PROMPT_VERSION,
+  single_pass: V5_TURN_PROMPT_VERSION,
 });
 
 const DEFAULT_SCENARIOS_DIR = path.join(__dirname, 'scenarios');
@@ -183,27 +190,54 @@ async function runScenario(scenario, deps) {
   const history = scenario.conversation_history || [];
   const ranSelector = scenario.run_action_selector === true;
   const ranPool = scenario.run_pool_selection === true;
+  const ranSinglePass = scenario.run_single_pass === true;
   const usesJudge = (scenario.assertions || []).some((a) => a.type === JUDGE_ASSERTION_TYPE);
   const modelId = config.model_id || config.aws?.model_id || DEFAULT_MODEL_ID;
 
   const tonePrompt = sanitizeTonePromptV4(config.tone_prompt);
-  const prompt = buildV4ConversationPrompt(scenario.user_input, kbContext, tonePrompt, history, config, scenario.session_context || {});
 
   let responseText = '';
   let ctas = [];
   let classifiedTopic = null;
   let sessionAligned = null;
+  let tailStatus = null;
   let judgeVerdict = null;
   let ranJudge = false;
   let error = null;
   try {
-    if (ranSelector && ranPool) {
-      throw new Error(`scenario "${scenario.id}" sets both run_action_selector and run_pool_selection — pick one path`);
+    const pathFlags = [
+      ranSelector && 'run_action_selector',
+      ranPool && 'run_pool_selection',
+      ranSinglePass && 'run_single_pass',
+    ].filter(Boolean);
+    if (pathFlags.length > 1) {
+      throw new Error(`scenario "${scenario.id}" sets ${pathFlags.join(' and ')} — pick one path`);
     }
+    // V5 single-pass scenarios exercise the merged turn prompt (V5.2) with its
+    // own inference params; every other scenario runs the V4 conversation
+    // prompt exactly as production does for V4.x tenants.
+    const prompt = ranSinglePass
+      ? buildV5TurnPrompt(scenario.user_input, kbContext, tonePrompt, history, config, scenario.session_context || {})
+      : buildV4ConversationPrompt(scenario.user_input, kbContext, tonePrompt, history, config, scenario.session_context || {});
+    const inference = ranSinglePass ? V5_TURN_INFERENCE_PARAMS : V4_STEP2_INFERENCE_PARAMS;
     responseText = await deps.invokeResponse(prompt, {
       modelId,
-      params: { max_tokens: V4_STEP2_INFERENCE_PARAMS.max_tokens, temperature: V4_STEP2_INFERENCE_PARAMS.temperature },
+      params: { max_tokens: inference.max_tokens, temperature: inference.temperature },
     });
+    if (ranSinglePass) {
+      // Score STRICTLY on the tail parser's own output. The production
+      // fail-soft ladder (malformed tail → selectActionsV4 rescue, V5.5) is
+      // deliberately NOT run here — rescuing in the harness would mask exactly
+      // the format regressions the single-pass scenarios exist to catch.
+      // responseText becomes the stripped prose (what the widget user sees),
+      // so response_* and grounded_in_kb assertions never see the sentinel.
+      const parser = createTailParser();
+      const forwarded = parser.feed(responseText);
+      const tail = parser.end();
+      responseText = forwarded + tail.remainingText;
+      ctas = tail.actionIds ?? [];
+      tailStatus = tail.status;
+    }
     if (ranSelector) {
       // Mirrors index.js: (responseText, priorHistory, config, client).
       ctas = await selectActionsV4(responseText, history, config, deps.bedrockClient);
@@ -239,6 +273,8 @@ async function runScenario(scenario, deps) {
     description: scenario.description || '',
     ranSelector,
     ranPool,
+    ranSinglePass,
+    tailStatus,
     classifiedTopic,
     sessionAligned,
     ranJudge,
@@ -294,7 +330,11 @@ function compareToBaseline(results, baseline, currentVersions = CURRENT_PROMPT_V
     const selectorChanged = r.ranSelector && bv.action_selector !== currentVersions.action_selector;
     // Only scenarios that actually ran the judge are invalidated by a judge bump.
     const judgeChanged = r.ranJudge && bv.groundedness_judge !== currentVersions.groundedness_judge;
-    if (conversationChanged || selectorChanged || judgeChanged) {
+    // Only single-pass scenarios are invalidated by a V5 turn-prompt bump.
+    // (Name-gated like the others, so pre-V5.4 baselines — which lack the
+    // single_pass key — never go stale for scenarios that didn't run it.)
+    const singlePassChanged = r.ranSinglePass && bv.single_pass !== currentVersions.single_pass;
+    if (conversationChanged || selectorChanged || judgeChanged || singlePassChanged) {
       return item(r, 'stale_baseline', base.pass, 'prompt version changed — baseline no longer valid, re-baseline deliberately');
     }
     if (r.pass && !base.pass) return item(r, 'fixed', base.pass, 'now passing — update baseline to lock it in');
@@ -313,6 +353,8 @@ function buildReportItem(r) {
     id: r.id,
     description: r.description,
     ranSelector: r.ranSelector,
+    ranSinglePass: r.ranSinglePass,
+    tailStatus: r.tailStatus,
     ranJudge: r.ranJudge,
     judgeVerdict: r.judgeVerdict,
     prompt_versions: r.prompt_versions,
