@@ -20,6 +20,7 @@ module.exports = {
     'index.js',
     'clerk_helper.js',
     'prompt_v4.js',
+    'prompt_v5.js',
     'streamTail.js',
     '!node_modules/**',
     '!coverage/**',
@@ -59,6 +60,14 @@ module.exports = {
     // every boundary path. Ratchet just below the measured floor per this
     // config's convention.
     './streamTail.js': {
+      branches: 95,
+      functions: 95,
+      lines: 95,
+      statements: 95,
+    },
+    // prompt_v5.js: V5.2 single-pass prompt composer — small module, fully
+    // exercised by __tests__/prompt_v5.test.js.
+    './prompt_v5.js': {
       branches: 95,
       functions: 95,
       lines: 95,
