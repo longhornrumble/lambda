@@ -29,6 +29,7 @@ import {
 } from './mergeStrategy.mjs';
 
 import { authenticateRequest } from './auth.mjs';
+import { dispatchPromoteWorkflow } from './promoteDispatch.mjs';
 
 /**
  * Authentication enforcement flag
@@ -126,6 +127,29 @@ export const handler = async (event) => {
       }
     } else {
       console.log(`Authenticated user: ${auth.email} (role: ${auth.role}, tenants: ${auth.tenants?.join(', ')})`);
+    }
+
+    // POST /config/:id/promote - Dispatch the gated staging→prod promotion workflow.
+    // Staging can't write prod stores (account isolation); this only fires the
+    // gated GitHub workflow, which does the prod copy via OIDC. The Config
+    // Builder confirm dialog is the deliberate gate (solo-operator model).
+    const promoteMatch = path.match(/^\/config\/([^/]+)\/promote$/);
+    if (httpMethod === 'POST' && promoteMatch) {
+      const tenantId = promoteMatch[1];
+      const invalid = validateTenantId(tenantId, headers);
+      if (invalid) return invalid;
+      try {
+        const result = await dispatchPromoteWorkflow(tenantId);
+        console.log(`Promotion dispatched for ${tenantId} by ${auth.email || 'unknown'}`);
+        return { statusCode: 202, headers, body: JSON.stringify(result) };
+      } catch (err) {
+        console.error(`Promotion dispatch failed for ${tenantId}:`, err.message);
+        return {
+          statusCode: err.statusCode || 500,
+          headers,
+          body: JSON.stringify({ error: 'Promotion Failed', message: err.message }),
+        };
+      }
     }
 
     // POST /config - Create new tenant configuration
