@@ -29,7 +29,7 @@ import {
 } from './mergeStrategy.mjs';
 
 import { authenticateRequest } from './auth.mjs';
-import { dispatchPromoteWorkflow } from './promoteDispatch.mjs';
+import { dispatchPromoteWorkflow, getPromoteStatus } from './promoteDispatch.mjs';
 
 /**
  * Authentication enforcement flag
@@ -148,6 +148,25 @@ export const handler = async (event) => {
           statusCode: err.statusCode || 500,
           headers,
           body: JSON.stringify({ error: 'Promotion Failed', message: err.message }),
+        };
+      }
+    }
+
+    // GET /config/:id/promote/status?after=<baseline> - poll the promote run's
+    // outcome so the Config Builder can show Promoting -> success/failure.
+    const promoteStatusMatch = path.match(/^\/config\/([^/]+)\/promote\/status$/);
+    if (httpMethod === 'GET' && promoteStatusMatch) {
+      const tenantId = promoteStatusMatch[1];
+      const invalid = validateTenantId(tenantId, headers);
+      if (invalid) return invalid;
+      try {
+        const result = await getPromoteStatus(queryStringParameters?.after);
+        return { statusCode: 200, headers, body: JSON.stringify(result) };
+      } catch (err) {
+        return {
+          statusCode: err.statusCode || 500,
+          headers,
+          body: JSON.stringify({ error: 'Status Check Failed', message: err.message }),
         };
       }
     }
