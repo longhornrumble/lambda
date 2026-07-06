@@ -55,6 +55,10 @@ async function getBooking(tenantId, bookingId, { client = ddb } = {}) {
     tenant_id: str(it.tenantId) ?? tenantId,
     booking_id: str(it.booking_id) ?? bookingId,
     status: str(it.status),
+    // attendance_state: written by the §E4 attendance/disposition path (Attendance_
+    // Disposition_Handler), NOT the C8 commit writer. The disposition cycle reads it back
+    // after attendance_check + after the terminal disposition. Absent → null (schema discipline).
+    attendance_state: str(it.attendance_state),
     start_at: str(it.start_at),
     end_at: str(it.end_at),
     timezone: str(it.timezone),

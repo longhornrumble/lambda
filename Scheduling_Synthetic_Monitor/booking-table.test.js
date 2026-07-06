@@ -22,6 +22,7 @@ describe('booking-table.getBooking', () => {
         tenantId: { S: 'TEN-SYNTH' },
         booking_id: { S: 'booking#1' },
         status: { S: 'booked' },
+        attendance_state: { S: 'pending_attendance' },
         coordinator_email: { S: 'c@x.org' },
         external_event_id: { S: 'evt1' },
         created_at: { S: '2026-07-01T00:00:00Z' },
@@ -35,6 +36,9 @@ describe('booking-table.getBooking', () => {
       tenant_id: 'TEN-SYNTH',
       booking_id: 'booking#1',
       status: 'booked',
+      // §E4 attendance field — the disposition cycle asserts on this; regression guard
+      // for the read-back gap that shipped the disposition cycle unable to pass live.
+      attendance_state: 'pending_attendance',
       coordinator_email: 'c@x.org',
       external_event_id: 'evt1',
       is_synthetic: true,
