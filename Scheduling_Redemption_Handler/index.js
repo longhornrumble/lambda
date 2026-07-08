@@ -196,7 +196,9 @@ function page(statusCode, title, body) {
       'cache-control': 'no-store',
       // Thin static page — no Picasso widget, no external scripts (§13.9).
       'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'",
-      referrer: 'no-referrer',
+      // SR-6: the header key is `Referrer-Policy`, not `referrer` — a `referrer`
+      // key is ignored by browsers, leaving the intended suppression inert.
+      'referrer-policy': 'no-referrer',
     },
     body:
       '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
@@ -212,7 +214,10 @@ function page(statusCode, title, body) {
 function redirect(location) {
   return {
     statusCode: 302,
-    headers: { location, 'cache-control': 'no-store' },
+    // SR-6: the 302 success target carries the one-time token in its query
+    // string; `Referrer-Policy: no-referrer` prevents it leaking via `Referer`
+    // on the subsequent navigation (defense-in-depth atop the browser default).
+    headers: { location, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer' },
     body: '',
   };
 }
