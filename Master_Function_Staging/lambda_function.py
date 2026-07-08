@@ -1512,88 +1512,6 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
     
     return add_cors_headers(response, event)
 
-def handle_generate_stream_token(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
-    """
-    Generate JWT token specifically for streaming operations.
-    Separate from init_session to maintain single responsibility principle.
-    Streaming tokens have purpose='stream' while conversation tokens have no purpose field.
-    """
-    logger.info(f"Generate stream token for tenant: {tenant_hash[:8] if tenant_hash else 'unknown'}...")
-    
-    try:
-        import time
-        import jwt
-        import boto3
-        import uuid
-        from botocore.exceptions import ClientError
-        
-        # Parse request body if it exists
-        body = json.loads(event.get('body', '{}')) if event.get('body') else {}
-        
-        # Use existing session_id if provided, otherwise generate new one
-        session_id = body.get('session_id', '')
-        if not session_id:
-            # Generate session ID same way as init_session fallback
-            session_id = f'session_{uuid.uuid4().hex[:16]}'
-            logger.info(f"Generated new session ID for streaming: {session_id[:16]}...")
-        else:
-            logger.info(f"Using existing session ID for streaming: {session_id[:16]}...")
-        
-        # For streaming, tenant_hash is the tenant_id
-        tenant_id = tenant_hash
-        
-        # Get JWT signing key using secure helper function
-        jwt_signing_key = get_jwt_signing_key()
-        
-        # Generate streaming-specific JWT token
-        # CRITICAL: Must include 'purpose': 'stream' for streaming handler validation
-        stream_token_payload = {
-            'iss': 'myrecruiter-chat',     # P0a Phase 1 (2026-05-02): claim distinguishes chat-class tokens (state + stream) from scheduling tokens; required by Phase 2 decoder hardening
-            'sessionId': session_id,      # camelCase required by streaming handler
-            'tenantId': tenant_id,         # camelCase required by streaming handler
-            'purpose': 'stream',           # REQUIRED for streaming authentication
-            'iat': int(time.time()),       # JWT standard: issued at
-            'exp': int(time.time()) + 3600 # JWT standard: expires in 1 hour for streaming
-        }
-        
-        # Create JWT token signed with HS256
-        stream_token = jwt.encode(stream_token_payload, jwt_signing_key, algorithm='HS256')
-        
-        # Prepare response with all necessary information
-        response_data = {
-            'stream_token': stream_token,
-            'session_id': session_id,
-            'tenant_hash': tenant_hash,
-            'tenant_id': tenant_id,
-            'expires_in': 3600,
-            # STREAMING_ENDPOINT env var is required (Phase 4 EC-P4-4).
-            # KeyError fail-loud if missing — prevents silently routing to
-            # the prior prod-account BSH URL that was previously hardcoded
-            # as the fallback (cross-account leakage risk).
-            'streaming_endpoint': os.environ['STREAMING_ENDPOINT'],
-            'purpose': 'stream',
-            'timestamp': datetime.utcnow().isoformat() + 'Z'
-        }
-        
-        logger.info(f"Stream token generated successfully for session {session_id[:16]}...")
-        
-        response = {
-            'statusCode': 200,
-            'body': json.dumps(response_data)
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to generate stream token: {str(e)}", exc_info=True)
-        response = {
-            'statusCode': 500,
-            'body': json.dumps({
-                'error': 'Internal Server Error',
-                'message': 'Failed to generate stream token'
-            })
-        }
-    
-    return add_cors_headers(response, event)
-
 def get_cache_status(event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Get cache status information
@@ -1763,8 +1681,6 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             return handle_init_session(event, tenant_hash)
         elif action == 'form_submission':
             return handle_form_submission(event, tenant_hash, getattr(context, 'aws_request_id', None))
-        elif action == 'generate_stream_token':
-            return handle_generate_stream_token(event, tenant_hash)
         elif action == 'cache_status':
             return get_cache_status(event)
         elif action == 'clear_cache':
@@ -1782,7 +1698,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'body': json.dumps({
                     'error': 'Not Found',
                     'message': f'Action {action} not found',
-                    'available_actions': ['health_check', 'get_config', 'chat', 'conversation', 'init_session', 'generate_stream_token', 'cache_status', 'clear_cache', 'warm_cache']
+                    'available_actions': ['health_check', 'get_config', 'chat', 'conversation', 'init_session', 'cache_status', 'clear_cache', 'warm_cache']
                 })
             }
             return add_cors_headers(response, event)
