@@ -1316,7 +1316,86 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
         # IMPORTANT: For public endpoints, we use tenant_hash as tenant_id
         # The conversation handler expects tenantId field
         tenant_id = tenant_hash
-        
+
+        # ===== C1 P1 (compat-open) - ownership-proven resume ==================
+        # SECURITY_REVIEW_2026-07-02 §C1: resuming a conversation must PROVE
+        # ownership of the session, not just present a raw (guessable/leakable)
+        # session_id. The proof is the previously issued signed state token, which
+        # only the original client received. If a token is presented we authenticate
+        # off it here; if none is presented we fall through to the legacy raw-
+        # session_id path below (still accepted during the rollout window,
+        # instrumented, and removed in P3 once widgets present the token).
+        _hdrs = event.get('headers', {}) or {}
+        _auth = (_hdrs.get('Authorization') or _hdrs.get('authorization') or
+                 _hdrs.get('X-Authorization') or _hdrs.get('x-authorization') or '')
+        presented_token = _auth[7:] if _auth.startswith('Bearer ') else (body.get('state_token') or '')
+        if presented_token:
+            jwt_signing_key = get_jwt_signing_key()
+            try:
+                claims = jwt.decode(
+                    presented_token,
+                    jwt_signing_key,
+                    algorithms=['HS256'],
+                    options={"require": ["iss", "iat", "exp"]},
+                    issuer='myrecruiter-chat',
+                )
+            except jwt.ExpiredSignatureError:
+                logger.info("C1_RESUME_TOKEN_EXPIRED - rejecting init resume; client re-inits new")
+                return add_cors_headers({'statusCode': 401, 'body': json.dumps(
+                    {'error': 'TOKEN_EXPIRED', 'message': 'State token has expired'})}, event)
+            except jwt.InvalidTokenError as decode_err:
+                logger.warning(f"C1_RESUME_TOKEN_INVALID - {decode_err}")
+                return add_cors_headers({'statusCode': 401, 'body': json.dumps(
+                    {'error': 'TOKEN_INVALID', 'message': 'Invalid state token'})}, event)
+
+            token_session_id = claims.get('sessionId')
+            # Bind the token to THIS tenant hash: a token minted for tenant A must
+            # not resume against tenant B (defense-in-depth; same guard as the
+            # conversation handler's tenantId/`t` cross-check).
+            if not token_session_id or claims.get('tenantId') != tenant_hash:
+                logger.warning("C1_RESUME_TENANT_MISMATCH - token tenantId != request tenant hash")
+                return add_cors_headers({'statusCode': 401, 'body': json.dumps(
+                    {'error': 'TENANT_MISMATCH', 'message': 'Token does not match tenant'})}, event)
+
+            # Authenticated resume: load the owned conversation, rotate the token.
+            resume_turn = 0
+            resume_has_history = False
+            try:
+                from conversation_handler import _get_conversation_from_db
+                resume_result = _get_conversation_from_db(token_session_id, tenant_hash)
+                if resume_result and resume_result.get('Item'):
+                    resume_item = resume_result['Item']
+                    resume_turn = int(resume_item.get('turn', {}).get('N', 0))
+                    resume_has_history = 'messages' in resume_item
+            except Exception as resume_db_err:
+                logger.debug(f"Authenticated-resume DB read failed (non-fatal): {resume_db_err}")
+
+            rotated_token = jwt.encode({
+                'iss': 'myrecruiter-chat',
+                'sessionId': token_session_id,
+                'tenantId': tenant_hash,
+                'turn': resume_turn,
+                'iat': int(time.time()),
+                'exp': int(time.time()) + (24 * 3600),
+            }, jwt_signing_key, algorithm='HS256')
+
+            resume_response = {
+                'session_id': token_session_id,
+                'state_token': rotated_token,
+                'turn': resume_turn,
+                'tenant_hash': tenant_hash,
+                'tenant_id': tenant_id,
+                'existing': resume_has_history,
+                'authenticated_resume': True,
+                'initialized': True,
+                'config': {'timeout': 86400, 'max_messages': 100},
+            }
+            if resume_has_history:
+                resume_response['conversation'] = {'turn': resume_turn, 'hasHistory': True}
+            logger.info(f"C1_AUTHENTICATED_RESUME session={token_session_id[:16]}... turn={resume_turn}")
+            return add_cors_headers({'statusCode': 200, 'body': json.dumps(resume_response)}, event)
+        # ===== end C1 P1 authenticated resume ================================
+
         # SURGICAL FIX: Check for existing conversation before creating new
         existing_conversation = None
         if client_session_id and client_session_id.startswith('session_'):
@@ -1342,6 +1421,14 @@ def handle_init_session(event: Dict[str, Any], tenant_hash: str) -> Dict[str, An
         
         # If we found existing conversation, return it (ADDITIVE PATH)
         if existing_conversation:
+            # C1 P1: this is the LEGACY raw-session_id resume (no ownership token was
+            # presented). Kept working during the rollout window; this counter lets us
+            # confirm widgets have migrated before P3 removes the path (grep the metric
+            # name in CloudWatch Logs Insights). See SECURITY_REVIEW_2026-07-02 §C1.
+            logger.warning(
+                f"C1_COMPAT_RAW_SESSION_RESUME session={client_session_id[:16]}... "
+                f"- raw session_id resume without ownership token (legacy; removed in P3)"
+            )
             try:
                 existing_turn = int(existing_conversation.get('turn', {}).get('N', 0))
                 
