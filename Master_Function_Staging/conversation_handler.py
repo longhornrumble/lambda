@@ -431,7 +431,20 @@ def _validate_state_token(event):
         for field in required_fields:
             if field not in payload:
                 raise ConversationError("TOKEN_INVALID", f"Missing required field: {field}", 401)
-        
+
+        # C1 P1 (SECURITY_REVIEW_2026-07-02): cross-tenant token-replay guard.
+        # The token's tenantId claim must match the tenant hash the caller presents
+        # in the `t` query param (extracted at the router, :110, but never compared
+        # before this). Without it, a token minted for one tenant hash could be
+        # replayed against another tenant's `t`. `t` absent -> no comparison (the
+        # operation still authorizes off the token's tenantId as before).
+        query_tenant = (event.get("queryStringParameters") or {}).get("t")
+        if query_tenant and query_tenant != payload['tenantId']:
+            logger.warning(
+                f"🚫 Tenant mismatch: token tenantId {payload['tenantId'][:8]}... != query t {query_tenant[:8]}..."
+            )
+            raise ConversationError("TENANT_MISMATCH", "Token does not match tenant", 401)
+
         logger.info(f"[{payload['tenantId'][:8]}...] ✅ Valid state token for turn {payload['turn']} (blacklist checked)")
         return payload
         
