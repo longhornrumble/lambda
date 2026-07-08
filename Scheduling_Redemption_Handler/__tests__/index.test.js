@@ -433,6 +433,27 @@ describe('interviewer attendance disposition (E6 — WS-E-ATTEND wires the actio
   });
 });
 
+describe('SR-6: Referrer-Policy header (correct key on pages + on the 302)', () => {
+  test('failure page sets Referrer-Policy: no-referrer and drops the ignored `referrer` key', async () => {
+    const res = await handler(evt('/cancel', 'not-a-real-token'));
+    expect(res.statusCode).toBe(400); // page() path
+    expect(res.headers['referrer-policy']).toBe('no-referrer');
+    // the old misspelled key (silently ignored by browsers) must be gone
+    expect(res.headers).not.toHaveProperty('referrer');
+  });
+
+  test('302 success redirect also carries Referrer-Policy: no-referrer', async () => {
+    const t = await tokens.sign(
+      'cancel',
+      { tenant_id: TENANT, booking_id: BOOKING, start_at: FAR_FUTURE_START },
+      { signingKey: KEY }
+    );
+    const res = await handler(evt('/cancel', t));
+    expect(res.statusCode).toBe(302); // redirect() path — carries the one-time token in the URL
+    expect(res.headers['referrer-policy']).toBe('no-referrer');
+  });
+});
+
 describe('§13.9 failure-mode HTTP contract', () => {
   test('tampered token → 400 generic (no detail leak)', async () => {
     const res = await handler(evt('/cancel', 'not-a-real-token'));
