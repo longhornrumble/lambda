@@ -20,7 +20,9 @@ const s3Mock = mockClient(S3Client);
 const {
   enhanceResponse,
   loadTenantConfig,
-  detectConversationBranch
+  detectConversationBranch,
+  evictOldestConfigEntries,
+  MAX_CONFIG_CACHE_SIZE
 } = require('../response_enhancer');
 
 // Test fixtures
@@ -1575,5 +1577,51 @@ describe('Context-Based CTA Styling - Integration Tests', () => {
       expect(cta.label || cta.text).toBeDefined();
       expect(cta.action).toBeDefined();
     });
+  });
+});
+
+// CS3: the tenant-config cache had no eviction — a long-lived Lambda instance
+// serving many tenants grew it unbounded (expired entries were ignored on read
+// but never deleted). evictOldestConfigEntries caps it, oldest-first.
+describe('CS3 — config cache eviction', () => {
+  test('trims to max size, removing the oldest entries by timestamp', () => {
+    const cache = {};
+    const total = MAX_CONFIG_CACHE_SIZE + 15;
+    for (let i = 0; i < total; i++) {
+      cache[`config_tenant_${i}`] = { data: {}, timestamp: 1000 + i }; // ascending age
+    }
+
+    evictOldestConfigEntries(cache);
+
+    expect(Object.keys(cache).length).toBe(MAX_CONFIG_CACHE_SIZE);
+    // The 15 oldest (lowest timestamps) are gone; the newest survive.
+    expect(cache['config_tenant_0']).toBeUndefined();
+    expect(cache['config_tenant_14']).toBeUndefined();
+    expect(cache['config_tenant_15']).toBeDefined();
+    expect(cache[`config_tenant_${total - 1}`]).toBeDefined();
+  });
+
+  test('is a no-op while at or under the cap', () => {
+    const cache = {};
+    for (let i = 0; i < MAX_CONFIG_CACHE_SIZE; i++) {
+      cache[`config_tenant_${i}`] = { data: {}, timestamp: 1000 + i };
+    }
+
+    evictOldestConfigEntries(cache);
+
+    expect(Object.keys(cache).length).toBe(MAX_CONFIG_CACHE_SIZE);
+    expect(cache['config_tenant_0']).toBeDefined();
+  });
+
+  test('honors an explicit smaller maxSize argument', () => {
+    const cache = {
+      a: { data: {}, timestamp: 3 },
+      b: { data: {}, timestamp: 1 },
+      c: { data: {}, timestamp: 2 },
+    };
+
+    evictOldestConfigEntries(cache, 1);
+
+    expect(Object.keys(cache)).toEqual(['a']); // only the newest (timestamp 3) remains
   });
 });
