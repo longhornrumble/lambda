@@ -8,6 +8,7 @@ const {
   formatAddressText,
   filterSensitiveFields,
   findFirstMatch,
+  isSecondaryPersonField,
   isSensitiveField,
   truncateText,
   getSchemaVersion,
@@ -17,6 +18,7 @@ const {
   EMAIL_KEYS,
   PHONE_KEYS,
   COMMENTS_KEYS,
+  SECONDARY_PERSON_MARKERS,
   SENSITIVE_FIELD_PATTERNS,
   COMMENTS_MAX_LENGTH,
   SCHEMA_VERSION
@@ -472,6 +474,142 @@ describe('Contact Extractor', () => {
       expect(SENSITIVE_FIELD_PATTERNS).toContain('ssn');
       expect(SENSITIVE_FIELD_PATTERNS).toContain('dob');
       expect(SENSITIVE_FIELD_PATTERNS).toContain('password');
+    });
+  });
+
+  // FS3: the email/phone fallbacks used to greedily take the first matching
+  // field in object order, so a reference/emergency-contact field could win
+  // over the applicant's own — sending their confirmation, or storing their
+  // contact record, against the wrong person.
+  describe('isSecondaryPersonField (FS3 marker)', () => {
+    test('flags reference/emergency fields (underscore, space, hyphen)', () => {
+      expect(isSecondaryPersonField('reference_email')).toBe(true);
+      expect(isSecondaryPersonField('Reference Email')).toBe(true);
+      expect(isSecondaryPersonField('Emergency Contact Phone')).toBe(true);
+      expect(isSecondaryPersonField('emergency-phone')).toBe(true);
+      expect(isSecondaryPersonField('references_phone')).toBe(true); // plural prefix
+    });
+
+    test('does NOT flag applicant fields that merely share letters', () => {
+      // "preference" contains the substring "reference" but is its own token
+      expect(isSecondaryPersonField('email_preference')).toBe(false);
+      expect(isSecondaryPersonField('communication_preference')).toBe(false);
+    });
+
+    test('does NOT flag ambiguous markers that are commonly the applicant', () => {
+      expect(isSecondaryPersonField('contact_email')).toBe(false);
+      expect(isSecondaryPersonField('caregivers_phone_number')).toBe(false);
+      expect(isSecondaryPersonField('parent_email')).toBe(false);
+      expect(isSecondaryPersonField('guardian_phone')).toBe(false);
+      expect(isSecondaryPersonField('spouse_email')).toBe(false);
+    });
+
+    test('handles empty / nullish keys', () => {
+      expect(isSecondaryPersonField('')).toBe(false);
+      expect(isSecondaryPersonField(null)).toBe(false);
+      expect(isSecondaryPersonField(undefined)).toBe(false);
+    });
+
+    test('marker set is deliberately tight (reference + emergency only)', () => {
+      expect(SECONDARY_PERSON_MARKERS).toEqual(['reference', 'emergency']);
+    });
+  });
+
+  describe('extractCanonicalContact - FS3 applicant vs secondary contact', () => {
+    test('applicant email wins over a reference email even when reference comes first', () => {
+      const formData = {
+        first_name: 'Jane',
+        'Reference Email': 'reference@example.com',
+        'Your Email': 'jane@example.com'
+      };
+
+      const result = extractCanonicalContact(formData);
+
+      expect(result.contact.email).toBe('jane@example.com');
+    });
+
+    test('applicant phone wins over an emergency-contact phone even when emergency comes first', () => {
+      const formData = {
+        first_name: 'Jane',
+        'Emergency Contact Phone': '555-000-0000',
+        'Your Phone': '555-111-1111'
+      };
+
+      const result = extractCanonicalContact(formData);
+
+      expect(result.contact.phone).toBe('555-111-1111');
+    });
+
+    test('email resolves to null when ONLY a secondary-person email exists', () => {
+      // Better a missing confirmation than the applicant's PII sent to a reference.
+      const formData = {
+        first_name: 'Jane',
+        'Reference Email': 'reference@example.com'
+      };
+
+      const result = extractCanonicalContact(formData);
+
+      expect(result.contact.email).toBeNull();
+    });
+
+    test('phone resolves to null when ONLY a secondary-person phone exists', () => {
+      const formData = {
+        first_name: 'Jane',
+        'Emergency Phone': '555-000-0000'
+      };
+
+      const result = extractCanonicalContact(formData);
+
+      expect(result.contact.phone).toBeNull();
+    });
+
+    test('ambiguous applicant fields (contact/caregiver/parent) still extract via fallback', () => {
+      // Non-standard labels that miss the exact key list but ARE the applicant.
+      const formData = {
+        'Contact Email Address': 'me@example.com',
+        'Caregiver Cell': '555-222-3333'
+      };
+
+      const result = extractCanonicalContact(formData);
+
+      expect(result.contact.email).toBe('me@example.com');
+      expect(result.contact.phone).toBe('555-222-3333');
+    });
+
+    test('exact applicant key still wins immediately over a reference (no regression)', () => {
+      const formData = {
+        email: 'jane@example.com',
+        phone: '555-111-1111',
+        'Reference Email': 'reference@example.com',
+        'Emergency Phone': '555-000-0000'
+      };
+
+      const result = extractCanonicalContact(formData);
+
+      expect(result.contact.email).toBe('jane@example.com');
+      expect(result.contact.phone).toBe('555-111-1111');
+    });
+
+    test('realistic mixed form: applicant contact never resolves to the reference block', () => {
+      // Secondary block deliberately listed FIRST (a form builder can place the
+      // emergency/reference fields ahead of the applicant's), and the
+      // applicant's email/phone use non-standard labels so both go through the
+      // greedy fallback — the exact scenario FS3 fixes.
+      const formData = {
+        'Reference Email': 'bob.ref@example.com',
+        'Reference Phone': '555-999-9999',
+        emergency_contact_email: 'ec@example.com',
+        applicant_first_name: 'Jane',
+        applicant_last_name: 'Doe',
+        'Preferred Email': 'jane.doe@example.com',
+        'Daytime Phone Number': '555-111-1111'
+      };
+
+      const result = extractCanonicalContact(formData);
+
+      expect(result.contact.first_name).toBe('Jane');
+      expect(result.contact.email).toBe('jane.doe@example.com');
+      expect(result.contact.phone).toBe('555-111-1111');
     });
   });
 });
