@@ -660,7 +660,7 @@ describe('Form Handler - Phase 2: Advanced Fulfillment Routing', () => {
       tenant_id: 'TEST123',
       priority: 'high'
     });
-    expect(payload.submission_id).toMatch(/^request_support_\d+$/);
+    expect(payload.submission_id).toMatch(/^request_support_\d+_[0-9a-f]{8}$/);
   });
 
   it('should store form data in S3 with correct key format', async () => {
@@ -672,7 +672,7 @@ describe('Form Handler - Phase 2: Advanced Fulfillment Routing', () => {
     const putCall = s3Mock.commandCalls(PutObjectCommand)[0];
     expect(putCall.args[0].input).toMatchObject({
       Bucket: 'test-forms-bucket',
-      Key: expect.stringMatching(/^submissions\/TEST123\/newsletter\/newsletter_\d+\.json$/),
+      Key: expect.stringMatching(/^submissions\/TEST123\/newsletter\/newsletter_\d+_[0-9a-f]{8}\.json$/),
       Body: JSON.stringify(mockFormData),
       ContentType: 'application/json'
     });
@@ -702,10 +702,10 @@ describe('Form Handler - Phase 2: Advanced Fulfillment Routing', () => {
     expect(updateInput.Key).toMatchObject({
       tenant_id: 'TEST123',
     });
-    expect(updateInput.Key.submission_id).toMatch(/^newsletter_\d+$/);
+    expect(updateInput.Key.submission_id).toMatch(/^newsletter_\d+_[0-9a-f]{8}$/);
     expect(updateInput.UpdateExpression).toBe('SET fulfillment_path = :fp');
     expect(updateInput.ExpressionAttributeValues[':fp']).toMatch(
-      /^s3:\/\/test-forms-bucket\/submissions\/TEST123\/newsletter\/newsletter_\d+\.json$/
+      /^s3:\/\/test-forms-bucket\/submissions\/TEST123\/newsletter\/newsletter_\d+_[0-9a-f]{8}\.json$/
     );
 
     // Form submit still succeeds
@@ -1123,7 +1123,7 @@ describe('Form Handler - Integration', () => {
       status: 'success',
       priority: 'high'
     });
-    expect(result.submissionId).toMatch(/^volunteer_apply_\d+$/);
+    expect(result.submissionId).toMatch(/^volunteer_apply_\d+_[0-9a-f]{8}$/);
     expect(result.fulfillment).toHaveLength(3);
   });
 
@@ -2068,5 +2068,69 @@ describe('Form Handler - SMS consent record TTL (WS-E-TCPA, FROZEN_CONTRACTS §E
     // The new ttl field: now + 4yr+30d (bounded by the call window, no Date mocking).
     expect(consentPut.Item.ttl).toBeGreaterThanOrEqual(before + FOUR_YEARS_30_DAYS);
     expect(consentPut.Item.ttl).toBeLessThanOrEqual(after + FOUR_YEARS_30_DAYS);
+  });
+});
+
+describe('Form Handler - submission integrity (FS1 truthful outcome, FS2 unique id)', () => {
+  // A form with no fulfillment channels and no internal notifications, so
+  // routeFulfillment returns [] (nothing delivered) — used to isolate the
+  // DB-persistence branch of the truthful-outcome guard.
+  const noFulfillmentConfig = {
+    tenant_id: 'TEST123',
+    chat_title: 'Test Org',
+    conversational_forms: {
+      barebones: { form_id: 'barebones', title: 'Barebones Form' },
+    },
+  };
+
+  beforeEach(() => {
+    sesMock.reset();
+    snsMock.reset();
+    dynamoMock.reset();
+    lambdaMock.reset();
+    s3Mock.reset();
+    dynamoMock.on(GetCommand).resolves({});
+  });
+
+  it('FS1: returns form_error (not success) when the DB write fails AND no channel delivers', async () => {
+    dynamoMock.on(PutCommand).rejects(new Error('ddb unavailable'));
+
+    const result = await submitForm('barebones', mockFormData, noFulfillmentConfig);
+
+    expect(result.type).toBe('form_error');
+    expect(result.status).toBe('error');
+    // The visitor must NOT receive a confirmation implying we got their submission.
+    expect(sesMock.commandCalls(SendEmailCommand)).toHaveLength(0);
+  });
+
+  it('FS1: reports success when the DB write succeeds even with no fulfillment channel', async () => {
+    dynamoMock.on(PutCommand).resolves({});
+
+    const result = await submitForm('barebones', mockFormData, noFulfillmentConfig);
+
+    expect(result.type).toBe('form_complete');
+    expect(result.status).toBe('success');
+  });
+
+  it('FS1: reports success when the DB write fails but a fulfillment channel delivers', async () => {
+    // newsletter form uses S3 fulfillment; let the S3 store succeed while the DB write fails.
+    dynamoMock.on(PutCommand).rejects(new Error('ddb unavailable'));
+    s3Mock.on(PutObjectCommand).resolves({});
+
+    const result = await submitForm('newsletter', mockFormData, mockTenantConfig);
+
+    expect(result.type).toBe('form_complete');
+    expect(result.status).toBe('success');
+  });
+
+  it('FS2: generates a unique submission_id with a random suffix on each call', async () => {
+    dynamoMock.on(PutCommand).resolves({});
+    s3Mock.on(PutObjectCommand).resolves({});
+
+    const r1 = await submitForm('newsletter', mockFormData, mockTenantConfig);
+    const r2 = await submitForm('newsletter', mockFormData, mockTenantConfig);
+
+    expect(r1.submissionId).toMatch(/^newsletter_\d+_[0-9a-f]{8}$/);
+    expect(r1.submissionId).not.toBe(r2.submissionId);
   });
 });
