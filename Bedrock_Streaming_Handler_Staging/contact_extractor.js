@@ -157,6 +157,22 @@ const SENSITIVE_FIELD_PATTERNS = [
 ];
 
 /**
+ * Field-key markers that identify a DIFFERENT person than the applicant — a
+ * professional/personal reference or an emergency contact. Contact info in
+ * these fields must never resolve to the applicant's own email/phone (FS3):
+ * doing so would send the applicant's confirmation email/SMS, or store their
+ * contact record, against the wrong person.
+ *
+ * Only UNAMBIGUOUS "not the applicant" markers belong here. Deliberately
+ * EXCLUDED because they commonly ARE the applicant on this platform's forms:
+ *   - "contact"   → contact_email is a primary applicant EMAIL_KEY
+ *   - "caregiver" → caregivers_phone_number is a primary applicant PHONE_KEY
+ *   - "parent" / "guardian" / "spouse" / "partner" → often the applicant or a
+ *     co-applicant (foster/volunteer context), not a third party.
+ */
+const SECONDARY_PERSON_MARKERS = ['reference', 'emergency'];
+
+/**
  * Maximum length for comments field before truncation
  */
 const COMMENTS_MAX_LENGTH = 500;
@@ -205,7 +221,9 @@ function findFirstMatch(formData, keyList) {
 }
 
 /**
- * Find the first matching value using partial key matching (contains)
+ * Find the first matching value using partial key matching (contains).
+ * Fields belonging to a secondary person (reference/emergency contact) are
+ * skipped so the applicant's phone never resolves to someone else's (FS3).
  *
  * @param {Object} formData - Parsed form data object
  * @param {string[]} patterns - Patterns to search for in keys
@@ -218,6 +236,9 @@ function findFirstMatchPartial(formData, patterns) {
 
   for (const pattern of patterns) {
     for (const [key, value] of Object.entries(formData)) {
+      if (isSecondaryPersonField(key)) {
+        continue;
+      }
       if (key.toLowerCase().includes(pattern.toLowerCase())) {
         if (value !== null && value !== undefined && value !== '') {
           return String(value).trim();
@@ -227,6 +248,31 @@ function findFirstMatchPartial(formData, patterns) {
   }
 
   return null;
+}
+
+/**
+ * Determine whether a field key/label belongs to a secondary person (a
+ * reference or emergency contact) rather than the applicant. Used to keep the
+ * greedy email/phone fallbacks from resolving the applicant's contact info to
+ * someone else's (FS3).
+ *
+ * Token-based (splits on any non-alphanumeric separator, then prefix-matches
+ * each marker) so "reference_email", "Emergency Contact Phone" and
+ * "emergency-phone" all match, while "email_preference" (which merely contains
+ * the substring "reference") does NOT — "preference" is its own token and does
+ * not start with "reference".
+ *
+ * @param {string} key - Field key or human-readable label
+ * @returns {boolean} True if the field belongs to a reference/emergency contact
+ */
+function isSecondaryPersonField(key) {
+  if (!key) {
+    return false;
+  }
+  const tokens = String(key).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return tokens.some(token =>
+    SECONDARY_PERSON_MARKERS.some(marker => token.startsWith(marker))
+  );
 }
 
 /**
@@ -294,8 +340,15 @@ function extractCanonicalContact(formData) {
   // Extract email - try exact keys first, then partial match
   let email = findFirstMatch(formData, EMAIL_KEYS);
   if (!email) {
-    // Fallback: find any field containing 'email' with @ in value
+    // Fallback: find any field containing 'email' with @ in value.
+    // Skip reference/emergency-contact fields so the applicant's confirmation
+    // never resolves to a secondary person's address (FS3). If only a
+    // secondary-person email exists, email stays null — every downstream send
+    // is guarded on a truthy email, so this is a safe no-op, not a lost flow.
     for (const [key, value] of Object.entries(formData)) {
+      if (isSecondaryPersonField(key)) {
+        continue;
+      }
       if (key.toLowerCase().includes('email') && value && String(value).includes('@')) {
         email = String(value).trim();
         break;
@@ -449,6 +502,7 @@ module.exports = {
   formatAddressText,
   filterSensitiveFields,
   findFirstMatch,
+  isSecondaryPersonField,
   isSensitiveField,
   truncateText,
   getSchemaVersion,
@@ -465,6 +519,7 @@ module.exports = {
   EMAIL_KEYS,
   PHONE_KEYS,
   COMMENTS_KEYS,
+  SECONDARY_PERSON_MARKERS,
   SENSITIVE_FIELD_PATTERNS,
   COMMENTS_MAX_LENGTH,
   SCHEMA_VERSION
