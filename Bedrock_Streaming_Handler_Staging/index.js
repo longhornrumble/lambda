@@ -153,7 +153,24 @@ if (streamifyResponse) {
 
 // Initialize AWS clients with configurable region
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-const bedrock = new BedrockRuntimeClient({ region: AWS_REGION });
+
+// CS1: bound the Bedrock invoke so a connect/response HANG fails fast instead of
+// holding the SSE stream open until the 300s Lambda timeout. requestTimeout is
+// cleared by @smithy/node-http-handler once response headers arrive (verified
+// against the bundled handler), so it guards connect + time-to-first-response —
+// it does NOT abort a live token stream once Bedrock starts responding.
+// throwOnRequestTimeout:true is REQUIRED — without it the timeout only logs a
+// warning and never aborts. On timeout the reject surfaces to streamingHandler's
+// outer try/catch (error SSE frame + stream end + heartbeat cleanup).
+const BEDROCK_STREAM_TIMEOUTS = {
+  connectionTimeout: 6000,
+  requestTimeout: 30000,
+  throwOnRequestTimeout: true,
+};
+const bedrock = new BedrockRuntimeClient({
+  region: AWS_REGION,
+  requestHandler: BEDROCK_STREAM_TIMEOUTS,
+});
 const sqs = new SQSClient({ region: AWS_REGION });
 
 // Analytics SQS queue URL. Unset in the staging account (per Issue #5
@@ -336,7 +353,19 @@ const streamingHandler = async (event, responseStream, context) => {
 
   // Route analytics requests (non-streaming) - write JSON response to stream
   const queryParams = event.queryStringParameters || {};
-  const parsedBody = event.body ? JSON.parse(event.body) : event;
+  // CS4: parse once, up front, guarded. A malformed body used to throw HERE —
+  // before the try below — rejecting the handler and bypassing the SSE error
+  // contract (the client saw a raw Lambda error, not a clean error frame).
+  let parsedBody;
+  try {
+    parsedBody = event.body ? JSON.parse(event.body) : event;
+  } catch (parseErr) {
+    console.error('❌ Malformed request body (invalid JSON):', parseErr.message);
+    responseStream.write(`data: ${JSON.stringify({ type: 'error', error: 'Invalid request body' })}\n\n`);
+    responseStream.write('data: [DONE]\n\n');
+    responseStream.end();
+    return;
+  }
   if (queryParams.action === 'analytics' || parsedBody.action === 'analytics') {
     console.log('📊 Routing to analytics handler (via streaming handler)');
     const result = await handleAnalyticsEvent(event);
@@ -372,8 +401,10 @@ const streamingHandler = async (event, responseStream, context) => {
     console.log('📥 Event type:', typeof event);
     console.log('📥 Event keys:', Object.keys(event));
     
-    // For direct invocation, event IS the body. For Function URL, event.body contains the JSON string
-    const body = event.body ? JSON.parse(event.body) : event;
+    // For direct invocation, event IS the body. For Function URL, event.body contains the JSON string.
+    // CS4: reuse the guarded parse above (identical `: event` fallback) instead of re-parsing —
+    // removes a redundant JSON.parse and any risk of the two copies diverging.
+    const body = parsedBody;
     console.log('📥 Parsed body:', JSON.stringify(body).substring(0, 200));
     
     const tenantHash = body.tenant_hash || '';
@@ -1211,7 +1242,20 @@ const bufferedHandler = async (event, context) => {
 
   // Route to analytics handler
   const queryParams = event.queryStringParameters || {};
-  const body = event.body ? JSON.parse(event.body) : event;
+  // CS4: guard the pre-try parse — a malformed body used to throw here and
+  // surface as a raw 500 instead of a clean 400 (same bug class as the
+  // streaming handler's parse guard above).
+  let body;
+  try {
+    body = event.body ? JSON.parse(event.body) : event;
+  } catch (parseErr) {
+    console.error('❌ Malformed request body (invalid JSON):', parseErr.message);
+    return {
+      statusCode: 400,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ error: 'Invalid request body' }),
+    };
+  }
 
   if (queryParams.action === 'analytics' || body.action === 'analytics') {
     console.log('📊 Routing to analytics handler');
@@ -1702,3 +1746,6 @@ const bufferedHandler = async (event, context) => {
 // runtime). Keep `cors-helper.js` AND the Lambda URL CORS config in sync;
 // see cors-helper.js module header.
 exports.handler = streamifyResponse ? streamifyResponse(streamingHandler) : bufferedHandler;
+// Exported for tests (assert the CS1 timeout contract is intact — timeouts set
+// and throwOnRequestTimeout enabled so the timeout actually aborts).
+exports.BEDROCK_STREAM_TIMEOUTS = BEDROCK_STREAM_TIMEOUTS;

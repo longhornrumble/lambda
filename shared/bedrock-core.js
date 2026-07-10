@@ -36,7 +36,18 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
  * next one. See __tests__/bedrock_core_assume_role.test.js for the pattern.
  */
 const KB_RETRIEVER_ROLE_ARN = process.env.KB_RETRIEVER_ROLE_ARN;
-const bedrockAgentClientConfig = { region: AWS_REGION };
+// CS1: bound the (non-streaming) Bedrock Retrieve call so a hung connection or
+// stalled response fails fast instead of hanging until the caller's Lambda
+// timeout — a KB-retrieve hang otherwise leaves the chat "typing" indefinitely.
+// throwOnRequestTimeout:true is REQUIRED (without it the timeout only warns).
+// On timeout the reject is caught by retrieveKB() → returns '' (fail-open: the
+// answer ships without KB grounding, same as the existing AccessDenied path).
+const KB_RETRIEVE_TIMEOUTS = {
+  connectionTimeout: 6000,
+  requestTimeout: 15000,
+  throwOnRequestTimeout: true,
+};
+const bedrockAgentClientConfig = { region: AWS_REGION, requestHandler: KB_RETRIEVE_TIMEOUTS };
 let kbCredsInitFailed = false;
 if (KB_RETRIEVER_ROLE_ARN) {
   try {
@@ -333,4 +344,5 @@ module.exports = {
   // Expose constants for consumers that need them
   CACHE_TTL,
   MAX_CACHE_SIZE,
+  KB_RETRIEVE_TIMEOUTS,
 };

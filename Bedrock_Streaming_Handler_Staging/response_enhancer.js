@@ -19,6 +19,33 @@ const TENANT_REGISTRY_TABLE = process.env.TENANT_REGISTRY_TABLE || `picasso-tena
 // Simple cache for tenant configs (5 minute TTL)
 const configCache = {};
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+// CS3: cap the cache so a long-lived Lambda instance serving many tenants can't
+// grow it unbounded (expired entries are ignored on read but were never deleted).
+// Mirrors shared/bedrock-core.js evictOldestCacheEntries.
+const MAX_CONFIG_CACHE_SIZE = 100; // Maximum entries
+
+/**
+ * Evict oldest entries if a cache exceeds its max size (LRU-style by insertion
+ * timestamp). No-op while under the cap. Signature mirrors
+ * shared/bedrock-core.js evictOldestCacheEntries.
+ * @param {Object} cache - Cache object to trim
+ * @param {number} maxSize - Maximum allowed entries
+ */
+function evictOldestConfigEntries(cache, maxSize = MAX_CONFIG_CACHE_SIZE) {
+  const keys = Object.keys(cache);
+  if (keys.length <= maxSize) return;
+
+  const sortedKeys = keys.sort((a, b) => (cache[a]?.timestamp || 0) - (cache[b]?.timestamp || 0));
+  const toRemove = sortedKeys.slice(0, keys.length - maxSize);
+
+  for (const key of toRemove) {
+    delete cache[key];
+  }
+
+  if (toRemove.length > 0) {
+    console.log(`🧹 Evicted ${toRemove.length} old config cache entries`);
+  }
+}
 
 // Track if we've warned about S3 bucket fallback (only warn once per Lambda instance)
 let s3BucketWarningLogged = false;
@@ -127,6 +154,7 @@ async function loadTenantConfig(tenantHash) {
             data: result,
             timestamp: Date.now()
         };
+        evictOldestConfigEntries(configCache);
 
         console.log(`Loaded config for ${tenantHash} (${tenantId})`);
         return result;
@@ -1154,5 +1182,7 @@ module.exports = {
     parseBranchHint,            // AI-suggested branch parsing
     getShowcaseForBranch,       // Showcase items lookup
     resolveShowcaseCTAs,        // Showcase CTA resolution
-    getShowcaseById             // Action chip → showcase direct routing
+    getShowcaseById,            // Action chip → showcase direct routing
+    evictOldestConfigEntries,   // CS3: config cache eviction (exported for tests)
+    MAX_CONFIG_CACHE_SIZE
 };
