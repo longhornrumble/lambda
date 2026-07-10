@@ -13,6 +13,7 @@ const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
 const { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const crypto = require('crypto');
 const {
   extractCanonicalContact,
 } = require('./contact_extractor');
@@ -250,14 +251,19 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     const priority = determinePriority(formId, formData, formConfig);
     console.log(`📊 Form priority determined: ${priority}`);
 
-    // Save to DynamoDB
-    const submissionId = `${formId}_${Date.now()}`;
+    // Save to DynamoDB. Include a random suffix so two submissions of the same
+    // form in the same millisecond cannot collide on the key and silently
+    // overwrite each other (Date.now() alone is not unique under bursty load).
+    const submissionId = `${formId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     // F-DSAR31: capture the subject id from the writer so it can be threaded
     // into the FORM_COMPLETED session-summary write below. Undefined if the
     // save failed/skipped — the writer guards on presence, so no stamp then.
     let piiSubjectId;
+    let dbSaved = false;
     try {
-      piiSubjectId = await saveFormSubmission(submissionId, formId, formData, config, priority, sessionId, conversationId);
+      const saveResult = await saveFormSubmission(submissionId, formId, formData, config, priority, sessionId, conversationId);
+      piiSubjectId = saveResult?.piiSubjectId;
+      dbSaved = saveResult?.persisted === true;
     } catch (dbError) {
       console.error('❌ DynamoDB save failed:', dbError);
       // Continue with fulfillment even if DynamoDB save fails
@@ -317,6 +323,31 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     // tenant_id='unknown' would silently lose the writeback because the
     // real form-submission row was written under the real tenant_id).
     await persistFulfillmentPath(submissionId, config.tenant_id, fulfillmentResult);
+
+    // Truthful-outcome guard: only claim success if the submission actually
+    // landed somewhere — persisted to DynamoDB OR delivered by at least one
+    // fulfillment channel. If the DB write failed AND every fulfillment channel
+    // failed, the submission is genuinely lost. Do NOT tell the visitor it went
+    // through, and do NOT send an applicant confirmation implying we received it.
+    const DELIVERED_STATUSES = new Set(['sent', 'invoked', 'stored']);
+    const anyDelivered = Array.isArray(fulfillmentResult)
+      && fulfillmentResult.some((r) => DELIVERED_STATUSES.has(r?.status));
+    if (!dbSaved && !anyDelivered) {
+      // Structured marker for a CloudWatch metric filter / alarm — this is a
+      // real data-loss event, not just a per-channel warning.
+      console.error(
+        `[FORM_SUBMISSION_LOST] tenant_id=${config.tenant_id || 'unknown'} `
+        + `form_id=${formId} submission_id=${submissionId} `
+        + `reason=db_save_failed_and_all_fulfillment_failed`
+      );
+      return {
+        type: 'form_error',
+        status: 'error',
+        statusCode: 502,
+        message: "Sorry — something went wrong on our end and your submission didn't go through. Please try again in a moment.",
+        submissionId,
+      };
+    }
 
     // Applicant confirmation: per-form config takes precedence over tenant-level legacy flag.
     // - New config (notifications.applicant_confirmation): requires enabled === true (strict boolean)
@@ -530,7 +561,7 @@ function buildLabeledFormData(formData, formConfig) {
 async function saveFormSubmission(submissionId, formId, formData, config, priority = 'normal', sessionId = null, conversationId = null) {
   if (!FORM_SUBMISSIONS_TABLE) {
     console.warn('⚠️ FORM_SUBMISSIONS_TABLE not configured, skipping DynamoDB save');
-    return;
+    return { piiSubjectId: undefined, persisted: false };
   }
 
   // Get form config for field labels
@@ -611,8 +642,10 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
     }
   };
 
+  let persisted = false;
   try {
     await dynamodb.send(new PutCommand(params));
+    persisted = true;
     console.log(`✅ Form saved to DynamoDB with pipeline_status: new, priority: ${priority}`);
   } catch (error) {
     // M9.G8 / F-DSAR24: phase-completion-audit code-reviewer 🔴 — this
@@ -639,7 +672,10 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
 
   // F-DSAR31 completion: return the subject id so the caller can thread it into
   // the FORM_COMPLETED session-summary write (makes that row DSAR-reachable).
-  return piiSubjectId;
+  // `persisted` tells the caller whether the row actually landed in DynamoDB —
+  // the internal catch above preserves UX by not throwing, so this flag is the
+  // only signal submitForm has to avoid falsely reporting success on a lost write.
+  return { piiSubjectId, persisted };
 }
 
 /**
