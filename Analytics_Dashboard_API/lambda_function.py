@@ -407,7 +407,17 @@ def lambda_handler(event, context):
     headers = event.get('headers', {}) or {}
     tenant_override = headers.get('X-Tenant-Override') or headers.get('x-tenant-override')
 
-    if tenant_override and user_role == 'super_admin':
+    if tenant_override:
+        if user_role != 'super_admin':
+            # The dashboard only sends this header for super admins, so a
+            # non-super-admin presenting it is tampering (or a broken client).
+            # Fail loudly instead of silently serving their own tenant so the
+            # attempt is visible in logs and alarmable.
+            logger.warning(
+                f"[TENANT_OVERRIDE_DENIED] {user_email} (role={user_role}) "
+                f"presented X-Tenant-Override for tenant {str(tenant_override)[:8]}..."
+            )
+            return cors_response(403, {'error': 'Not authorized to view other tenants'})
         try:
             tenant_id = sanitize_tenant_id(tenant_override)
             logger.info(f"[Super Admin] {user_email} switched to tenant: {tenant_id[:8]}...")
