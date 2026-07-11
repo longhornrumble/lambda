@@ -167,6 +167,33 @@ async function handleFormMode(body, tenantConfig, requestId = null) {
  * @param {Object} config - Tenant config with form definitions
  * @returns {Object} Validation result
  */
+// FS9: submit-time validation bounds. Generous — no legitimate form trips these;
+// they exist to reject abusive/oversized payloads.
+const MAX_FIELD_VALUE_LENGTH = 10000;
+const MAX_SUBMITTED_FIELDS = 200;
+
+/**
+ * Email format check — single source of truth for the email rule (mirrors the
+ * flow's per-field check and the submit-time re-check). Returns an error string
+ * or null. RFC 5321 max length 320.
+ */
+function emailFormatError(value) {
+  if (value.length > 320) return 'Email address is too long';
+  if (!/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value)) return 'Please enter a valid email address';
+  return null;
+}
+
+/**
+ * Phone format check — single source of truth. Returns an error string or null.
+ * At least 7 digits, max 20 chars, only digits/space/() -/+.
+ */
+function phoneFormatError(value) {
+  if (value.length > 20) return 'Phone number is too long';
+  if (value.replace(/\D/g, '').length < 7) return 'Phone number must have at least 7 digits';
+  if (!/^[\d\s\-\(\)\+]+$/.test(value)) return 'Please enter a valid phone number';
+  return null;
+}
+
 async function validateFormField(fieldId, value, config) {
   // SEC: log the field id only — the value is applicant PII.
   console.log(`🔍 Validating field ${fieldId}`);
@@ -178,32 +205,19 @@ async function validateFormField(fieldId, value, config) {
     errors.push('This field is required');
   }
 
-  // Field-specific validation
+  // Field-specific validation (format helpers shared with submit-time re-check)
   switch (fieldId) {
-    case 'email':
-      // Strengthened email validation with length limits (RFC 5321: max 320 chars)
-      if (value) {
-        if (value.length > 320) {
-          errors.push('Email address is too long');
-        } else if (!/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(value)) {
-          errors.push('Please enter a valid email address');
-        }
-      }
+    case 'email': {
+      const e = value ? emailFormatError(value) : null;
+      if (e) errors.push(e);
       break;
+    }
 
-    case 'phone':
-      // Strengthened phone validation: must have at least 7 digits, max 20 chars
-      if (value) {
-        const digitsOnly = value.replace(/\D/g, '');
-        if (value.length > 20) {
-          errors.push('Phone number is too long');
-        } else if (digitsOnly.length < 7) {
-          errors.push('Phone number must have at least 7 digits');
-        } else if (!/^[\d\s\-\(\)\+]+$/.test(value)) {
-          errors.push('Please enter a valid phone number');
-        }
-      }
+    case 'phone': {
+      const e = value ? phoneFormatError(value) : null;
+      if (e) errors.push(e);
       break;
+    }
 
     case 'age_confirm':
       if (value === 'no') {
@@ -236,6 +250,92 @@ async function validateFormField(fieldId, value, config) {
 }
 
 /**
+ * Does a configured field have a value in the submitted data? Handles composite
+ * fields (phone_with_consent / name / address), whose value is either an object
+ * keyed by subfield id under formData[field.id] or flattened to subfield keys.
+ */
+function fieldHasValue(field, formData) {
+  const v = formData[field.id];
+  if (typeof v === 'string') return v.trim() !== '';
+  if (v && typeof v === 'object') return Object.values(v).some((x) => String(x ?? '').trim() !== '');
+  if (v !== undefined && v !== null) return String(v).trim() !== '';
+  // composite flattened onto subfield keys
+  if (Array.isArray(field.subfields)) {
+    return field.subfields.some((sf) => String(formData[sf.id] ?? '').trim() !== '');
+  }
+  return false;
+}
+
+/** Extract the phone value from a phone_with_consent composite (object or flat). */
+function compositePhoneValue(field, formData) {
+  if (!Array.isArray(field.subfields)) return null;
+  const phoneSub = field.subfields.find((sf) => sf.type === 'phone');
+  if (!phoneSub) return null;
+  const composite = formData[field.id];
+  const fromObj = composite && typeof composite === 'object' ? composite[phoneSub.id] : undefined;
+  const raw = fromObj ?? formData[phoneSub.id];
+  return raw != null && String(raw).trim() !== '' ? String(raw) : null;
+}
+
+/**
+ * FS9: server-side re-validation at the submit gate. The interactive flow
+ * validates each field as it's collected, but nothing re-checks the assembled
+ * payload — so a client that bypasses the flow or tampers with the bundle could
+ * slip malformed/oversized data past. This re-applies the per-field rules,
+ * CONFIG-AWARE (honors each field's `required` + `type`), so legitimately-blank
+ * OPTIONAL fields are never rejected and only missing-required or bad-format
+ * values (i.e. bypass/tamper/typo) are caught.
+ *
+ * @returns {Array<{field, label, errors}>} empty array when the submission is valid
+ */
+function validateSubmission(formData, formConfig) {
+  if (!formData || typeof formData !== 'object' || Array.isArray(formData)) {
+    return [{ field: null, label: 'form', errors: ['Malformed submission'] }];
+  }
+
+  // Structural / size backstop — bounds an abusive payload regardless of config.
+  const entries = Object.entries(formData);
+  if (entries.length > MAX_SUBMITTED_FIELDS) {
+    return [{ field: null, label: 'form', errors: ['Too many fields in submission'] }];
+  }
+
+  const problems = [];
+  for (const [id, value] of entries) {
+    if (typeof value === 'string' && value.length > MAX_FIELD_VALUE_LENGTH) {
+      problems.push({ field: id, label: id, errors: ['Value is too long'] });
+    }
+  }
+
+  // Config-driven per-field checks. Skip when the form declares no fields (can't
+  // know required/type) — the size backstop above still applied.
+  const fields = Array.isArray(formConfig?.fields) ? formConfig.fields : [];
+  for (const field of fields) {
+    const label = field.label || field.id;
+    const present = fieldHasValue(field, formData);
+
+    if (field.required && !present) {
+      problems.push({ field: field.id, label, errors: [`${label} is required`] });
+      continue;
+    }
+    if (!present) continue; // optional + blank → fine
+
+    // Format checks on present values, by declared type.
+    let fmtErr = null;
+    const value = formData[field.id];
+    if (field.type === 'email' && typeof value === 'string') {
+      fmtErr = emailFormatError(value.trim());
+    } else if (field.type === 'phone' && typeof value === 'string') {
+      fmtErr = phoneFormatError(value.trim());
+    } else if (field.type === 'phone_with_consent') {
+      const phone = compositePhoneValue(field, formData);
+      if (phone) fmtErr = phoneFormatError(phone.trim());
+    }
+    if (fmtErr) problems.push({ field: field.id, label, errors: [fmtErr] });
+  }
+  return problems;
+}
+
+/**
  * Submit a completed form
  * @param {string} formId - Form identifier
  * @param {Object} formData - Collected form data
@@ -256,8 +356,30 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
       throw new Error('Missing required parameters: formId, formData, or config');
     }
 
-    // Determine priority for notifications
     const formConfig = config.conversational_forms?.[formId] || {};
+
+    // FS9: re-validate the assembled payload server-side before doing anything
+    // with it. The interactive flow checks each field as it's collected, but the
+    // submit gate itself trusted the bundle — so a bypassed/tampered payload
+    // could slip malformed or oversized data through. Reject + identify the
+    // field(s) so the visitor can correct and resubmit. Config-aware, so blank
+    // OPTIONAL fields are never rejected.
+    const validationProblems = validateSubmission(formData, formConfig);
+    if (validationProblems.length > 0) {
+      console.warn(
+        `[FORM_VALIDATION_REJECTED] tenant_id=${config.tenant_id || 'unknown'} `
+        + `form_id=${formId} fields=[${validationProblems.map((p) => p.field).join(', ')}]`
+      );
+      return {
+        type: 'form_error',
+        status: 'error',
+        statusCode: 400,
+        message: `Please double-check the following and resubmit: ${validationProblems.map((p) => p.label).join(', ')}.`,
+        validation_errors: validationProblems,
+      };
+    }
+
+    // Determine priority for notifications
     const priority = determinePriority(formId, formData, formConfig);
     console.log(`📊 Form priority determined: ${priority}`);
 
@@ -1978,5 +2100,8 @@ module.exports = {
   getSESFromEmail,
   htmlEscapeVars,
   normalizeToE164,
-  isPhoneOptedOut
+  isPhoneOptedOut,
+  validateSubmission,
+  emailFormatError,
+  phoneFormatError
 };

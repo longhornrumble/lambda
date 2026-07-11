@@ -41,7 +41,8 @@ const {
   submitForm,
   htmlEscapeVars,
   normalizeToE164,
-  isPhoneOptedOut
+  isPhoneOptedOut,
+  validateSubmission
 } = require('../form_handler');
 
 // Test fixtures
@@ -2354,5 +2355,122 @@ describe('Form Handler - FS10: applicant SMS consent controls', () => {
     expect(invokes.length).toBe(1);
     expect(invokes[0].body).toContain('Hi Jane, thanks for applying!');
     expect(invokes[0].body).toMatch(/Reply STOP to opt out/i);
+  });
+});
+
+// FS9: server-side re-validation at the submit gate. Mirrors the per-field
+// rules, config-aware (honors required + type), rejecting + identifying the
+// field so a bypassed/tampered payload can't slip malformed/oversized data past.
+describe('Form Handler - FS9: submit-time re-validation', () => {
+  const fieldsConfig = {
+    tenant_id: 'TEST123',
+    conversational_forms: {
+      volunteer_apply: {
+        form_id: 'volunteer_apply',
+        title: 'Volunteer',
+        fields: [
+          { id: 'first_name', type: 'text', label: 'First Name', required: true },
+          { id: 'email', type: 'email', label: 'Email', required: true },
+          { id: 'phone', type: 'phone', label: 'Phone', required: false },
+          { id: 'notes', type: 'textarea', label: 'Notes', required: false },
+        ],
+      },
+    },
+  };
+  const formCfg = fieldsConfig.conversational_forms.volunteer_apply;
+
+  describe('validateSubmission (unit)', () => {
+    it('passes a well-formed submission', () => {
+      expect(validateSubmission(
+        { first_name: 'Jane', email: 'jane@example.com', phone: '555-123-4567' }, formCfg
+      )).toEqual([]);
+    });
+
+    it('flags a missing REQUIRED field, identifying it', () => {
+      const problems = validateSubmission({ email: 'jane@example.com' }, formCfg); // first_name missing
+      expect(problems.map((p) => p.field)).toContain('first_name');
+    });
+
+    it('allows a blank OPTIONAL field (no false reject)', () => {
+      expect(validateSubmission(
+        { first_name: 'Jane', email: 'jane@example.com', phone: '' }, formCfg
+      )).toEqual([]);
+    });
+
+    it('flags a malformed email, identifying it', () => {
+      const problems = validateSubmission({ first_name: 'Jane', email: 'not-an-email' }, formCfg);
+      expect(problems.map((p) => p.field)).toContain('email');
+    });
+
+    it('flags a malformed phone, identifying it', () => {
+      const problems = validateSubmission(
+        { first_name: 'Jane', email: 'jane@example.com', phone: '12' }, formCfg
+      );
+      expect(problems.map((p) => p.field)).toContain('phone');
+    });
+
+    it('validates the phone in a phone_with_consent composite (object + flat)', () => {
+      const cfg = { fields: [{
+        id: 'pwc', type: 'phone_with_consent', label: 'Phone', required: true,
+        subfields: [{ id: 'pwc_phone', type: 'phone' }, { id: 'pwc_consent', type: 'select', sms_consent: true }],
+      }] };
+      // object form, bad phone → flagged
+      expect(validateSubmission({ pwc: { pwc_phone: '12', pwc_consent: 'yes' } }, cfg).map((p) => p.field)).toContain('pwc');
+      // flat form, good phone → OK
+      expect(validateSubmission({ pwc_phone: '555-123-4567' }, cfg)).toEqual([]);
+    });
+
+    it('rejects an oversized field value', () => {
+      const problems = validateSubmission(
+        { first_name: 'Jane', email: 'jane@example.com', notes: 'x'.repeat(10001) }, formCfg
+      );
+      expect(problems.length).toBeGreaterThan(0);
+    });
+
+    it('rejects too many fields', () => {
+      const many = {};
+      for (let i = 0; i < 201; i++) many[`f${i}`] = 'x';
+      expect(validateSubmission(many, formCfg).length).toBeGreaterThan(0);
+    });
+
+    it('skips per-field checks when the form declares no fields', () => {
+      expect(validateSubmission({ anything: 'goes' }, {})).toEqual([]);
+    });
+
+    it('rejects a malformed (non-object) payload', () => {
+      expect(validateSubmission(null, formCfg).length).toBeGreaterThan(0);
+      expect(validateSubmission([], formCfg).length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('submitForm integration', () => {
+    beforeEach(() => {
+      sesMock.reset();
+      dynamoMock.reset();
+      lambdaMock.reset();
+      s3Mock.reset();
+      sesMock.on(SendEmailCommand).resolves({ MessageId: 'm' });
+      dynamoMock.on(PutCommand).resolves({});
+      dynamoMock.on(GetCommand).resolves({});
+      dynamoMock.on(UpdateCommand).resolves({});
+      lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+      s3Mock.on(PutObjectCommand).resolves({});
+    });
+
+    it('rejects a malformed email at submit — identifies the field, does NOT save or send', async () => {
+      const result = await submitForm('volunteer_apply', { first_name: 'Jane', email: 'not-an-email' }, fieldsConfig);
+
+      expect(result.type).toBe('form_error');
+      expect(result.statusCode).toBe(400);
+      expect(result.validation_errors.map((p) => p.field)).toContain('email');
+      // Nothing persisted or sent — rejected before save/fulfillment.
+      expect(dynamoMock.commandCalls(PutCommand)).toHaveLength(0);
+      expect(sesMock.commandCalls(SendEmailCommand)).toHaveLength(0);
+    });
+
+    it('accepts a valid submission (proceeds past validation)', async () => {
+      const result = await submitForm('volunteer_apply', { first_name: 'Jane', email: 'jane@example.com' }, fieldsConfig);
+      expect(result.statusCode).not.toBe(400);
+    });
   });
 });
