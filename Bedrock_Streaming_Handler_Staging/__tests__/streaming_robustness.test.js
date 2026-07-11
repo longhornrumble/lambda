@@ -121,6 +121,41 @@ describe('CS4 — streamingHandler malformed body', () => {
   });
 });
 
+describe('SEC — streamingHandler does not log raw request-body PII', () => {
+  let indexModule;
+  let logSpy;
+  beforeAll(() => {
+    indexModule = require('../index.js');
+  });
+  beforeEach(() => {
+    validateCfOriginHeader.mockReset();
+    loadConfig.mockReset();
+    retrieveKB.mockReset();
+    validateCfOriginHeader.mockResolvedValue({ valid: true, reason: null });
+    loadConfig.mockResolvedValue(null); // early-return after the parsed-body log
+    retrieveKB.mockResolvedValue('');
+    logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  test('the parsed-body log emits keys only — never the user_input value', async () => {
+    const event = {
+      body: JSON.stringify({ tenant_hash: 'abcdef012345', user_input: 'reach me at victim@example.com' }),
+    };
+    await indexModule.handler(event, createMockResponseStream(), {});
+
+    const logged = logSpy.mock.calls
+      .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+      .join('\n');
+    // The raw user input (with an email) must not appear in any log line...
+    expect(logged).not.toContain('victim@example.com');
+    // ...but the key set + a tenant-hash prefix are still logged for debugging.
+    expect(logged).toContain('Parsed body keys');
+  });
+});
+
 describe('CS4 — bufferedHandler malformed body', () => {
   test('returns a clean 400 instead of an unhandled throw', async () => {
     jest.resetModules();
