@@ -226,12 +226,18 @@ describe('V5.5 wired contract (1a source-pin pattern)', () => {
     expect(v5Sites).toHaveLength(2);
   });
 
-  test('the V5 CTA branch precedes V4_ACTION_SELECTOR in BOTH chains', () => {
+  test('the V5 CTA branch precedes V4_ACTION_SELECTOR in the shared pipeline (both handlers delegate)', () => {
     const fs = require('fs');
-    const source = fs.readFileSync(require.resolve('../index.js'), 'utf8');
-    // In each CTA chain the v5Active arm must appear before the V4 flag check:
-    // `else if (v5Active) { ... } else if (config.feature_flags?.V4_ACTION_SELECTOR)`.
-    const ordered = source.match(/} else if \(v5Active\) \{[\s\S]*?} else if \(config\.feature_flags\?\.V4_ACTION_SELECTOR\) \{/g) || [];
-    expect(ordered).toHaveLength(2);
+    const index = fs.readFileSync(require.resolve('../index.js'), 'utf8');
+    const pipeline = fs.readFileSync(require.resolve('../responsePipeline.js'), 'utf8');
+    // Post-dedup the CTA ladder lives ONCE, in responsePipeline.js — a STRONGER invariant than
+    // the old two-copy grep (the ordering can no longer drift between the twins). The v5Active
+    // arm must precede the V4 flag check there (tenants carry both flags; appended-after would
+    // make the V5 flip a no-op).
+    const ordered = pipeline.match(/} else if \(v5Active\) \{[\s\S]*?} else if \(config\.feature_flags\?\.V4_ACTION_SELECTOR\) \{/g) || [];
+    expect(ordered).toHaveLength(1);
+    // Both handlers must route through the shared pipeline so both inherit that ordering.
+    const delegations = index.match(/await runResponsePipeline\(/g) || [];
+    expect(delegations).toHaveLength(2);
   });
 });
