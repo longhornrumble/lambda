@@ -1206,3 +1206,89 @@ class TestFormHandler(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class TestFS5IdempotencyToken(unittest.TestCase):
+    """FS5 twin — client_submission_id dedup (mirrors BSH form_handler.test.js).
+
+    A validated widget token makes the submission key deterministic; the
+    conditional put turns a retry into DuplicateSubmission, answered with
+    success and NO re-run of notifications/fulfillment. Absent/malformed
+    token → uuid4 key, no dedup (backward compatible).
+    """
+
+    TOKEN = 'f' * 64  # sha256-hex-shaped
+
+    def setUp(self):
+        base = TestFormHandler('setUp')
+        base.setUp()
+        self.tenant_config = base.tenant_config
+        self.sample_form_data = dict(base.sample_form_data)
+        self._setup_aws_mocks = base._setup_aws_mocks
+
+    def _submit(self, form_data):
+        handler = FormHandler(self.tenant_config)
+        mock_webhook_response = Mock()
+        mock_webhook_response.status_code = 200
+        with patch('requests.post', return_value=mock_webhook_response):
+            return handler.handle_form_submission(form_data)
+
+    @mock_dynamodb
+    @mock_ses
+    @mock_sns
+    @mock_s3
+    @mock_lambda
+    def test_valid_token_yields_deterministic_submission_id(self):
+        self._setup_aws_mocks()
+        form_data = {**self.sample_form_data, 'client_submission_id': self.TOKEN}
+        result = self._submit(form_data)
+        self.assertTrue(result['success'])
+        self.assertEqual(result['submission_id'], f'volunteer_signup_idem_{self.TOKEN}')
+
+    @mock_dynamodb
+    @mock_ses
+    @mock_sns
+    @mock_s3
+    @mock_lambda
+    def test_retry_with_same_token_is_deduped_success_no_refulfillment(self):
+        self._setup_aws_mocks()
+        form_data = {**self.sample_form_data, 'client_submission_id': self.TOKEN}
+        first = self._submit(form_data)
+        self.assertTrue(first['success'])
+        self.assertNotIn('duplicate', first)
+
+        second = self._submit(form_data)  # the retry
+        self.assertTrue(second['success'])           # visitor still sees success
+        self.assertTrue(second.get('duplicate'))     # but flagged as duplicate
+        self.assertEqual(second['fulfillment'], {'status': 'duplicate_skipped'})
+        self.assertEqual(second['notifications_sent'], [])  # no double emails/SMS
+        self.assertEqual(second['submission_id'], first['submission_id'])
+
+        # exactly ONE row landed in the table
+        table = boto3.resource('dynamodb', region_name='us-east-1').Table('picasso_form_submissions')
+        self.assertEqual(table.scan()['Count'], 1)
+
+    @mock_dynamodb
+    @mock_ses
+    @mock_sns
+    @mock_s3
+    @mock_lambda
+    def test_malformed_token_is_ignored_uuid_key_no_dedup(self):
+        self._setup_aws_mocks()
+        for bad in ['short', 'has spaces!!', 'x' * 200]:
+            form_data = {**self.sample_form_data, 'client_submission_id': bad}
+            result = self._submit(form_data)
+            self.assertTrue(result['success'])
+            # uuid4 shape, not the idem shape
+            self.assertNotIn('_idem_', result['submission_id'])
+            uuid.UUID(result['submission_id'])  # parses as a uuid → legacy key
+
+    @mock_dynamodb
+    @mock_ses
+    @mock_sns
+    @mock_s3
+    @mock_lambda
+    def test_no_token_legacy_uuid_key(self):
+        self._setup_aws_mocks()
+        result = self._submit(dict(self.sample_form_data))
+        self.assertTrue(result['success'])
+        uuid.UUID(result['submission_id'])  # unchanged legacy behavior

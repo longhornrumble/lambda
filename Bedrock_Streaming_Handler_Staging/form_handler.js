@@ -47,6 +47,13 @@ const NOTIFICATION_SENDS_TABLE = process.env.NOTIFICATION_SENDS_TABLE || 'picass
 const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent';
 const SMS_MONTHLY_LIMIT = parseInt(process.env.SMS_MONTHLY_LIMIT || '100', 10);
 
+// FS5: shape of the widget-supplied idempotency token (client_submission_id).
+// The widget derives it from sha256(session|form|form_data) — 64 lowercase hex —
+// but any opaque 16-128 char [A-Za-z0-9_-] token is accepted. A malformed or
+// absent token simply disables dedup for that request (fully backward compatible:
+// old widget clients send nothing and get today's behavior).
+const IDEM_TOKEN_SHAPE = /^[A-Za-z0-9_-]{16,128}$/;
+
 
 /**
  * Sanitize text for SMS messages - remove special characters that could cause issues
@@ -148,7 +155,7 @@ async function handleFormMode(body, tenantConfig, requestId = null) {
   }
 
   if (action === 'submit_form') {
-    return await submitForm(form_id, form_data, tenantConfig, session_id, conversation_id, requestId, body.client_timestamp);
+    return await submitForm(form_id, form_data, tenantConfig, session_id, conversation_id, requestId, body.client_timestamp, body.client_submission_id);
   }
 
   // Default validation response
@@ -344,7 +351,7 @@ function validateSubmission(formData, formConfig) {
  * @param {string} conversationId - Conversation ID for tracking
  * @returns {Object} Submission result
  */
-async function submitForm(formId, formData, config, sessionId = null, conversationId = null, requestId = null, clientTimestamp = null) {
+async function submitForm(formId, formData, config, sessionId = null, conversationId = null, requestId = null, clientTimestamp = null, clientSubmissionId = null) {
   // SEC: never log raw formData — it is entirely applicant PII (name, email,
   // phone, address, free-text). Log only the form id + field keys (identifiers,
   // not values) for operational debugging.
@@ -383,10 +390,24 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     const priority = determinePriority(formId, formData, formConfig);
     console.log(`📊 Form priority determined: ${priority}`);
 
-    // Save to DynamoDB. Include a random suffix so two submissions of the same
-    // form in the same millisecond cannot collide on the key and silently
-    // overwrite each other (Date.now() alone is not unique under bursty load).
-    const submissionId = `${formId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    // FS5: client-supplied idempotency token. When the widget sends a valid
+    // client_submission_id, the submission key becomes DETERMINISTIC — so a
+    // retry of the same submission (dropped SSE → user re-clicks submit, or the
+    // HTTP provider's automatic timeout retry) collides on the conditional save
+    // below and is answered with success WITHOUT re-running fulfillment
+    // (no duplicate rows, no double emails/SMS). Malformed/absent token →
+    // today's random key, no dedup (backward compatible).
+    const idemToken = typeof clientSubmissionId === 'string' && IDEM_TOKEN_SHAPE.test(clientSubmissionId)
+      ? clientSubmissionId
+      : null;
+
+    // Save to DynamoDB. Without a token: include a random suffix so two
+    // submissions of the same form in the same millisecond cannot collide on
+    // the key and silently overwrite each other (Date.now() alone is not
+    // unique under bursty load).
+    const submissionId = idemToken
+      ? `${formId}_idem_${idemToken}`
+      : `${formId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
     // F-DSAR31: capture the subject id from the writer so it can be threaded
     // into the FORM_COMPLETED session-summary write below. Undefined if the
     // save failed/skipped — the writer guards on presence, so no stamp then.
@@ -396,6 +417,22 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
       const saveResult = await saveFormSubmission(submissionId, formId, formData, config, priority, sessionId, conversationId);
       piiSubjectId = saveResult?.piiSubjectId;
       dbSaved = saveResult?.persisted === true;
+      // FS5: the conditional save says this submission_id already exists — a
+      // token-keyed retry of a submission that already landed. Short-circuit
+      // with the standard success shape; the FIRST attempt owns fulfillment.
+      if (saveResult?.duplicate === true && idemToken) {
+        console.log(`🔁 [FS5] duplicate submission ${submissionId} — returning success without re-running fulfillment`);
+        return {
+          type: 'form_complete',
+          status: 'success',
+          message: 'Thank you! Your application has been submitted successfully. You will receive a confirmation email shortly.',
+          submissionId,
+          priority,
+          duplicate: true,
+          fulfillment: { status: 'duplicate_skipped' },
+          applicant_contact: null,
+        };
+      }
     } catch (dbError) {
       console.error('❌ DynamoDB save failed:', dbError);
       // Continue with fulfillment even if DynamoDB save fails
@@ -774,7 +811,13 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
       // §1798.105 12-month common reference; counsel-pending refinement may
       // shorten/extend post-M8 Q1 response.
       ttl: Math.floor(Date.now() / 1000) + (365 * 24 * 3600)
-    }
+    },
+    // FS5: never overwrite an existing submission row. With a token-derived
+    // (deterministic) submission_id this is the dedup — a retry collides here
+    // and the caller answers success without re-running fulfillment. With the
+    // random-suffix id a collision is practically impossible, so this is inert
+    // for tokenless (legacy-widget) requests.
+    ConditionExpression: 'attribute_not_exists(submission_id)',
   };
 
   let persisted = false;
@@ -783,6 +826,14 @@ async function saveFormSubmission(submissionId, formId, formData, config, priori
     persisted = true;
     console.log(`✅ Form saved to DynamoDB with pipeline_status: new, priority: ${priority}`);
   } catch (error) {
+    // FS5: a conditional-check failure means the row ALREADY EXISTS — the first
+    // attempt landed. Not a lost write: report duplicate so the caller can
+    // short-circuit with success instead of double-fulfilling. (MFS's D3 twin
+    // taught us these 409s are by-design signals, not failures.)
+    if (error?.name === 'ConditionalCheckFailedException') {
+      console.log(`🔁 [FS5] submission ${params.Item?.submission_id} already exists — duplicate retry detected`);
+      return { piiSubjectId: undefined, persisted: false, duplicate: true };
+    }
     // M9.G8 / F-DSAR24: phase-completion-audit code-reviewer 🔴 — this
     // catch is intentional (preserves consumer UX when DDB is unreachable,
     // matches the original "Don't fail the submission if DynamoDB fails"

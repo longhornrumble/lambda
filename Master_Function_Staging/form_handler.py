@@ -7,6 +7,7 @@ Handles notifications, storage, and fulfillment
 import html
 import json
 import os
+import re
 import time
 import uuid
 import logging
@@ -54,6 +55,23 @@ SMS_USAGE_TABLE = os.environ.get('SMS_USAGE_TABLE', 'picasso_sms_usage')
 NOTIFICATION_SENDS_TABLE = os.environ.get('NOTIFICATION_SENDS_TABLE', 'picasso-notification-sends')
 
 notification_sends_table = dynamodb.Table(NOTIFICATION_SENDS_TABLE)
+
+# FS5 twin (mirrors BSH form_handler.js IDEM_TOKEN_SHAPE): shape of the
+# widget-supplied idempotency token (client_submission_id). Valid token →
+# deterministic submission_id + conditional put, so a retried submission is
+# answered with success instead of double-fulfilled. Absent/malformed →
+# today's uuid4 key, no dedup (backward compatible).
+IDEM_TOKEN_SHAPE = re.compile(r'^[A-Za-z0-9_-]{16,128}$')
+
+
+class DuplicateSubmission(Exception):
+    """FS5: the conditional put says this submission_id already exists —
+    a token-keyed retry of a submission that already landed. Carries the
+    id so the caller can answer with the standard success shape."""
+
+    def __init__(self, submission_id: str):
+        super().__init__(f'duplicate submission {submission_id}')
+        self.submission_id = submission_id
 
 
 def _default_from_email() -> str:
@@ -238,6 +256,10 @@ class FormHandler:
             if not form_config:
                 raise ValueError(f"Form type '{form_type}' not configured for tenant")
 
+            # FS5: widget-supplied idempotency token (see IDEM_TOKEN_SHAPE).
+            raw_token = form_data.get('client_submission_id')
+            client_token = raw_token if isinstance(raw_token, str) and IDEM_TOKEN_SHAPE.match(raw_token) else None
+
             # Store submission — the one step whose failure fails the request.
             # D1/D4 (BSH-FS1 twin): a lost lead must be alarmable, and the
             # marker's key=value tail is CloudWatch-metric-filter friendly.
@@ -250,7 +272,21 @@ class FormHandler:
                     form_config=form_config,
                     tenant_hash=tenant_hash,
                     request_id=request_id,
+                    client_token=client_token,
                 )
+            except DuplicateSubmission as dup:
+                # FS5: a retry of a submission that already landed. The FIRST
+                # attempt owns notifications/fulfillment — answer success
+                # WITHOUT re-running any of it (no dup rows, no double emails).
+                logger.info(f"[FS5] duplicate submission {dup.submission_id} — success without re-fulfillment")
+                return {
+                    'success': True,
+                    'submission_id': dup.submission_id,
+                    'duplicate': True,
+                    'notifications_sent': [],
+                    'fulfillment': {'status': 'duplicate_skipped'},
+                    'next_steps': self._get_next_steps(form_type, form_config),
+                }
             except Exception as store_err:  # noqa: BLE001
                 logger.error(
                     f"[FORM_SUBMISSION_LOST] tenant_id={self.tenant_id or 'unknown'} "
@@ -346,9 +382,14 @@ class FormHandler:
     def _store_submission(self, form_type: str, responses: Dict[str, Any],
                          session_id: str, conversation_id: str,
                          form_config: Dict[str, Any] = None,
-                         tenant_hash: str = None, request_id: str = None) -> str:
+                         tenant_hash: str = None, request_id: str = None,
+                         client_token: str = None) -> str:
         """Store form submission in DynamoDB"""
-        submission_id = str(uuid.uuid4())
+        # FS5: a validated client token makes the key DETERMINISTIC (mirrors
+        # BSH `${formId}_idem_${token}`), so a retry collides on the
+        # conditional put below → DuplicateSubmission → the caller answers
+        # success without re-running fulfillment. No token → uuid4 as before.
+        submission_id = f"{form_type}_idem_{client_token}" if client_token else str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
 
         # D5: the boto3 *resource* serializer raises TypeError on any Python
@@ -406,7 +447,14 @@ class FormHandler:
                     # and CCPA §1798.105 12-month common reference; counsel-pending
                     # refinement may shorten/extend post-M8 Q1 response.
                     'ttl': int(time.time()) + (365 * 24 * 3600),
-                }
+                },
+                # FS5: never overwrite an existing submission row. With a
+                # token-derived (deterministic) key this IS the dedup; with a
+                # uuid4 key a collision is practically impossible, so this is
+                # inert for tokenless (legacy-widget) requests. NB boto3
+                # RESOURCE API — the string ConditionExpression form is valid
+                # here (do NOT port BSH's PutCommand params shape).
+                ConditionExpression='attribute_not_exists(submission_id)',
             )
             logger.info(f"Stored submission: {submission_id} with form_title: {form_title}")
 
@@ -432,6 +480,15 @@ class FormHandler:
             return submission_id
 
         except ClientError as e:
+            # FS5: a conditional-check failure on a TOKEN-keyed put means the
+            # row already exists — the first attempt landed. Signal duplicate
+            # (caller answers success) instead of raising into the D1
+            # [FORM_SUBMISSION_LOST] path, which would falsely error the
+            # visitor on a submission that actually succeeded. NB: the D3
+            # breaker fix already excludes this code from failure counting.
+            if (client_token
+                    and e.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException'):
+                raise DuplicateSubmission(submission_id) from e
             logger.error(f"Error storing submission: {str(e)}")
             raise
 
