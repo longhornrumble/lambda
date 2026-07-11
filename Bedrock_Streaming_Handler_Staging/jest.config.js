@@ -18,6 +18,7 @@ module.exports = {
     'form_handler.js',
     'response_enhancer.js',
     'index.js',
+    'responsePipeline.js',
     'clerk_helper.js',
     'prompt_v4.js',
     'prompt_v5.js',
