@@ -110,7 +110,6 @@ jobs:
               redact_pii.py
               response_formatter.py
               session_utils.py
-              template_renderer.py
               tenant_config_loader.py
               tenant_inference.py
               tenant_registry.py
