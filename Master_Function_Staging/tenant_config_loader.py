@@ -1,3 +1,4 @@
+import copy
 import os
 import json
 import logging
@@ -267,7 +268,10 @@ def get_config_for_tenant_by_hash(tenant_hash):
         cache_age = time.time() - cache_timestamps.get(tenant_hash, 0)
         if cache_age < cache_timeout:
             logger.info(f"[{tenant_hash[:8]}...] ✅ Using cached config (age: {int(cache_age)}s)")
-            config = cached_config[tenant_hash].copy()
+            # D14: deep copy — a shallow .copy() shares nested dicts, so a
+            # caller mutating e.g. config['conversational_forms'] poisoned
+            # the cache for every later request on the warm container.
+            config = copy.deepcopy(cached_config[tenant_hash])
             config = add_cloudfront_metadata_hash_only(config, tenant_hash)
             log_cache_metrics(tenant_hash, "hit", cache_age)
             return config

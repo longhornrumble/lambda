@@ -603,10 +603,13 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         # Process the streaming response
         sse_chunks = []
         
-        # Process the event stream
-        for event in response['body']:
-            if 'chunk' in event:
-                chunk = event['chunk']
+        # Process the event stream. D6: the loop var must NOT be named
+        # `event` — it shadowed the Lambda event param, so add_cors_headers
+        # below received a Bedrock chunk and every non-default origin got the
+        # wrong ACAO on the streaming fallback.
+        for stream_event in response['body']:
+            if 'chunk' in stream_event:
+                chunk = stream_event['chunk']
                 if 'bytes' in chunk:
                     chunk_data = json.loads(chunk['bytes'].decode('utf-8'))
                     

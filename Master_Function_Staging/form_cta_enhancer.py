@@ -11,7 +11,9 @@ import time
 from typing import Dict, Any, Optional, List
 
 logger = logging.getLogger()
-s3_client = boto3.client('s3')
+# D11: fail-fast timeouts (boto3 default is 60s/60s)
+from aws_client_manager import boto_config_for
+s3_client = boto3.client('s3', config=boto_config_for('s3'))
 
 # Cache for tenant configurations
 config_cache = {}
@@ -58,10 +60,15 @@ def resolve_tenant_hash(tenant_hash: str) -> Optional[str]:
 def load_tenant_config(tenant_hash: str) -> Dict[str, Any]:
     """Load tenant configuration from S3 with caching"""
 
-    # Check cache first
+    # Check cache first. D8: honor a TTL like every sibling cache — without
+    # it a Config-Builder form/CTA edit never reached warm containers until
+    # cold start (stale/removed forms kept being offered).
     if tenant_hash in config_cache:
-        logger.info(f"Using cached config for tenant {tenant_hash[:8]}...")
-        return config_cache[tenant_hash]
+        cache_age = time.time() - config_cache[tenant_hash].get('_cached_at', 0)
+        if cache_age < 300:  # 5-minute cache, matches resolve_tenant_hash
+            logger.info(f"Using cached config for tenant {tenant_hash[:8]}...")
+            return config_cache[tenant_hash]
+        config_cache.pop(tenant_hash, None)
 
     try:
         # First resolve hash to ID
@@ -84,7 +91,8 @@ def load_tenant_config(tenant_hash: str) -> Dict[str, Any]:
             'conversational_forms': config.get('conversational_forms', {}),
             'form_settings': config.get('form_settings', {}),
             'conversation_branches': config.get('conversation_branches', {}),  # PHASE 3
-            'cta_definitions': config.get('cta_definitions', {})  # PHASE 3
+            'cta_definitions': config.get('cta_definitions', {}),  # PHASE 3
+            '_cached_at': time.time()  # D8: TTL marker
         }
 
         logger.info(f"Loaded tenant config for {tenant_hash[:8]}... with {len(config.get('conversational_forms', {}))} forms, {len(config.get('conversation_branches', {}))} branches, {len(config.get('cta_definitions', {}))} CTAs")
