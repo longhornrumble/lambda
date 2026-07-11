@@ -84,6 +84,23 @@ function escapeHtml(str) {
 }
 
 /**
+ * HTML-escape every value in a template-variable bag before it is interpolated
+ * into an HTML email body. The template itself is tenant-configured (trusted);
+ * the VALUES are applicant-controlled (untrusted), so escape the values — not
+ * the template. Used for the custom body_template render paths (staff
+ * notification + applicant confirmation) so an injected field value such as
+ * "<script>…" cannot become markup in the email. Subject/SMS renders keep the
+ * raw values (plaintext, no HTML context).
+ */
+function htmlEscapeVars(vars) {
+  const out = {};
+  for (const [k, v] of Object.entries(vars || {})) {
+    out[k] = escapeHtml(String(v ?? ''));
+  }
+  return out;
+}
+
+/**
  * Validate a URL is https:// only — prevents javascript: and data: URI injection.
  */
 function isValidHttpsUrl(url) {
@@ -1318,7 +1335,8 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
 
   let htmlBody;
   if (bodyTemplate) {
-    const bodyText = renderTemplate(bodyTemplate, templateVars);
+    // SEC: escape applicant-controlled values before they enter the HTML body.
+    const bodyText = renderTemplate(bodyTemplate, htmlEscapeVars(templateVars));
     htmlBody = `<div style="font-family: Arial, sans-serif; line-height: 1.6;">${bodyText.replace(/\n/g, '<br>')}</div>`;
   } else {
     // Default HTML email body
@@ -1428,16 +1446,23 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
     form_data: formDataText,
   };
 
-  let subject, bodyText;
+  // bodyText = raw (plaintext email part); bodyTextHtml = value-escaped (HTML part).
+  // SEC: escape applicant-controlled values before they enter the HTML body,
+  // but keep the plaintext part un-escaped so it reads normally.
+  let subject, bodyText, bodyTextHtml;
 
   if (confirmationConfig?.subject && confirmationConfig?.body_template) {
     // Use per-form template from tenant config
     subject = renderTemplate(confirmationConfig.subject, templateVars);
     bodyText = renderTemplate(confirmationConfig.body_template, templateVars);
+    bodyTextHtml = renderTemplate(confirmationConfig.body_template, htmlEscapeVars(templateVars));
   } else {
     // Fallback to generic template
     subject = `Thank you for your ${formConfig.title || formId} submission`;
     bodyText = `Dear Applicant,\n\nWe have received your ${formConfig.title || formId} submission to ${tenantName}.\n\nOur team will review your information and get back to you soon.\n\nIf you have any questions, please don't hesitate to contact us.\n\nBest regards,\n${tenantName} Team`;
+    // Fallback interpolates only tenant/config values (no applicant data), so
+    // the HTML variant is the same text.
+    bodyTextHtml = bodyText;
   }
 
   // Build HTML email — branded if use_tenant_branding is enabled and branding config exists
@@ -1462,7 +1487,7 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
           <div style="color:#ffffff; font-size:18px; font-weight:600; margin-top:${logoUrl ? '12' : '0'}px;">${safeOrgName}</div>
         </td></tr>
         <tr><td style="padding:32px 24px; color:#333333; font-size:15px; line-height:1.6;">
-          ${bodyText.replace(/\n/g, '<br>')}
+          ${bodyTextHtml.replace(/\n/g, '<br>')}
         </td></tr>
         <tr><td style="padding:16px 24px; border-top:1px solid #eeeeee; color:#999999; font-size:12px; text-align:center;">
           &copy; ${new Date().getFullYear()} ${safeOrgName}
@@ -1474,7 +1499,7 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
 </html>`;
   } else {
     // No branding — bare HTML (existing behavior)
-    htmlBody = `<div>${bodyText.replace(/\n/g, '<br>')}</div>`;
+    htmlBody = `<div>${bodyTextHtml.replace(/\n/g, '<br>')}</div>`;
   }
 
   const params = {
@@ -1916,5 +1941,6 @@ module.exports = {
   validateFormField,
   submitForm,
   getSESFromEmail,
+  htmlEscapeVars,
   SmsRateLimitError
 };

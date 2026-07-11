@@ -173,6 +173,31 @@ const bedrock = new BedrockRuntimeClient({
 });
 const sqs = new SQSClient({ region: AWS_REGION });
 
+/**
+ * SEC: client-supplied conversation_history was interpolated into the prompt
+ * verbatim while only the CURRENT turn was sanitized — letting an earlier turn
+ * smuggle role-marker/ChatML injection into a later turn's context. Sanitize
+ * every history message's content the same way the current turn is
+ * (bedrock-core sanitizeUserInput), preserving role + shape. Applied once at
+ * ingestion so every downstream consumer (prompt builders, CTA selector, agent
+ * tools, analytics) sees the sanitized transcript.
+ * @param {Array} history - Raw conversation history from the request body
+ * @returns {Array} History with each message's content/text sanitized
+ */
+function sanitizeConversationHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history.map((msg) => {
+    if (!msg || typeof msg !== 'object') return msg;
+    if (typeof msg.content === 'string') {
+      return { ...msg, content: sanitizeUserInput(msg.content) };
+    }
+    if (typeof msg.text === 'string') {
+      return { ...msg, text: sanitizeUserInput(msg.text) };
+    }
+    return msg;
+  });
+}
+
 // Analytics SQS queue URL. Unset in the staging account (per Issue #5
 // batch-1 deferral — no staging SQS queue yet); handleAnalyticsEvent
 // no-ops when this is empty so cross-account writes can't accidentally
@@ -432,10 +457,13 @@ const streamingHandler = async (event, responseStream, context) => {
     // Capture the question for logging
     questionBuffer = userInput;
     
-    // Extract conversation history from the request
-    const conversationHistory = body.conversation_history || 
-                               body.conversation_context?.recentMessages || 
-                               [];
+    // Extract conversation history from the request (SEC: sanitize each message
+    // — it is client-supplied and otherwise reaches the prompt verbatim).
+    const conversationHistory = sanitizeConversationHistory(
+      body.conversation_history ||
+      body.conversation_context?.recentMessages ||
+      []
+    );
     
     console.log(`📝 Processing: ${tenantHash.substring(0,8)}... / ${sessionId.substring(0,12)}...`);
     console.log(`💬 Conversation history: ${conversationHistory.length} messages`);
@@ -1297,10 +1325,13 @@ const bufferedHandler = async (event, context) => {
     // Capture the question
     questionBuffer = userInput;
 
-    // Extract conversation history from the request
-    const conversationHistory = body.conversation_history ||
-                               body.conversation_context?.recentMessages ||
-                               [];
+    // Extract conversation history from the request (SEC: sanitize each message
+    // — it is client-supplied and otherwise reaches the prompt verbatim).
+    const conversationHistory = sanitizeConversationHistory(
+      body.conversation_history ||
+      body.conversation_context?.recentMessages ||
+      []
+    );
 
     console.log(`💬 Conversation history: ${conversationHistory.length} messages`);
 
@@ -1751,3 +1782,5 @@ exports.handler = streamifyResponse ? streamifyResponse(streamingHandler) : buff
 // Exported for tests (assert the CS1 timeout contract is intact — timeouts set
 // and throwOnRequestTimeout enabled so the timeout actually aborts).
 exports.BEDROCK_STREAM_TIMEOUTS = BEDROCK_STREAM_TIMEOUTS;
+// Exported for tests (SEC: history sanitization at ingestion).
+exports.sanitizeConversationHistory = sanitizeConversationHistory;

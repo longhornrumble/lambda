@@ -39,6 +39,7 @@ const {
   handleFormMode,
   validateFormField,
   submitForm,
+  htmlEscapeVars,
   SmsRateLimitError
 } = require('../form_handler');
 
@@ -2182,5 +2183,77 @@ describe('Form Handler - SEC: no applicant PII in logs', () => {
     expect(submitLine).toContain('first_name'); // field key retained
     expect(submitLine).not.toContain('john.doe@example.com'); // value NOT logged
     expect(submitLine).not.toContain('John');   // value NOT logged
+  });
+});
+
+// SEC (C): a tenant custom body_template renders applicant-controlled values
+// into an HTML email. The values must be escaped so an injected field cannot
+// become markup in a STAFF-facing email (the real vuln; F-DSAR25 covered only
+// the auto-generated form_data table, not the custom-template path).
+describe('Form Handler - SEC: HTML email template escaping', () => {
+  describe('htmlEscapeVars', () => {
+    it('escapes HTML metacharacters in every value', () => {
+      const out = htmlEscapeVars({
+        a: '<script>alert(1)</script>',
+        b: 'Tom & "Jerry"',
+        c: 'plain',
+      });
+      expect(out.a).toBe('&lt;script&gt;alert(1)&lt;/script&gt;');
+      expect(out.b).toBe('Tom &amp; &quot;Jerry&quot;');
+      expect(out.c).toBe('plain');
+    });
+
+    it('coerces null/undefined/number to safe strings', () => {
+      const out = htmlEscapeVars({ x: null, y: undefined, z: 42 });
+      expect(out.x).toBe('');
+      expect(out.y).toBe('');
+      expect(out.z).toBe('42');
+    });
+
+    it('handles a null/empty bag', () => {
+      expect(htmlEscapeVars(null)).toEqual({});
+      expect(htmlEscapeVars({})).toEqual({});
+    });
+  });
+
+  it('staff notification email escapes an injected applicant field value', async () => {
+    sesMock.reset();
+    dynamoMock.reset();
+    lambdaMock.reset();
+    s3Mock.reset();
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'm' });
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+    dynamoMock.on(UpdateCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
+    const cfg = {
+      tenant_id: 'TEST123',
+      chat_title: 'Test Org',
+      conversational_forms: {
+        volunteer_apply: {
+          form_id: 'volunteer_apply',
+          title: 'Volunteer',
+          notifications: {
+            internal: {
+              enabled: true,
+              recipients: ['staff@example.com'],
+              body_template: '<p>Applicant: {first_name}</p>',
+            },
+          },
+        },
+      },
+    };
+    const injected = { first_name: '<script>alert(1)</script>', email: 'applicant@example.com' };
+
+    await submitForm('volunteer_apply', injected, cfg);
+
+    const staffCall = sesMock
+      .commandCalls(SendEmailCommand)
+      .find((c) => (c.args[0].input.Destination.ToAddresses || []).includes('staff@example.com'));
+    expect(staffCall).toBeDefined();
+    const html = staffCall.args[0].input.Message.Body.Html.Data;
+    expect(html).toContain('&lt;script&gt;');       // value escaped
+    expect(html).not.toContain('<script>alert(1)'); // raw script NOT injected
   });
 });
