@@ -19,6 +19,19 @@
  * Per the analytics_integration.test.js note, aws-sdk-client-mock does NOT reach
  * inside an isolated registry, so every seam — including the Bedrock client — is
  * jest.doMock'd against module-scope spies that each test configures.
+ *
+ * PHASE 2 (pre-Bedrock branches, dedup #5 follow-up): the net now also covers the
+ * Bedrock-bypass branches that run BEFORE the shared responsePipeline. Empirical
+ * twin map (read from index.js, 2026-07-11):
+ *   • show_showcase click — duplicated in BOTH handlers → PARITY asserted.
+ *   • form_mode, scheduling click turns, email capture, prep-note capture —
+ *     STREAMING-ONLY. The buffered twin has no such branches (form_mode 400s on
+ *     missing user_input; click metadata falls through to normal chat). Those get
+ *     streaming GOLDEN MASTERS plus KNOWN-DIVERGENCE freezes on the buffered path,
+ *     so any future change to either side of the asymmetry is deliberate, not drift.
+ *     (Reachability: the buffered handler runs only where `awslambda` is absent —
+ *     never on the real Lambda; production form submissions ride the streaming lane
+ *     or the MFS HTTP-fallback lane.)
  */
 
 'use strict';
@@ -36,6 +49,13 @@ const spies = {
   runNewBookingEntry: jest.fn(),
   writeSessionSummary: jest.fn(),
   bedrockSend: jest.fn(),
+  // Phase 2 — pre-Bedrock branch seams
+  handleFormMode: jest.fn(),
+  getShowcaseById: jest.fn(),
+  loadTenantConfig: jest.fn(),
+  captureAttendeeEmail: jest.fn(),
+  capturePrepNote: jest.fn(),
+  tenantHasPostBookingQuestion: jest.fn(),
 };
 
 // Bedrock streaming mock: an async-iterable body of content_block_delta frames.
@@ -78,10 +98,11 @@ function loadHandler(streaming) {
       getCacheKey: jest.fn(), isCacheValid: jest.fn(), evictOldestCacheEntries: jest.fn(),
       CACHE_TTL: 300000, MAX_CACHE_SIZE: 100,
     }));
-    jest.doMock('../form_handler', () => ({ handleFormMode: jest.fn() }));
+    jest.doMock('../form_handler', () => ({ handleFormMode: (...a) => spies.handleFormMode(...a) }));
     jest.doMock('../response_enhancer', () => ({
       enhanceResponse: (...a) => spies.enhanceResponse(...a),
-      getShowcaseById: jest.fn(), loadTenantConfig: jest.fn(),
+      getShowcaseById: (...a) => spies.getShowcaseById(...a),
+      loadTenantConfig: (...a) => spies.loadTenantConfig(...a),
     }));
     jest.doMock('../analytics_writer', () => ({ writeSessionSummary: (...a) => spies.writeSessionSummary(...a) }));
     jest.doMock('../prompt_v4', () => {
@@ -96,14 +117,14 @@ function loadHandler(streaming) {
     jest.doMock('../scheduling/schedulingFlow', () => ({ runSchedulingTurn: (...a) => spies.runSchedulingTurn(...a) }));
     jest.doMock('../scheduling/newBookingEntry', () => ({
       runNewBookingEntry: (...a) => spies.runNewBookingEntry(...a),
-      captureAttendeeEmail: jest.fn(async () => ({ captured: false })),
+      captureAttendeeEmail: (...a) => spies.captureAttendeeEmail(...a),
       // Real-shaped regex: the handler calls EMAIL_SHAPE.test(userInput) to gate the
       // email-capture branch. A non-email input must return false so both paths skip it.
       EMAIL_SHAPE: /^[^\s@<>]+@[^\s@]+\.[^\s@]+$/,
     }));
     jest.doMock('../scheduling/postBookingPrepNote', () => ({
-      capturePrepNote: jest.fn(async () => ({ captured: false })),
-      tenantHasPostBookingQuestion: jest.fn(() => false),
+      capturePrepNote: (...a) => spies.capturePrepNote(...a),
+      tenantHasPostBookingQuestion: (...a) => spies.tenantHasPostBookingQuestion(...a),
     }));
     jest.doMock('../scheduling/agentTurn', () => ({ agentTurn: jest.fn(), isAgentTurnEnabled: jest.fn(() => false) }));
     jest.doMock('../scheduling/bindingContext', () => {
@@ -193,6 +214,13 @@ beforeEach(() => {
   spies.runSchedulingTurn.mockResolvedValue({ handled: false });
   spies.runNewBookingEntry.mockResolvedValue({ handled: false });
   spies.writeSessionSummary.mockResolvedValue(true);
+  // Phase 2 defaults — every pre-Bedrock gate closed so pre-Phase-2 tests are unchanged.
+  spies.handleFormMode.mockResolvedValue({ type: 'form_complete', message: 'ok' });
+  spies.getShowcaseById.mockReturnValue(null);
+  spies.loadTenantConfig.mockResolvedValue(baseConfig);
+  spies.captureAttendeeEmail.mockResolvedValue({ captured: false });
+  spies.capturePrepNote.mockResolvedValue({ captured: false });
+  spies.tenantHasPostBookingQuestion.mockReturnValue(false);
   // Fresh stream per invocation — a test drives BOTH handlers, and a Bedrock async-iterable
   // body must not be shared/re-consumed across the two calls.
   spies.bedrockSend.mockImplementation(async () => createBedrockStream(['Hello ', 'world']));
@@ -299,5 +327,189 @@ describe('characterization — Bedrock error path', () => {
     expect(statusCode).toBe(500);
     expect(events.some((e) => e.type === 'error')).toBe(true);
     expect(events[events.length - 1]).toEqual({ type: 'DONE' });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PHASE 2 — pre-Bedrock Bedrock-bypass branches.
+// User-visible copy below is FROZEN verbatim from index.js: these are wire bytes the
+// widget renders, so a wording change is a behaviour change and should trip the net.
+const ENTRY_COPY = 'Happy to set that up — let me pull up some openings for you…';
+const ENTRY_FALLBACK_COPY = "I couldn't pull up available times just now. Please try again in a few minutes.";
+const CONFIRM_READY_COPY = 'Perfect — tap "Yes, book it" and I\'ll lock it in.';
+const BOOKED_COPY = 'Booked! Your calendar invite is on its way.';
+
+const schedulingConfig = () => ({ ...baseConfig, feature_flags: { scheduling_enabled: true } });
+
+describe('phase 2 — show_showcase click (the one genuinely twinned pre-Bedrock branch)', () => {
+  const showcaseEvent = () => chatEvent({ routing_metadata: { action: 'show_showcase', target_showcase_id: 'sc9' } });
+
+  it('parity: found card → both emit the identical showcase_card frame then DONE, no Bedrock call', async () => {
+    spies.getShowcaseById.mockReturnValue({ id: 'sc9', title: 'Our Programs' });
+    const s = noStreamMarkers(semantic(await runStreaming(showcaseEvent())));
+    const b = await runBuffered(showcaseEvent());
+    expect(s).toEqual([
+      { type: 'showcase_card', showcaseCard: { id: 'sc9', title: 'Our Programs' } },
+      { type: 'DONE' },
+    ]);
+    expect(semantic(b.events)).toEqual(s);
+    expect(b.statusCode).toBe(200);
+    expect(spies.bedrockSend).not.toHaveBeenCalled();
+  });
+
+  it('parity: unknown id → both emit error then DONE (buffered stays 200 — not-found is not a 500)', async () => {
+    spies.getShowcaseById.mockReturnValue(null);
+    const s = noStreamMarkers(semantic(await runStreaming(showcaseEvent())));
+    const b = await runBuffered(showcaseEvent());
+    expect(s).toEqual([{ type: 'error' }, { type: 'DONE' }]);
+    expect(semantic(b.events)).toEqual(s);
+    expect(b.statusCode).toBe(200);
+  });
+
+  it('parity: loadTenantConfig throws → both emit error then DONE; buffered returns 500', async () => {
+    spies.loadTenantConfig.mockRejectedValue(new Error('s3 down'));
+    const s = noStreamMarkers(semantic(await runStreaming(showcaseEvent())));
+    const b = await runBuffered(showcaseEvent());
+    expect(s).toEqual([{ type: 'error' }, { type: 'DONE' }]);
+    expect(semantic(b.events)).toEqual(s);
+    expect(b.statusCode).toBe(500);
+  });
+});
+
+describe('phase 2 — form_mode turn (STREAMING-ONLY branch)', () => {
+  const formEvent = () => ({
+    body: JSON.stringify({ tenant_hash: 'abc123', form_mode: true, form_id: 'volunteer_apply', form_data: { name: 'J' } }),
+  });
+
+  it('streaming golden master: form response relayed as one frame, applicant_contact seam field STRIPPED, then DONE', async () => {
+    spies.handleFormMode.mockResolvedValue({
+      type: 'form_complete', message: 'Thanks!', session_id: 'sess1',
+      applicant_contact: { email: 'a@b.co' }, // D3 internal seam — must never reach the wire
+    });
+    const events = await runStreaming(formEvent());
+    const frame = events.find((e) => e.type === 'form_complete');
+    expect(frame).toBeDefined();
+    expect(frame.message).toBe('Thanks!');
+    expect(frame).not.toHaveProperty('applicant_contact');
+    expect(events[events.length - 1]).toEqual({ type: 'DONE' });
+    expect(spies.bedrockSend).not.toHaveBeenCalled();
+  });
+
+  it('streaming: handleFormMode throws → generic error frame then DONE (no dead air, no internal detail)', async () => {
+    spies.handleFormMode.mockRejectedValue(new Error('ddb exploded'));
+    const events = await runStreaming(formEvent());
+    const err = events.find((e) => e.type === 'error');
+    expect(err.error).toBe('Form processing failed. Please try again.');
+    expect(events[events.length - 1]).toEqual({ type: 'DONE' });
+  });
+
+  it('KNOWN DIVERGENCE (frozen): buffered has NO form_mode branch — form-only body 400s on missing user_input', async () => {
+    // Reachability makes this acceptable today: the buffered twin never runs on the real
+    // Lambda (awslambda global always present), and production form submissions ride the
+    // streaming lane or the MFS HTTP-fallback lane. If this test trips, someone changed
+    // one side of the asymmetry — decide deliberately whether the twin follows.
+    const { events, statusCode } = await runBuffered(formEvent());
+    expect(statusCode).toBe(400);
+    expect(semantic(events)).toEqual([{ type: 'error' }, { type: 'DONE' }]);
+    expect(spies.handleFormMode).not.toHaveBeenCalled();
+  });
+});
+
+describe('phase 2 — scheduling click turns (STREAMING-ONLY, deterministic, zero model calls)', () => {
+  beforeEach(() => { spies.loadConfig.mockResolvedValue(schedulingConfig()); });
+
+  it('entry click, propose seam down: entry copy + fallback copy + DONE; detector model disabled (bedrock: null)', async () => {
+    const ev = chatEvent({ routing_metadata: { scheduling_intent: 'new_booking' } });
+    const seq = semantic(await runStreaming(ev));
+    expect(seq).toEqual([
+      { type: 'start' },
+      { type: 'text', content: ENTRY_COPY },
+      { type: 'text', content: ENTRY_FALLBACK_COPY },
+      { type: 'DONE' },
+    ]);
+    expect(spies.bedrockSend).not.toHaveBeenCalled();
+    expect(spies.runNewBookingEntry.mock.calls[0][0].bedrock).toBeNull();
+  });
+
+  it('select_slot click → confirming with identity: confirm-ready copy + DONE, no Bedrock', async () => {
+    spies.runNewBookingEntry.mockResolvedValue({ handled: true, state: 'confirming', identity: { email: 'a@b.co' } });
+    const ev = chatEvent({ routing_metadata: { scheduling_action: 'select_slot', scheduling_slot_id: 'slot1' } });
+    const seq = semantic(await runStreaming(ev));
+    expect(seq).toEqual([{ type: 'start' }, { type: 'text', content: CONFIRM_READY_COPY }, { type: 'DONE' }]);
+    expect(spies.bedrockSend).not.toHaveBeenCalled();
+  });
+
+  it('confirm_book click → executed: booked copy + DONE, no Bedrock', async () => {
+    spies.runNewBookingEntry.mockResolvedValue({ handled: true, executed: true });
+    const ev = chatEvent({ routing_metadata: { scheduling_action: 'confirm_book' } });
+    const seq = semantic(await runStreaming(ev));
+    expect(seq).toEqual([{ type: 'start' }, { type: 'text', content: BOOKED_COPY }, { type: 'DONE' }]);
+    expect(spies.bedrockSend).not.toHaveBeenCalled();
+  });
+
+  it('click turn NEVER dead-airs: runNewBookingEntry throws → fallback copy + DONE', async () => {
+    spies.runNewBookingEntry.mockRejectedValue(new Error('flow exploded'));
+    const ev = chatEvent({ routing_metadata: { scheduling_action: 'confirm_book' } });
+    const seq = semantic(await runStreaming(ev));
+    expect(seq).toEqual([{ type: 'start' }, { type: 'text', content: ENTRY_FALLBACK_COPY }, { type: 'DONE' }]);
+  });
+
+  it('KNOWN DIVERGENCE (frozen): buffered has NO pre-Bedrock click router — an entry click streams a chat answer, and the widget signal is consumed by the POST-response pipeline hook with a LIVE detector client', async () => {
+    // On streaming, a click turn returns pre-Bedrock (deterministic, bedrock: null).
+    // On buffered, the turn runs as normal chat (the P0-2 "KB copy co-mingles with the
+    // booking flow" shape) and the shared responsePipeline's §B16d entry hook still
+    // receives routing_metadata — with a real Bedrock client, not null.
+    const ev = chatEvent({ routing_metadata: { scheduling_intent: 'new_booking' } });
+    const { events, statusCode } = await runBuffered(ev);
+    expect(statusCode).toBe(200);
+    expect(semantic(events)).toEqual([
+      { type: 'text', content: 'Hello ' }, { type: 'text', content: 'world' }, { type: 'DONE' },
+    ]);
+    expect(spies.bedrockSend).toHaveBeenCalled();
+    expect(spies.runNewBookingEntry).toHaveBeenCalledTimes(1);
+    expect(spies.runNewBookingEntry.mock.calls[0][0].bedrock).not.toBeNull();
+  });
+});
+
+describe('phase 2 — bare-email capture turn (STREAMING-ONLY)', () => {
+  beforeEach(() => { spies.loadConfig.mockResolvedValue(schedulingConfig()); });
+  const emailEvent = () => chatEvent({ user_input: 'jane@example.org' });
+
+  it('captured: acknowledges the email + DONE, no model call (§B14: capture never commits)', async () => {
+    spies.captureAttendeeEmail.mockResolvedValue({ captured: true, email: 'jane@example.org' });
+    const seq = semantic(await runStreaming(emailEvent()));
+    expect(seq).toEqual([
+      { type: 'start' },
+      { type: 'text', content: 'Got it — jane@example.org. Tap "Yes, book it" to confirm your time.' },
+      { type: 'DONE' },
+    ]);
+    expect(spies.bedrockSend).not.toHaveBeenCalled();
+  });
+
+  it('not captured (no confirming session): falls through to normal chat', async () => {
+    const seq = semantic(await runStreaming(emailEvent()));
+    expect(spies.captureAttendeeEmail).toHaveBeenCalledTimes(1);
+    expect(spies.bedrockSend).toHaveBeenCalled();
+    expect(seq).toContainEqual({ type: 'text', content: 'Hello ' });
+    expect(seq[seq.length - 1]).toEqual({ type: 'DONE' });
+  });
+});
+
+describe('phase 2 — post-booking prep-note capture turn (STREAMING-ONLY)', () => {
+  beforeEach(() => { spies.loadConfig.mockResolvedValue(schedulingConfig()); });
+
+  it('captured: turn ends with DONE only (ack is written by capturePrepNote itself), no model call', async () => {
+    spies.tenantHasPostBookingQuestion.mockReturnValue(true);
+    spies.capturePrepNote.mockResolvedValue({ captured: true });
+    const seq = semantic(await runStreaming(chatEvent({ user_input: 'I want to discuss onboarding' })));
+    expect(seq).toEqual([{ type: 'start' }, { type: 'DONE' }]);
+    expect(spies.bedrockSend).not.toHaveBeenCalled();
+  });
+
+  it('config gate closed (no form configures a question): no per-turn state read, normal chat unchanged', async () => {
+    const seq = semantic(await runStreaming(chatEvent({ user_input: 'I want to discuss onboarding' })));
+    expect(spies.capturePrepNote).not.toHaveBeenCalled();
+    expect(spies.bedrockSend).toHaveBeenCalled();
+    expect(seq[seq.length - 1]).toEqual({ type: 'DONE' });
   });
 });
