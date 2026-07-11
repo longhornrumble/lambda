@@ -251,27 +251,22 @@ describe('characterization — V4 action selector tier', () => {
 });
 
 describe('characterization — showcase card (enhanceResponse.showcaseCard)', () => {
-  // ⚠️ KNOWN DRIFT — the net's first catch (an F-DSAR25-class divergence). Streaming emits
-  // enhancedData.showcaseCard inside the CTA tiers (index.js:1033 explicit-click, :1158
-  // fallback); the BUFFERED twin OMITS it there — only its dedicated showcase-ROUTING branch
-  // (index.js:1306) ever emits a card. So a showcase card returned by enhanceResponse reaches
-  // streaming clients but NOT buffered ones. These two tests FREEZE that current reality.
-  // Phase 1's shared post-response pipeline unifies the emit path → buffered will gain the
-  // frame → these assertions must then FLIP to a single parity assertion. That flip is a
-  // deliberate Phase-1 acceptance signal, not an incidental churn.
+  // ✅ DRIFT RESOLVED by Phase 1. Pre-dedup, streaming emitted enhanceResponse.showcaseCard in
+  // the CTA tiers but the buffered twin dropped it (an F-DSAR25-class divergence the net caught
+  // and froze). The shared responsePipeline.js now unifies the emit path, so BOTH handlers emit
+  // the frame. The former known-drift pair is retired for this parity assertion — the deliberate
+  // acceptance signal for the extraction.
   beforeEach(() => {
     spies.enhanceResponse.mockResolvedValue({
       message: '', metadata: { routing_tier: 'explicit' }, ctaButtons: [],
       showcaseCard: { id: 'sc1', title: 'Our Programs' },
     });
   });
-  it('streaming DOES emit a showcase_card frame from enhanceResponse', async () => {
+  it('parity: both handlers emit a showcase_card frame', async () => {
     const s = noStreamMarkers(semantic(await runStreaming(chatEvent())));
-    expect(s).toContainEqual({ type: 'showcase_card', showcaseCard: { id: 'sc1', title: 'Our Programs' } });
-  });
-  it('buffered does NOT (pre-Phase-1 drift: buffered omits enhancedData.showcaseCard in the CTA tiers)', async () => {
     const b = semantic((await runBuffered(chatEvent())).events);
-    expect(b.some((e) => e.type === 'showcase_card')).toBe(false);
+    expect(s).toContainEqual({ type: 'showcase_card', showcaseCard: { id: 'sc1', title: 'Our Programs' } });
+    expect(s).toEqual(b);
   });
 });
 
