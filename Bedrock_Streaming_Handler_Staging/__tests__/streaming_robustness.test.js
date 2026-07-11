@@ -119,6 +119,30 @@ describe('CS4 — streamingHandler malformed body', () => {
     // No "Invalid request body" error — the parse accepted valid JSON.
     expect(chunks.some((c) => typeof c === 'string' && c.includes('Invalid request body'))).toBe(false);
   });
+
+  test('CS5: an early-return path ends the stream exactly once (finally does not re-end)', async () => {
+    // Missing tenant_hash → early return INSIDE the try; the `return` still runs
+    // the finally, which must NOT call end() a second time.
+    const event = { body: JSON.stringify({ user_input: 'hi' }) }; // no tenant_hash
+    const responseStream = createMockResponseStream();
+
+    await indexModule.handler(event, responseStream, {});
+
+    expect(responseStream.end).toHaveBeenCalledTimes(1);
+  });
+
+  test('SEC: the main catch sends a generic error, not the internal error.message', async () => {
+    loadConfig.mockRejectedValue(new Error('DB_CONN_STRING_LEAK_xyz'));
+    retrieveKB.mockResolvedValue('');
+    const event = { body: JSON.stringify({ tenant_hash: 'abc', user_input: 'hi' }) };
+    const responseStream = createMockResponseStream();
+
+    await indexModule.handler(event, responseStream, {});
+
+    const chunks = responseStream.getChunks().join('\n');
+    expect(chunks).not.toContain('DB_CONN_STRING_LEAK_xyz'); // internal detail NOT leaked
+    expect(chunks).toContain('Something went wrong');        // generic message sent
+  });
 });
 
 describe('SEC — streamingHandler does not log raw request-body PII', () => {
