@@ -152,10 +152,14 @@ def handle_get_conversation(event):
         # 4. Generate new rotated token
         new_token = _generate_rotated_token(token_data)
         
-        # 5. Audit successful retrieval (fail-closed for security)
+        # 5. Audit successful retrieval (fail-closed for security).
+        # D9: _log_audit_event catches internally and returns False — it
+        # never raises — so the except-based gate was dead code and an audit
+        # outage let conversations proceed unrecorded. Check the return.
         if AUDIT_LOGGER_AVAILABLE:
+            audit_ok = False
             try:
-                audit_logger._log_audit_event(
+                audit_ok = audit_logger._log_audit_event(
                     tenant_id=tenant_id,
                     event_type='CONVERSATION_RETRIEVED',
                     session_id=session_id,
@@ -163,6 +167,8 @@ def handle_get_conversation(event):
                 )
             except Exception as e:
                 logger.error(f"❌ Audit logging failed for retrieval: {e}")
+            if not audit_ok:
+                logger.error("❌ Audit logging failed for retrieval — failing closed")
                 raise ConversationError("AUDIT_FAILED", "Security audit service unavailable", 503)
         else:
             logger.error("❌ Audit logger unavailable for retrieval operation")
@@ -256,9 +262,11 @@ def handle_save_conversation(event):
         new_token = _generate_rotated_token(token_data)
         
         # 8. Audit successful save (fail-closed for security in production only)
+        # D9: check the boolean return — _log_audit_event never raises.
         if AUDIT_LOGGER_AVAILABLE:
+            audit_ok = False
             try:
-                audit_logger._log_audit_event(
+                audit_ok = audit_logger._log_audit_event(
                     tenant_id=tenant_id,
                     event_type='CONVERSATION_SAVED',
                     session_id=session_id,
@@ -270,6 +278,7 @@ def handle_save_conversation(event):
                 )
             except Exception as e:
                 logger.error(f"❌ Audit logging failed for save: {e}")
+            if not audit_ok:
                 # Only fail-closed in production environment
                 if ENVIRONMENT == 'production':
                     raise ConversationError("AUDIT_FAILED", "Security audit service unavailable", 503)
@@ -824,54 +833,63 @@ def _delete_conversation_from_db(session_id, tenant_id):
         messages_deleted = 0
         summaries_deleted = 0
         
-        # Delete from messages table with timeout protection
-        if AWS_CLIENT_MANAGER_AVAILABLE:
-            try:
-                messages_response = protected_dynamodb_operation(
-                    'query',
-                    TableName=MESSAGES_TABLE_NAME,
-                    KeyConditionExpression='sessionId = :sid',
-                    ExpressionAttributeValues={':sid': {'S': session_id}},
-                    ProjectionExpression='sessionId, #ts',
-                    ExpressionAttributeNames={'#ts': 'messageTimestamp'}
-                )
-            except (ConnectTimeoutError, ReadTimeoutError, CircuitBreakerError) as e:
-                logger.error(f"⏰ DynamoDB timeout querying messages for deletion: {e}")
-                raise ConversationError("DB_TIMEOUT", "Database service temporarily unavailable", 503)
-        else:
-            # Fallback to legacy client
-            messages_response = dynamodb.query(
-                TableName=MESSAGES_TABLE_NAME,
-                KeyConditionExpression='sessionId = :sid',
-                ExpressionAttributeValues={':sid': {'S': session_id}},
-                ProjectionExpression='sessionId, #ts',
-                ExpressionAttributeNames={'#ts': 'timestamp'}
-            )
-        
-        for item in messages_response.get('Items', []):
+        # Delete from messages table with timeout protection.
+        # D14: paginate — a >1MB conversation used to partial-delete on the
+        # first page yet report success (this is a PII-deletion path). Also
+        # the legacy branch projected '#ts' = 'timestamp' while the delete
+        # keyed on messageTimestamp → KeyError; both branches now project
+        # the real sort key.
+        last_evaluated_key = None
+        while True:
+            query_kwargs = {
+                'TableName': MESSAGES_TABLE_NAME,
+                'KeyConditionExpression': 'sessionId = :sid',
+                'ExpressionAttributeValues': {':sid': {'S': session_id}},
+                'ProjectionExpression': 'sessionId, #ts',
+                'ExpressionAttributeNames': {'#ts': 'messageTimestamp'},
+            }
+            if last_evaluated_key:
+                query_kwargs['ExclusiveStartKey'] = last_evaluated_key
+
             if AWS_CLIENT_MANAGER_AVAILABLE:
                 try:
-                    protected_dynamodb_operation(
-                        'delete_item',
+                    messages_response = protected_dynamodb_operation(
+                        'query', **query_kwargs)
+                except (ConnectTimeoutError, ReadTimeoutError, CircuitBreakerError) as e:
+                    logger.error(f"⏰ DynamoDB timeout querying messages for deletion: {e}")
+                    raise ConversationError("DB_TIMEOUT", "Database service temporarily unavailable", 503)
+            else:
+                # Fallback to legacy client
+                messages_response = dynamodb.query(**query_kwargs)
+
+            for item in messages_response.get('Items', []):
+                if AWS_CLIENT_MANAGER_AVAILABLE:
+                    try:
+                        protected_dynamodb_operation(
+                            'delete_item',
+                            TableName=MESSAGES_TABLE_NAME,
+                            Key={
+                                'sessionId': {'S': session_id},
+                                'messageTimestamp': item['messageTimestamp']
+                            }
+                        )
+                    except (ConnectTimeoutError, ReadTimeoutError, CircuitBreakerError) as e:
+                        logger.error(f"⏰ DynamoDB timeout deleting message: {e}")
+                        raise ConversationError("DB_TIMEOUT", "Database service temporarily unavailable", 503)
+                else:
+                    # Fallback to legacy client
+                    dynamodb.delete_item(
                         TableName=MESSAGES_TABLE_NAME,
                         Key={
                             'sessionId': {'S': session_id},
                             'messageTimestamp': item['messageTimestamp']
                         }
                     )
-                except (ConnectTimeoutError, ReadTimeoutError, CircuitBreakerError) as e:
-                    logger.error(f"⏰ DynamoDB timeout deleting message: {e}")
-                    raise ConversationError("DB_TIMEOUT", "Database service temporarily unavailable", 503)
-            else:
-                # Fallback to legacy client
-                dynamodb.delete_item(
-                    TableName=MESSAGES_TABLE_NAME,
-                    Key={
-                        'sessionId': {'S': session_id},
-                        'messageTimestamp': item['messageTimestamp']
-                    }
-                )
-            messages_deleted += 1
+                messages_deleted += 1
+
+            last_evaluated_key = messages_response.get('LastEvaluatedKey')
+            if not last_evaluated_key:
+                break
         
         # Delete from summaries table with timeout protection
         try:

@@ -222,6 +222,12 @@ class AuditLogger:
                 
             except ClientError as e:
                 error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                # D9: the ConditionExpression exists to prevent duplicate
+                # rows — a conditional failure means the event IS logged.
+                # Report success so fail-closed callers don't 503 on a
+                # benign duplicate (same class as the D3 breaker bug).
+                if error_code == 'ConditionalCheckFailedException':
+                    return True
                 logger.error(f"DynamoDB audit write failed: {error_code}")
                 
                 self._buffer_metric('AuditWriteFailures', 1, [

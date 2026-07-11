@@ -1,5 +1,7 @@
 import json
 import logging
+import time
+import uuid
 from session_utils import extract_session_data
 from redact_pii import redact_pii
 
@@ -203,33 +205,47 @@ def extract_user_input(event):
     return event.get("user_input", "")
 
 def extract_session_id(event):
-    """Extract session ID from event"""
-    
+    """Extract session ID from event.
+
+    D7: `import time` used to sit at the bottom of this function, which made
+    `time` function-local everywhere above it — the eager default-arg
+    f-strings raised UnboundLocalError, the bare excepts swallowed it, and
+    the client-supplied session_id was ALWAYS discarded in favor of a
+    second-granularity fallback that collided across concurrent users.
+    Module-level imports + a uuid suffix on the fallback fix both.
+    """
+
+    def _fallback():
+        return f"session_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
     # From Lex
     session_id = event.get("sessionId")
     if session_id:
         return session_id
-    
+
     # From HTTP body
     try:
         body = event.get("body", "{}")
         if isinstance(body, str):
             body = json.loads(body)
         context = body.get("context", {})
-        return context.get("session_id", f"session_{int(time.time())}")
-    except:
+        session_id = context.get("session_id")
+        if session_id:
+            return session_id
+    except Exception:
         pass
-    
+
     # From session utils
     try:
         session = extract_session_data(event)
-        return session.get("session_id", f"session_{int(time.time())}")
-    except:
+        session_id = session.get("session_id")
+        if session_id:
+            return session_id
+    except Exception:
         pass
-    
+
     # Generate fallback
-    import time
-    return f"session_{int(time.time())}"
+    return _fallback()
 
 def build_session_attributes_hash(tenant_hash, prompt_index, topic):
     """Build session attributes for hash-based system"""
