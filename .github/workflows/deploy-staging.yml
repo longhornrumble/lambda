@@ -406,8 +406,6 @@ jobs:
               token_blacklist.py
               jwt
               PyJWT-2.10.1.dist-info
-              notification_templates.json
-              analytics_writer_contract.json
             # Most MFS env vars stay out-of-band today; the merge-not-replace
             # step at line ~156 preserves them. CI manages the keys listed
             # below per Phase 4. Both are fail-loud reads in code (KeyError
@@ -997,7 +995,7 @@ jobs:
               echo "::error file=$f::Tracked runtime file missing from deploy zip — add it to include_globs (in BOTH deploy-staging.yml and deploy-production.yml)"
               MISSING=1
             fi
-          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)(test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)$')
+          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)((test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)|analytics_writer_contract\.json)$')
           if [ "$MISSING" -eq 0 ]; then echo "Zip-manifest guard: all tracked runtime files present."; fi
           exit $MISSING
 

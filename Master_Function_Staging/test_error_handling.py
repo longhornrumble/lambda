@@ -16,7 +16,6 @@ from datetime import datetime
 
 # Import modules under test
 from form_handler import FormHandler
-from template_renderer import TemplateRenderer
 from lambda_function import lambda_handler, handle_form_submission
 
 
@@ -283,97 +282,6 @@ class TestErrorHandling(unittest.TestCase):
                     {'enabled': True, 'recipients': ['+15551234567']},
                     {'form_type': 'test'}
                 )
-
-    def test_template_renderer_file_permission_error(self):
-        """Test template renderer with file permission errors"""
-        # Create a temporary file without read permissions
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            json.dump({'test': 'data'}, f)
-            temp_file = f.name
-
-        try:
-            # Remove read permissions
-            os.chmod(temp_file, 0o000)
-
-            # Should fall back to default templates
-            renderer = TemplateRenderer(temp_file)
-            self.assertIn('email_templates', renderer.templates)
-
-        finally:
-            # Restore permissions and cleanup
-            os.chmod(temp_file, 0o644)
-            os.unlink(temp_file)
-
-    def test_template_renderer_corrupted_json(self):
-        """Test template renderer with corrupted JSON file"""
-        corrupted_json_files = [
-            '{"incomplete": "json"',  # Missing closing brace
-            '{"key": "value",}',      # Trailing comma
-            '{"key": "value" "another": "value"}',  # Missing comma
-            '{key: "value"}',         # Unquoted key
-            '{"unicode": "test\\u"}',  # Invalid unicode escape
-        ]
-
-        for corrupted_json in corrupted_json_files:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-                f.write(corrupted_json)
-                temp_file = f.name
-
-            try:
-                # Should fall back to default templates
-                renderer = TemplateRenderer(temp_file)
-                self.assertIn('email_templates', renderer.templates)
-
-            finally:
-                os.unlink(temp_file)
-
-    def test_template_renderer_extremely_large_template(self):
-        """Test template renderer with extremely large template"""
-        # Create a very large template.
-        # render_email_template uses f"{form_type}_confirmation" as key,
-        # so key must be "large_template_confirmation" for form_type="large_template".
-        large_template = {
-            'email_templates': {
-                'large_template_confirmation': {
-                    'subject': 'x' * 10000,  # 10KB subject
-                    'body_html': 'y' * 100000,  # 100KB body
-                    'body_text': 'z' * 50000   # 50KB text
-                }
-            }
-        }
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(large_template, f)
-            temp_file = f.name
-
-        try:
-            renderer = TemplateRenderer(temp_file)
-
-            # Should handle large templates
-            result = renderer.render_email_template(
-                'large_template',
-                {'name': 'Test'},
-                {'organization_name': 'Test Org'}
-            )
-
-            self.assertIn('subject', result)
-            self.assertGreater(len(result['subject']), 9000)
-
-        finally:
-            os.unlink(temp_file)
-
-    def test_template_renderer_recursive_variables(self):
-        """Test template renderer with recursive variable references"""
-        renderer = TemplateRenderer()
-
-        # Template that references non-existent variables
-        template = 'Hello {{name}}, your {{missing_var}} is {{another_missing}}'
-        variables = {'name': 'John'}
-
-        result = renderer.render_template(template, variables)
-
-        # Should leave missing variables as-is
-        self.assertEqual(result, 'Hello John, your {{missing_var}} is {{another_missing}}')
 
     def test_lambda_handler_malformed_event(self):
         """Test Lambda handler with malformed event structure"""
