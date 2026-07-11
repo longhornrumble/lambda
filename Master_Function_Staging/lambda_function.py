@@ -23,7 +23,10 @@ def get_jwt_signing_key() -> Optional[str]:
     # Try Secrets Manager first (preferred)
     try:
         import boto3
-        secrets_client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+        from aws_client_manager import boto_config_for
+        secrets_client = boto3.client('secretsmanager',
+                                      region_name=os.environ.get('AWS_REGION', 'us-east-1'),
+                                      config=boto_config_for('secretsmanager'))
         secret_name = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
         response = secrets_client.get_secret_value(SecretId=secret_name)
 
@@ -105,7 +108,10 @@ def get_cf_origin_secret() -> Optional[str]:
 
     try:
         import boto3
-        client = boto3.client('secretsmanager', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+        from aws_client_manager import boto_config_for
+        client = boto3.client('secretsmanager',
+                              region_name=os.environ.get('AWS_REGION', 'us-east-1'),
+                              config=boto_config_for('secretsmanager'))
         secret_name = os.environ.get('CF_ORIGIN_SECRET_NAME', 'picasso/mfs/cf-origin-secret')
         response = client.get_secret_value(SecretId=secret_name)
         secret_string = response.get('SecretString', '')
@@ -555,11 +561,13 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         except Exception as e:
             logger.error(f"[{tenant_hash[:8]}...] ❌ KB retrieval failed for fallback streaming: {e}")
         
-        # Initialize Bedrock client
+        # Initialize Bedrock client (D11: fail-fast timeouts, 5s/30s)
         import boto3
+        from aws_client_manager import boto_config_for
         bedrock_client = boto3.client(
             'bedrock-runtime',
-            region_name=os.environ.get('AWS_REGION', 'us-east-1')
+            region_name=os.environ.get('AWS_REGION', 'us-east-1'),
+            config=boto_config_for('bedrock')
         )
         
         # Model ID resolution: tenant config wins; fall back to Lambda default

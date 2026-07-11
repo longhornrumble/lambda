@@ -20,7 +20,10 @@ logger.setLevel(logging.INFO)
 
 # Environment Configuration
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
-BLACKLIST_TABLE_NAME = os.environ.get('BLACKLIST_TABLE_NAME', f'picasso-token-blacklist-{ENVIRONMENT}')
+# D12: bare default per the account-as-environment naming convention — the
+# old f'-{ENVIRONMENT}' fallback pointed at the retained-idle legacy twin in
+# staging. The env var is IaC-set in both accounts; this is fallback only.
+BLACKLIST_TABLE_NAME = os.environ.get('BLACKLIST_TABLE_NAME', 'picasso-token-blacklist')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 
 # Performance and Security Settings

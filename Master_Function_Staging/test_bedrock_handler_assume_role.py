@@ -13,7 +13,7 @@ import io
 import json
 import sys
 import time
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 
@@ -22,9 +22,10 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _reset_cache(module):
-    """Reset the module-level _kb_client_cache to its initial state."""
+    """Reset the module-level client caches to their initial state."""
     module._kb_client_cache["client"] = None
     module._kb_client_cache["expires_at"] = 0
+    module._default_kb_client_cache["client"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +65,8 @@ class TestBedrockHandlerOptimizedAssumeRole:
             result = bho._get_bedrock_agent_client()
 
         assert mock_boto3.client.call_count == 1
-        mock_boto3.client.assert_called_once_with("bedrock-agent-runtime")
+        # D11: the default-creds client now carries a fail-fast timeout Config.
+        mock_boto3.client.assert_called_once_with("bedrock-agent-runtime", config=ANY)
         assert result is fake_client
 
     def test_env_set_assumes_role(self, monkeypatch):
@@ -88,6 +90,7 @@ class TestBedrockHandlerOptimizedAssumeRole:
             aws_access_key_id="ASIA_FAKE",
             aws_secret_access_key="secret",
             aws_session_token="token",
+            config=ANY,  # D11: fail-fast timeout Config
         )
         assert result is fake_bedrock_client
 

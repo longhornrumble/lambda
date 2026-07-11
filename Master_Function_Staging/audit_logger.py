@@ -21,7 +21,10 @@ logger.setLevel(logging.INFO)
 # Configuration
 ENVIRONMENT = os.environ.get('ENVIRONMENT', 'staging')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
-AUDIT_TABLE_NAME = os.environ.get('AUDIT_TABLE_NAME', f"picasso-audit-{ENVIRONMENT}")
+# D12: bare default per the account-as-environment naming convention (the
+# env var is IaC-set in both accounts; prod's table is still '-production'
+# until naming-parity Phase 4, but prod never consults this fallback).
+AUDIT_TABLE_NAME = os.environ.get('AUDIT_TABLE_NAME', "picasso-audit")
 DEFAULT_RETENTION_DAYS = 90
 MAX_RETENTION_DAYS = 365
 

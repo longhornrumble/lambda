@@ -46,6 +46,25 @@ TIMEOUT_CONFIG = {
         'connect_timeout': 2,
         'read_timeout': 5,
         'retries': 2
+    },
+    # D11: hot-path notification/fulfillment clients. Without an explicit
+    # Config, boto3 defaults to 60s connect + 60s read — an SES/SNS brownout
+    # would burn the whole invocation mid-form-pipeline instead of failing
+    # fast like the protected DDB calls.
+    'ses': {
+        'connect_timeout': 2,
+        'read_timeout': 5,
+        'retries': 2
+    },
+    'sns': {
+        'connect_timeout': 2,
+        'read_timeout': 5,
+        'retries': 2
+    },
+    'lambda': {
+        'connect_timeout': 2,
+        'read_timeout': 10,  # fulfillment invokes are InvocationType=Event
+        'retries': 2
     }
 }
 
@@ -55,6 +74,14 @@ CIRCUIT_BREAKER_CONFIG = {
     'timeout_duration': 60,  # Seconds to wait before trying again
     'half_open_max_calls': 3  # Max calls to test in half-open state
 }
+
+def _is_conditional_check_failure(exc: Exception) -> bool:
+    """True for DynamoDB ConditionalCheckFailedException (expected 409s)."""
+    return (
+        isinstance(exc, ClientError)
+        and exc.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException'
+    )
+
 
 class CircuitBreakerError(Exception):
     """Exception raised when circuit breaker is open"""
@@ -126,10 +153,19 @@ class CircuitBreaker:
             return result
             
         except Exception as e:
+            # D3: ConditionalCheckFailedException is application-level control
+            # flow, not a service failure — analytics_writer uses it for
+            # idempotency and conversation_handler for CAS version conflicts.
+            # Counting it opened the breaker on benign 409 bursts, which made
+            # the fail-closed blacklist check 503 every conversation on the
+            # container for 60s. Re-raise without touching breaker state.
+            if _is_conditional_check_failure(e):
+                raise e
+
             # Record failure
             self.failure_count += 1
             self.last_failure_time = current_time
-            
+
             # Check if we should open the circuit
             if self.state == 'CLOSED' and self.failure_count >= self.failure_threshold:
                 self.state = 'OPEN'
@@ -322,6 +358,17 @@ def _cleanup_cache(cache_type: str) -> None:
 
 # Global instance for use across modules
 aws_client_manager = AWSClientManager()
+
+
+def boto_config_for(service_name: str) -> Config:
+    """Public timeout Config for module-level boto3 clients/resources.
+
+    D11 adoption path: modules that build their own clients at import time
+    (form_handler, tenant_config_loader, bedrock_handler_optimized) attach
+    this Config instead of routing every call through protected_call —
+    fail-fast timeouts without widening circuit-breaker adoption.
+    """
+    return aws_client_manager._create_boto_config(service_name)
 
 # Convenience functions for common operations
 def get_dynamodb_client() -> boto3.client:
