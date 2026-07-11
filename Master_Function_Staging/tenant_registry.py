@@ -12,7 +12,9 @@ import logging
 
 logger = logging.getLogger()
 
-TABLE_NAME = os.environ.get('TENANT_REGISTRY_TABLE', f"picasso-tenant-registry-{os.environ.get('ENVIRONMENT', 'staging')}")
+# D12: bare default per the account-as-environment naming convention (the
+# env var is IaC-set in both accounts; fallback only).
+TABLE_NAME = os.environ.get('TENANT_REGISTRY_TABLE', "picasso-tenant-registry")
 
 # Module-level cache for registry lookups (matches hash_to_tenant_cache pattern in tenant_config_loader.py)
 _registry_cache = {}

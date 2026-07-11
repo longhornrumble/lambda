@@ -27,12 +27,16 @@ from contact_extractor import (
 )
 from redact_pii import redact_pii
 
-# Initialize AWS clients
-dynamodb = boto3.resource('dynamodb')
-ses = boto3.client('ses')
-sns = boto3.client('sns')
-s3 = boto3.client('s3')
-lambda_client = boto3.client('lambda')
+# Initialize AWS clients. D11: explicit fail-fast timeouts — the boto3
+# default is 60s connect + 60s read, which would burn the whole invocation
+# mid-form-pipeline during an SES/SNS/DDB brownout.
+from aws_client_manager import boto_config_for
+
+dynamodb = boto3.resource('dynamodb', config=boto_config_for('dynamodb'))
+ses = boto3.client('ses', config=boto_config_for('ses'))
+sns = boto3.client('sns', config=boto_config_for('sns'))
+s3 = boto3.client('s3', config=boto_config_for('s3'))
+lambda_client = boto3.client('lambda', config=boto_config_for('lambda'))
 
 # Initialize logger
 logger = logging.getLogger()

@@ -15,7 +15,10 @@ CLOUDFRONT_DOMAIN = "chat.myrecruiter.ai"
 MAPPINGS_PREFIX = "mappings"
 TENANTS_PREFIX = "tenants"
 
-s3 = boto3.client("s3")
+# D11: fail-fast timeouts (2s connect / 3s read / 2 retries) instead of the
+# 60s boto3 defaults — a config-bucket brownout must not eat the invocation.
+from aws_client_manager import boto_config_for
+s3 = boto3.client("s3", config=boto_config_for('s3'))
 cached_config = {}  # Cache by hash, not tenant_id
 cache_timestamps = {}
 hash_to_tenant_cache = {}  # Cache hash→tenant_id mappings for S3 access

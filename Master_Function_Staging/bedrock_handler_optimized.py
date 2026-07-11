@@ -11,7 +11,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # Synchronous InvokeModel client — default creds, same account.
-bedrock = boto3.client("bedrock-runtime")
+# D11: 5s connect / 30s read (boto3 default is 60/60).
+from aws_client_manager import boto_config_for
+
+bedrock = boto3.client("bedrock-runtime", config=boto_config_for('bedrock'))
 
 # ---------------------------------------------------------------------------
 # Lazy KB client with cross-account assume-role + 50-minute TTL refresh.
@@ -19,6 +22,7 @@ bedrock = boto3.client("bedrock-runtime")
 # can manipulate KB_RETRIEVER_ROLE_ARN between cases without importlib.reload.
 # ---------------------------------------------------------------------------
 _kb_client_cache = {"client": None, "expires_at": 0}
+_default_kb_client_cache = {"client": None}
 
 
 def _get_bedrock_agent_client():
@@ -33,8 +37,12 @@ def _get_bedrock_agent_client():
     role_arn = os.environ.get("KB_RETRIEVER_ROLE_ARN", "")
 
     if not role_arn:
-        # No cross-account role — default creds, no caching needed.
-        return boto3.client("bedrock-agent-runtime")
+        # No cross-account role — default creds. D11/D14: memoize (this was
+        # rebuilding a client on every KB retrieval) and apply timeouts.
+        if _default_kb_client_cache["client"] is None:
+            _default_kb_client_cache["client"] = boto3.client(
+                "bedrock-agent-runtime", config=boto_config_for('bedrock'))
+        return _default_kb_client_cache["client"]
 
     now = time.time()
     if _kb_client_cache["client"] is not None and now < _kb_client_cache["expires_at"]:
@@ -53,6 +61,7 @@ def _get_bedrock_agent_client():
             aws_access_key_id=creds["AccessKeyId"],
             aws_secret_access_key=creds["SecretAccessKey"],
             aws_session_token=creds["SessionToken"],
+            config=boto_config_for('bedrock'),
         )
         _kb_client_cache["client"] = client
         _kb_client_cache["expires_at"] = now + 50 * 60  # 50-minute TTL
