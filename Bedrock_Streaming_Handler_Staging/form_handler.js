@@ -402,8 +402,11 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     if (shouldSendApplicantSms) {
       const isDryRun = config.sms_settings?.applicant_sms_dry_run === true;
       const orgName = config.chat_title || config.tenant_id || '';
-      const defaultApplicantSmsBody = `${orgName}: We received your submission. Check your email for details or reply HELP for assistance.`;
-      const applicantSmsBody = applicantSmsConfig.template
+      // Compliance (FS10 / consent-advisor): a transactional confirmation must
+      // carry STOP opt-out language + a rates disclosure. Default body includes
+      // both; operator templates get STOP appended if they omit it.
+      const defaultApplicantSmsBody = `${orgName}: We received your submission. Check your email for details. Reply HELP for help, STOP to opt out. Msg & data rates may apply.`;
+      let applicantSmsBody = applicantSmsConfig.template
         ? renderTemplate(applicantSmsConfig.template, {
             first_name: applicantContact?.first_name || '',
             last_name: applicantContact?.last_name || '',
@@ -412,8 +415,18 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
             submission_id: submissionId,
           })
         : defaultApplicantSmsBody;
+      if (!/\bSTOP\b/i.test(applicantSmsBody)) {
+        applicantSmsBody += ' Reply STOP to opt out.';
+      }
 
-      if (isDryRun) {
+      // Compliance (FS10 / consent-advisor): never text a number that replied
+      // STOP. The consent record is only written when the applicant checks the
+      // box, but a prior opt-out (from any tenant form) persists — honor it.
+      const optedOut = await isPhoneOptedOut(config.tenant_id, applicantPhone);
+
+      if (optedOut) {
+        console.log(`🚫 Applicant SMS suppressed — recipient previously opted out (STOP): ${redactPII(applicantPhone)}`);
+      } else if (isDryRun) {
         console.log(`🧪 [DRY RUN] Applicant SMS would send to ${redactPII(applicantPhone)}: "${redactPII(applicantSmsBody)}"`);
       } else {
         lambdaClient.send(new InvokeCommand({
@@ -1245,6 +1258,43 @@ function findConsentDisclosure(formConfig) {
  * @param {string} submissionId - Submission that captured consent
  * @param {string} consentLanguage - Disclosure text shown to contact
  */
+/**
+ * Normalize a phone to clean E.164 ("+15551234567") for consent-table lookups.
+ * The STOP handler (SMS_Webhook_Handler) writes opt-outs keyed by the carrier's
+ * clean E.164 from-number, so we must match that exact form or miss an opt-out.
+ */
+function normalizeToE164(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  const digits = s.replace(/[^\d]/g, '');
+  if (s.startsWith('+')) return digits ? `+${digits}` : null;
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return digits ? `+${digits}` : null;
+}
+
+/**
+ * FS10 / consent: has this phone opted out of transactional SMS (replied STOP)?
+ * Never send an applicant confirmation SMS to a number that opted out.
+ * Fails OPEN on a lookup error — the carrier/10DLC layer also suppresses STOPped
+ * numbers, so a rare DynamoDB error should not drop every confirmation SMS.
+ */
+async function isPhoneOptedOut(tenantId, phone) {
+  const e164 = normalizeToE164(phone);
+  if (!SMS_CONSENT_TABLE || !tenantId || !e164) return false;
+  try {
+    const res = await dynamodb.send(new GetCommand({
+      TableName: SMS_CONSENT_TABLE,
+      Key: { pk: `TENANT#${tenantId}`, sk: `CONSENT#transactional#${e164}` },
+    }));
+    const rec = res?.Item;
+    return !!(rec && (rec.opted_out_at || rec.consent_given === false));
+  } catch (err) {
+    console.error('⚠️ Opt-out lookup failed (fail-open, carrier layer still suppresses):', err.message);
+    return false;
+  }
+}
+
 async function writeConsentRecord(tenantId, phoneE164, formId, submissionId, consentLanguage = '') {
   if (!SMS_CONSENT_TABLE || !tenantId || !phoneE164) {
     return;
@@ -1942,5 +1992,7 @@ module.exports = {
   submitForm,
   getSESFromEmail,
   htmlEscapeVars,
+  normalizeToE164,
+  isPhoneOptedOut,
   SmsRateLimitError
 };

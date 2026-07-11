@@ -40,6 +40,8 @@ const {
   validateFormField,
   submitForm,
   htmlEscapeVars,
+  normalizeToE164,
+  isPhoneOptedOut,
   SmsRateLimitError
 } = require('../form_handler');
 
@@ -2255,5 +2257,101 @@ describe('Form Handler - SEC: HTML email template escaping', () => {
     const html = staffCall.args[0].input.Message.Body.Html.Data;
     expect(html).toContain('&lt;script&gt;');       // value escaped
     expect(html).not.toContain('<script>alert(1)'); // raw script NOT injected
+  });
+});
+
+// FS10 (communications-consent-advisor): never text a number that replied STOP,
+// and the transactional confirmation must carry STOP opt-out language.
+describe('Form Handler - FS10: applicant SMS consent controls', () => {
+  const smsConfig = (formOverrides = {}) => ({
+    tenant_id: 'TEST123',
+    chat_title: 'Test Org',
+    sms_settings: { enabled: true, from_number: '+15550000000' },
+    conversational_forms: {
+      volunteer_apply: {
+        form_id: 'volunteer_apply',
+        title: 'Volunteer',
+        notifications: { applicant_confirmation: { sms: { enabled: true, ...formOverrides } } },
+      },
+    },
+  });
+  const applicant = { first_name: 'Jane', email: 'jane@example.com', phone: '+15551234567' };
+
+  const applicantSmsInvokes = () =>
+    lambdaMock
+      .commandCalls(InvokeCommand)
+      .map((c) => { try { return JSON.parse(c.args[0].input.Payload); } catch { return {}; } })
+      .filter((p) => p.type === 'applicant');
+
+  beforeEach(() => {
+    sesMock.reset();
+    dynamoMock.reset();
+    lambdaMock.reset();
+    s3Mock.reset();
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'm' });
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(UpdateCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+    s3Mock.on(PutObjectCommand).resolves({});
+  });
+
+  describe('normalizeToE164', () => {
+    it('normalizes common formats to clean E.164', () => {
+      expect(normalizeToE164('+15551234567')).toBe('+15551234567');
+      expect(normalizeToE164('+1-555-123-4567')).toBe('+15551234567');
+      expect(normalizeToE164('(555) 123-4567')).toBe('+15551234567');
+      expect(normalizeToE164('5551234567')).toBe('+15551234567');
+      expect(normalizeToE164(null)).toBeNull();
+      expect(normalizeToE164('')).toBeNull();
+    });
+  });
+
+  describe('isPhoneOptedOut', () => {
+    it('returns true when the consent record is opted out', async () => {
+      dynamoMock.on(GetCommand).resolves({ Item: { opted_out_at: '2026-01-01T00:00:00Z', consent_given: false } });
+      expect(await isPhoneOptedOut('TEST123', '+15551234567')).toBe(true);
+    });
+    it('returns false when there is no record (implied-consent path)', async () => {
+      dynamoMock.on(GetCommand).resolves({});
+      expect(await isPhoneOptedOut('TEST123', '+15551234567')).toBe(false);
+    });
+    it('fails open (false) on a lookup error', async () => {
+      dynamoMock.on(GetCommand).rejects(new Error('ddb down'));
+      expect(await isPhoneOptedOut('TEST123', '+15551234567')).toBe(false);
+    });
+  });
+
+  it('suppresses the applicant SMS when the recipient previously opted out', async () => {
+    // Only the consent-table lookup returns an opted-out record; other Gets → {}.
+    dynamoMock.on(GetCommand).callsFake((input) =>
+      input.TableName === 'picasso-sms-consent'
+        ? { Item: { opted_out_at: '2026-01-01T00:00:00Z', consent_given: false } }
+        : {}
+    );
+
+    await submitForm('volunteer_apply', applicant, smsConfig());
+
+    expect(applicantSmsInvokes().length).toBe(0);
+  });
+
+  it('sends the applicant SMS (with STOP language) when not opted out', async () => {
+    dynamoMock.on(GetCommand).resolves({}); // no consent record → not opted out
+
+    await submitForm('volunteer_apply', applicant, smsConfig());
+
+    const invokes = applicantSmsInvokes();
+    expect(invokes.length).toBe(1);
+    expect(invokes[0].body).toMatch(/STOP/i); // opt-out language present
+  });
+
+  it('appends STOP to an operator template that omits it', async () => {
+    dynamoMock.on(GetCommand).resolves({});
+
+    await submitForm('volunteer_apply', applicant, smsConfig({ template: 'Hi {first_name}, thanks for applying!' }));
+
+    const invokes = applicantSmsInvokes();
+    expect(invokes.length).toBe(1);
+    expect(invokes[0].body).toContain('Hi Jane, thanks for applying!');
+    expect(invokes[0].body).toMatch(/Reply STOP to opt out/i);
   });
 });
