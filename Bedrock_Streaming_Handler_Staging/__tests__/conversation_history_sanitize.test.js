@@ -38,6 +38,14 @@ describe('SEC (B) — sanitizeConversationHistory', () => {
     expect(out[0].content).toBe('What volunteer roles are open?');
   });
 
+  test('CS8: caps the message count to the most recent 50', () => {
+    const big = Array.from({ length: 120 }, (_, i) => ({ role: 'user', content: `msg ${i}` }));
+    const out = sanitizeConversationHistory(big);
+    expect(out.length).toBe(50);
+    expect(out[0].content).toBe('msg 70');   // oldest kept = 120 - 50
+    expect(out[49].content).toBe('msg 119');  // newest kept
+  });
+
   test('is defensive about shape: non-array → [], and passes through odd entries', () => {
     expect(sanitizeConversationHistory(null)).toEqual([]);
     expect(sanitizeConversationHistory('nope')).toEqual([]);

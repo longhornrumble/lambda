@@ -184,9 +184,14 @@ const sqs = new SQSClient({ region: AWS_REGION });
  * @param {Array} history - Raw conversation history from the request body
  * @returns {Array} History with each message's content/text sanitized
  */
+const MAX_HISTORY_MESSAGES = 50;
 function sanitizeConversationHistory(history) {
   if (!Array.isArray(history)) return [];
-  return history.map((msg) => {
+  // CS8: bound the message COUNT — the client controls history length, and an
+  // unbounded array bloats the prompt (cost/latency, and a DoS lever). Keep the
+  // most recent MAX_HISTORY_MESSAGES; per-message length is capped by
+  // sanitizeUserInput. Real sessions are far shorter than this ceiling.
+  return history.slice(-MAX_HISTORY_MESSAGES).map((msg) => {
     if (!msg || typeof msg !== 'object') return msg;
     if (typeof msg.content === 'string') {
       return { ...msg, content: sanitizeUserInput(msg.content) };
@@ -565,7 +570,7 @@ const streamingHandler = async (event, responseStream, context) => {
         return;
       } catch (error) {
         console.error('Form mode error:', error);
-        write(`data: ${JSON.stringify({ type: 'error', error: `Form processing failed: ${error.message}` })}\n\n`);
+        write(`data: ${JSON.stringify({ type: 'error', error: 'Form processing failed. Please try again.' })}\n\n`);
         write('data: [DONE]\n\n');
         streamEnded = true;
         responseStream.end();
@@ -613,7 +618,7 @@ const streamingHandler = async (event, responseStream, context) => {
         return;
       } catch (error) {
         console.error('Showcase mode error:', error);
-        write(`data: ${JSON.stringify({ type: 'error', error: `Showcase processing failed: ${error.message}` })}\n\n`);
+        write(`data: ${JSON.stringify({ type: 'error', error: 'Showcase processing failed. Please try again.' })}\n\n`);
         write('data: [DONE]\n\n');
         streamEnded = true;
         responseStream.end();
@@ -1232,20 +1237,24 @@ const streamingHandler = async (event, responseStream, context) => {
     }
 
   } catch (error) {
+    // SEC: log the detail server-side but send the client a generic message —
+    // error.message can carry internal/exception detail.
     console.error('❌ Stream error:', error);
-    write(`data: ${JSON.stringify({ type: 'error', error: String(error.message) })}\n\n`);
+    write(`data: ${JSON.stringify({ type: 'error', error: 'Something went wrong. Please try again.' })}\n\n`);
   } finally {
     // Clean up
     if (heartbeatInterval) {
       clearInterval(heartbeatInterval);
     }
-    
-    // Send completion marker
-    write('data: [DONE]\n\n');
-    
-    // End the stream
-    streamEnded = true;
-    responseStream.end();
+
+    // CS5: several early-return paths above already sent [DONE] and ended the
+    // stream (a `return` inside the try still runs this finally). Only emit the
+    // terminator + end when the stream is still open, to avoid a double end().
+    if (!streamEnded) {
+      write('data: [DONE]\n\n');
+      streamEnded = true;
+      responseStream.end();
+    }
   }
 
 };
@@ -1416,7 +1425,7 @@ const bufferedHandler = async (event, context) => {
         };
       } catch (error) {
         console.error('Showcase mode error:', error);
-        chunks.push(`data: {"type": "error", "error": "Showcase processing failed: ${error.message}"}\n\n`);
+        chunks.push(`data: {"type": "error", "error": "Showcase processing failed. Please try again."}\n\n`);
         chunks.push('data: [DONE]\n\n');
 
         return {
@@ -1754,7 +1763,7 @@ const bufferedHandler = async (event, context) => {
   } catch (error) {
     console.error('Handler error:', error);
     
-    chunks.push(`data: {"type": "error", "error": "${error.message}"}\n\n`);
+    chunks.push(`data: {"type": "error", "error": "Something went wrong. Please try again."}\n\n`);
     chunks.push('data: [DONE]\n\n');
     
     return {
