@@ -47,18 +47,6 @@ const NOTIFICATION_SENDS_TABLE = process.env.NOTIFICATION_SENDS_TABLE || 'picass
 const SMS_CONSENT_TABLE = process.env.SMS_CONSENT_TABLE || 'picasso-sms-consent';
 const SMS_MONTHLY_LIMIT = parseInt(process.env.SMS_MONTHLY_LIMIT || '100', 10);
 
-/**
- * Thrown by routeFulfillment when the tenant's monthly SMS cap is exhausted.
- * Caught specifically in submitForm to return a 429 structured response.
- */
-class SmsRateLimitError extends Error {
-  constructor(usage, limit) {
-    super('SMS monthly limit reached');
-    this.name = 'SmsRateLimitError';
-    this.usage = usage;
-    this.limit = limit;
-  }
-}
 
 /**
  * Sanitize text for SMS messages - remove special characters that could cause issues
@@ -463,16 +451,6 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
     };
 
   } catch (error) {
-    if (error instanceof SmsRateLimitError) {
-      console.warn(`⚠️ SMS rate limit response: tenant cap exhausted (${error.usage}/${error.limit})`);
-      return {
-        type: 'form_error',
-        statusCode: 429,
-        status: 'rate_limited',
-        error: 'SMS rate limit reached. No SMS notifications were sent.',
-        retryAfter: 'next calendar month',
-      };
-    }
     console.error('❌ Form submission error:', error);
     return {
       type: 'form_error',
@@ -1031,8 +1009,15 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
   if (allSmsRecipients.length > 0) {
     const usage = await getMonthlySMSUsage(config.tenant_id);
     if (usage >= SMS_MONTHLY_LIMIT) {
-      console.warn(`⚠️ SMS monthly limit reached for tenant ${config.tenant_id}: ${usage}/${SMS_MONTHLY_LIMIT}`);
-      throw new SmsRateLimitError(usage, SMS_MONTHLY_LIMIT);
+      // FS4: the monthly SMS ceiling is an internal cost guardrail, not a
+      // submission failure. Skip the staff SMS and record it — the form is
+      // still saved and the email notification still goes out, so the visitor
+      // sees success. (A throw here used to abort the whole submission → a false
+      // 429 → duplicate re-submits.) The [SMS_RATE_LIMITED] marker is the
+      // alarmable hook for the operator "SMS ceiling hit, add credits" notice.
+      console.warn(`⚠️ SMS monthly limit reached for tenant ${config.tenant_id}: ${usage}/${SMS_MONTHLY_LIMIT} — skipping ${allSmsRecipients.length} staff SMS`);
+      console.error(`[SMS_RATE_LIMITED] tenant_id=${config.tenant_id || 'unknown'} form_id=${formId} usage=${usage} limit=${SMS_MONTHLY_LIMIT} skipped=${allSmsRecipients.length}`);
+      results.push({ channel: 'sms', status: 'skipped', reason: 'rate_limited', usage, limit: SMS_MONTHLY_LIMIT, skipped: allSmsRecipients.length });
     } else {
       // Build SMS body from template or default
       const safeName = `${sanitizeForSMS(formData.first_name, 30)} ${sanitizeForSMS(formData.last_name, 30)}`.trim();
@@ -1993,6 +1978,5 @@ module.exports = {
   getSESFromEmail,
   htmlEscapeVars,
   normalizeToE164,
-  isPhoneOptedOut,
-  SmsRateLimitError
+  isPhoneOptedOut
 };

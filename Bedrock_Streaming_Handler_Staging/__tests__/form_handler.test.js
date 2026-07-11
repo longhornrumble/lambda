@@ -41,8 +41,7 @@ const {
   submitForm,
   htmlEscapeVars,
   normalizeToE164,
-  isPhoneOptedOut,
-  SmsRateLimitError
+  isPhoneOptedOut
 } = require('../form_handler');
 
 // Test fixtures
@@ -508,32 +507,40 @@ describe('Form Handler - Phase 2: SMS Rate Limiting', () => {
     );
   });
 
-  it('should return 429 when monthly limit reached (at cap)', async () => {
+  it('FS4: skips the staff SMS but still SUCCEEDS when the monthly limit is reached (at cap)', async () => {
     dynamoMock.on(GetCommand).resolves({ Item: { count: 100 } });
 
     const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
 
-    expect(snsMock.commandCalls(PublishCommand)).toHaveLength(0);
-    // SMS cap exhausted: submitForm now returns a 429 structured error response
-    expect(result.statusCode).toBe(429);
-    expect(result.error).toBeDefined();
-    expect(result.status).toBe('rate_limited');
-    // Counter must NOT be incremented past the cap
-    const updateCalls = dynamoMock.commandCalls(UpdateCommand);
-    expect(updateCalls).toHaveLength(0);
+    // No SMS sent...
+    const smsInvokes = lambdaMock.commandCalls(InvokeCommand).filter(
+      (c) => c.args[0].input.FunctionName === (process.env.SMS_SENDER_FUNCTION || 'SMS_Sender')
+    );
+    expect(smsInvokes).toHaveLength(0);
+    // ...but NOT a failure: the form was saved + emailed, so the visitor sees success.
+    expect(result.statusCode).not.toBe(429);
+    expect(result.status).not.toBe('error');
+    // SMS is recorded as skipped (rate_limited) — the alarmable hook for admin notify.
+    expect(result.fulfillment).toContainEqual(
+      expect.objectContaining({ channel: 'sms', status: 'skipped', reason: 'rate_limited' })
+    );
+    // Counter must NOT be incremented past the cap.
+    expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(0);
   });
 
-  it('should return 429 when monthly limit exceeded (over cap)', async () => {
+  it('FS4: skips + succeeds when the monthly limit is exceeded (over cap)', async () => {
     dynamoMock.on(GetCommand).resolves({ Item: { count: 150 } });
 
     const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
 
-    expect(snsMock.commandCalls(PublishCommand)).toHaveLength(0);
-    expect(result.statusCode).toBe(429);
-    expect(result.error).toBeDefined();
-    // Counter must NOT be incremented past the cap
-    const updateCalls = dynamoMock.commandCalls(UpdateCommand);
-    expect(updateCalls).toHaveLength(0);
+    const smsInvokes = lambdaMock.commandCalls(InvokeCommand).filter(
+      (c) => c.args[0].input.FunctionName === (process.env.SMS_SENDER_FUNCTION || 'SMS_Sender')
+    );
+    expect(smsInvokes).toHaveLength(0);
+    expect(result.statusCode).not.toBe(429);
+    expect(result.status).not.toBe('error');
+    // Counter must NOT be incremented past the cap.
+    expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(0);
   });
 
   it('should increment SMS usage counter after sending', async () => {
@@ -609,26 +616,20 @@ describe('Form Handler - Phase 2: SMS Rate Limiting', () => {
   });
 
   // EC-P1.4: T3 threat mitigation — SMS cap-exhausted path returns 429 structured error
-  it('EC-P1.4: SMS cap-exhausted path returns 429 with structured error body', async () => {
+  it('FS4/EC-P1.4: SMS cap-exhausted path skips SMS + succeeds (no invoke, no increment)', async () => {
     // Simulate cap exactly at limit (usage === SMS_MONTHLY_LIMIT)
     dynamoMock.on(GetCommand).resolves({ Item: { count: 100 } });
 
     const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
 
-    // statusCode must be 429
-    expect(result.statusCode).toBe(429);
+    // No false failure — the submission succeeded (saved + emailed).
+    expect(result.statusCode).not.toBe(429);
+    expect(result.status).not.toBe('error');
 
-    // response body must have an `error` field (no cross-tenant info)
-    expect(result.error).toBeDefined();
-    expect(typeof result.error).toBe('string');
-
-    // Must not leak tenant-specific data in the error message
-    expect(result.error).not.toContain('TEST123');
-
-    // SMS counter must NOT be incremented past the cap
+    // SMS counter must NOT be incremented past the cap.
     expect(dynamoMock.commandCalls(UpdateCommand)).toHaveLength(0);
 
-    // No SMS Lambda invocation must occur
+    // No SMS Lambda invocation must occur.
     const smsInvocations = lambdaMock.commandCalls(InvokeCommand).filter(call =>
       call.args[0].input.FunctionName === (process.env.SMS_SENDER_FUNCTION || 'SMS_Sender')
     );
