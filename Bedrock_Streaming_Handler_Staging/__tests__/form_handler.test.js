@@ -2134,3 +2134,53 @@ describe('Form Handler - submission integrity (FS1 truthful outcome, FS2 unique 
     expect(r1.submissionId).not.toBe(r2.submissionId);
   });
 });
+
+// SEC: applicant PII (name/email/phone/address/free-text) must never land in
+// CloudWatch logs. submitForm logs only form-field KEYS (not values); every
+// email/phone log site is redactPII-masked.
+describe('Form Handler - SEC: no applicant PII in logs', () => {
+  let logSpy;
+
+  beforeEach(() => {
+    sesMock.reset();
+    snsMock.reset();
+    dynamoMock.reset();
+    lambdaMock.reset();
+    s3Mock.reset();
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'msg' });
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+    dynamoMock.on(UpdateCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+    s3Mock.on(PutObjectCommand).resolves({});
+    logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    logSpy.mockRestore();
+  });
+
+  const allLoggedLines = () =>
+    logSpy.mock.calls.map((args) =>
+      args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ')
+    );
+
+  it('submitForm never logs the raw applicant email or phone (confirmation/SMS sites redacted)', async () => {
+    // This fulfillment config sends a fulfillment email AND an applicant
+    // confirmation + SMS, so the "sent to" log sites actually run here.
+    await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+    const logged = allLoggedLines().join('\n');
+    expect(logged).not.toContain('john.doe@example.com');
+    expect(logged).not.toContain('555-123-4567');
+  });
+
+  it('the submit log keeps field KEYS for debugging but not the PII values', async () => {
+    await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+    const submitLine = allLoggedLines().find((l) => l.includes('Submitting form'));
+    expect(submitLine).toBeDefined();
+    expect(submitLine).toContain('email');      // field key retained
+    expect(submitLine).toContain('first_name'); // field key retained
+    expect(submitLine).not.toContain('john.doe@example.com'); // value NOT logged
+    expect(submitLine).not.toContain('John');   // value NOT logged
+  });
+});

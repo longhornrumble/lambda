@@ -405,7 +405,9 @@ const streamingHandler = async (event, responseStream, context) => {
     // CS4: reuse the guarded parse above (identical `: event` fallback) instead of re-parsing —
     // removes a redundant JSON.parse and any risk of the two copies diverging.
     const body = parsedBody;
-    console.log('📥 Parsed body:', JSON.stringify(body).substring(0, 200));
+    // SEC: don't log raw body values — user_input / form_data are user content
+    // (potential PII). Log only the key set + a tenant-hash prefix for routing debug.
+    console.log('📥 Parsed body keys:', Object.keys(body || {}), '| tenant:', String(body?.tenant_hash || '').substring(0, 8));
     
     const tenantHash = body.tenant_hash || '';
     const sessionId = body.session_id || 'default';
@@ -1152,7 +1154,7 @@ const streamingHandler = async (event, responseStream, context) => {
         const isNullOrGeneral = !topicName || topicName === 'general_inquiry';
         const previousTopic = sessionContext.last_classified_topic;
         if (isShortMessage && isNullOrGeneral && previousTopic) {
-          console.log(`[Step 3a] Continuation detected: "${userInput}" → carrying forward topic "${previousTopic}"`);
+          console.log(`[Step 3a] Continuation detected: "${redactPII(userInput)}" → carrying forward topic "${previousTopic}"`);
           topicName = previousTopic;
         }
 
@@ -1675,7 +1677,7 @@ const bufferedHandler = async (event, context) => {
         const isNullOrGen = !topicName || topicName === 'general_inquiry';
         const prevTopic = sessionContext.last_classified_topic;
         if (isShortMsg && isNullOrGen && prevTopic) {
-          console.log(`[Step 3a buffered] Continuation detected: "${userInput}" → carrying forward topic "${prevTopic}"`);
+          console.log(`[Step 3a buffered] Continuation detected: "${redactPII(userInput)}" → carrying forward topic "${prevTopic}"`);
           topicName = prevTopic;
         }
 

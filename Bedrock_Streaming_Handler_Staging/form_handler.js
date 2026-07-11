@@ -14,6 +14,7 @@ const { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand } = requir
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 const crypto = require('crypto');
+const { redactPII } = require('./redactPII');
 const {
   extractCanonicalContact,
 } = require('./contact_extractor');
@@ -162,7 +163,8 @@ async function handleFormMode(body, tenantConfig, requestId = null) {
  * @returns {Object} Validation result
  */
 async function validateFormField(fieldId, value, config) {
-  console.log(`🔍 Validating field ${fieldId}: ${value}`);
+  // SEC: log the field id only — the value is applicant PII.
+  console.log(`🔍 Validating field ${fieldId}`);
 
   const errors = [];
 
@@ -238,7 +240,10 @@ async function validateFormField(fieldId, value, config) {
  * @returns {Object} Submission result
  */
 async function submitForm(formId, formData, config, sessionId = null, conversationId = null, requestId = null, clientTimestamp = null) {
-  console.log(`📨 Submitting form ${formId}:`, formData);
+  // SEC: never log raw formData — it is entirely applicant PII (name, email,
+  // phone, address, free-text). Log only the form id + field keys (identifiers,
+  // not values) for operational debugging.
+  console.log(`📨 Submitting form ${formId} — fields: [${Object.keys(formData || {}).join(', ')}]`);
 
   try {
     // Validate required parameters
@@ -309,7 +314,7 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
           console.error('❌ Consent record write failed:', err.message);
         });
       } else {
-        console.log(`ℹ️ No SMS consent given for ${applicantPhone} in form ${formId} — skipping consent record`);
+        console.log(`ℹ️ No SMS consent given for ${redactPII(applicantPhone)} in form ${formId} — skipping consent record`);
       }
     }
 
@@ -392,7 +397,7 @@ async function submitForm(formId, formData, config, sessionId = null, conversati
         : defaultApplicantSmsBody;
 
       if (isDryRun) {
-        console.log(`🧪 [DRY RUN] Applicant SMS would send to ${applicantPhone}: "${applicantSmsBody}"`);
+        console.log(`🧪 [DRY RUN] Applicant SMS would send to ${redactPII(applicantPhone)}: "${redactPII(applicantSmsBody)}"`);
       } else {
         lambdaClient.send(new InvokeCommand({
           FunctionName: process.env.SMS_SENDER_FUNCTION || 'SMS_Sender',
@@ -922,7 +927,7 @@ async function routeFulfillment(formId, formData, config, submissionId, priority
         sesMessageId = sesResponse?.MessageId || 'unknown';
         successCount++;
       } catch (err) {
-        console.error(`Email fulfillment failed for ${recipient}:`, err);
+        console.error(`Email fulfillment failed for ${redactPII(recipient)}:`, err);
         sendError = err;
       }
 
@@ -1231,7 +1236,7 @@ async function writeConsentRecord(tenantId, phoneE164, formId, submissionId, con
   // Normalize to E.164 if not already
   const phone = phoneE164.startsWith('+') ? phoneE164 : `+1${phoneE164.replace(/\D/g, '')}`;
   if (!/^\+\d{10,15}$/.test(phone)) {
-    console.warn(`⚠️ Cannot write consent: invalid phone format ${phoneE164}`);
+    console.warn(`⚠️ Cannot write consent: invalid phone format ${redactPII(phoneE164)}`);
     return;
   }
 
@@ -1266,11 +1271,11 @@ async function writeConsentRecord(tenantId, phoneE164, formId, submissionId, con
       },
       ConditionExpression: 'attribute_not_exists(pk)',
     }));
-    console.log(`✅ Consent record created for ${phone} (tenant: ${tenantId})`);
+    console.log(`✅ Consent record created for ${redactPII(phone)} (tenant: ${tenantId})`);
   } catch (error) {
     if (error.name === 'ConditionalCheckFailedException') {
       // Record already exists — don't overwrite (consent is immutable once given)
-      console.log(`ℹ️ Consent record already exists for ${phone} (tenant: ${tenantId})`);
+      console.log(`ℹ️ Consent record already exists for ${redactPII(phone)} (tenant: ${tenantId})`);
     } else {
       console.error('Failed to write consent record:', error);
     }
@@ -1379,7 +1384,7 @@ async function sendFormEmail(toEmail, formId, formData, config, priority = 'norm
   };
 
   const sesResponse = await sesClient.send(new SendEmailCommand(params));
-  console.log(`✅ Form email sent to ${toEmail}`);
+  console.log(`✅ Form email sent to ${redactPII(toEmail)}`);
   return sesResponse;
 }
 
@@ -1496,7 +1501,7 @@ async function sendConfirmationEmail(userEmail, formId, formData, config, submis
 
   try {
     await sesClient.send(new SendEmailCommand(params));
-    console.log(`✅ Confirmation email sent to ${userEmail} using ${confirmationConfig ? 'per-form template' : 'fallback template'}`);
+    console.log(`✅ Confirmation email sent to ${redactPII(userEmail)} using ${confirmationConfig ? 'per-form template' : 'fallback template'}`);
   } catch (error) {
     console.error('Failed to send confirmation email:', error);
     // Don't fail the submission if confirmation email fails
@@ -1545,7 +1550,7 @@ async function sendFormSMS(phoneNumber, formId, formData, priority = 'normal') {
   };
 
   await snsClient.send(new PublishCommand(params));
-  console.log(`✅ SMS notification sent to ${phoneNumber} (priority: ${priority})`);
+  console.log(`✅ SMS notification sent to ${redactPII(phoneNumber)} (priority: ${priority})`);
 }
 
 /**
