@@ -4,7 +4,7 @@ const { handleSchedulingMutate } = require('../scheduling-mutate');
 
 // Minimal fakes for the injected seam (no real Google/Zoom/DDB).
 function baseInjected(overrides = {}) {
-  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [], rebind: [], actionLinks: [], confirm: [] };
+  const calls = { reschedule: [], cancel: [], zoom: [], persist: [], facade: [], token: [], notify: [], cancelReason: [], cooldown: [], rebind: [], actionLinks: [], confirm: [], freeBusy: [] };
   const calendarEvents = {
     buildEventBody: (x) => ({ built: x }),
     insertEvent: (calId, body) => { calls.facade.push(['insert', calId]); return { id: 'evt-new' }; },
@@ -45,6 +45,9 @@ function baseInjected(overrides = {}) {
       // the commit path's notify step the reschedule branch was missing. Deterministic
       // fake; the real sendConfirmationEmail is covered by confirmation-email.test.js.
       sendConfirmationEmail: async (args, opts) => { calls.confirm.push({ args, opts }); return { messageId: 'rcm1' }; },
+      // FS7: default freeBusy re-check sees a FREE slot so existing reschedule tests proceed
+      // unchanged. Tests that exercise the TOCTOU guard override with a busy interval.
+      availability: { getBusyIntervals: async (args) => { calls.freeBusy.push(args); return { busy: [] }; } },
       logger: { warn: () => {}, error: () => {} },
       ...overrides,
     },
@@ -404,6 +407,61 @@ describe('handleSchedulingMutate — reschedule', () => {
     });
     const out = await handleSchedulingMutate(RESCH_EVENT, injected);
     expect(out.outcome).toBe('success'); // swallowed
+  });
+});
+
+describe('handleSchedulingMutate — reschedule TOCTOU re-check (FS7)', () => {
+  const BUSY_OVERLAP = { getBusyIntervals: async () => ({ busy: [{ start: '2026-07-01T15:00:00Z', end: '2026-07-01T15:30:00Z' }] }) };
+
+  it('the NEW slot is now busy → slot_unavailable, NO calendar move, NO persist, NO confirmation', async () => {
+    const { injected, calls } = baseInjected({ availability: BUSY_OVERLAP });
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out).toEqual({ outcome: 'slot_unavailable', reason: 'recheck_busy' });
+    expect(calls.reschedule).toHaveLength(0); // never moved the calendar
+    expect(calls.persist).toHaveLength(0);
+    expect(calls.confirm).toHaveLength(0);
+    expect(calls.rebind).toHaveLength(0);
+  });
+
+  it('a busy interval that only TOUCHES the edge (end == start) does NOT block (half-open overlap)', async () => {
+    const { injected, calls } = baseInjected({
+      availability: { getBusyIntervals: async () => ({ busy: [{ start: '2026-07-01T14:30:00Z', end: '2026-07-01T15:00:00Z' }] }) },
+    });
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out.outcome).toBe('success'); // abutting, not overlapping → proceeds
+    expect(calls.reschedule).toHaveLength(1);
+  });
+
+  it('re-checks the coordinator + NEW-slot window BEFORE moving (free → proceeds)', async () => {
+    const { injected, calls } = baseInjected();
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out.outcome).toBe('success');
+    expect(calls.freeBusy).toHaveLength(1);
+    const q = calls.freeBusy[0];
+    expect(q.coordinatorId).toBe('coord@x.com'); // the OAuth secret-path key (same as the move)
+    expect(q.windowStart).toBe(RESCH_EVENT.newSlot.start);
+    expect(q.windowEnd).toBe(RESCH_EVENT.newSlot.end);
+  });
+
+  it('FAIL-OPEN: a freeBusy error does not block the move (reschedule never LESS reliable than the no-check baseline)', async () => {
+    const warns = [];
+    const { injected, calls } = baseInjected({
+      availability: { getBusyIntervals: async () => { throw new Error('freeBusy 500'); } },
+      logger: { warn: (msg) => warns.push(msg), error: () => {} },
+    });
+    const out = await handleSchedulingMutate(RESCH_EVENT, injected);
+    expect(out.outcome).toBe('success'); // proceeded despite the re-check failing
+    expect(calls.reschedule).toHaveLength(1);
+    expect(warns).toContain('reschedule_recheck_freebusy_failed');
+  });
+
+  it('does NOT re-check freeBusy on a cancel (guard is reschedule-only)', async () => {
+    const { injected, calls } = baseInjected();
+    await handleSchedulingMutate(
+      { action: 'scheduling_mutate', mutation: 'cancel', tenantId: 'T1', coordinatorId: 'c@x.com', bookingId: 'bk1', booking: { booking_id: 'bk1', tenant_id: 'T1' } },
+      injected
+    );
+    expect(calls.freeBusy).toHaveLength(0);
   });
 });
 
