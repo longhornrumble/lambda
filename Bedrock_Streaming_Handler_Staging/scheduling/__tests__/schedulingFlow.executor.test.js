@@ -50,6 +50,12 @@ describe('executor payload + outcome mapping (via _doReschedule/_doCancel)', () 
     expect(res).toEqual({ executed: false, outcome: 'failed', fallback: 'email' });
   });
 
+  it("FS7: executor 'slot_unavailable' (TOCTOU re-check blocked the move) → executed:false + reason, NO email fallback", async () => {
+    const res = await _doReschedule({ tenantId: 'T1', binding: BINDING, booking: BOOKING, newSlot: SLOT, deps: { invokeSchedulingExecutor: async () => ({ outcome: 'slot_unavailable', reason: 'recheck_busy' }) }, logger: console });
+    expect(res).toEqual({ executed: false, outcome: 'slot_unavailable', reason: 'slot_unavailable' });
+    expect(res.fallback).toBeUndefined(); // NOT the email path — that would falsely advance the session to 'booked'
+  });
+
   it("executor returns { error } on a non-failed outcome → still fallback (defensive guard)", async () => {
     const res = await _doCancel({ tenantId: 'T1', binding: BINDING, booking: BOOKING, deps: { invokeSchedulingExecutor: async () => ({ outcome: 'deleted', error: 'weird' }) }, logger: console });
     expect(res.fallback).toBe('email');
@@ -104,6 +110,26 @@ describe('SR-2: email-fallback advances state (terminal turn → no executor re-
     expect(res.fallback).toBe('email');
     expect(saved.some((s) => s.state === 'booked')).toBe(true);          // advanced → re-fire now rejects
     expect(written.some((d) => d.includes('scheduling_notice'))).toBe(true); // user told "we'll confirm by email"
+  });
+});
+
+describe('FS7: reschedule slot taken between offer and confirm → no state advance + slot-gone notice', () => {
+  it('confirm_reschedule with executor slot_unavailable → session NOT advanced to booked; guest told the time is gone', async () => {
+    const saved = [];
+    const written = [];
+    const deps = {
+      resolveBinding: async () => ({ booking_id: 'bk1', coordinator_id: 'c@x.com', intent: 'rescheduling_intent' }),
+      loadState: async () => ({ state: 'confirming', selected_slot: SLOT }),
+      loadBooking: async () => BOOKING,
+      saveState: async (s) => { saved.push(s); },
+      // BCH's freeBusy re-check found the NEW slot already taken → slot_unavailable (no calendar op).
+      invokeSchedulingExecutor: async () => ({ outcome: 'slot_unavailable', reason: 'recheck_busy' }),
+    };
+    const bedrock = { send: async () => ({ body: new TextEncoder().encode(JSON.stringify({ content: [{ text: '{"action":"confirm_reschedule"}' }] })) }) };
+    const res = await runSchedulingTurn({ responseText: 'ok', conversationHistory: [], tenantId: 'T1', sessionId: 's1', config: {}, bedrock, write: (d) => written.push(d), deps });
+    expect(res).toMatchObject({ handled: true, executed: false, action: 'confirm_reschedule', reason: 'slot_unavailable' });
+    expect(saved.some((s) => s.state === 'booked')).toBe(false);                    // booking kept its OLD time — never marked booked
+    expect(written.some((d) => d.includes('"notice":"slot_unavailable"'))).toBe(true); // guest told the time is gone (not a false "moved!")
   });
 });
 

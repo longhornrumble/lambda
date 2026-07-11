@@ -52,6 +52,11 @@ const reminderScheduler = require('../Reminder_Scheduler/scheduler');
 // sendConfirmationEmail: re-send the booking confirmation (with an updated .ics) for the NEW
 // time on reschedule — the commit path's notify step, which the reschedule path was missing.
 const { buildActionLinks, sendConfirmationEmail } = require('./confirmation-email');
+// FS7: the coordinator's live freeBusy — re-checked for the NEW slot right before a reschedule
+// move. The new-booking commit re-checks availability at commit time (index.js step 1) but the
+// reschedule path historically did NOT, so a slot taken between offer and confirm double-booked
+// the coordinator (Google Calendar accepts overlapping events). Same module index.js bundles.
+const availabilityModule = require('../shared/scheduling/availability');
 
 // tolerate camel OR snake on the inbound booking (schema discipline)
 function pick(b, camel, snake) {
@@ -73,6 +78,34 @@ function formatWhen(start, timeZone) {
   }
 }
 
+// FS7: is the coordinator's calendar already busy at the proposed NEW slot? Re-checks live
+// freeBusy right before a reschedule move — mirrors the new-booking commit's step-1 re-check
+// (index.js liveFreeBusyRecheck), which the reschedule path was missing. `coordinatorId` is the
+// OAuth secret-path key (same one the move's getOAuthClient uses); availability resolves the
+// calendar from that secret's coordinator_email. FAIL-OPEN: reschedule today has NO check at all,
+// so a freeBusy hiccup must never make it LESS reliable — on any error we log a non-PII
+// discriminator and return false (proceed). Only a POSITIVE "now busy" read blocks the move.
+async function isNewSlotBusy({ availability, tenantId, coordinatorId, booking, newSlot, logger }) {
+  try {
+    const resourceId =
+      pick(booking, 'resourceId', 'resource_id') ||
+      pick(booking, 'coordinatorEmail', 'coordinator_email');
+    const fb = await availability.getBusyIntervals({
+      tenantId, resourceId, coordinatorId,
+      windowStart: newSlot.start, windowEnd: newSlot.end,
+    });
+    const busy = (fb && fb.busy) || [];
+    const s = Date.parse(newSlot.start);
+    const e = Date.parse(newSlot.end);
+    return busy.some((iv) => Date.parse(iv.start) < e && Date.parse(iv.end) > s);
+  } catch (err) {
+    (logger.warn || logger.error || (() => {}))('reschedule_recheck_freebusy_failed', {
+      error_name: (err && err.name) || 'unknown',
+    });
+    return false; // fail-open: never make reschedule less reliable than the no-check baseline
+  }
+}
+
 async function handleSchedulingMutate(event = {}, injected = {}) {
   const calendarEvents = injected.calendarEvents || calendarEventsModule;
   const zoomClient = injected.zoomClient || zoomClientModule;
@@ -88,6 +121,7 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
   const _rebindReminders = injected.rebindReminders || reminderScheduler.rebindReminders;
   const _buildActionLinks = injected.buildActionLinks || buildActionLinks;
   const _sendConfirmationEmail = injected.sendConfirmationEmail || sendConfirmationEmail;
+  const _availability = injected.availability || availabilityModule;
   const logger = injected.logger || console;
 
   const { mutation, tenantId, coordinatorId, booking } = event;
@@ -175,6 +209,16 @@ async function handleSchedulingMutate(event = {}, injected = {}) {
 
     // reschedule
     const { newSlot } = event;
+    // FS7: re-check live availability for the NEW slot BEFORE moving the event. Without this a
+    // slot taken between offer and confirm would overwrite the old slot AND double-book the
+    // coordinator. On a busy read: NO calendar op — return slot_unavailable so the caller re-offers
+    // (the booking stays at its old time). isNewSlotBusy fails OPEN, so a freeBusy error proceeds.
+    if (await isNewSlotBusy({ availability: _availability, tenantId, coordinatorId, booking, newSlot, logger })) {
+      (logger.log || logger.info || (() => {}))('reschedule_slot_unavailable', {
+        booking_id: pick(booking, 'bookingId', 'booking_id'),
+      });
+      return { outcome: 'slot_unavailable', reason: 'recheck_busy' };
+    }
     const conferenceType = pick(booking, 'conferenceProvider', 'conference_provider') || 'google_meet';
     const conference = _resolveProvider(conferenceType, { zoomClient });
     const result = await _executeReschedule({ booking, newSlot, deps: { calendar, conference, logger } });

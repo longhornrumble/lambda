@@ -64,6 +64,15 @@ function _emitFallbackNotice(write, sessionId) {
   }
 }
 
+// FS7: the reschedule executor re-checked availability and the NEW slot was already taken. The
+// booking stays at its old time; tell the guest the time is gone so a post-stream "moved!" line
+// isn't left uncorrected. Sibling to _emitFallbackNotice (same scheduling_notice channel).
+function _emitSlotGoneNotice(write, sessionId) {
+  if (typeof write === 'function') {
+    write(`data: ${JSON.stringify({ type: 'scheduling_notice', notice: 'slot_unavailable', session_id: sessionId })}\n\n`);
+  }
+}
+
 // ─── booking field reads (schema discipline — tolerate camel OR snake) ──────────────────
 
 function pick(booking, camel, snake) {
@@ -274,6 +283,14 @@ async function _executeViaExecutor(mutation, { tenantId, binding, booking, newSl
     if (!res || res.error || res.outcome === 'failed') {
       return { executed: false, outcome: (res && res.outcome) || 'failed', fallback: 'email' };
     }
+    // FS7: BCH re-checked live availability and the NEW slot was taken between offer and confirm
+    // (reschedule TOCTOU). This is NOT executed and NOT a system error → NO email fallback (that
+    // would falsely advance the session to 'booked' and promise an email follow-up). Surface
+    // reason:'slot_unavailable' so the caller keeps the booking at its OLD time and tells the guest
+    // the time is gone (mirrors the new-booking 'slot_unavailable' vocabulary).
+    if (res.outcome === 'slot_unavailable') {
+      return { executed: false, outcome: 'slot_unavailable', reason: 'slot_unavailable' };
+    }
     return { executed: true, outcome: res.outcome, booking: res.booking };
   } catch (err) {
     (logger || console).error(`[WS-CONVO] scheduling executor invoke failed (fallback→email): error_name=${(err && err.name) || 'unknown'}`);
@@ -483,6 +500,9 @@ async function runSchedulingTurn({
           await deps.saveState({ tenantId, sessionId, state: 'booked' });
         }
         if (res.fallback === 'email') _emitFallbackNotice(write, sessionId);
+        // FS7: slot taken between offer and confirm — state was NOT advanced above (executed:false,
+        // no email fallback), so the booking keeps its old time; tell the guest the time is gone.
+        else if (res.reason === 'slot_unavailable') _emitSlotGoneNotice(write, sessionId);
         return { handled: true, action, ...res };
       }
 
