@@ -1,6 +1,7 @@
 import json
 import logging
 from session_utils import extract_session_data
+from redact_pii import redact_pii
 
 from bedrock_handler_optimized import retrieve_kb_chunks, build_prompt, call_claude_with_prompt, get_cache_status, warm_cache_for_tenant
 
@@ -29,7 +30,9 @@ def route_intent(event, config=None, conversation_context=None):
         session_id = extract_session_id(event)
 
         logger.info(f"[{tenant_hash[:8] if tenant_hash else 'unknown'}...] Session ID: {session_id}")
-        logger.info(f"[{tenant_hash[:8] if tenant_hash else 'unknown'}...] User input: {user_input[:40]}...")
+        # S3: redact before truncating — a slice can split an email/phone so
+        # the redaction regex no longer matches it.
+        logger.info(f"[{tenant_hash[:8] if tenant_hash else 'unknown'}...] User input: {redact_pii(user_input)[:40]}...")
         
         # Use passed conversation_context or try to extract it from the event body
         if conversation_context:
@@ -142,8 +145,9 @@ def route_intent(event, config=None, conversation_context=None):
             )
 
     except Exception as e:
+        # S4: detail stays in the log (exc_info above) — never in the client body.
         logger.error(f"❌ Intent routing failed: {str(e)}", exc_info=True)
-        return format_http_error(500, "Internal server error", str(e))
+        return format_http_error(500, "Internal server error")
 
 def extract_tenant_hash(event):
     """Extract tenant hash from event (hash-only system)"""

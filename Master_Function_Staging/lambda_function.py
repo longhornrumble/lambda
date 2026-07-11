@@ -358,6 +358,62 @@ def health_check(event: Dict[str, Any] = None) -> Dict[str, Any]:
     
     return add_cors_headers(response, event)
 
+# Top-level config keys the widget actually reads (grep-verified against
+# Picasso/src, 2026-07-11 — see docs/audits/master_function_analysis_2026-07-11.md
+# S1 in the superrepo). Everything else in the tenant config is server-side
+# only (tone_prompt, aws.knowledge_base_id, channels page tokens, webhook,
+# notification_settings, monitor.webhookUrl, tenant_id, ...) and must never
+# be served to the public get_config endpoint: the tenant_hash query param is
+# embedded in every client page, so this response is world-readable.
+_FRONTEND_CONFIG_KEYS = (
+    'tenant_hash', 'chat_title', 'welcome_message', 'callout_text', 'calloutText',
+    'branding', 'features', 'feature_flags', 'conversational_forms',
+    'action_chips', 'cta_definitions', 'conversation_branches', 'quick_help',
+    'privacy_notice_url', 'scheduling', 'showcase_items', 'content_showcase',
+    'widget_behavior', 'streaming', 'metadata',
+    # Legacy top-level form-completion fallbacks (FormCompletionCard.jsx)
+    'next_steps', 'post_submission', 'confirmation_message', 'actions',
+)
+
+
+def _frontend_safe_form(form: Any) -> Any:
+    """Strip staff-facing fields from one conversational_forms entry.
+
+    `notifications` (staff emails/phones + templates) and `fulfillment`
+    (webhook_url/recipients — both the legacy form-level key and the nested
+    post_submission.fulfillment) are consumed only by the backend form
+    pipeline; the widget renders fields/title/post_submission messaging.
+    """
+    if not isinstance(form, dict):
+        return form
+    safe = {k: v for k, v in form.items() if k not in ('notifications', 'fulfillment')}
+    post_submission = safe.get('post_submission')
+    if isinstance(post_submission, dict):
+        safe['post_submission'] = {
+            k: v for k, v in post_submission.items() if k != 'fulfillment'
+        }
+    return safe
+
+
+def _frontend_safe_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a full tenant config onto the widget-visible surface.
+
+    Builds a new dict (never mutates the loader's cached object). Missing
+    keys are simply omitted — old-shape configs must keep working.
+    """
+    safe = {}
+    for key in _FRONTEND_CONFIG_KEYS:
+        if key not in config:
+            continue
+        value = config[key]
+        if key == 'conversational_forms' and isinstance(value, dict):
+            value = {form_id: _frontend_safe_form(f) for form_id, f in value.items()}
+        elif key == 'post_submission' and isinstance(value, dict):
+            value = {k: v for k, v in value.items() if k != 'fulfillment'}
+        safe[key] = value
+    return safe
+
+
 def get_config_for_tenant(tenant_hash: str, event: Dict[str, Any] = None) -> Dict[str, Any]:
     """
     Return configuration for a specific tenant
@@ -386,7 +442,7 @@ def get_config_for_tenant(tenant_hash: str, event: Dict[str, Any] = None) -> Dic
             logger.info(f"Successfully loaded config for tenant: {tenant_hash[:8]}...")
             response = {
                 'statusCode': 200,
-                'body': json.dumps(config_data)
+                'body': json.dumps(_frontend_safe_config(config_data))
             }
         else:
             logger.warning(f"No config found for tenant: {tenant_hash[:8]}...")
@@ -591,9 +647,11 @@ def handle_streaming_chat_fallback(event: Dict[str, Any], tenant_hash: str) -> D
         logger.error(f"Error in fallback streaming chat: {str(e)}", exc_info=True)
 
         # Return error as SSE format
+        # S4: never leak internal exception detail (table names/ARNs/stack
+        # text) to the client — it is already logged with exc_info above.
         error_data = json.dumps({
             "type": "error",
-            "content": f"Streaming error: {str(e)}",
+            "content": "Streaming error — please try again.",
             "session_id": session_id if 'session_id' in locals() else 'unknown'
         })
         error_sse = f'data: {error_data}\n\ndata: [DONE]\n\n'
@@ -1262,10 +1320,31 @@ def handle_form_submission(event: Dict[str, Any], tenant_hash: str, request_id: 
 
         logger.info(f"Form submission processed: {result.get('submission_id')}")
 
-        response = {
-            'statusCode': 200,
-            'body': json.dumps(result)
-        }
+        # D2: a failed submission must not read as a healthy 200 to
+        # status-code clients / CloudFront metrics / 5xx alarms. The handler
+        # returns error_code='invalid_form' for caller mistakes (unknown form
+        # type) and 'form_processing_failed' for our-side failures.
+        if result.get('success'):
+            response = {
+                'statusCode': 200,
+                'body': json.dumps(result)
+            }
+        else:
+            error_code = result.get('error', 'form_processing_failed')
+            status_code = 400 if error_code == 'invalid_form' else 502
+            response = {
+                'statusCode': status_code,
+                'body': json.dumps({
+                    'success': False,
+                    'error': error_code,
+                    'message': (
+                        'Please check the form and try again.'
+                        if status_code == 400 else
+                        "Sorry — something went wrong on our end and your "
+                        "submission didn't go through. Please try again in a moment."
+                    )
+                })
+            }
 
         return add_cors_headers(response, event)
 
@@ -1701,7 +1780,7 @@ def handle_cache_warming(event: Dict[str, Any], tenant_hash: str) -> Dict[str, A
             'statusCode': 500,
             'body': json.dumps({
                 'error': 'Internal Server Error',
-                'message': f'Cache warming failed: {str(e)}'
+                'message': 'Cache warming failed'
             })
         }
     
