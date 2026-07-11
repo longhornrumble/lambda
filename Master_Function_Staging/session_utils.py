@@ -39,15 +39,13 @@ def extract_session_data(event, tenant_info=None):
     # 2. Fallback to session attributes
     elif session_attrs.get("tenant_id"):
         tenant_id = session_attrs.get("tenant_id")
-    # 3. Try to extract from JWT if available
-    elif event.get('headers', {}).get('authorization'):
-        try:
-            from tenant_inference import extract_tenant_from_token
-            jwt_tenant = extract_tenant_from_token(event)
-            if jwt_tenant:
-                tenant_id = jwt_tenant.get('tenant_id')
-        except ImportError:
-            pass
+    # (A third fallback — resolving the tenant from a client-supplied JWT via
+    # the deleted tenant_inference subsystem — was removed 2026-07-11. It was
+    # unreachable from legitimate traffic (the widget always sends ?t=) and
+    # let a MALFORMED request (?action=chat with no `t` + an authorization
+    # header) drive tenant resolution from an attacker-supplied token,
+    # bypassing the hash-based tenant system. Tenant identity now comes only
+    # from the caller-provided hash or session attributes.)
 
     # Validate tenant_id for security
     if tenant_id and not _is_valid_tenant_id(tenant_id):
