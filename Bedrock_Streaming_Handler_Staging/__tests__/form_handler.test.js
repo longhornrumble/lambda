@@ -2474,3 +2474,95 @@ describe('Form Handler - FS9: submit-time re-validation', () => {
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FS5 — client idempotency token (client_submission_id)
+// A widget-supplied token makes the submission key deterministic; the save's
+// ConditionExpression turns a retry into a detected duplicate answered with
+// success and NO re-run of fulfillment (no double emails/SMS). Absent or
+// malformed token → today's random key, no dedup (backward compatible).
+// ─────────────────────────────────────────────────────────────────────────────
+describe('FS5: client idempotency token', () => {
+  const TOKEN = 'a'.repeat(64); // sha256-hex-shaped
+
+  beforeEach(() => {
+    sesMock.reset(); snsMock.reset(); dynamoMock.reset(); lambdaMock.reset(); s3Mock.reset();
+    dynamoMock.on(PutCommand).resolves({});
+    dynamoMock.on(GetCommand).resolves({});
+    dynamoMock.on(UpdateCommand).resolves({});
+    sesMock.on(SendEmailCommand).resolves({ MessageId: 'm1' });
+  });
+
+  it('valid token → deterministic submission_id + attribute_not_exists condition on the save', async () => {
+    const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig, null, null, null, null, TOKEN);
+    expect(result.status).toBe('success');
+    const put = dynamoMock.commandCalls(PutCommand)
+      .find((c) => c.args[0].input.TableName === 'test-form-submissions');
+    expect(put.args[0].input.Item.submission_id).toBe(`volunteer_apply_idem_${TOKEN}`);
+    expect(put.args[0].input.ConditionExpression).toBe('attribute_not_exists(submission_id)');
+  });
+
+  it('duplicate retry (conditional check fails) → success + duplicate:true, fulfillment SKIPPED (no emails)', async () => {
+    const dupErr = new Error('The conditional request failed');
+    dupErr.name = 'ConditionalCheckFailedException';
+    dynamoMock.on(PutCommand).rejects(dupErr);
+
+    const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig, null, null, null, null, TOKEN);
+    expect(result).toMatchObject({
+      type: 'form_complete',
+      status: 'success',
+      duplicate: true,
+      submissionId: `volunteer_apply_idem_${TOKEN}`,
+      fulfillment: { status: 'duplicate_skipped' },
+    });
+    // The FIRST attempt owns fulfillment — the retry must not send anything.
+    expect(sesMock.commandCalls(SendEmailCommand)).toHaveLength(0);
+    expect(snsMock.calls()).toHaveLength(0);
+  });
+
+  it('malformed token (too short / bad charset) → ignored, random-suffix key, no dedup', async () => {
+    for (const bad of ['short', 'has spaces in it!!', 'x'.repeat(200)]) {
+      dynamoMock.resetHistory();
+      const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig, null, null, null, null, bad);
+      expect(result.status).toBe('success');
+      const put = dynamoMock.commandCalls(PutCommand)
+        .find((c) => c.args[0].input.TableName === 'test-form-submissions');
+      expect(put.args[0].input.Item.submission_id).toMatch(/^volunteer_apply_\d+_[0-9a-f]{8}$/);
+    }
+  });
+
+  it('no token → unchanged legacy behavior (random-suffix key)', async () => {
+    const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+    expect(result.status).toBe('success');
+    const put = dynamoMock.commandCalls(PutCommand)
+      .find((c) => c.args[0].input.TableName === 'test-form-submissions');
+    expect(put.args[0].input.Item.submission_id).toMatch(/^volunteer_apply_\d+_[0-9a-f]{8}$/);
+  });
+
+  it('tokenless conditional failure does NOT short-circuit (fail-open like today, fulfillment continues)', async () => {
+    const dupErr = new Error('The conditional request failed');
+    dupErr.name = 'ConditionalCheckFailedException';
+    // Reject only the form-submissions put; everything else resolves.
+    dynamoMock.on(PutCommand).callsFake((input) => {
+      if (input.TableName === 'test-form-submissions') throw dupErr;
+      return {};
+    });
+    const result = await submitForm('volunteer_apply', mockFormData, mockTenantConfig);
+    // no token → no duplicate short-circuit; flow continues to fulfillment
+    expect(result.duplicate).toBeUndefined();
+  });
+
+  it('handleFormMode threads body.client_submission_id through to the key', async () => {
+    const body = {
+      action: 'submit_form',
+      form_id: 'volunteer_apply',
+      form_data: mockFormData,
+      client_submission_id: TOKEN,
+    };
+    const result = await handleFormMode(body, mockTenantConfig);
+    expect(result.status).toBe('success');
+    const put = dynamoMock.commandCalls(PutCommand)
+      .find((c) => c.args[0].input.TableName === 'test-form-submissions');
+    expect(put.args[0].input.Item.submission_id).toBe(`volunteer_apply_idem_${TOKEN}`);
+  });
+});

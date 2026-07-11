@@ -99,7 +99,9 @@ class TestD4PostStoreIsolation(unittest.TestCase):
         self.stored = {}
         table = MagicMock()
         table.put_item.side_effect = (
-            lambda Item: self.stored.__setitem__(Item['submission_id'], Item))
+            # FS5: accept ConditionExpression (and future kwargs) — the real
+            # put_item now carries attribute_not_exists(submission_id).
+            lambda Item, **kw: self.stored.__setitem__(Item['submission_id'], Item))
         patcher = patch.object(_fh(), 'dynamodb')
         md = patcher.start()
         self.addCleanup(patcher.stop)
@@ -144,7 +146,8 @@ class TestD5FloatCoercion(unittest.TestCase):
         stored = {}
         table = MagicMock()
         table.put_item.side_effect = (
-            lambda Item: stored.__setitem__(Item['submission_id'], Item))
+            # FS5: accept ConditionExpression (and future kwargs).
+            lambda Item, **kw: stored.__setitem__(Item['submission_id'], Item))
         with patch.object(_fh(), 'dynamodb') as md:
             md.Table.return_value = table
             result = _submit(handler, {'email': 'a@b.org',
