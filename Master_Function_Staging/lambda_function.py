@@ -10,48 +10,33 @@ from urllib.parse import parse_qs
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Track JWT signing key retrieval warnings (only log once per Lambda instance)
-_jwt_key_warning_logged = False
-
 def get_jwt_signing_key() -> Optional[str]:
     """
-    Get JWT signing key from Secrets Manager, falling back to env var.
-    SECURITY: Never use hardcoded default keys - fail explicitly if no key available.
+    Single-source JWT signing key (consolidation, 2026-07-11 — operator choice:
+    "paranoid everywhere"). Delegates to conversation_handler._get_jwt_signing_key,
+    which is breaker-protected, 60s-cached, format-validated, and FAILS CLOSED
+    when Secrets Manager is down. The previous local copy's JWT_SECRET env-var
+    fallback was REMOVED — an env-readable signing key let anyone who can read
+    the environment mint tokens, and its silent-degrade behavior meant a Secrets
+    outage weakened auth instead of surfacing.
+
+    Contract preserved for the four call sites: returns the key, or None on any
+    failure (they already handle None with their own 401/500/new-conversation
+    paths). NB the retired copy also tolerated a JSON-shaped secret
+    ({"signingKey": ...}); the canonical retrieval reads the raw SecretString —
+    identical behavior for the plain-string secret in use (the two copies could
+    only ever have interoperated on a plain string).
     """
-    global _jwt_key_warning_logged
-
-    # Try Secrets Manager first (preferred)
     try:
-        import boto3
-        from aws_client_manager import boto_config_for
-        secrets_client = boto3.client('secretsmanager',
-                                      region_name=os.environ.get('AWS_REGION', 'us-east-1'),
-                                      config=boto_config_for('secretsmanager'))
-        secret_name = os.environ.get('JWT_SECRET_KEY_NAME', 'picasso/jwt/signing-key')
-        response = secrets_client.get_secret_value(SecretId=secret_name)
-
-        # Handle both JSON and plain string formats
-        secret_string = response.get('SecretString', '')
-        try:
-            secret_data = json.loads(secret_string)
-            return secret_data.get('signingKey', secret_string)
-        except json.JSONDecodeError:
-            return secret_string
-
-    except Exception as e:
-        if not _jwt_key_warning_logged:
-            logger.critical(f"SECURITY WARNING: Failed to retrieve JWT signing key from Secrets Manager: {e}")
-            _jwt_key_warning_logged = True
-
-        # Fall back to environment variable (NOT a hardcoded default)
-        env_key = os.environ.get('JWT_SECRET')
-        if env_key:
-            if not _jwt_key_warning_logged:
-                logger.warning("Using JWT_SECRET environment variable as fallback (Secrets Manager unavailable)")
-            return env_key
-
-        # No key available - log critical error
-        logger.critical("SECURITY CRITICAL: No JWT signing key available - authentication will fail")
+        # Function-level import — matches the existing lambda_function ↔
+        # conversation_handler convention and avoids a module-load cycle.
+        from conversation_handler import _get_jwt_signing_key
+        return _get_jwt_signing_key()
+    except Exception as e:  # noqa: BLE001 — callers key off None
+        logger.critical(
+            "SECURITY CRITICAL: JWT signing key unavailable "
+            f"(no env fallback — removed 2026-07-11): {type(e).__name__}"
+        )
         return None
 
 
@@ -222,6 +207,16 @@ _CORS_ALLOWED_ORIGINS_DEFAULT = [
 # correct fallback regardless of allowlist ordering.
 _CORS_DEFAULT_FALLBACK_ORIGIN = 'https://chat.myrecruiter.ai'
 
+# Canonical CORS method/header sets (consolidation, 2026-07-11 — operator
+# choice: "union both, one builder"). The two assemblers had drifted into a
+# latent disagreement: this file allowed DELETE + X-Requested-With but not
+# x-api-key; response_formatter allowed x-api-key but not DELETE +
+# X-Requested-With. The UNION is canonical (nothing that worked breaks), and
+# response_formatter now imports THESE constants instead of hand-rolling its
+# own strings — the set can no longer drift between the two.
+CORS_ALLOW_METHODS = 'GET, POST, OPTIONS, DELETE'
+CORS_ALLOW_HEADERS = 'Content-Type, Authorization, X-Requested-With, x-api-key'
+
 
 def validate_cors_origin(request_headers, tenant_hash, config_data):
     """
@@ -323,8 +318,8 @@ def add_cors_headers(response: Dict[str, Any], event: Dict[str, Any] = None) -> 
 
     # Add CORS headers - this is the single source of truth
     response['headers']['Access-Control-Allow-Origin'] = allowed_origin
-    response['headers']['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, DELETE'
-    response['headers']['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+    response['headers']['Access-Control-Allow-Methods'] = CORS_ALLOW_METHODS
+    response['headers']['Access-Control-Allow-Headers'] = CORS_ALLOW_HEADERS
     # Always set credentials true — we never use wildcard now, so this is safe.
     response['headers']['Access-Control-Allow-Credentials'] = 'true'
     

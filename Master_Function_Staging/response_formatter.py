@@ -49,11 +49,16 @@ def format_http_response(message, session_id, context=None, request_headers=None
         "cache_strategy": "no-cache"  # Chat responses should not be cached
     })
     
-    # Base headers without CORS
+    # Base headers. CORS method/header sets come from lambda_function's
+    # canonical constants (consolidation 2026-07-11) — this file previously
+    # hand-rolled a DIFFERENT set (no DELETE / X-Requested-With) and the two
+    # assemblers had silently drifted. Function-level import per the existing
+    # lambda_function ↔ handler convention (no module-load cycle).
+    from lambda_function import CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS
     headers = {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type,x-api-key,Authorization",
+        "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+        "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
         "Cache-Control": "no-cache, must-revalidate",  # Chat responses are dynamic
         "CloudFront-Domain": CLOUDFRONT_DOMAIN,
         "X-Delivery-Method": "cloudfront",
@@ -119,11 +124,12 @@ def format_http_error(status_code, message, details=None, request_headers=None, 
     """Format error response with CloudFront-appropriate headers and secure CORS"""
     logger.warning(f"⚠️ Formatting error response: {status_code} - {message} via CloudFront")
     
-    # Base headers without CORS
+    # Base headers. Canonical CORS constants — see format_http_response above.
+    from lambda_function import CORS_ALLOW_METHODS, CORS_ALLOW_HEADERS
     headers = {
         "Content-Type": "application/json",
-        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type,x-api-key,Authorization",
+        "Access-Control-Allow-Methods": CORS_ALLOW_METHODS,
+        "Access-Control-Allow-Headers": CORS_ALLOW_HEADERS,
         "Cache-Control": "no-cache, must-revalidate",  # Errors should not be cached
         "CloudFront-Domain": CLOUDFRONT_DOMAIN,
         "X-Delivery-Method": "cloudfront",
