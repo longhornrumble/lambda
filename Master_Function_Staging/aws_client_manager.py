@@ -370,28 +370,8 @@ def boto_config_for(service_name: str) -> Config:
     """
     return aws_client_manager._create_boto_config(service_name)
 
-# Convenience functions for common operations
-def get_dynamodb_client() -> boto3.client:
-    """Get DynamoDB client with timeout protection"""
-    return aws_client_manager.get_client('dynamodb')
-
-def get_secrets_client() -> boto3.client:
-    """Get Secrets Manager client with timeout protection"""
-    return aws_client_manager.get_client('secretsmanager')
-
-def get_s3_client() -> boto3.client:
-    """Get S3 client with timeout protection"""
-    return aws_client_manager.get_client('s3')
-
-def get_bedrock_client() -> boto3.client:
-    """Get Bedrock client with timeout protection"""
-    return aws_client_manager.get_client('bedrock-runtime')
-
-def get_cloudwatch_client() -> boto3.client:
-    """Get CloudWatch client with timeout protection"""
-    return aws_client_manager.get_client('cloudwatch')
-
-# Protected operation functions
+# Protected operation functions (the unused get_*_client convenience
+# wrappers and protected_s3_operation were removed 2026-07-11 — zero callers)
 def protected_dynamodb_operation(operation: str, **kwargs) -> Any:
     """
     Execute DynamoDB operation with circuit breaker protection
@@ -417,19 +397,6 @@ def protected_secrets_operation(operation: str, **kwargs) -> Any:
         Operation result
     """
     return aws_client_manager.protected_call('secretsmanager', operation, **kwargs)
-
-def protected_s3_operation(operation: str, **kwargs) -> Any:
-    """
-    Execute S3 operation with circuit breaker protection
-    
-    Args:
-        operation: S3 operation (get_object, head_object, etc.)
-        **kwargs: Operation parameters
-        
-    Returns:
-        Operation result
-    """
-    return aws_client_manager.protected_call('s3', operation, **kwargs)
 
 class GracefulDegradationHandler:
     """Enhanced timeout handler with graceful degradation and caching"""

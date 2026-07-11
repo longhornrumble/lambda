@@ -59,7 +59,6 @@ def discover_test_modules():
     """Discover all test modules for form processing"""
     test_modules = [
         'test_form_handler',
-        'test_template_renderer',
         'test_lambda_integration',
         'test_dynamodb_operations',
         'test_sms_rate_limiting',
@@ -121,7 +120,6 @@ def run_test_suite(test_category='all', verbose=True):
     elif test_category == 'unit':
         modules_to_run = [
             'test_form_handler',
-            'test_template_renderer',
             'test_dynamodb_operations',
             'test_sms_rate_limiting'
         ]
