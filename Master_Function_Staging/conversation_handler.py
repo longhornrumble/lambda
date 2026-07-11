@@ -794,22 +794,42 @@ def _save_conversation_to_db(session_id, tenant_id, delta, expected_turn):
                         'expires_at': {'N': str(message_ttl)}
                     }
                     
-                    if AWS_CLIENT_MANAGER_AVAILABLE:
+                    # D13: never silently OVERWRITE a message — the composite key
+                    # (sessionId, messageTimestamp=ms_epoch+i) collides when two
+                    # saves land in the same millisecond, and an unconditional put
+                    # made the second one clobber the first. Conditional put + on a
+                    # collision re-key +2ms (past the sibling at base+1) and retry
+                    # ONCE — mirrors the summary CAS style above. A second
+                    # collision falls through to the outer ClientError → 500.
+                    for _d13_attempt in range(2):
                         try:
-                            protected_dynamodb_operation(
-                                'put_item',
-                                TableName=MESSAGES_TABLE_NAME,
-                                Item=message_item
-                            )
-                        except (ConnectTimeoutError, ReadTimeoutError, CircuitBreakerError) as e:
-                            logger.error(f"⏰ DynamoDB timeout saving message for session {session_id[:12]}...: {e}")
-                            raise ConversationError("DB_TIMEOUT", "Database service temporarily unavailable", 503)
-                    else:
-                        # Fallback to legacy client
-                        dynamodb.put_item(
-                            TableName=MESSAGES_TABLE_NAME,
-                            Item=message_item
-                        )
+                            if AWS_CLIENT_MANAGER_AVAILABLE:
+                                try:
+                                    protected_dynamodb_operation(
+                                        'put_item',
+                                        TableName=MESSAGES_TABLE_NAME,
+                                        Item=message_item,
+                                        ConditionExpression='attribute_not_exists(sessionId)'
+                                    )
+                                except (ConnectTimeoutError, ReadTimeoutError, CircuitBreakerError) as e:
+                                    logger.error(f"⏰ DynamoDB timeout saving message for session {session_id[:12]}...: {e}")
+                                    raise ConversationError("DB_TIMEOUT", "Database service temporarily unavailable", 503)
+                            else:
+                                # Fallback to legacy client
+                                dynamodb.put_item(
+                                    TableName=MESSAGES_TABLE_NAME,
+                                    Item=message_item,
+                                    ConditionExpression='attribute_not_exists(sessionId)'
+                                )
+                            break
+                        except ClientError as _d13_err:
+                            if (_d13_attempt == 0
+                                    and _d13_err.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException'):
+                                _d13_bumped = int(message_item['messageTimestamp']['N']) + 2
+                                logger.warning(f"[D13] same-ms message collision for session {session_id[:12]}... — re-keying to {_d13_bumped}")
+                                message_item['messageTimestamp']['N'] = str(_d13_bumped)
+                                continue
+                            raise
         
         logger.info(f"[{tenant_id[:8]}...] ✅ Conversation saved successfully")
         
