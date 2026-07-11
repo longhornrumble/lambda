@@ -13,6 +13,7 @@ import logging
 import ipaddress
 import socket
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import urlparse
 import boto3
@@ -575,39 +576,71 @@ class FormHandler:
             if not form_config:
                 raise ValueError(f"Form type '{form_type}' not configured for tenant")
 
-            # Store submission
-            submission_id = self._store_submission(
-                form_type=form_type,
-                responses=responses,
-                session_id=session_id,
-                conversation_id=conversation_id,
-                form_config=form_config,
-                tenant_hash=tenant_hash,
-                request_id=request_id,
-            )
+            # Store submission — the one step whose failure fails the request.
+            # D1/D4 (BSH-FS1 twin): a lost lead must be alarmable, and the
+            # marker's key=value tail is CloudWatch-metric-filter friendly.
+            try:
+                submission_id = self._store_submission(
+                    form_type=form_type,
+                    responses=responses,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    form_config=form_config,
+                    tenant_hash=tenant_hash,
+                    request_id=request_id,
+                )
+            except Exception as store_err:  # noqa: BLE001
+                logger.error(
+                    f"[FORM_SUBMISSION_LOST] tenant_id={self.tenant_id or 'unknown'} "
+                    f"form_id={form_type} reason=db_save_failed "
+                    f"error_class={type(store_err).__name__}",
+                    exc_info=True,
+                )
+                # Applicant confirmation is never reached on this path — the
+                # visitor must not be thanked for a submission we dropped.
+                return {
+                    'success': False,
+                    'error': 'form_processing_failed'
+                }
 
-            # Determine priority
-            priority = self._determine_priority(form_type, responses, form_config)
+            # D4: every step after the store is best-effort — a stored
+            # submission always reports success; notification/fulfillment
+            # failures are logged (and visible in the returned status fields),
+            # never converted into a client-facing error that would prompt a
+            # retry and a duplicate row.
+            priority = 'normal'
+            try:
+                priority = self._determine_priority(form_type, responses, form_config)
+            except Exception:  # noqa: BLE001
+                logger.error("Priority determination failed (submission stored)",
+                             exc_info=True)
 
-            # Send notifications
-            notification_results = self._send_notifications(
-                form_config=form_config,
-                form_data={
-                    'form_type': form_type,
-                    'responses': responses,
-                    'submission_id': submission_id,
-                    'priority': priority
-                },
-                priority=priority
-            )
+            notification_results = []
+            try:
+                notification_results = self._send_notifications(
+                    form_config=form_config,
+                    form_data={
+                        'form_type': form_type,
+                        'responses': responses,
+                        'submission_id': submission_id,
+                        'priority': priority
+                    },
+                    priority=priority
+                )
+            except Exception:  # noqa: BLE001
+                logger.error("Notification dispatch failed (submission stored)",
+                             exc_info=True)
 
-            # Handle fulfillment
-            fulfillment_result = self._process_fulfillment(
-                form_config=form_config,
-                form_type=form_type,
-                responses=responses,
-                submission_id=submission_id
-            )
+            fulfillment_result = {'type': 'unknown', 'status': 'error'}
+            try:
+                fulfillment_result = self._process_fulfillment(
+                    form_config=form_config,
+                    form_type=form_type,
+                    responses=responses,
+                    submission_id=submission_id
+                )
+            except Exception:  # noqa: BLE001
+                logger.error("Fulfillment failed (submission stored)", exc_info=True)
 
             # Sprint D writer extension: persist S3 fulfillment URI on the row
             # so the PII DSAR walker can delete the per-tenant S3 object on
@@ -655,6 +688,12 @@ class FormHandler:
         """Store form submission in DynamoDB"""
         submission_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
+
+        # D5: the boto3 *resource* serializer raises TypeError on any Python
+        # float (a 25.50 donation / 4.5 rating would lose the whole
+        # submission). Round-trip through JSON with parse_float=Decimal —
+        # responses arrived as JSON, so this is lossless.
+        responses = json.loads(json.dumps(responses), parse_float=Decimal)
 
         # Build labeled form data for human-readable storage
         form_config = form_config or {}
@@ -738,9 +777,10 @@ class FormHandler:
                           form_config: Dict[str, Any]) -> str:
         """Determine notification priority based on form data"""
 
-        # Check for explicit priority fields
+        # Check for explicit priority fields. D4: the value is
+        # visitor-supplied and may be a list/bool — never assume str.
         if 'urgency' in responses:
-            urgency = responses['urgency'].lower()
+            urgency = str(responses['urgency']).lower()
             if urgency in ['immediate', 'urgent', 'high']:
                 return 'high'
             elif urgency in ['normal', 'this week']:
@@ -896,12 +936,22 @@ class FormHandler:
         """Send SMS notifications with rate limiting"""
         sent = []
 
-        # Check monthly usage limit
+        # Check monthly usage limit. D10 (BSH-FS4 twin): the cap is a soft
+        # cost guardrail — skip the SMS and continue (the submission still
+        # succeeds), but emit an alarmable marker so the skip is visible.
+        # The read-then-increment stays non-atomic by design (FS4 decision).
         monthly_limit = sms_config.get('monthly_limit', 100)
         current_usage = self._get_monthly_sms_usage()
 
         if current_usage >= monthly_limit:
+            recipients_skipped = len(sms_config.get('recipients', []))
             logger.warning(f"SMS monthly limit reached: {current_usage}/{monthly_limit}")
+            logger.error(
+                f"[SMS_RATE_LIMITED] tenant_id={self.tenant_id or 'unknown'} "
+                f"form_id={form_data.get('form_type', 'unknown')} "
+                f"usage={current_usage} limit={monthly_limit} "
+                f"skipped={recipients_skipped}"
+            )
             return sent
 
         recipients = sms_config.get('recipients', [])
@@ -1018,18 +1068,25 @@ class FormHandler:
                 return {'type': 'lambda', 'status': 'error', 'error': str(e)}
 
         elif fulfillment_type == 'email':
-            # Send fulfillment email to user
+            # Send fulfillment email to user. D1 (BSH-FS1 twin): report
+            # 'sent' only if the SES call actually succeeded — a suppressed
+            # recipient / sandbox / quota failure must not read as success.
             user_email = responses.get('email')
             if user_email:
                 # Check per-form applicant_confirmation config first (portal Templates tab)
                 confirmation_config = form_config.get('notifications', {}).get('applicant_confirmation', {})
                 if confirmation_config.get('enabled') and confirmation_config.get('subject') and confirmation_config.get('body_template'):
-                    self._send_applicant_confirmation(user_email, confirmation_config, responses, form_type, form_config, submission_id)
+                    delivered = self._send_applicant_confirmation(user_email, confirmation_config, responses, form_type, form_config, submission_id)
                 else:
                     # Fall back to legacy email_templates config
                     template = fulfillment.get('template', 'thank_you')
-                    self._send_fulfillment_email(user_email, template, responses, form_type, submission_id)
-                return {'type': 'email', 'status': 'sent', 'recipient': user_email}
+                    delivered = self._send_fulfillment_email(user_email, template, responses, form_type, submission_id)
+                return {
+                    'type': 'email',
+                    'status': 'sent' if delivered else 'error',
+                    'recipient': user_email
+                }
+            return {'type': 'email', 'status': 'skipped', 'reason': 'no_email_in_responses'}
 
         elif fulfillment_type == 's3':
             # Store in S3
@@ -1243,8 +1300,11 @@ class FormHandler:
 
     def _send_applicant_confirmation(self, recipient: str, confirmation_config: Dict[str, Any],
                                      responses: Dict[str, Any], form_type: str,
-                                     form_config: Dict[str, Any], submission_id: str = 'unknown'):
-        """Send applicant confirmation using per-form template config (portal Templates tab)."""
+                                     form_config: Dict[str, Any], submission_id: str = 'unknown') -> bool:
+        """Send applicant confirmation using per-form template config (portal Templates tab).
+
+        Returns True only if the SES send succeeded (D1 truthful status).
+        """
         try:
             tenant_name = self.tenant_config.get('chat_title', 'Organization')
 
@@ -1291,14 +1351,19 @@ class FormHandler:
                 ]
             )
             logger.info(f"Applicant confirmation sent to {redact_pii(recipient)} using per-form template")
+            return True
 
         except ClientError as e:
             logger.error(f"Applicant confirmation email error: {str(e)}")
+            return False
 
     def _build_display_text(self, responses: Dict[str, Any], form_config: Dict[str, Any]) -> str:
         """Build human-readable form data text for email templates."""
         fields = form_config.get('fields', [])
-        field_map = {f['id']: f.get('label', f['id']) for f in fields}
+        # D4: tolerate malformed field entries (missing id) — old configs must
+        # never crash the confirmation-email path.
+        field_map = {f['id']: f.get('label', f['id'])
+                     for f in fields if isinstance(f, dict) and 'id' in f}
         lines = []
         for key, value in responses.items():
             label = field_map.get(key, key.replace('_', ' ').title())
@@ -1308,8 +1373,11 @@ class FormHandler:
         return '\n'.join(lines)
 
     def _send_fulfillment_email(self, recipient: str, template: str, responses: Dict[str, Any],
-                               form_type: str = 'unknown', submission_id: str = 'unknown'):
-        """Send fulfillment email to form submitter"""
+                               form_type: str = 'unknown', submission_id: str = 'unknown') -> bool:
+        """Send fulfillment email to form submitter.
+
+        Returns True only if the SES send succeeded (D1 truthful status).
+        """
         try:
             # Get template content from config or use default
             templates = self.tenant_config.get('email_templates', {})
@@ -1346,9 +1414,11 @@ class FormHandler:
             )
 
             logger.info(f"Fulfillment email sent to {redact_pii(recipient)}")
+            return True
 
         except ClientError as e:
             logger.error(f"Fulfillment email error: {str(e)}")
+            return False
 
     def _get_default_template(self, template_type: str) -> Dict[str, str]:
         """Get default email template"""
