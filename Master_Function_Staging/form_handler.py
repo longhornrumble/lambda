@@ -4,6 +4,7 @@ Processes form submissions from Picasso chat widget
 Handles notifications, storage, and fulfillment
 """
 
+import html
 import json
 import os
 import time
@@ -23,6 +24,7 @@ from contact_extractor import (
     get_schema_version,
     SCHEMA_VERSION
 )
+from redact_pii import redact_pii
 
 # Initialize AWS clients
 dynamodb = boto3.resource('dynamodb')
@@ -629,11 +631,21 @@ class FormHandler:
                 'next_steps': self._get_next_steps(form_type, form_config)
             }
 
-        except Exception as e:
-            logger.error(f"Form submission error: {str(e)}")
+        except ValueError as e:
+            # Caller mistake (e.g. unknown form type) — detail stays in logs;
+            # lambda_function maps 'invalid_form' to a 400.
+            logger.error(f"Form submission rejected: {str(e)}")
             return {
                 'success': False,
-                'error': str(e)
+                'error': 'invalid_form'
+            }
+        except Exception as e:
+            # S4: never return str(e) (table names / ARNs / stack detail) to
+            # the client. lambda_function maps this to a 502.
+            logger.error(f"Form submission error: {str(e)}", exc_info=True)
+            return {
+                'success': False,
+                'error': 'form_processing_failed'
             }
 
     def _store_submission(self, form_type: str, responses: Dict[str, Any],
@@ -830,7 +842,7 @@ class FormHandler:
 
                 ses_message_id = response.get('MessageId', 'unknown')
                 sent.append(f"email:{recipient}")
-                logger.info(f"Email sent to {recipient}: {ses_message_id}")
+                logger.info(f"Email sent to {redact_pii(recipient)}: {ses_message_id}")
 
                 # Audit: write send record to picasso-notification-sends
                 try:
@@ -854,7 +866,7 @@ class FormHandler:
                     logger.error(f"Failed to write notification send record: {ddb_err}", exc_info=True)
 
             except ClientError as e:
-                logger.error(f"Email send error to {recipient}: {str(e)}")
+                logger.error(f"Email send error to {redact_pii(recipient)}: {str(e)}")
 
                 # Audit: write failure record to picasso-notification-sends
                 try:
@@ -909,10 +921,10 @@ class FormHandler:
                 sent.append(f"sms:{phone}")
                 self._increment_sms_usage()
                 current_usage += 1
-                logger.info(f"SMS sent to {phone}: {response['MessageId']}")
+                logger.info(f"SMS sent to {redact_pii(phone)}: {response['MessageId']}")
 
             except ClientError as e:
-                logger.error(f"SMS send error to {phone}: {str(e)}")
+                logger.error(f"SMS send error to {redact_pii(phone)}: {str(e)}")
 
         return sent
 
@@ -1187,18 +1199,22 @@ class FormHandler:
         form_type = form_data.get('form_type', 'Unknown')
         submission_id = form_data.get('submission_id', '')
 
-        # Build HTML table of responses
+        # Build HTML table of responses. S2: field names and values are
+        # visitor-supplied — escape them so a crafted submission cannot inject
+        # HTML/script into the staff inbox.
         rows = []
         for field, value in responses.items():
-            field_label = field.replace('_', ' ').title()
+            field_label = html.escape(field.replace('_', ' ').title())
             rows.append(f"""
                 <tr>
                     <td style="padding: 8px; border: 1px solid #ddd; font-weight: bold;">{field_label}</td>
-                    <td style="padding: 8px; border: 1px solid #ddd;">{value}</td>
+                    <td style="padding: 8px; border: 1px solid #ddd;">{html.escape(str(value))}</td>
                 </tr>
             """)
 
-        html = f"""
+        # NB: named html_body, not `html` — a local `html` would shadow the
+        # module import and break the escaping calls above (D7 class bug).
+        html_body = f"""
         <html>
         <head>
             <style>
@@ -1210,7 +1226,7 @@ class FormHandler:
             </style>
         </head>
         <body>
-            <h2>New Form Submission: {form_type.replace('_', ' ').title()}</h2>
+            <h2>New Form Submission: {html.escape(form_type.replace('_', ' ').title())}</h2>
             <table>
                 {''.join(rows)}
             </table>
@@ -1223,7 +1239,7 @@ class FormHandler:
         </html>
         """
 
-        return html
+        return html_body
 
     def _send_applicant_confirmation(self, recipient: str, confirmation_config: Dict[str, Any],
                                      responses: Dict[str, Any], form_type: str,
@@ -1242,12 +1258,15 @@ class FormHandler:
                 'form_data': self._build_display_text(responses, form_config),
             }
 
-            # Render templates
+            # Render templates. S2: the operator-authored template is trusted
+            # HTML-wise, but the interpolated values are visitor-supplied —
+            # escape them in the HTML body (subject is an SES API field, not
+            # HTML; escaping there would garble it).
             subject = confirmation_config['subject']
             body_text = confirmation_config['body_template']
             for key, value in template_vars.items():
                 subject = subject.replace(f'{{{key}}}', str(value))
-                body_text = body_text.replace(f'{{{key}}}', str(value))
+                body_text = body_text.replace(f'{{{key}}}', html.escape(str(value)))
 
             html_body = f"<div>{body_text.replace(chr(10), '<br>')}</div>"
 
@@ -1271,7 +1290,7 @@ class FormHandler:
                     {'Name': 'email_type', 'Value': 'applicant_confirmation'}
                 ]
             )
-            logger.info(f"Applicant confirmation sent to {recipient} using per-form template")
+            logger.info(f"Applicant confirmation sent to {redact_pii(recipient)} using per-form template")
 
         except ClientError as e:
             logger.error(f"Applicant confirmation email error: {str(e)}")
@@ -1300,11 +1319,12 @@ class FormHandler:
             subject = template_content.get('subject', 'Thank you for your submission')
             body = template_content.get('body', 'We have received your form submission.')
 
-            # Replace placeholders
+            # Replace placeholders. S2: escape visitor-supplied values in the
+            # HTML body (subject is an SES API field, not HTML).
             for key, value in responses.items():
                 placeholder = f"{{{key}}}"
                 subject = subject.replace(placeholder, str(value))
-                body = body.replace(placeholder, str(value))
+                body = body.replace(placeholder, html.escape(str(value)))
 
             # Send email
             ses.send_email(
@@ -1325,7 +1345,7 @@ class FormHandler:
                 ]
             )
 
-            logger.info(f"Fulfillment email sent to {recipient}")
+            logger.info(f"Fulfillment email sent to {redact_pii(recipient)}")
 
         except ClientError as e:
             logger.error(f"Fulfillment email error: {str(e)}")

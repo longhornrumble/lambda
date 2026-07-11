@@ -5,6 +5,7 @@ import boto3
 import hashlib
 import time
 from typing import Dict, Tuple, List, Any
+from redact_pii import redact_pii
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -90,10 +91,10 @@ def retrieve_kb_chunks(user_input, config):
         # Check cache first
         cache_key = get_cache_key(user_input, f"kb:{kb_id}")
         if cache_key in KB_CACHE and is_cache_valid(KB_CACHE[cache_key]):
-            logger.info(f"✅ KB Cache hit for: {user_input[:40]}...")
+            logger.info(f"✅ KB Cache hit for: {redact_pii(user_input)[:40]}...")
             return KB_CACHE[cache_key]['chunks'], KB_CACHE[cache_key]['sources']
 
-        logger.info(f"📚 Retrieving KB chunks for input: {user_input[:40]}... using KB: {kb_id}")
+        logger.info(f"📚 Retrieving KB chunks for input: {redact_pii(user_input)[:40]}... using KB: {kb_id}")
         
         # Time the KB retrieval
         start_time = time.time()
@@ -132,7 +133,7 @@ def retrieve_kb_chunks(user_input, config):
             sources.append(source_info)
         
         if not formatted_chunks:
-            logger.warning(f"⚠️ No relevant information found in knowledge base for: {user_input[:40]}...")
+            logger.warning(f"⚠️ No relevant information found in knowledge base for: {redact_pii(user_input)[:40]}...")
             return "", []
         
         logger.info(f"✅ Retrieved {len(formatted_chunks)} chunks from KB")
