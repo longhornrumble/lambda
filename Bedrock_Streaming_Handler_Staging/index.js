@@ -65,6 +65,7 @@ const { capturePrepNote, tenantHasPostBookingQuestion } = require('./scheduling/
 // the recovery loop; engages on the widget's scheduling_intent:'new_booking' signal or an
 // in-flight new-booking session row.
 const { runNewBookingEntry, captureAttendeeEmail, EMAIL_SHAPE } = require('./scheduling/newBookingEntry');
+const { runResponsePipeline } = require('./responsePipeline');
 // [Fix-2a B-2] The §B10 binding uuid (body.session) is forwarded into a DynamoDB SK
 // (binding#<uuid>) + can drive a reschedule/cancel via the §B14 boundary, so format-gate it:
 // accept ONLY a canonical UUID (crypto.randomUUID shape). Rejects probing strings, oversized
@@ -1043,198 +1044,16 @@ const streamingHandler = async (event, responseStream, context) => {
     }
 
     // Enhance response with CTAs after streaming is complete
-    try {
-      const routingMetadata = body.routing_metadata || {};
-      const sessionContext = body.session_context || {};
-
-      const validation = validateTopicDefinitions(config);
-
-      // WS-CONVO (B3 keystone): post-stream §B14 action boundary. Resolves the §B10
-      // binding (returns no-op when absent → the CTA logic below runs unchanged) and, when
-      // a reschedule/cancel binding governs this turn, detects a STRUCTURED action and
-      // executes via the shipped §B9 modules — NEVER on free text. The Google-auth facade +
-      // booking/state DDB I/O are the integrator's in-chat wiring seam (deps); until wired,
-      // detection + transitions run and execution is skipped non-fatally.
-      // Feature-gated (see schedulingEnabled above): when scheduling is OFF, skip the
-      // turn entirely → schedulingResult is null → the CTA chain below runs unchanged.
-      const schedulingResult = schedulingEnabled
-        ? await runSchedulingTurn({
-            responseText: responseBuffer, conversationHistory,
-            tenantId: config?.tenant_id, sessionId, bindingSessionId, config, bedrock, write,
-            deps: { ...schedulingDeps, ...schedulingExecDep },
-          })
-        : null;
-
-      // WS-NEWBOOK (§B16d): if the recovery loop didn't own this turn, try the NEW-booking
-      // entry-hook (engages on routing_metadata.scheduling_intent:'new_booking' or an in-flight
-      // new-booking session row). No-op for normal chat. tenantId from config (audit row 9).
-      const newBookingResult = (schedulingEnabled && !schedulingResult?.handled)
-        ? await runNewBookingEntry({
-            responseText: responseBuffer, conversationHistory,
-            tenantId: config?.tenant_id, sessionId, config, bedrock, write,
-            routingMetadata, deps: { ...schedulingDeps, ...newBookingDep },
-          })
-        : null;
-
-      if (schedulingResult?.handled || newBookingResult?.handled) {
-        // S-3: this turn was a scheduling turn (slot presentation / selection / state
-        // progression / the §B14 boundary). The flow owns the post-stream surface —
-        // skip normal CTA selection so a scheduling turn doesn't also append CTAs.
-        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult?.action || newBookingResult?.action || 'n/a'}) — skipping CTA selection`);
-      } else if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
-        // Tiers 1-2: Explicit clicks — use enhanceResponse()
-        console.log('[Tier 1-2] Explicit click routing — using enhanceResponse()');
-        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-
-        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-          write(`data: ${JSON.stringify({
-            type: 'cta_buttons',
-            ctaButtons: enhancedData.ctaButtons,
-            metadata: enhancedData.metadata,
-            session_id: sessionId
-          })}\n\n`);
-          console.log(`🎯 [Tier 1-2] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'explicit'}`);
-        }
-        // Send showcase card if present
-        if (enhancedData.showcaseCard) {
-          write(`data: ${JSON.stringify({
-            type: 'showcase_card',
-            showcaseCard: enhancedData.showcaseCard,
-            metadata: enhancedData.metadata,
-            session_id: sessionId
-          })}\n\n`);
-        }
-
-      } else if (v5Active) {
-        // V5 single-pass: the actions came from the SAME call that wrote the
-        // prose (v5Tail). Sits BEFORE V4_ACTION_SELECTOR — tenants may carry
-        // both flags, and V5 must win. Validation = selectActionsV4's semantics
-        // (known-ids filter + cap 4, shared via validateActionIds).
-        let selectedIds;
-        if (v5Tail && v5Tail.actionIds !== null) {
-          selectedIds = validateActionIds(v5Tail.actionIds, config);
-        } else if (v5CatalogEmpty) {
-          // No ai_available CTAs ⇒ the prompt asked for no tail; nothing to
-          // select and no fallback (selectActionsV4 has no empty-vocabulary
-          // early-return — it would burn a guaranteed-empty live call).
-          selectedIds = [];
-        } else {
-          // Fail-soft ladder: no/bad tail → ONE selectActionsV4 call → else no
-          // buttons. Never an error to the user.
-          console.log(`[V5 SinglePass] tail ${v5Tail ? v5Tail.status : 'missing'} — fail-soft selectActionsV4`);
-          selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
-        }
-
-        if (selectedIds.length > 0) {
-          const ctaButtons = selectedIds.map((id, idx) => {
-            const { style, ...cleanCta } = config.cta_definitions[id] || {};
-            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
-          });
-
-          write(`data: ${JSON.stringify({
-            type: 'cta_buttons',
-            ctaButtons,
-            metadata: {
-              routing_tier: 'v5_single_pass',
-              selected_ids: selectedIds,
-              conversation_context: { selected_ctas: selectedIds }
-            },
-            session_id: sessionId
-          })}\n\n`);
-          console.log(`🎯 [V5 SinglePass] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
-        } else {
-          console.log('[V5 SinglePass] No CTAs selected');
-        }
-
-      } else if (config.feature_flags?.V4_ACTION_SELECTOR) {
-        // V4.0 Action Selector: AI picks CTAs from the full vocabulary
-        console.log('[V4 ActionSelector] Using LLM-based CTA selection');
-        const selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
-
-        if (selectedIds.length > 0) {
-          const ctaButtons = selectedIds.map((id, idx) => {
-            const { style, ...cleanCta } = config.cta_definitions[id] || {};
-            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
-          });
-
-          write(`data: ${JSON.stringify({
-            type: 'cta_buttons',
-            ctaButtons,
-            metadata: {
-              routing_tier: 'v4_action_selector',
-              selected_ids: selectedIds,
-              conversation_context: { selected_ctas: selectedIds }
-            },
-            session_id: sessionId
-          })}\n\n`);
-          console.log(`🎯 [V4 ActionSelector] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
-        } else {
-          console.log('[V4 ActionSelector] No CTAs selected');
-        }
-
-      } else if (validation.definitions.length > 0) {
-        // Step 3a: Topic classification (non-streaming LLM call)
-        console.log(`[Step 3a] Classifying topic (${validation.definitions.length} definitions)`);
-        let topicName = await classifyTopic(
-          userInput,
-          conversationHistory,
-          { ...config, topic_definitions: validation.definitions },
-          bedrock
-        );
-
-        // Continuation detection: short/ambiguous messages carry forward the previous topic
-        const isShortMessage = userInput.trim().length < 20;
-        const isNullOrGeneral = !topicName || topicName === 'general_inquiry';
-        const previousTopic = sessionContext.last_classified_topic;
-        if (isShortMessage && isNullOrGeneral && previousTopic) {
-          console.log(`[Step 3a] Continuation detected: "${redactPII(userInput)}" → carrying forward topic "${previousTopic}"`);
-          topicName = previousTopic;
-        }
-
-        // Step 3b: Dynamic CTA pool selection (deterministic, no AI)
-        const result = selectCTAsFromPool(topicName, config, sessionContext);
-
-        // Send CTA SSE event
-        if (result.ctaButtons && result.ctaButtons.length > 0) {
-          write(`data: ${JSON.stringify({
-            type: 'cta_buttons',
-            ctaButtons: result.ctaButtons,
-            metadata: result.metadata,
-            session_id: sessionId
-          })}\n\n`);
-          console.log(`🎯 [Step3] sent ${result.ctaButtons.length} CTAs | topic: ${result.metadata?.classified_topic || 'null'} | depth: ${result.metadata?.depth} | method: ${result.metadata?.routing_method}`);
-        } else {
-          console.log(`[Step3] No CTAs to send | topic: ${topicName || 'null'} | method: ${result.metadata?.routing_method}`);
-        }
-
-      } else {
-        // No topic_definitions — fallback to enhanceResponse()
-        console.log('No topic_definitions configured — using enhanceResponse()');
-        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-
-        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-          write(`data: ${JSON.stringify({
-            type: 'cta_buttons',
-            ctaButtons: enhancedData.ctaButtons,
-            metadata: enhancedData.metadata,
-            session_id: sessionId
-          })}\n\n`);
-          console.log(`🎯 [fallback] sent ${enhancedData.ctaButtons.length} CTAs | tier: ${enhancedData.metadata?.routing_tier || 'unknown'}`);
-        }
-        if (enhancedData.showcaseCard) {
-          write(`data: ${JSON.stringify({
-            type: 'showcase_card',
-            showcaseCard: enhancedData.showcaseCard,
-            metadata: enhancedData.metadata,
-            session_id: sessionId
-          })}\n\n`);
-        }
-      }
-
-    } catch (enhanceError) {
-      console.error('❌ CTA enhancement error:', enhanceError);
-      // Don't fail the response if CTA enhancement fails
-    }
+    await runResponsePipeline({
+      emit: write,
+      responseBuffer, userInput, conversationHistory,
+      config, tenantHash, sessionId, bindingSessionId,
+      routingMetadata: body.routing_metadata || {},
+      sessionContext: body.session_context || {},
+      schedulingEnabled, bedrock,
+      v5Active, v5Tail, v5CatalogEmpty,
+      schedulingDeps, schedulingExecDep, newBookingDep,
+    });
 
   } catch (error) {
     // SEC: log the detail server-side but send the client a generic message —
@@ -1604,147 +1423,16 @@ const bufferedHandler = async (event, context) => {
     }
 
     // Enhance response with CTAs after generation is complete
-    try {
-      const routingMetadata = body.routing_metadata || {};
-      const sessionContext = body.session_context || {};
-
-      const validation = validateTopicDefinitions(config);
-
-      // WS-CONVO (B3 keystone): post-stream §B14 action boundary (buffered path). Same
-      // contract as the streaming path; SSE is emitted by splicing into `chunks` (mirrors
-      // the CTA splice below). No-op when no §B10 binding governs the session.
-      // Feature-gated (see schedulingEnabled above): OFF → null → CTA chain unchanged.
-      const schedulingResult = schedulingEnabled
-        ? await runSchedulingTurn({
-            responseText: responseBuffer, conversationHistory,
-            tenantId: config?.tenant_id, sessionId, bindingSessionId, config, bedrock,
-            write: (data) => chunks.splice(chunks.length - 1, 0, data),
-            deps: { ...schedulingDeps, ...schedulingExecDep },
-          })
-        : null;
-
-      // WS-NEWBOOK (§B16d): NEW-booking entry-hook (buffered path), only if the recovery loop
-      // didn't own this turn. No-op for normal chat. SSE spliced into `chunks` like above.
-      const newBookingResult = (schedulingEnabled && !schedulingResult?.handled)
-        ? await runNewBookingEntry({
-            responseText: responseBuffer, conversationHistory,
-            tenantId: config?.tenant_id, sessionId, config, bedrock,
-            write: (data) => chunks.splice(chunks.length - 1, 0, data),
-            routingMetadata, deps: { ...schedulingDeps, ...newBookingDep },
-          })
-        : null;
-
-      if (schedulingResult?.handled || newBookingResult?.handled) {
-        // S-3: scheduling turn owned the post-stream surface — skip CTA selection.
-        console.log(`[WS-CONVO] scheduling turn handled (action=${schedulingResult?.action || newBookingResult?.action || 'n/a'}) — skipping CTA selection`);
-      } else if (routingMetadata.action_chip_triggered || routingMetadata.cta_triggered) {
-        // Tiers 1-2: Explicit clicks
-        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-          const ctaData = JSON.stringify({
-            type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
-            metadata: enhancedData.metadata, session_id: sessionId
-          });
-          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-        }
-      } else if (v5Active) {
-        // V5 single-pass (buffered path) — mirrors the streaming block: actions
-        // come from the same call that wrote the prose; sits BEFORE
-        // V4_ACTION_SELECTOR so V5 wins when a tenant carries both flags.
-        let selectedIds;
-        if (v5Tail && v5Tail.actionIds !== null) {
-          selectedIds = validateActionIds(v5Tail.actionIds, config);
-        } else if (v5CatalogEmpty) {
-          // No tail was asked for (no ai_available CTAs) — no fallback call.
-          selectedIds = [];
-        } else {
-          console.log(`[V5 SinglePass buffered] tail ${v5Tail ? v5Tail.status : 'missing'} — fail-soft selectActionsV4`);
-          selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
-        }
-
-        if (selectedIds.length > 0) {
-          const ctaButtons = selectedIds.map((id, idx) => {
-            const { style, ...cleanCta } = config.cta_definitions[id] || {};
-            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
-          });
-
-          const ctaData = JSON.stringify({
-            type: 'cta_buttons', ctaButtons,
-            metadata: {
-              routing_tier: 'v5_single_pass',
-              selected_ids: selectedIds,
-              conversation_context: { selected_ctas: selectedIds }
-            },
-            session_id: sessionId
-          });
-          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-          console.log(`🎯 [V5 SinglePass buffered] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
-        }
-
-      } else if (config.feature_flags?.V4_ACTION_SELECTOR) {
-        // V4.0 Action Selector (buffered path)
-        console.log('[V4 ActionSelector buffered] Using LLM-based CTA selection');
-        const selectedIds = await selectActionsV4(responseBuffer, conversationHistory, config, bedrock);
-
-        if (selectedIds.length > 0) {
-          const ctaButtons = selectedIds.map((id, idx) => {
-            const { style, ...cleanCta } = config.cta_definitions[id] || {};
-            return { ...cleanCta, id, _position: idx === 0 ? 'primary' : 'secondary' };
-          });
-
-          const ctaData = JSON.stringify({
-            type: 'cta_buttons', ctaButtons,
-            metadata: {
-              routing_tier: 'v4_action_selector',
-              selected_ids: selectedIds,
-              conversation_context: { selected_ctas: selectedIds }
-            },
-            session_id: sessionId
-          });
-          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-          console.log(`🎯 [V4 ActionSelector buffered] sent ${ctaButtons.length} CTAs: [${selectedIds.join(', ')}]`);
-        }
-
-      } else if (validation.definitions.length > 0) {
-        // Step 3a + 3b: Topic classification → Pool selection
-        let topicName = await classifyTopic(
-          userInput, conversationHistory,
-          { ...config, topic_definitions: validation.definitions }, bedrock
-        );
-
-        // Continuation detection: short/ambiguous messages carry forward the previous topic
-        const isShortMsg = userInput.trim().length < 20;
-        const isNullOrGen = !topicName || topicName === 'general_inquiry';
-        const prevTopic = sessionContext.last_classified_topic;
-        if (isShortMsg && isNullOrGen && prevTopic) {
-          console.log(`[Step 3a buffered] Continuation detected: "${redactPII(userInput)}" → carrying forward topic "${prevTopic}"`);
-          topicName = prevTopic;
-        }
-
-        const result = selectCTAsFromPool(topicName, config, sessionContext);
-        if (result.ctaButtons && result.ctaButtons.length > 0) {
-          const ctaData = JSON.stringify({
-            type: 'cta_buttons', ctaButtons: result.ctaButtons,
-            metadata: result.metadata, session_id: sessionId
-          });
-          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-          console.log(`🎯 [Step3 buffered] sent ${result.ctaButtons.length} CTAs | topic: ${result.metadata?.classified_topic || 'null'} | depth: ${result.metadata?.depth}`);
-        }
-      } else {
-        // No topic_definitions — fallback to enhanceResponse()
-        const enhancedData = await enhanceResponse(responseBuffer, userInput, tenantHash, sessionContext, routingMetadata);
-        if (enhancedData.ctaButtons && enhancedData.ctaButtons.length > 0) {
-          const ctaData = JSON.stringify({
-            type: 'cta_buttons', ctaButtons: enhancedData.ctaButtons,
-            metadata: enhancedData.metadata, session_id: sessionId
-          });
-          chunks.splice(chunks.length - 1, 0, `data: ${ctaData}\n\n`);
-        }
-      }
-    } catch (enhanceError) {
-      console.error('❌ CTA enhancement error:', enhanceError);
-      // Don't fail the response if CTA enhancement fails
-    }
+    await runResponsePipeline({
+      emit: (data) => chunks.splice(chunks.length - 1, 0, data),
+      responseBuffer, userInput, conversationHistory,
+      config, tenantHash, sessionId, bindingSessionId,
+      routingMetadata: body.routing_metadata || {},
+      sessionContext: body.session_context || {},
+      schedulingEnabled, bedrock,
+      v5Active, v5Tail, v5CatalogEmpty,
+      schedulingDeps, schedulingExecDep, newBookingDep,
+    });
 
     // For Lambda Function URLs, we need to return the raw SSE content
     // The Function URL will handle setting the appropriate headers
