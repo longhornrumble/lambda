@@ -567,6 +567,38 @@ def _handle_oauth_callback(event: dict) -> dict:
         print(f"[ERROR] DynamoDB write failed for tenant_id={tenant_id}: {exc}")
         return _html_error_popup("Failed to save channel mapping — please try again")
 
+    # --- Instagram channel row (Page-linked IG Professional account) ---
+    # IG DM webhooks arrive with entry.id = the IG ACCOUNT id, and the webhook
+    # resolves PAGE#<igAccountId> / CHANNEL#instagram. IG Send API calls use
+    # the SAME Page access token, so the row reuses the encrypted token.
+    # Without this row IG DMs pass HMAC then die at tenant resolution
+    # (found live 2026-07-12).
+    try:
+        ig_response = _graph_get(
+            f"/{page_id}",
+            {"fields": "instagram_business_account", "access_token": page_access_token},
+        )
+        ig_account_id = (ig_response.get("instagram_business_account") or {}).get("id")
+        if ig_account_id:
+            ig_item = dict(item)
+            ig_item.update(
+                {
+                    "PK": f"PAGE#{ig_account_id}",
+                    "SK": "CHANNEL#instagram",
+                    "channelType": "instagram",
+                    "igAccountId": ig_account_id,
+                }
+            )
+            _channel_table().put_item(Item=ig_item)
+            print(
+                f"[INFO] Instagram channel mapping written for ig_account_id={ig_account_id}, tenant_id={tenant_id}"
+            )
+        else:
+            print(f"[INFO] No Instagram Professional account linked to page_id={page_id} — messenger only")
+    except Exception as exc:
+        # Non-fatal: the Messenger channel is saved; IG connects on a re-run.
+        print(f"[WARN] Instagram channel mapping failed for page_id={page_id}: {exc}")
+
     # --- Subscribe Page to webhook ---
     try:
         _graph_post(

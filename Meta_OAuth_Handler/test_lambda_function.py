@@ -168,6 +168,7 @@ class TestOAuthCallback(unittest.TestCase):
         mock_get.side_effect = [
             {"access_token": "USER_TOKEN_XYZ"},  # token exchange
             {"data": [{"id": "PAGE_001", "name": "My Test Page", "access_token": "PAGE_TOKEN_XYZ"}]},  # /me/accounts
+            {},  # /<page_id>?fields=instagram_business_account — none linked
         ]
         mock_post.return_value = {"success": True}
         mock_table.return_value.put_item = MagicMock()
@@ -221,6 +222,7 @@ class TestOAuthCallback(unittest.TestCase):
                 }
             },
             {"id": "PAGE_777", "name": "Portfolio Page", "access_token": "PAGE_TOKEN_777"},  # direct fetch
+            {},  # instagram_business_account lookup — none linked
         ]
         mock_post.return_value = {"success": True}
         mock_table.return_value.put_item = MagicMock()
@@ -303,6 +305,7 @@ class TestOAuthCallback(unittest.TestCase):
         mock_get.side_effect = [
             {"access_token": "USER_TOKEN_XYZ"},
             {"data": [{"id": "PAGE_001", "name": "My Test Page", "access_token": "PAGE_TOKEN_XYZ"}]},
+            {},  # instagram_business_account lookup — none linked
         ]
         mock_post.return_value = {"success": True}
         mock_table.return_value.put_item = MagicMock()
@@ -330,6 +333,42 @@ class TestOAuthCallback(unittest.TestCase):
         with patch.object(lf, "_TENANT_REGISTRY_TABLE", ""):
             result = lf._tenant_hash("TENANT_XYZ")
         self.assertEqual(result, hashlib.sha256(b"TENANT_XYZ").hexdigest()[:16])
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    @patch("lambda_function._graph_post")
+    @patch("lambda_function._encrypt_token", return_value="ENCRYPTED_TOKEN_BASE64")
+    @patch("lambda_function._channel_table")
+    def test_instagram_row_written_when_page_linked(
+        self, mock_table, mock_encrypt, mock_post, mock_get, _mock_secret
+    ):
+        """A Page with a linked IG Professional account gets a SECOND channel
+        row keyed by the IG account id — the webhook resolves IG DMs by it."""
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},
+            {"data": [{"id": "PAGE_001", "name": "My Test Page", "access_token": "PAGE_TOKEN_XYZ"}]},
+            {"instagram_business_account": {"id": "IG_555"}},
+        ]
+        mock_post.return_value = {"success": True}
+        mock_table.return_value.put_item = MagicMock()
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        response = lf.lambda_handler(event, _make_context())
+
+        self.assertIn("META_OAUTH_SUCCESS", response["body"])
+        calls = mock_table.return_value.put_item.call_args_list
+        self.assertEqual(len(calls), 2)
+        ig_item = calls[1][1]["Item"]
+        self.assertEqual(ig_item["PK"], "PAGE#IG_555")
+        self.assertEqual(ig_item["SK"], "CHANNEL#instagram")
+        self.assertEqual(ig_item["channelType"], "instagram")
+        self.assertEqual(ig_item["igAccountId"], "IG_555")
+        self.assertEqual(ig_item["tenantId"], "TENANT_XYZ")
+        self.assertEqual(ig_item["encryptedPageToken"], "ENCRYPTED_TOKEN_BASE64")
 
     @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
     def test_expired_state_jwt(self, _mock_secret):
