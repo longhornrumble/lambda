@@ -25,7 +25,7 @@ const { mockClient } = require('aws-sdk-client-mock');
 require('aws-sdk-client-mock-jest');
 
 const { DynamoDBClient, GetItemCommand } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
@@ -144,6 +144,7 @@ beforeEach(() => {
   ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([]));
   ddbMock.on(PutCommand).resolves({});
   ddbMock.on(UpdateCommand).resolves({});
+  ddbMock.on(DeleteCommand).resolves({});
 
   // Default KMS stub
   kmsMock.on(DecryptCommand).resolves({
@@ -855,5 +856,524 @@ describe('payload v2 legacy-gap contract (C1)', () => {
     const event = { ...v2Payload(classification, WEBHOOK_FIXTURES.fbText), timestamp: Date.now() };
     await expect(handler(event)).resolves.not.toThrow();
     expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+  });
+});
+
+// ─── M1b — Processor hygiene (C1, C2, C5, C8) ──────────────────────────────
+//
+// Unconditional hygiene (echo/standby short-circuit, edit/delete idempotent
+// handling, TTL fix, per-channel send caps) plus flag-gated behavior
+// (unsupported-input fallback, disclosure line) gated on
+// config.feature_flags.MESSENGER_CHANNEL. Payloads built THROUGH the real
+// webhook classifier + fixtures, same pattern as the legacy-gap contract
+// suite above.
+
+describe('M1b — processor hygiene', () => {
+  const { classifyMessagingEvent } = require('../Meta_Webhook_Handler/classify');
+  const WEBHOOK_FIXTURES = require('../Meta_Webhook_Handler/__fixtures__/messagingEvents');
+
+  const DEFAULT_DISCLOSURE_LINE =
+    "Just a heads up — you're chatting with an automated assistant.";
+  const DEFAULT_UNSUPPORTED_INPUT_FALLBACK =
+    "Sorry, I can't read that kind of message yet — could you type it instead?";
+
+  /** Mirror of the webhook's forwardClassifiedEvent payload construction (same shape as the suite above). */
+  function v2Payload(classification, fixture, overrides = {}) {
+    return {
+      psid: classification.psid,
+      messageText: classification.messageText,
+      pageId: WEBHOOK_FIXTURES.PAGE_ID,
+      tenantId: 'TENANT_ABC',
+      tenantHash: 'abc123',
+      channelType: 'messenger',
+      messageMid: classification.messageMid,
+      isPostback: classification.isPostback,
+      v: 2,
+      eventKind: classification.eventKind,
+      timestamp: typeof fixture.timestamp === 'number' ? fixture.timestamp : Date.now(),
+      quickReplyPayload: classification.quickReplyPayload,
+      appId: classification.appId,
+      attachmentTypes: classification.attachmentTypes,
+      targetMid: classification.targetMid,
+      editedText: classification.editedText,
+      replyTo: classification.replyTo,
+      isStandby: classification.isStandby,
+      ...overrides,
+    };
+  }
+
+  describe('Unsupported-input fallback (flag-gated, 30-second rule)', () => {
+    test('attachment + flag ON → exactly one fetch send with the default fallback string, no Bedrock', async () => {
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      fetchMock = makeFetchMock([{ ok: true, body: { message_id: 'mid.fallback' } }]);
+      global.fetch = fetchMock;
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbAttachmentImage);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbAttachmentImage, { timestamp: Date.now() });
+
+      await handler(event);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, options] = fetchMock.mock.calls[0];
+      const body = JSON.parse(options.body);
+      expect(body.message.text).toBe(DEFAULT_UNSUPPORTED_INPUT_FALLBACK);
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    });
+
+    test('config-override string is honored (messenger_behavior.strings.unsupported_input_fallback)', async () => {
+      loadConfig.mockResolvedValue({
+        feature_flags: { MESSENGER_CHANNEL: true },
+        messenger_behavior: { strings: { unsupported_input_fallback: 'Custom fallback text.' } },
+      });
+      fetchMock = makeFetchMock([{ ok: true, body: {} }]);
+      global.fetch = fetchMock;
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbAttachmentImage);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbAttachmentImage, { timestamp: Date.now() });
+      await handler(event);
+
+      const [, options] = fetchMock.mock.calls[0];
+      expect(JSON.parse(options.body).message.text).toBe('Custom fallback text.');
+    });
+
+    test('sticker + flag ON → same fallback path', async () => {
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      fetchMock = makeFetchMock([{ ok: true, body: {} }]);
+      global.fetch = fetchMock;
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbStickerPostMigration);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbStickerPostMigration, { timestamp: Date.now() });
+      await handler(event);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    });
+
+    test('unsupported + flag ON → same fallback path', async () => {
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      fetchMock = makeFetchMock([{ ok: true, body: {} }]);
+      global.fetch = fetchMock;
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbUnsupportedFutureContent);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbUnsupportedFutureContent, { timestamp: Date.now() });
+      await handler(event);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    });
+
+    test('attachment + flag OFF → zero sends, zero Bedrock (byte-identical baseline)', async () => {
+      loadConfig.mockResolvedValue({}); // no feature_flags
+      fetchMock = makeFetchMock([]);
+      global.fetch = fetchMock;
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbAttachmentImage);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbAttachmentImage, { timestamp: Date.now() });
+      await handler(event);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    });
+  });
+
+  describe('Echo / standby — unconditional early return (ignores the flag)', () => {
+    test('echo event never triggers Bedrock/history/sends, even with flag ON', async () => {
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbEcho);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbEcho, { timestamp: Date.now() });
+      await handler(event);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 0);
+    });
+
+    test('echo event never triggers Bedrock/history/sends, flag OFF', async () => {
+      loadConfig.mockResolvedValue({});
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbEcho);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbEcho, { timestamp: Date.now() });
+      await handler(event);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 0);
+    });
+
+    test('standby event (isStandby true, non-echo kind) never triggers Bedrock/history/sends, flag ON', async () => {
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbText);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbText, { isStandby: true, timestamp: Date.now() });
+      await handler(event);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 0);
+    });
+
+    test('standby event (isStandby true, non-echo kind) never triggers Bedrock/history/sends, flag OFF', async () => {
+      loadConfig.mockResolvedValue({});
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbText);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbText, { isStandby: true, timestamp: Date.now() });
+      await handler(event);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 0);
+    });
+  });
+
+  describe('Delete / edit — idempotent, meta:-only (C1 v1.1 — Meta redeliveries bypass dedup)', () => {
+    test('delete event queries then deletes ONLY matching-mid rows', async () => {
+      const sessionId = `meta:${WEBHOOK_FIXTURES.PAGE_ID}:${WEBHOOK_FIXTURES.PSID}`;
+      ddbMock.on(QueryCommand).resolves({
+        Items: [
+          { sessionId, messageTimestamp: 1000, role: 'user', content: 'hi', mid: 'm_deleted_1' },
+          { sessionId, messageTimestamp: 1001, role: 'assistant', content: 'hello' },
+          { sessionId, messageTimestamp: 1002, role: 'user', content: 'other', mid: 'm_other' },
+        ],
+      });
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbDeleteTwoMids);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbDeleteTwoMids, { timestamp: Date.now() });
+
+      await handler(event);
+
+      expect(ddbMock).toHaveReceivedCommandTimes(QueryCommand, 1);
+      const deleteCalls = ddbMock.commandCalls(DeleteCommand);
+      expect(deleteCalls).toHaveLength(1);
+      expect(deleteCalls[0].args[0].input.Key.sessionId).toBe(sessionId);
+      expect(deleteCalls[0].args[0].input.Key.sessionId.startsWith('meta:')).toBe(true);
+      expect(deleteCalls[0].args[0].input.Key.messageTimestamp).toBe(1000);
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    });
+
+    test('delete event with zero matches is idempotent (no throw, no delete)', async () => {
+      ddbMock.on(QueryCommand).resolves({ Items: [] });
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.igDelete);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.igDelete, { timestamp: Date.now() });
+
+      await expect(handler(event)).resolves.toBeUndefined();
+      expect(ddbMock).toHaveReceivedCommandTimes(DeleteCommand, 0);
+    });
+
+    test('edit event updates content/text_en on the matching row', async () => {
+      const sessionId = `meta:${WEBHOOK_FIXTURES.PAGE_ID}:${WEBHOOK_FIXTURES.PSID}`;
+      ddbMock.on(QueryCommand).resolves({
+        Items: [{ sessionId, messageTimestamp: 2000, role: 'user', content: 'orig', mid: WEBHOOK_FIXTURES.MID }],
+      });
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbEdit);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbEdit, { timestamp: Date.now() });
+      await handler(event);
+
+      const updateCalls = ddbMock.commandCalls(UpdateCommand);
+      expect(updateCalls).toHaveLength(1);
+      const input = updateCalls[0].args[0].input;
+      expect(input.Key.sessionId).toBe(sessionId);
+      expect(input.Key.sessionId.startsWith('meta:')).toBe(true);
+      expect(input.Key.messageTimestamp).toBe(2000);
+      expect(input.ExpressionAttributeValues[':c']).toBe('edited text');
+    });
+
+    test('edit event with zero matches is idempotent (no throw, no update)', async () => {
+      ddbMock.on(QueryCommand).resolves({ Items: [] });
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.igEdit);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.igEdit, { timestamp: Date.now() });
+
+      await expect(handler(event)).resolves.toBeUndefined();
+      expect(ddbMock).toHaveReceivedCommandTimes(UpdateCommand, 0);
+    });
+
+    test('delete/edit only ever touch a meta:-prefixed sessionId, even with adversarial pageId/psid content', async () => {
+      // sessionId is always built as `meta:${pageId}:${psid}` in code — no path
+      // exists to construct anything else from a v2 payload. This drives the
+      // invariant with pageId/psid values that themselves contain 'meta:'-like
+      // substrings, to prove the guard isn't accidentally string-matching.
+      const weirdPageId = 'weird:page:id';
+      const weirdPsid = 'weird:psid';
+      ddbMock.on(QueryCommand).resolves({ Items: [] });
+
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbEdit);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbEdit, {
+        pageId: weirdPageId,
+        psid: weirdPsid,
+        timestamp: Date.now(),
+      });
+      await handler(event);
+
+      const queryCalls = ddbMock.commandCalls(QueryCommand);
+      const editQuery = queryCalls[queryCalls.length - 1];
+      const queriedSessionId = editQuery.args[0].input.ExpressionAttributeValues[':sid'];
+      expect(queriedSessionId).toBe(`meta:${weirdPageId}:${weirdPsid}`);
+      expect(queriedSessionId.startsWith('meta:')).toBe(true);
+    });
+  });
+
+  describe('TTL fix — expires_at (not ttl) + mid on the user row only', () => {
+    test('new context rows carry expires_at (seconds, ≈+7d), never ttl; user row carries mid, assistant row does not', async () => {
+      const before = Math.floor(Date.now() / 1000);
+      await handler(buildEvent({ messageMid: 'm_test_mid_123' }));
+
+      const putCalls = ddbMock.commandCalls(PutCommand);
+      expect(putCalls).toHaveLength(2);
+      const items = putCalls.map((c) => c.args[0].input.Item);
+      const userItem = items.find((i) => i.role === 'user');
+      const assistantItem = items.find((i) => i.role === 'assistant');
+
+      for (const item of items) {
+        expect(item.ttl).toBeUndefined();
+        expect(typeof item.expires_at).toBe('number');
+        expect(item.expires_at).toBeGreaterThanOrEqual(before + 60 * 60 * 24 * 7 - 5);
+        expect(item.expires_at).toBeLessThanOrEqual(before + 60 * 60 * 24 * 7 + 5);
+      }
+
+      expect(userItem.mid).toBe('m_test_mid_123');
+      expect(assistantItem.mid).toBeUndefined();
+    });
+  });
+
+  describe('Per-channel send caps (C5 — IG 1000 chars, FB 2000 chars)', () => {
+    test('Instagram reply of >1000 chars chunks all pieces to ≤1000 chars', async () => {
+      const longText = 'This is a sentence. '.repeat(80) + 'Final sentence.'; // >1000 chars
+      bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse(longText));
+      fetchMock = makeFetchMock([
+        { ok: true, body: { message_id: 'mid.ig1' } }, // IG has no typing indicator — first call is chunk 1
+        { ok: true, body: { message_id: 'mid.ig2' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ channelType: 'instagram', pageId: 'IG_ACCT_999' }));
+
+      const sendCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/messages'));
+      expect(sendCalls.length).toBeGreaterThanOrEqual(2);
+      for (const [, options] of sendCalls) {
+        const body = JSON.parse(options.body);
+        expect(body.message.text.length).toBeLessThanOrEqual(1000);
+      }
+    });
+
+    test('Facebook Messenger reply of >2000 chars still chunks to ≤2000 chars', async () => {
+      const longText = 'This is a sentence. '.repeat(150) + 'And this is the final sentence.'; // >2000 chars
+      bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse(longText));
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing_on
+        { ok: true, body: { message_id: 'mid.1' } },
+        { ok: true, body: { message_id: 'mid.2' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent());
+
+      const sendCalls = fetchMock.mock.calls.slice(1); // skip typing
+      expect(sendCalls.length).toBeGreaterThanOrEqual(2);
+      for (const [, options] of sendCalls) {
+        const body = JSON.parse(options.body);
+        expect(body.message.text.length).toBeLessThanOrEqual(2000);
+      }
+    });
+  });
+
+  describe('Disclosure line (C2 strings, C8 session-first-turn)', () => {
+    test('empty history + flag ON → disclosure sent as its own message BEFORE the reply', async () => {
+      loadConfig.mockResolvedValue({
+        feature_flags: { MESSENGER_CHANNEL: true },
+        tone_prompt: 'Helpful.',
+      });
+      ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([])); // empty history
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing
+        { ok: true, body: { message_id: 'mid.disclosure' } }, // disclosure
+        { ok: true, body: { message_id: 'mid.reply' } }, // actual reply
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent());
+
+      const sendCalls = fetchMock.mock.calls.slice(1); // skip typing
+      expect(sendCalls.length).toBe(2);
+      const firstBody = JSON.parse(sendCalls[0][1].body);
+      expect(firstBody.message.text).toBe(DEFAULT_DISCLOSURE_LINE);
+      const secondBody = JSON.parse(sendCalls[1][1].body);
+      expect(secondBody.message.text).toContain('talent acquisition');
+    });
+
+    test('config-override disclosure_line string is honored', async () => {
+      loadConfig.mockResolvedValue({
+        feature_flags: { MESSENGER_CHANNEL: true },
+        messenger_behavior: { strings: { disclosure_line: 'Custom disclosure.' } },
+      });
+      ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([]));
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} },
+        { ok: true, body: {} },
+        { ok: true, body: {} },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent());
+
+      const sendCalls = fetchMock.mock.calls.slice(1);
+      const firstBody = JSON.parse(sendCalls[0][1].body);
+      expect(firstBody.message.text).toBe('Custom disclosure.');
+    });
+
+    test('non-empty history → no disclosure even with flag ON', async () => {
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      ddbMock.on(QueryCommand).resolves(
+        makeRecentMessagesQueryResult([
+          { role: 'user', content: 'hi', messageTimestamp: 1000 },
+          { role: 'assistant', content: 'hello', messageTimestamp: 1001 },
+        ])
+      );
+
+      await handler(buildEvent());
+
+      // typing + single reply only — no disclosure
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    test('flag OFF → no disclosure regardless of history (byte-identical baseline)', async () => {
+      loadConfig.mockResolvedValue({}); // flag off
+      ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([]));
+
+      await handler(buildEvent());
+
+      // typing + single reply only — no disclosure
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+  });
+});
+
+// ─── M1b review follow-ups: failure paths + boundary + G-P1 log redaction ────
+
+describe('M1b — failure paths and guards (code-review findings)', () => {
+  const { classifyMessagingEvent } = require('../Meta_Webhook_Handler/classify');
+  const WEBHOOK_FIXTURES = require('../Meta_Webhook_Handler/__fixtures__/messagingEvents');
+
+  function v2From(fixture, overrides = {}) {
+    const [c] = classifyMessagingEvent(fixture);
+    return {
+      psid: c.psid,
+      messageText: c.messageText,
+      pageId: WEBHOOK_FIXTURES.PAGE_ID,
+      tenantId: 'TENANT_ABC',
+      tenantHash: 'abc123',
+      channelType: 'messenger',
+      messageMid: c.messageMid,
+      isPostback: c.isPostback,
+      v: 2,
+      eventKind: c.eventKind,
+      timestamp: Date.now(),
+      quickReplyPayload: c.quickReplyPayload,
+      appId: c.appId,
+      attachmentTypes: c.attachmentTypes,
+      targetMid: c.targetMid,
+      editedText: c.editedText,
+      replyTo: c.replyTo,
+      isStandby: c.isStandby,
+      ...overrides,
+    };
+  }
+
+  const flagOnConfig = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'You are a helpful recruiter assistant.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+  };
+
+  test('malformed v2 payload: validation-failure log NEVER carries content (G-P1)', async () => {
+    const logSpy = jest.spyOn(console, 'log');
+    const errSpy = jest.spyOn(console, 'error');
+    const event = v2From(WEBHOOK_FIXTURES.fbEdit, {
+      tenantHash: undefined, // trips validateV2BaseEvent
+      editedText: 'SECRET-EDITED-CONTENT',
+      replyTo: { storyUrl: 'https://instagram.com/stories/SECRET' },
+    });
+    await expect(handler(event)).resolves.not.toThrow();
+    const allLogged = [...logSpy.mock.calls, ...errSpy.mock.calls]
+      .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+      .join('\n');
+    expect(allLogged).toContain('Event validation failed'); // spy actually observes the drop line
+    expect(allLogged).not.toContain('SECRET-EDITED-CONTENT');
+    expect(allLogged).not.toContain('stories/SECRET');
+    expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('stale attachment event (>24h): fallback reply suppressed by the send-window guard', async () => {
+    loadConfig.mockResolvedValue(flagOnConfig);
+    const event = v2From(WEBHOOK_FIXTURES.fbAttachmentImage, {
+      timestamp: Date.now() - 25 * 60 * 60 * 1000,
+    });
+    await expect(handler(event)).resolves.not.toThrow();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+  });
+
+  test('stale delete event (>24h) STILL deletes history (window guard exempts non-sending kinds)', async () => {
+    ddbMock.on(QueryCommand).resolves({
+      Items: [{ sessionId: `meta:${WEBHOOK_FIXTURES.PAGE_ID}:${WEBHOOK_FIXTURES.IGSID}`, messageTimestamp: 1, mid: WEBHOOK_FIXTURES.MID, role: 'user' }],
+    });
+    const event = v2From(WEBHOOK_FIXTURES.igDelete, {
+      timestamp: Date.now() - 48 * 60 * 60 * 1000,
+      channelType: 'instagram',
+    });
+    await expect(handler(event)).resolves.not.toThrow();
+    expect(ddbMock).toHaveReceivedCommand(DeleteCommand);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('Query failure during delete handling propagates (Lambda retry contract), no sends', async () => {
+    ddbMock.on(QueryCommand).rejects(new Error('provisioned throughput exceeded'));
+    const event = v2From(WEBHOOK_FIXTURES.igDelete, { channelType: 'instagram' });
+    await expect(handler(event)).rejects.toThrow('provisioned throughput exceeded');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('UpdateItem failure during edit handling propagates, no sends', async () => {
+    ddbMock.on(QueryCommand).resolves({
+      Items: [{ sessionId: `meta:${WEBHOOK_FIXTURES.PAGE_ID}:${WEBHOOK_FIXTURES.PSID}`, messageTimestamp: 1, mid: WEBHOOK_FIXTURES.MID, role: 'user' }],
+    });
+    ddbMock.on(UpdateCommand).rejects(new Error('conditional check failed'));
+    const event = v2From(WEBHOOK_FIXTURES.fbEdit);
+    await expect(handler(event)).rejects.toThrow('conditional check failed');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('fallback send failure rethrows (async-retry contract)', async () => {
+    loadConfig.mockResolvedValue(flagOnConfig);
+    fetchMock = makeFetchMock([{ ok: false, status: 500, body: { error: { message: 'send failed' } } }]);
+    global.fetch = fetchMock;
+    const event = v2From(WEBHOOK_FIXTURES.fbAttachmentImage);
+    await expect(handler(event)).rejects.toThrow();
+  });
+
+  test('disclosure send failure does NOT block the real reply', async () => {
+    loadConfig.mockResolvedValue(flagOnConfig);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([])); // empty history → disclosure due
+    // typing ok, disclosure send FAILS, reply send ok
+    fetchMock = makeFetchMock([
+      { ok: true, body: {} },
+      { ok: false, status: 500, body: { error: { message: 'disclosure send failed' } } },
+      { ok: true, body: {} },
+    ]);
+    global.fetch = fetchMock;
+    await expect(handler(buildEvent())).resolves.not.toThrow();
+    // typing + failed disclosure attempt + reply = 3 fetch calls
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  test('IG text of exactly 1000 chars stays a single chunk', async () => {
+    loadConfig.mockResolvedValue(flagOnConfig);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi' }])); // non-empty → no disclosure
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('B'.repeat(1000)));
+    await handler(buildEvent({ channelType: 'instagram' }));
+    const sendBodies = fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message && typeof b.message.text === 'string');
+    expect(sendBodies).toHaveLength(1);
+    expect(sendBodies[0].message.text.length).toBe(1000);
   });
 });

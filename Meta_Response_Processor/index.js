@@ -40,10 +40,11 @@
 
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
-const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
+const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
+const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 
 // ─── AWS client initialisation ────────────────────────────────────────────────
 
@@ -77,11 +78,14 @@ const DEFAULT_TONE = 'You are a helpful assistant.';
 const DEFAULT_FALLBACK_MESSAGE =
   "I'm sorry, I'm having trouble right now. Please try again in a moment.";
 
+// ── M1b (messenger_behavior strings, C2) — defaults; config overrides win ──
+const DEFAULT_DISCLOSURE_LINE =
+  "Just a heads up — you're chatting with an automated assistant.";
+const DEFAULT_UNSUPPORTED_INPUT_FALLBACK =
+  "Sorry, I can't read that kind of message yet — could you type it instead?";
+
 const META_GRAPH_VERSION = 'v21.0';
 const META_SEND_API_BASE = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
-
-/** Maximum characters per Messenger message (Meta platform limit) */
-const MESSENGER_MAX_CHARS = 2000;
 
 /** Number of most-recent conversation turns to include in the prompt */
 const MAX_HISTORY_TURNS = 5;
@@ -265,16 +269,22 @@ async function loadConversationContext(pageId, psid) {
 /**
  * Persist the latest Q&A pair to the recent-messages table as individual rows.
  *
+ * M1b TTL fix: the table's TTL attribute is `expires_at` (epoch seconds), not
+ * `ttl` — writing `ttl` meant rows never expired. `mid` is stored on the user
+ * row only (assistant rows have no inbound mid) so edit/delete events (C1)
+ * can find the row to mutate/remove.
+ *
  * @param {string} pageId
  * @param {string} psid
  * @param {string} userText — sanitised user input
  * @param {string} assistantText — AI response
+ * @param {string|null} [messageMid] — inbound message mid, stored on the user row only
  * @returns {Promise<void>}
  */
-async function storeConversationContext(pageId, psid, userText, assistantText) {
+async function storeConversationContext(pageId, psid, userText, assistantText, messageMid) {
   const sessionId = `meta:${pageId}:${psid}`;
   const now = Date.now(); // epoch ms — matches messageTimestamp Number type
-  const ttl = Math.floor(now / 1000) + 60 * 60 * 24 * 7; // 7-day TTL
+  const expires_at = Math.floor(now / 1000) + 60 * 60 * 24 * 7; // 7-day TTL (table TTL attribute)
 
   // Write user message
   await dynamodb.send(
@@ -287,7 +297,8 @@ async function storeConversationContext(pageId, psid, userText, assistantText) {
         content: userText,
         // §E5 Chain 1: English-equivalent slot (v1: text_en = content, verbatim). Readers tolerate absence.
         text_en: userText,
-        ttl,
+        expires_at,
+        ...(messageMid ? { mid: messageMid } : {}),
       },
     })
   );
@@ -303,7 +314,7 @@ async function storeConversationContext(pageId, psid, userText, assistantText) {
         content: assistantText,
         // §E5 Chain 1: English-equivalent slot (v1: text_en = content, verbatim). Readers tolerate absence.
         text_en: assistantText,
-        ttl,
+        expires_at,
       },
     })
   );
@@ -312,6 +323,178 @@ async function storeConversationContext(pageId, psid, userText, assistantText) {
     sessionId,
     storedMessages: 2,
   });
+}
+
+// ─── Edit / delete (C1 v1.1 — Meta redeliveries mean these MUST be idempotent) ─
+
+/**
+ * Query all rows for a session and return only those whose `mid` matches.
+ * Never touches a table row outside a `meta:`-prefixed sessionId — the table
+ * is SHARED with live widget chat.
+ *
+ * @param {string} sessionId — MUST already start with 'meta:'
+ * @param {string} mid — target message mid
+ * @returns {Promise<Array<object>>}
+ */
+async function findMessageRowsByMid(sessionId, mid) {
+  if (!sessionId.startsWith('meta:')) {
+    // Structurally unreachable (sessionId is always built as
+    // `meta:${pageId}:${psid}`), but guarded explicitly per C1/M1b — the
+    // recent-messages table is shared with live widget chat.
+    throw new Error(`Refusing to query non-meta sessionId: ${sessionId}`);
+  }
+
+  const result = await dynamodb.send(
+    new QueryCommand({
+      TableName: RECENT_MESSAGES_TABLE,
+      KeyConditionExpression: 'sessionId = :sid',
+      ExpressionAttributeValues: { ':sid': sessionId },
+    })
+  );
+
+  return (result.Items || []).filter((item) => item.mid === mid);
+}
+
+/**
+ * Handle a `delete` event (C1): remove stored rows matching targetMid.
+ * Idempotent — Meta redeliveries (edit/delete bypass webhook dedup) may
+ * invoke this more than once for the same mid; zero matches is success.
+ *
+ * @param {string} sessionId
+ * @param {string|null} targetMid
+ * @returns {Promise<void>}
+ */
+async function handleDeleteEvent(sessionId, targetMid) {
+  if (!sessionId.startsWith('meta:')) {
+    log('ERROR', 'Refusing to process delete for non-meta sessionId', { sessionId });
+    return;
+  }
+  if (!targetMid) {
+    log('WARN', 'Delete event with no targetMid — nothing to do', { sessionId });
+    return;
+  }
+
+  const matches = await findMessageRowsByMid(sessionId, targetMid);
+  if (matches.length === 0) {
+    log('INFO', 'Delete event: no matching rows (idempotent no-op)', { sessionId, targetMid });
+    return;
+  }
+
+  for (const item of matches) {
+    await dynamodb.send(
+      new DeleteCommand({
+        TableName: RECENT_MESSAGES_TABLE,
+        Key: { sessionId: item.sessionId, messageTimestamp: item.messageTimestamp },
+      })
+    );
+  }
+  log('INFO', 'Delete event: removed matching rows', {
+    sessionId,
+    targetMid,
+    deletedCount: matches.length,
+  });
+}
+
+/**
+ * Handle an `edit` event (C1): update the stored copy's content/text_en.
+ * Idempotent — zero matches is success (row may have already expired or been
+ * deleted).
+ *
+ * @param {string} sessionId
+ * @param {string|null} targetMid
+ * @param {string|null} editedText
+ * @returns {Promise<void>}
+ */
+async function handleEditEvent(sessionId, targetMid, editedText) {
+  if (!sessionId.startsWith('meta:')) {
+    log('ERROR', 'Refusing to process edit for non-meta sessionId', { sessionId });
+    return;
+  }
+  if (!targetMid) {
+    log('WARN', 'Edit event with no targetMid — nothing to do', { sessionId });
+    return;
+  }
+
+  const matches = await findMessageRowsByMid(sessionId, targetMid);
+  if (matches.length === 0) {
+    log('INFO', 'Edit event: no matching rows (idempotent no-op)', { sessionId, targetMid });
+    return;
+  }
+
+  for (const item of matches) {
+    await dynamodb.send(
+      new UpdateCommand({
+        TableName: RECENT_MESSAGES_TABLE,
+        Key: { sessionId: item.sessionId, messageTimestamp: item.messageTimestamp },
+        UpdateExpression: 'SET content = :c, text_en = :c',
+        ExpressionAttributeValues: { ':c': editedText },
+      })
+    );
+  }
+  log('INFO', 'Edit event: updated matching rows', {
+    sessionId,
+    targetMid,
+    updatedCount: matches.length,
+  });
+}
+
+/**
+ * Read a `messenger_behavior` string honoring C2 precedence:
+ * channel_overrides.{channelType}.strings.{key} > messenger_behavior.strings.{key} > default.
+ *
+ * @param {object} config — tenant config
+ * @param {string} channelType — 'messenger' | 'instagram'
+ * @param {string} key — string key (C2 MessengerStrings)
+ * @param {string} fallback — code-owned default
+ * @returns {string}
+ */
+function getMessengerString(config, channelType, key, fallback) {
+  const behavior = config.messenger_behavior || {};
+  const channelOverride = behavior.channel_overrides?.[channelType]?.strings?.[key];
+  if (channelOverride !== undefined) return channelOverride;
+  const topLevel = behavior.strings?.[key];
+  if (topLevel !== undefined) return topLevel;
+  return fallback;
+}
+
+/**
+ * Handle an unsupported-input event (attachment/sticker/unsupported, C1) when
+ * `feature_flags.MESSENGER_CHANNEL` is on: reply with the configured fallback
+ * string (30-second rule) — no Bedrock call, no history write.
+ *
+ * @param {{pageId: string, psid: string, channelType: string, config: object, sessionId: string, eventKind: string}} params
+ * @returns {Promise<void>}
+ */
+async function handleUnsupportedInputFallback({ pageId, psid, channelType, config, sessionId, eventKind }) {
+  let pageAccessToken;
+  try {
+    pageAccessToken = await loadPageAccessToken(pageId, channelType);
+  } catch (tokenErr) {
+    log('ERROR', 'Failed to load page access token for unsupported-input fallback — dropping', {
+      pageId,
+      channelType,
+      error: tokenErr.message,
+    });
+    return;
+  }
+
+  const fallbackText = getMessengerString(
+    config,
+    channelType,
+    'unsupported_input_fallback',
+    DEFAULT_UNSUPPORTED_INPUT_FALLBACK
+  );
+
+  try {
+    await sendResponseMessages(pageId, psid, fallbackText, pageAccessToken, channelType);
+    log('INFO', 'Sent unsupported-input fallback', { sessionId, eventKind, channelType });
+  } catch (sendErr) {
+    log('ERROR', 'Failed to send unsupported-input fallback — will retry', {
+      sessionId,
+      error: sendErr.message,
+    });
+    throw sendErr;
+  }
 }
 
 // ─── Channel-mapping metadata update ─────────────────────────────────────────
@@ -467,23 +650,24 @@ async function sendMessengerMessage(pageId, psid, text, accessToken, channelType
 // ─── Message splitting ────────────────────────────────────────────────────────
 
 /**
- * Split a response into Messenger-safe chunks (<= MESSENGER_MAX_CHARS each).
- * Splits at the last sentence-ending punctuation before the limit; falls back
- * to the last space if no sentence boundary is found.
+ * Split a response into channel-safe chunks (<= maxChars each). Splits at the
+ * last sentence-ending punctuation before the limit; falls back to the last
+ * space if no sentence boundary is found.
  *
  * @param {string} text — Full response text
- * @returns {string[]} — Ordered array of chunks, each <= MESSENGER_MAX_CHARS
+ * @param {number} maxChars — Per-message cap for the target channel (C5)
+ * @returns {string[]} — Ordered array of chunks, each <= maxChars
  */
-function splitMessage(text) {
-  if (text.length <= MESSENGER_MAX_CHARS) {
+function splitMessage(text, maxChars = MESSAGE_CHAR_LIMITS.messenger) {
+  if (text.length <= maxChars) {
     return [text];
   }
 
   const chunks = [];
   let remaining = text;
 
-  while (remaining.length > MESSENGER_MAX_CHARS) {
-    const slice = remaining.slice(0, MESSENGER_MAX_CHARS);
+  while (remaining.length > maxChars) {
+    const slice = remaining.slice(0, maxChars);
 
     // Find last sentence boundary within the slice
     const sentenceMatch = slice.match(/^([\s\S]*[.!?])\s/);
@@ -494,7 +678,7 @@ function splitMessage(text) {
     } else {
       // Fall back to last space
       const lastSpace = slice.lastIndexOf(' ');
-      splitAt = lastSpace > 0 ? lastSpace + 1 : MESSENGER_MAX_CHARS;
+      splitAt = lastSpace > 0 ? lastSpace + 1 : maxChars;
     }
 
     chunks.push(remaining.slice(0, splitAt).trimEnd());
@@ -519,7 +703,8 @@ function splitMessage(text) {
  * @returns {Promise<void>}
  */
 async function sendResponseMessages(pageId, psid, text, accessToken, channelType) {
-  const chunks = splitMessage(text);
+  const maxChars = MESSAGE_CHAR_LIMITS[channelType] || MESSAGE_CHAR_LIMITS.messenger;
+  const chunks = splitMessage(text, maxChars);
   log('INFO', 'Sending response', { pageId, psid, chunks: chunks.length, totalChars: text.length, channelType });
 
   for (let i = 0; i < chunks.length; i++) {
@@ -664,6 +849,23 @@ function validateEvent(event) {
   }
 }
 
+/**
+ * Shape validation for v2 event kinds that legitimately carry
+ * messageText:null (edit/delete/echo/attachment/sticker/unsupported — C1).
+ * Deliberately does NOT require messageText — validateEvent above still owns
+ * that check for the text-turn path.
+ * @param {object} event
+ * @throws if required v1 fields are missing
+ */
+function validateV2BaseEvent(event) {
+  const required = ['psid', 'pageId', 'tenantId', 'tenantHash'];
+  for (const field of required) {
+    if (!event[field] || typeof event[field] !== 'string') {
+      throw new Error(`Invalid v2 event: missing or non-string field "${field}"`);
+    }
+  }
+}
+
 // ─── Lambda handler ───────────────────────────────────────────────────────────
 
 /**
@@ -689,6 +891,101 @@ exports.handler = async function handler(event) {
     channelType: event.channelType || 'messenger',
     messageMid: event.messageMid,
   });
+
+  // ── v2 event-kind routing (C1; M1b hygiene) ──────────────────────────────
+  // Handled BEFORE validateEvent because several v2 kinds legitimately carry
+  // messageText:null (edit/delete/echo/attachment/sticker/unsupported).
+  // v1 payloads (no `v`/`eventKind`) fall straight through to the unchanged
+  // legacy path below.
+  if (event && event.v === 2 && typeof event.eventKind === 'string') {
+    try {
+      validateV2BaseEvent(event);
+    } catch (validationErr) {
+      // Shape-only diagnostics — NEVER the event object: v2 payloads carry
+      // user content (messageText/editedText/replyTo) that must not reach
+      // CloudWatch (G-P1).
+      log('ERROR', 'Event validation failed — dropping message', {
+        error: validationErr.message,
+        eventKind: event.eventKind,
+        pageId: event.pageId,
+        psid: event.psid,
+        messageMid: event.messageMid,
+        keys: Object.keys(event),
+      });
+      return;
+    }
+
+    const eventKind = event.eventKind;
+    const v2PageId = event.pageId;
+    const v2Psid = event.psid;
+    const v2ChannelType = event.channelType || 'messenger';
+    const sessionId = `meta:${v2PageId}:${v2Psid}`;
+
+    // ── echo / standby: staff/self traffic — never answer, never store ────
+    if (eventKind === 'echo' || event.isStandby === true) {
+      log('INFO', 'Echo or standby event — no reply, no history write', {
+        sessionId,
+        eventKind,
+        isStandby: event.isStandby === true,
+      });
+      return;
+    }
+
+    // ── delete: Meta terms require removing stored copies (C5) ────────────
+    if (eventKind === 'delete') {
+      await handleDeleteEvent(sessionId, event.targetMid);
+      return;
+    }
+
+    // ── edit: update the stored copy in place ──────────────────────────────
+    if (eventKind === 'edit') {
+      await handleEditEvent(sessionId, event.targetMid, event.editedText);
+      return;
+    }
+
+    // ── attachment / sticker / unsupported: flag-gated 30-second fallback ──
+    if (eventKind === 'attachment' || eventKind === 'sticker' || eventKind === 'unsupported') {
+      // 24h send-window guard (same rule as the legacy path's step 0a): a
+      // stale/DLQ-redelivered event must never trigger an outbound send.
+      // delete/edit/echo above are exempt on purpose — they never send.
+      if (event.timestamp && Date.now() - event.timestamp > MESSAGE_WINDOW_MS) {
+        log('WARN', '24-hour messaging window exceeded — dropping fallback reply', {
+          sessionId,
+          eventKind,
+          messageAgeHours: Math.round((Date.now() - event.timestamp) / (60 * 60 * 1000)),
+        });
+        return;
+      }
+
+      let v2Config = {};
+      try {
+        v2Config = (await loadConfig(event.tenantHash)) || {};
+      } catch (configErr) {
+        log('WARN', 'Failed to load tenant config for unsupported-input fallback — using defaults', {
+          tenantHash: event.tenantHash,
+          error: configErr.message,
+        });
+        v2Config = {};
+      }
+
+      if (v2Config.feature_flags?.MESSENGER_CHANNEL === true) {
+        await handleUnsupportedInputFallback({
+          pageId: v2PageId,
+          psid: v2Psid,
+          channelType: v2ChannelType,
+          config: v2Config,
+          sessionId,
+          eventKind,
+        });
+        return;
+      }
+      // Flag off: fall through to the legacy pipeline below — validateEvent's
+      // messageText requirement drops this exactly as it did before v2 (C1
+      // deploy-ordering guarantee — byte-identical baseline).
+    }
+    // quick_reply / postback / text eventKinds: no special M1b handling here —
+    // fall through to the pipeline below unchanged.
+  }
 
   // ── 0. Input validation ──────────────────────────────────────────────────
   try {
@@ -804,7 +1101,7 @@ exports.handler = async function handler(event) {
 
     // Still store context and update lastUserMessageAt
     try {
-      await storeConversationContext(pageId, psid, messageText, welcomeMessage);
+      await storeConversationContext(pageId, psid, messageText, welcomeMessage, messageMid);
     } catch (storeErr) {
       log('WARN', 'Failed to store GET_STARTED context', { pageId, psid, error: storeErr.message });
     }
@@ -884,6 +1181,34 @@ exports.handler = async function handler(event) {
   // ── 5. Stop typing refresh and send response via Meta Send API ───────────
   clearInterval(typingRefreshInterval);
 
+  // ── 4b. Disclosure line (C2 strings, C8 session-first-turn) ──────────────
+  // Flag-gated: sent as its own message, BEFORE the normal reply, only on the
+  // first turn of a session (empty loaded history). Flag off ⇒ no disclosure
+  // (byte-identical to pre-program baseline).
+  if (config.feature_flags?.MESSENGER_CHANNEL === true && conversationHistory.length === 0) {
+    const disclosureText = getMessengerString(
+      config,
+      channelType,
+      'disclosure_line',
+      DEFAULT_DISCLOSURE_LINE
+    );
+    try {
+      await sendResponseMessages(pageId, psid, disclosureText, pageAccessToken, channelType);
+      log('INFO', 'Sent disclosure line (first turn of session)', {
+        pageId,
+        psid,
+        sessionId: `meta:${pageId}:${psid}`,
+      });
+    } catch (discErr) {
+      // Non-fatal: don't block the real reply on the disclosure send failing.
+      log('WARN', 'Failed to send disclosure line — continuing with reply', {
+        pageId,
+        psid,
+        error: discErr.message,
+      });
+    }
+  }
+
   try {
     await sendResponseMessages(pageId, psid, responseText, pageAccessToken, channelType);
     log('INFO', 'Response delivered to Messenger', {
@@ -915,7 +1240,7 @@ exports.handler = async function handler(event) {
 
   // ── 6. Store conversation context ─────────────────────────────────────────
   try {
-    await storeConversationContext(pageId, psid, sanitizedInput, responseText);
+    await storeConversationContext(pageId, psid, sanitizedInput, responseText, messageMid);
   } catch (storeErr) {
     // Non-fatal: log and continue
     log('WARN', 'Failed to store conversation context', {
