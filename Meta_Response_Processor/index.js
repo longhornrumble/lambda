@@ -1155,9 +1155,14 @@ function stripFormattingMarkers(text) {
  * malformed/missing tail while CTAs exist -> ONE selectActionsV4 call ->
  * on any failure, no actions. The reply text is always served.
  *
+ * @param {{suppressActions?: boolean}} [options] — M7b: suppress the V5 action
+ *   catalog/tail instruction for a mid-form digression turn (plan §6 M7b
+ *   decision 2) — the tail is still ALWAYS parsed (no-leak hardening stays),
+ *   but v5Active is forced false so actionIds is always `[]` for this turn.
  * @returns {Promise<{responseText: string, actionIds: string[], tailStatus: string}>}
  */
-async function generateMessengerV5Response(userInput, kbContext, sessionHistory, config, channelType) {
+async function generateMessengerV5Response(userInput, kbContext, sessionHistory, config, channelType, options = {}) {
+  const { suppressActions = false } = options;
   // C6 model precedence: channel override -> messenger_behavior -> config -> default.
   const modelId = resolveMessengerModelId(config, channelType, DEFAULT_MODEL_ID);
   const maxTokens = config.streaming?.max_tokens || 1000;
@@ -1168,7 +1173,8 @@ async function generateMessengerV5Response(userInput, kbContext, sessionHistory,
     kbContext,
     config,
     sessionHistory,
-    channelType
+    channelType,
+    { suppressActions }
   );
 
   const requestBody = {
@@ -1770,20 +1776,37 @@ exports.handler = async function handler(event) {
             formState.active = !!stepResult.session;
             consumed++;
 
+            let drainedSendOk = true;
             try {
-              await sendResponseMessages(
-                pageId,
-                psid,
-                stepResult.message.text,
-                pageAccessToken,
-                channelType,
-                stepResult.message.quickReplies?.length ? { quickReplies: stepResult.message.quickReplies } : null
-              );
+              for (const msg of stepResult.messages) {
+                await sendResponseMessages(
+                  pageId,
+                  psid,
+                  msg.text,
+                  pageAccessToken,
+                  channelType,
+                  msg.quickReplies?.length ? { quickReplies: msg.quickReplies } : null
+                );
+              }
             } catch (sendErr) {
+              drainedSendOk = false;
               log('WARN', 'Failed to deliver a drained form message', { sessionId: lockSessionId, error: sendErr.message });
             }
+            // Save-ordering fix (M7b): persist the field-collection outcome
+            // ONLY after its message(s) sent successfully — never on a failed
+            // send (see advanceFormSession's doc comment).
+            if (drainedSendOk && stepResult.pendingSave) {
+              try {
+                await formEngine.saveFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: stepResult.pendingSave });
+              } catch (saveErr) {
+                log('WARN', 'Form session save failed mid-drain — proceeding (in-memory state may lag DDB)', {
+                  sessionId: lockSessionId,
+                  error: saveErr.message,
+                });
+              }
+            }
             try {
-              await storeConversationContext(pageId, psid, itemText, stepResult.message.text, item?.mid || null);
+              await storeConversationContext(pageId, psid, itemText, stepResult.messages[0].text, item?.mid || null);
             } catch (_storeErr) {
               // non-fatal — same tolerance as the rest of this drain loop
             }
@@ -2002,24 +2025,99 @@ exports.handler = async function handler(event) {
   }
 
   /**
-   * M7a: apply ONE piece of form input (free text, or a resolved ffld/fctl
-   * tap) against the given session, returning the updated session (null once
-   * the form ends — submitted or cancelled) and the message to send. Single
-   * entry point shared by the main-turn form path below AND the C7 drain
-   * loop (finalizeConversationLock) — drained form input is applied
-   * SEQUENTIALLY, one item at a time, never joined into one combined turn
-   * (unlike the RAG path, where a coalesced burst becomes one Bedrock call).
+   * M7b: ONE RAG-answer turn for a digression mid-form (plan §6 M7b decision
+   * 1 — C9 free-text-fallback territory: a question that fails the current
+   * field's validation gets a real answer instead of a bare validation
+   * error). V5 actions are SUPPRESSED (decision 2) — no catalog/turn-check/
+   * tail instruction are ever built for this turn, so `actionIds` is always
+   * `[]` and NOTHING renders as a quick reply/button for it (pinned by
+   * tests). The form_session row is NEVER read or written here (T1 — a
+   * digression must not refresh expires_at); the caller re-sends the same
+   * field prompt afterward using its own already-loaded `session`/`step`.
+   *
+   * D1/X3 + injection guard (decision 3): only `questionText` (the user's own
+   * typed words — already conversation content, not sensitive) and ordinary
+   * session history go into the prompt. `session.answers` is NEVER read by
+   * this function — there is no `session` parameter at all, by construction.
+   *
+   * @param {string} questionText — the user's free-typed question
+   * @returns {Promise<{text: string, quickReplies: Array<object>}>}
+   */
+  async function runFormDigressionTurn(questionText) {
+    let conversationHistory = [];
+    try {
+      conversationHistory = await loadConversationContext(pageId, psid);
+    } catch (ctxErr) {
+      log('WARN', 'Form digression: failed to load conversation context', {
+        sessionId: lockSessionId,
+        error: ctxErr.message,
+      });
+    }
+    const sessionWindow = computeSessionWindow(conversationHistory);
+
+    let responseText;
+    try {
+      const kbContext = await retrieveKB(questionText, config);
+      const v5 = await generateMessengerV5Response(
+        questionText,
+        kbContext,
+        sessionWindow.sessionMessages,
+        config,
+        channelType,
+        { suppressActions: true }
+      );
+      responseText = v5.responseText;
+    } catch (digErr) {
+      log('WARN', 'Form digression RAG turn failed — using fallback message', {
+        sessionId: lockSessionId,
+        error: digErr.message,
+      });
+      responseText = config.bedrock_instructions?.fallback_message || DEFAULT_FALLBACK_MESSAGE;
+    }
+    if (!responseText || responseText.trim().length === 0) {
+      responseText = config.bedrock_instructions?.fallback_message || DEFAULT_FALLBACK_MESSAGE;
+    }
+    // NO quick replies/buttons ever — a digression answer is plain text only.
+    return { text: responseText, quickReplies: [] };
+  }
+
+  /**
+   * M7a/M7b: apply ONE piece of form input (free text, or a resolved
+   * ffld/fctl tap) against the given session. Single entry point shared by
+   * the main-turn form path below AND the C7 drain loop (
+   * finalizeConversationLock) — drained form input is applied SEQUENTIALLY,
+   * one item at a time, never joined into one combined turn (unlike the RAG
+   * path, where a coalesced burst becomes one Bedrock call).
    *
    * D1/X3: only formId/fieldKey/status are ever logged here — never a
    * rawText/value.
+   *
+   * State-escape / save-ordering (M7b adversarial focus, plan §6): this
+   * function NEVER persists the field-collection outcome itself — it returns
+   * `pendingSave` (the session to write, or `null` when nothing should be
+   * written) and the caller persists it ONLY AFTER the returned `messages`
+   * have been sent successfully. This is deliberately SEND-then-SAVE, not the
+   * M7a-original SAVE-then-SEND: if the Send API throws, the row is left at
+   * its PRE-turn state, so a crash/send-failure mid-field-turn can never
+   * leave `current_field` pointing past what the user was actually shown —
+   * a retry (Lambda redelivery) reprocesses the identical, still-valid
+   * `current_field` against the same rawText deterministically. Terminal
+   * actions (cancel, an eligibility decline, a successful MFS submission)
+   * remain eager/unconditional deletes — per the state-escape rule those
+   * side effects must happen regardless of Send API outcome (already true
+   * for confirmForm's own MFS-invoke-then-delete sequencing, untouched here).
+   *
+   * @returns {Promise<{session: object|null, messages: Array<{text: string, quickReplies: Array<object>}>, pendingSave: object|null}>}
    */
   async function advanceFormSession({ session, form, rawText, ffld, fctl }) {
     const safeFfld = ffld && ffld.formId === session.form_id ? ffld : null;
     const safeFctl = fctl && fctl.formId === session.form_id ? fctl : null;
 
-    // Cancel wins at ANY stage, from either the fctl:cancel tap or the exact
-    // typed word — checked ONLY against genuinely free-typed text (not an
-    // ffld tap's option value, which could coincidentally be "cancel").
+    // Cancel/exit wins at ANY stage, from either the fctl:cancel tap or an
+    // exact typed keyword (M7b: cancel/exit/quit/stop/"never mind") — checked
+    // ONLY against genuinely free-typed text (not an ffld tap's option value,
+    // which could coincidentally match one of those words). Deletion is
+    // eager/unconditional (state-escape rule) — it happens before any send.
     if ((safeFctl && safeFctl.op === 'cancel') || (!safeFfld && formEngine.isCancelKeyword(rawText))) {
       try {
         await formEngine.deleteFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId: lockSessionId });
@@ -2028,12 +2126,16 @@ exports.handler = async function handler(event) {
       }
       log('INFO', 'Form cancelled', { sessionId: lockSessionId, formId: session.form_id });
       const text = getMessengerString(config, channelType, 'form_cancelled', formEngine.DEFAULT_FORM_CANCELLED);
-      return { session: null, message: { text, quickReplies: [] } };
+      return { session: null, messages: [{ text, quickReplies: [] }], pendingSave: null };
     }
 
     if (session.current_field === formEngine.SUMMARY_STAGE) {
       const isConfirm = (safeFctl && safeFctl.op === 'confirm') || (!safeFfld && !safeFctl && formEngine.isConfirmKeyword(rawText));
       if (isConfirm) {
+        // confirmForm owns its own side-effect ordering (S1 MFS invoke, THEN
+        // delete-on-success / no-touch-on-failure, T3) — that sequencing is
+        // independent of whether the Messenger confirmation send below
+        // succeeds, so no deferred save is needed here.
         const result = await formEngine.confirmForm({
           session,
           config,
@@ -2050,40 +2152,65 @@ exports.handler = async function handler(event) {
           formId: session.form_id,
           submitted: result.submitted,
         });
-        return { session: result.submitted ? null : session, message: result.message };
+        return { session: result.submitted ? null : session, messages: [result.message], pendingSave: null };
       }
       // Anything else at the summary stage: re-show it (also counts as
       // activity — refresh the idle TTL, distinct from confirmForm's T3
-      // no-touch-on-failure rule).
+      // no-touch-on-failure rule). Deferred: caller saves after a successful send.
       const touched = formEngine.touchSession(session);
-      try {
-        await formEngine.saveFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: touched });
-      } catch (saveErr) {
-        log('WARN', 'Form session TTL refresh failed at summary stage', { sessionId: lockSessionId, error: saveErr.message });
-      }
-      return { session: touched, message: formEngine.buildSummary(touched, form, config, channelType) };
+      return { session: touched, messages: [formEngine.buildSummary(touched, form, config, channelType)], pendingSave: touched };
     }
 
     // Field-collection stage. A resolved ffld tap supplies its option value
     // directly ONLY when it targets the session's CURRENT field — a stale
     // tap for a different/already-answered field falls back to rawText.
     const value = safeFfld && safeFfld.fieldKey === session.current_field ? safeFfld.value : rawText;
-    const result = formEngine.handleAnswer({ session, form, config, channelType, rawText: value });
-    try {
-      await formEngine.saveFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: result.session });
-    } catch (saveErr) {
-      log('WARN', 'Form session save failed — proceeding (in-memory state may lag DDB)', {
-        sessionId: lockSessionId,
-        error: saveErr.message,
-      });
+
+    // M7b digression check (decision 1): only against genuinely free-typed
+    // text failing the CURRENT field's own validation — never against a
+    // resolved ffld tap's value (a tap is never a digression). The
+    // form_session row is completely untouched (T1): no attempts increment,
+    // no touchSession, no save — `session` returned is the SAME reference.
+    const step = formEngine.findStep(form, session.current_field);
+    if (step) {
+      const precheck = formEngine.validateAnswer(step, value);
+      if (!precheck.valid && formEngine.isQuestionLike(rawText)) {
+        const ragMessage = await runFormDigressionTurn(rawText);
+        const resumeMessage = formEngine.fieldPromptMessage(step, form.form_id || session.form_id, config, channelType);
+        log('INFO', 'Form digression handled — resuming same field', {
+          sessionId: lockSessionId,
+          formId: session.form_id,
+          fieldKey: step.key,
+        });
+        return { session, messages: [ragMessage, resumeMessage], pendingSave: null };
+      }
     }
+
+    const result = formEngine.handleAnswer({ session, form, config, channelType, rawText: value });
+
+    if (result.status === 'ineligible') {
+      // M7b eligibility gate: unconditional/eager delete (state-escape rule —
+      // same posture as cancel), never submitted.
+      try {
+        await formEngine.deleteFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId: lockSessionId });
+      } catch (delErr) {
+        log('WARN', 'Form session delete on ineligible decline failed', { sessionId: lockSessionId, error: delErr.message });
+      }
+      log('INFO', 'Form ineligible — declined and session ended', {
+        sessionId: lockSessionId,
+        formId: session.form_id,
+        fieldKey: session.current_field,
+      });
+      return { session: null, messages: [result.message], pendingSave: null };
+    }
+
     log('INFO', 'Form answer processed', {
       sessionId: lockSessionId,
       formId: session.form_id,
       fieldKey: session.current_field,
       status: result.status,
     });
-    return { session: result.session, message: result.message };
+    return { session: result.session, messages: [result.message], pendingSave: result.session };
   }
 
   // ── M7a: active conversational-form session (C4 form_session; T2 — an
@@ -2130,20 +2257,35 @@ exports.handler = async function handler(event) {
     const outcome = await advanceFormSession({ session: formSession, form, rawText: sanitizedInput, ffld, fctl });
 
     try {
-      await sendResponseMessages(
-        pageId,
-        psid,
-        outcome.message.text,
-        pageAccessToken,
-        channelType,
-        outcome.message.quickReplies?.length ? { quickReplies: outcome.message.quickReplies } : null
-      );
+      for (const msg of outcome.messages) {
+        await sendResponseMessages(
+          pageId,
+          psid,
+          msg.text,
+          pageAccessToken,
+          channelType,
+          msg.quickReplies?.length ? { quickReplies: msg.quickReplies } : null
+        );
+      }
     } catch (sendErr) {
       log('ERROR', 'Failed to deliver form message — will retry', { sessionId: lockSessionId, error: sendErr.message });
       throw sendErr;
     }
+    // Save-ordering fix (M7b): persist the field-collection outcome ONLY
+    // after its message(s) sent successfully — see advanceFormSession's doc
+    // comment (a send failure above already threw and skipped this).
+    if (outcome.pendingSave) {
+      try {
+        await formEngine.saveFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: outcome.pendingSave });
+      } catch (saveErr) {
+        log('WARN', 'Form session save failed — proceeding (in-memory state may lag DDB)', {
+          sessionId: lockSessionId,
+          error: saveErr.message,
+        });
+      }
+    }
     try {
-      await storeConversationContext(pageId, psid, sanitizedInput, outcome.message.text, messageMid);
+      await storeConversationContext(pageId, psid, sanitizedInput, outcome.messages[0].text, messageMid);
     } catch (storeErr) {
       log('WARN', 'Failed to store form-turn context', { sessionId: lockSessionId, error: storeErr.message });
     }

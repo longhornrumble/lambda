@@ -70,12 +70,20 @@ function resolveMessengerTone(config, channelType) {
  * @param {object} config — tenant config
  * @param {Array<object>} sessionHistory — SESSION-SCOPED rows (sessionWindow.js)
  * @param {'messenger'|'instagram'} channelType
+ * @param {{suppressActions?: boolean}} [options] — M7b: `suppressActions:true`
+ *   (a mid-form digression turn, plan §6 M7b decision 2) skips the action
+ *   catalog/turn-check/tail-instruction blocks entirely, forcing v5Active
+ *   false — the response is always plain short-form, and the caller's tail
+ *   parse (which always runs regardless — hardening) can never surface
+ *   actionIds for this turn. Omitted/false ⇒ byte-identical to pre-M7b
+ *   behavior (existing 5-arg call sites are unaffected).
  * @returns {{ systemContent: string, messages: Array<object>, v5Active: boolean, promptVersion: string }}
  */
-function buildMessengerV5Prompt(userInput, kbContext, config, sessionHistory, channelType) {
+function buildMessengerV5Prompt(userInput, kbContext, config, sessionHistory, channelType, options = {}) {
+  const { suppressActions = false } = options;
   const tone = resolveMessengerTone(config, channelType);
-  const catalogBlock = buildActionCatalogBlock(config);
-  const v5Active = catalogBlock.length > 0;
+  const catalogBlock = suppressActions ? '' : buildActionCatalogBlock(config);
+  const v5Active = !suppressActions && catalogBlock.length > 0;
 
   // Turn check counts assistant questions in the CURRENT SESSION only (C8) —
   // guaranteed by the caller passing session-scoped history.
