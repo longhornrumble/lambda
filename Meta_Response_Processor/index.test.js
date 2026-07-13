@@ -126,6 +126,7 @@ beforeEach(() => {
   sesMock.reset();
   jest.clearAllMocks();
   delete process.env.SES_FROM_EMAIL; // M6a default: unset ⇒ email disabled unless a test opts in
+  delete process.env.ESCALATION_EMAIL; // platform-default recipient fallback: unset unless a test opts in
 
   // Default SQS stub: analytics emissions succeed silently
   sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
@@ -2208,6 +2209,53 @@ describe('M6a — escalation.js unit tests (pass_thread_control / pause row / SE
     });
 
     test('escalation_email absent → skipped, SES never called', async () => {
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      const sendSpy = jest.fn();
+      const result = await escalation.sendEscalationEmail({
+        sesClient: { send: sendSpy },
+        config: {},
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: 'meta:PAGE_456:PSID_123',
+      });
+      expect(result).toEqual({ skipped: true, reason: 'no_recipient' });
+      expect(sendSpy).not.toHaveBeenCalled();
+    });
+
+    test('no tenant escalation_email but ESCALATION_EMAIL env set → sends to the env default', async () => {
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      process.env.ESCALATION_EMAIL = 'notify@myrecruiter.ai';
+      const sendSpy = jest.fn().mockResolvedValue({ MessageId: 'ses-1' });
+      const result = await escalation.sendEscalationEmail({
+        sesClient: { send: sendSpy },
+        config: {},
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: 'meta:PAGE_456:PSID_123',
+        pageId: 'PAGE_456',
+      });
+      expect(result).toEqual({ sent: true });
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      expect(sendSpy.mock.calls[0][0].input.Destination.ToAddresses).toEqual(['notify@myrecruiter.ai']);
+    });
+
+    test('tenant escalation_email takes precedence over ESCALATION_EMAIL env', async () => {
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      process.env.ESCALATION_EMAIL = 'platform-default@myrecruiter.ai';
+      const sendSpy = jest.fn().mockResolvedValue({ MessageId: 'ses-1' });
+      const result = await escalation.sendEscalationEmail({
+        sesClient: { send: sendSpy },
+        config: { messenger_behavior: { escalation_email: 'staff@tenant.org' } },
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: 'meta:PAGE_456:PSID_123',
+        pageId: 'PAGE_456',
+      });
+      expect(result).toEqual({ sent: true });
+      expect(sendSpy.mock.calls[0][0].input.Destination.ToAddresses).toEqual(['staff@tenant.org']);
+    });
+
+    test('neither tenant escalation_email nor ESCALATION_EMAIL env → skipped, SES never called', async () => {
       process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
       const sendSpy = jest.fn();
       const result = await escalation.sendEscalationEmail({
