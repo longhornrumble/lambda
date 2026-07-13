@@ -6,14 +6,15 @@ messenger-evidence.yml --ref main`, or run `run_evidence.js` with staging creds.
 
 ## Rounds
 
-- **Round 1** (workflow run 29238875077, pre-hardening prompt): brevity 40/40,
+- **Round 1** (raw artifacts committed under `round1/`; workflow run
+  29238875077, pre-hardening prompt): brevity 40/40,
   tail emitted+valid 40/40, restraint 10/10, cap 40/40 — but **3/40 samples
   emitted markdown bold** (all in `long_answer_bait`; Messenger/IG render
   formatting characters literally). Finding drove a one-line hardening of the
   locked base rule (lambda#440).
 - **Round 2** (committed here, post-hardening): **markdown 0/40**; brevity
-  38/40 (both misses = 4 sentences, within a sentence of the cap); every
-  other gate 100%.
+  38/40 (misses = 4 and 5 sentences — the 5 partly a counter artifact: the
+  "vs." abbreviation reads as a sentence ender); every other gate 100%.
 
 ## Gates (round 2, n=40 across 8 scenarios × 5 samples, temperature 0.7)
 
@@ -34,3 +35,30 @@ Known residuals for M3b: 2/40 four-sentence replies (rate comparable to the
 legacy prompt's real-world behavior; the channel splitter handles length
 safely) - not blocking. M3b adds a deterministic formatting strip in the send
 path as belt-and-suspenders against residual markdown.
+
+## Rounds 3-4 (M3b — gate conditions closed)
+
+- **Round 3** (branch dispatch): new instrumented gates ran; the first
+  turn-check metric (reply must not end with '?') mis-scored 5/5 PERFECT
+  funnel advances as failures — the TURN CHECK block PRESCRIBES ending with
+  an invitation ("Ready to apply?"). Metric corrected to the V5
+  proposal-judge shape (names the concrete step AND attaches an action).
+- **Round 4** (`round4/` — the CURRENT evidence; rounds preserved under
+  `round1/` / `round2/`; one folder per round, no top-level artifacts): brevity 45/45, tail 45/45, restraint 10/10,
+  cap 45/45, **markdown_free 45/45 (instrumented)**,
+  **turn_check_advances_funnel 4/5** — the one strict-judge miss reads
+  "Ready to learn more about how to get started?" with the learn action
+  attached, i.e. a real funnel advance the judge's step-term vocabulary
+  missed ("get started"/"learn more" added for future runs; committed
+  artifacts unchanged — honesty over re-rolls). Human read: 5/5.
+
+## Post-gate upgrades (M3b, per the tech-lead PASS-WITH-CONDITIONS)
+
+- The markdown gate is now INSTRUMENTED in the harness (`markdown_free`), no
+  longer a manual README claim.
+- A `turn_check_at_threshold` scenario (two session-scoped assistant
+  questions) puts the TURN CHECK block in the live system prompt; its gate
+  (`turn_check_advances_funnel`, corrected in round 3 — see above) requires
+  the reply to name the concrete next step and attach its action.
+- `countSentences` blind spots documented in the harness (abbreviation
+  inflation is conservative for the brevity gate).

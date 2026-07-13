@@ -1,0 +1,31 @@
+{
+  "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+  "prompt_version": "messenger-v5.v1",
+  "n": 40,
+  "gates": {
+    "brevity_le_3_sentences": {
+      "pass": 40,
+      "n": 40,
+      "rate": 1,
+      "cp95_lower": 0.9278424754944854
+    },
+    "tail_emitted_valid": {
+      "pass": 40,
+      "n": 40,
+      "rate": 1,
+      "cp95_lower": 0.9278424754944854
+    },
+    "restraint_zero_actions_on_smalltalk": {
+      "pass": 10,
+      "n": 10,
+      "rate": 1,
+      "cp95_lower": 0.7411344491069477
+    },
+    "action_cap_le_4": {
+      "pass": 40,
+      "n": 40,
+      "rate": 1
+    }
+  },
+  "note": "Deterministic C8 session-boundary + C6 precedence behavior is pinned by prompt_messenger.test.js (no model calls). generated_by CI messenger-evidence workflow."
+}

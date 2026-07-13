@@ -38,6 +38,18 @@ const DEFAULT_TONE = 'You are a helpful assistant.';
 const MESSENGER_BASE_RULES =
   'You are responding via a mobile messaging app (Facebook Messenger or Instagram DM) where the chat window is very small. STRICT RULES: Respond in 2-3 short sentences maximum. Be friendly but direct. No lists, no bullet points, no headers, no markdown, no asterisks or formatting symbols - plain conversational text only (Messenger and Instagram render formatting characters literally). Never write more than 3 sentences in a single response. If the user wants more detail, they will ask a follow-up question.';
 
+/** Resolve the model per C6: channel override -> section -> config.model_id -> caller default. */
+function resolveMessengerModelId(config, channelType, fallbackModelId) {
+  const mb = config?.messenger_behavior;
+  const channelKey = channelType === 'instagram' ? 'instagram' : 'messenger';
+  return (
+    mb?.channel_overrides?.[channelKey]?.model_id ??
+    mb?.model_id ??
+    config?.model_id ??
+    fallbackModelId
+  );
+}
+
 /** Resolve the persona layer per C6 (replace, never concatenate). */
 function resolveMessengerTone(config, channelType) {
   const mb = config?.messenger_behavior;
@@ -97,6 +109,7 @@ function buildMessengerV5Prompt(userInput, kbContext, config, sessionHistory, ch
 module.exports = {
   buildMessengerV5Prompt,
   resolveMessengerTone,
+  resolveMessengerModelId,
   MESSENGER_BASE_RULES,
   MESSENGER_V5_PROMPT_VERSION,
 };

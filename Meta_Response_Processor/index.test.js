@@ -1222,8 +1222,10 @@ describe('M1b — processor hygiene', () => {
       loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
       ddbMock.on(QueryCommand).resolves(
         makeRecentMessagesQueryResult([
-          { role: 'user', content: 'hi', messageTimestamp: 1000 },
-          { role: 'assistant', content: 'hello', messageTimestamp: 1001 },
+          // current-session timestamps: C8 (M3b) treats stale history as a
+          // NEW session (disclosure would then correctly fire)
+          { role: 'user', content: 'hi', messageTimestamp: Date.now() - 120000 },
+          { role: 'assistant', content: 'hello', messageTimestamp: Date.now() - 60000 },
         ])
       );
 
@@ -1367,7 +1369,7 @@ describe('M1b — failure paths and guards (code-review findings)', () => {
 
   test('IG text of exactly 1000 chars stays a single chunk', async () => {
     loadConfig.mockResolvedValue(flagOnConfig);
-    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi' }])); // non-empty → no disclosure
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }])); // non-empty → no disclosure
     bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('B'.repeat(1000)));
     await handler(buildEvent({ channelType: 'instagram' }));
     const sendBodies = fetchMock.mock.calls
@@ -1399,7 +1401,7 @@ describe('M-Ha — META_SEND_FAILURE classification', () => {
 
   test('failed reply send emits a structured META_SEND_FAILURE line with the class', async () => {
     const errSpy = jest.spyOn(console, 'error');
-    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi' }]));
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
     fetchMock = makeFetchMock([
       { ok: true, body: {} }, // typing
       { ok: false, status: 400, body: { error: { code: 190, message: 'Error validating access token' } } },
@@ -1422,5 +1424,204 @@ describe('M-Ha — META_SEND_FAILURE classification', () => {
     expect(Object.values(CLASSIFICATIONS).sort()).toEqual([
       'page_restricted', 'rate_limited', 'token_dead', 'unclassified', 'user_unavailable', 'window_closed',
     ].sort());
+  });
+});
+
+// ─── M3b — Messenger V5 wiring (flag-gated; C8 windowing; tail hygiene) ──────
+
+describe('M3b — Messenger V5 wiring', () => {
+  const { buildMessengerPrompt_TEST_EXPORT } = {}; // legacy prompt pinned via request-body capture below
+  const V5_FLAG_CONFIG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'You are a helpful recruiter assistant.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    cta_definitions: {
+      volunteer_form: { label: 'Volunteer Sign-Up', action: 'start_form', ai_available: true },
+    },
+  };
+
+  function bedrockBodies() {
+    return bedrockMock.commandCalls(InvokeModelCommand).map((c) =>
+      JSON.parse(Buffer.from(c.args[0].input.body).toString('utf8'))
+    );
+  }
+
+  function sentTexts() {
+    return fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message && typeof b.message.text === 'string')
+      .map((b) => b.message.text);
+  }
+
+  test('flag OFF: request body is byte-identical to the legacy buildMessengerPrompt output', async () => {
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'prior' }]));
+    await handler(buildEvent());
+
+    const [body] = bedrockBodies();
+    // Pin the legacy prompt shape: tone + the legacy STRICT RULES sentence
+    expect(body.system).toContain('You are a helpful recruiter assistant.');
+    expect(body.system).toContain('You are responding via Facebook Messenger where the chat window is very small.');
+    // V5 material must be absent
+    expect(body.system).not.toContain('AVAILABLE ACTIONS');
+    expect(body.system).not.toContain('ACTION TAIL');
+    expect(body.system).not.toContain('mobile messaging app');
+  });
+
+  test('flag ON + valid tail: tail never crosses sendResponseMessages, ids validated, visible text stored', async () => {
+    loadConfig.mockResolvedValue(V5_FLAG_CONFIG);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'prior', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand).resolves(
+      makeBedrockResponse('Great question! We can get you signed up.\n<<<ACTIONS ["volunteer_form"]>>>')
+    );
+
+    await handler(buildEvent());
+
+    for (const text of sentTexts()) {
+      expect(text).not.toContain('<<<ACTIONS');
+      expect(text).not.toContain('>>>');
+      expect(text).not.toContain('volunteer_form');
+    }
+    // exactly one Bedrock call (valid tail ⇒ no V4 fallback)
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+    // stored assistant row carries the visible text, not the tail
+    const puts = ddbMock.commandCalls(PutCommand).map((c) => c.args[0].input).filter((i) => i.Item?.role === 'assistant');
+    expect(puts).toHaveLength(1);
+    expect(puts[0].Item.content).not.toContain('<<<ACTIONS');
+  });
+
+  test('flag ON + malformed tail: exactly ONE fail-soft selectActionsV4 call, reply still served', async () => {
+    loadConfig.mockResolvedValue(V5_FLAG_CONFIG);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'prior', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand)
+      .resolvesOnce(makeBedrockResponse('A reply.\n<<<ACTIONS not-json'))
+      .resolves(makeBedrockResponse('[]')); // V4 selector fallback response
+
+    await handler(buildEvent());
+
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 2); // turn + one fallback
+    const texts = sentTexts();
+    expect(texts.some((t) => t.includes('A reply.'))).toBe(true);
+    for (const t of texts) expect(t).not.toContain('<<<ACTIONS');
+  });
+
+  test('flag ON: formatting markers stripped from the sent reply (M3a residual belt-and-suspenders)', async () => {
+    loadConfig.mockResolvedValue(V5_FLAG_CONFIG);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'prior', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand).resolves(
+      makeBedrockResponse('We have **Love Box** and __Dare to Dream__ programs.\n<<<ACTIONS []>>>')
+    );
+
+    await handler(buildEvent());
+
+    const texts = sentTexts();
+    expect(texts.some((t) => t.includes('Love Box') && !t.includes('**'))).toBe(true);
+    expect(texts.every((t) => !t.includes('__'))).toBe(true);
+  });
+
+  test('C8 through the handler: >24h-gap history does NOT trip TURN CHECK; same-session questions do', async () => {
+    loadConfig.mockResolvedValue(V5_FLAG_CONFIG);
+    const now = Date.now();
+    // Two old assistant questions across a 48h gap, then a fresh exchange
+    ddbMock.on(QueryCommand).resolves({
+      Items: [
+        { role: 'assistant', content: 'Old question one?', messageTimestamp: now - 50 * 3600 * 1000 },
+        { role: 'assistant', content: 'Old question two?', messageTimestamp: now - 49 * 3600 * 1000 },
+        { role: 'user', content: 'back again', messageTimestamp: now - 3600 * 1000 },
+      ],
+    });
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Welcome back!\n<<<ACTIONS []>>>'));
+
+    await handler(buildEvent());
+    let [body] = bedrockBodies();
+    expect(body.system).not.toContain('TURN CHECK');
+
+    // Same-session: two recent questions ⇒ TURN CHECK present
+    bedrockMock.reset();
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Sure!\n<<<ACTIONS []>>>'));
+    ddbMock.on(QueryCommand).resolves({
+      Items: [
+        { role: 'assistant', content: 'Recent question one?', messageTimestamp: now - 2 * 3600 * 1000 },
+        { role: 'user', content: 'answer', messageTimestamp: now - 3600 * 1000 },
+        { role: 'assistant', content: 'Recent question two?', messageTimestamp: now - 1800 * 1000 },
+      ],
+    });
+    await handler(buildEvent());
+    [body] = bedrockBodies();
+    expect(body.system).toContain('TURN CHECK');
+  });
+
+  test('flag ON, no ai_available CTAs: plain V5 short-form, no tail machinery, one Bedrock call', async () => {
+    loadConfig.mockResolvedValue({ ...V5_FLAG_CONFIG, cta_definitions: {} });
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'prior', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Plain reply.'));
+
+    await handler(buildEvent());
+
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+    const [body] = bedrockBodies();
+    expect(body.system).not.toContain('ACTION TAIL');
+    expect(sentTexts().some((t) => t.includes('Plain reply.'))).toBe(true);
+  });
+});
+
+// ─── M3b review follow-ups ───────────────────────────────────────────────────
+
+describe('M3b — review follow-ups', () => {
+  const V5_FLAG_CONFIG2 = {
+    model_id: 'config-model',
+    tone_prompt: 'T.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    cta_definitions: { volunteer_form: { label: 'V', action: 'start_form', ai_available: true } },
+  };
+
+  test('returning user after >24h gap gets the disclosure line AGAIN (C8: each session)', async () => {
+    loadConfig.mockResolvedValue(V5_FLAG_CONFIG2);
+    const now = Date.now();
+    ddbMock.on(QueryCommand).resolves({
+      Items: [
+        { role: 'user', content: 'old', messageTimestamp: now - 30 * 3600 * 1000 },
+        { role: 'assistant', content: 'old reply', messageTimestamp: now - 29 * 3600 * 1000 },
+      ],
+    });
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Welcome back!\n<<<ACTIONS []>>>'));
+
+    await handler(buildEvent());
+
+    const texts = fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message && typeof b.message.text === 'string')
+      .map((b) => b.message.text);
+    expect(texts.some((t) => t.includes('automated assistant'))).toBe(true); // disclosure re-fired
+  });
+
+  test('C6 model precedence: channel override wins in the V5 request', async () => {
+    loadConfig.mockResolvedValue({
+      ...V5_FLAG_CONFIG2,
+      messenger_behavior: { model_id: 'section-model', channel_overrides: { messenger: { model_id: 'channel-model' } } },
+    });
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+
+    await handler(buildEvent());
+
+    expect(bedrockMock.commandCalls(InvokeModelCommand)[0].args[0].input.modelId).toBe('channel-model');
+  });
+
+  test('hallucinated sentinel with NO catalog still never leaks (always-parse hardening)', async () => {
+    loadConfig.mockResolvedValue({ ...V5_FLAG_CONFIG2, cta_definitions: {} });
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand).resolves(
+      makeBedrockResponse('Copied from KB: <<<ACTIONS ["whatever"]>>> end.')
+    );
+
+    await handler(buildEvent());
+
+    const texts = fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message && typeof b.message.text === 'string')
+      .map((b) => b.message.text);
+    for (const t of texts) expect(t).not.toContain('<<<ACTIONS');
   });
 });
