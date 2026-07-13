@@ -1,0 +1,58 @@
+# M3a evidence runs — Messenger V5 prompt (Messenger Channel Experience).
+#
+# workflow_dispatch only. Mirrors the chat-eval-net job's credential setup:
+# the `staging` GitHub Environment scopes AWS_DEPLOY_ROLE_ARN to the
+# staging-account (525) role, which carries bedrock:InvokeModel. ~40 live
+# Haiku calls per run. Artifacts (results.jsonl + summary.json) are uploaded
+# and then COMMITTED into Meta_Response_Processor/evals/evidence/messenger/
+# by the invoking session — evidence is repo-versioned, runs are reproducible.
+name: Messenger Evidence — Meta_Response_Processor
+
+on:
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  messenger-evidence:
+    name: Messenger V5 prompt evidence (live Bedrock)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: staging
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: Meta_Response_Processor/package-lock.json
+
+      - name: Configure AWS credentials (staging OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Install dependencies
+        working-directory: Meta_Response_Processor
+        run: npm install
+
+      - name: Run evidence harness (live Bedrock - Haiku)
+        working-directory: Meta_Response_Processor
+        run: node evals/evidence/messenger/run_evidence.js
+
+      - name: Upload evidence artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: messenger-evidence
+          path: |
+            Meta_Response_Processor/evals/evidence/messenger/results.jsonl
+            Meta_Response_Processor/evals/evidence/messenger/summary.json
+          retention-days: 30
