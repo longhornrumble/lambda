@@ -63,6 +63,121 @@
  * business timezone and labels every card + the intro line with its explicit
  * abbreviation (tz_label from BCH's scheduling_propose `context`) — never a
  * bare time, but not auto-localized to the user's device.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * M8b — Messenger scheduling "manage" (reschedule/cancel of a PAST booking).
+ * docs/messenger/CONTRACTS.md C3 (new `sched` ops `mcancel`/`mresched`/
+ * `mabort` — additive under the existing `PIC1:sched:{op}:{arg}` route,
+ * which C3 documents as extensible: "ops defined in M8a, e.g. `slot:{arg}`"),
+ * C9 (free-text fallback), CB config.ts `CTAActionType` `resume_scheduling`
+ * (already reserved for M8b by the M8a doc comment in
+ * renderMessengerActions.js).
+ *
+ * BOOKING LOOKUP MECHANISM (verified from source, not assumed):
+ *   Booking_Commit_Handler's `scheduling_mutate` action
+ *   (Booking_Commit_Handler/scheduling-mutate.js:109 `handleSchedulingMutate`)
+ *   is a PURE EXECUTOR — it does NOT look up the booking itself. Every real
+ *   caller (BSH's schedulingFlow.js `_executeViaExecutor`, Scheduling_Page_
+ *   Api/index.js's `mutate` action) already holds a loaded Booking row and a
+ *   `coordinatorId`, and BOTH derive it via their OWN direct DynamoDB read of
+ *   the Booking table (`picasso-booking-{env}`) — a per-Lambda IAM grant this
+ *   Meta processor does NOT have (and this subphase does not add one; a new
+ *   IAM grant is a Terraform change, out of scope for OWN: schedulingDriver.js/
+ *   index.js). Instead: M8a's own `commitAndRecordConsent` ALREADY receives
+ *   the freshly-committed booking on `res.booking` (BCH's commit-success
+ *   response, Booking_Commit_Handler/index.js:473 `booking: bookingItem`) —
+ *   data we already possess at that exact moment, no extra read needed. M8b
+ *   extends that one commit path to persist a C4-additive `last_booking` row
+ *   (PK/SK unchanged, new stateType — no C4 amendment) carrying a PII-
+ *   minimized projection of that SAME booking (MUTATE_BOOKING_FIELDS below,
+ *   copied verbatim from BSH's already-audited `_EXEC_BOOKING_FIELDS`,
+ *   Bedrock_Streaming_Handler_Staging/scheduling/schedulingFlow.js:~225) plus
+ *   the derived `coordinator_id`. M8b's manage flow reads ONLY this row —
+ *   zero Booking-table access, ever.
+ *
+ *   `res.booking` is the RAW DynamoDB item Booking_Commit_Handler/booking-
+ *   store.js's `buildBookingItem` writes (every attribute wrapped via its
+ *   local `s()` string-AttributeValue helper — `{ coordinator_email: {S:
+ *   '...'}, ... }`), because `writeBooking`/`getBookingById` use the
+ *   low-level `DynamoDBClient` (not the Document client) — confirmed by
+ *   reading booking-store.js directly. `unmarshallBookingItem` below is a
+ *   minimal S-only unmarshal, the same shape as Scheduling_Page_Api/
+ *   index.js's local `unmarshall()` helper (never re-derived, independently
+ *   reconstructed here only because it's a few lines and pulling in
+ *   `@aws-sdk/util-dynamodb` for one caller wasn't worth a new dependency).
+ *
+ * PINNED scheduling_mutate INVOKE SHAPE (verbatim from
+ * Bedrock_Streaming_Handler_Staging/scheduling/schedulingFlow.js
+ * `_executeViaExecutor`, validated server-side by Booking_Commit_Handler/
+ * scheduling-mutate.js:127-136):
+ *   { action: 'scheduling_mutate', mutation: 'cancel'|'reschedule', tenantId,
+ *     coordinatorId, booking: <projected fields>, newSlot?: {start, end} }
+ *   Response: { outcome: 'success'|'deleted'|'pending_calendar_sync'|'failed'
+ *     |'rate_limited'|'slot_unavailable', booking?, error? } — cancel emits
+ *     'deleted'|'pending_calendar_sync'; reschedule emits 'success'|
+ *     'pending_calendar_sync'|'slot_unavailable' (FS7 live re-check)|'failed'.
+ *
+ * FLOW:
+ *   Entry (no active scheduling_session — checked by index.js's existing
+ *   precedence order): a manage-intent keyword ("reschedule" / "cancel my
+ *   appointment", tight word-boundary regex — KNOWN v1 DEVIATION: this is
+ *   keyword matching, not NLU, so an off-topic mention like "what's your
+ *   reschedule policy?" can false-positive into a manage prompt; disclosed,
+ *   not hidden), OR a `resume_scheduling` CTA tap (ambiguous — shows a
+ *   two-option menu), OR a typed/tapped confirm|abort of a PREVIOUSLY shown
+ *   manage-confirm prompt (`last_booking.pending_manage_action`).
+ *     -> no last_booking (absent or T2-expired) => graceful decline, ZERO
+ *        invokes (`resolveManageTrigger`/`handleManageTrigger` never call
+ *        deps.invokeProposal/invokeMutate on this path — structurally, not
+ *        just by convention).
+ *     -> found => build an explicit-confirmation message naming the target
+ *        ("Your {slot_label} appointment — cancel it?") with QRs
+ *        `PIC1:sched:mcancel:{bookingId}` / `PIC1:sched:mresched:{bookingId}`
+ *        (C9 free-text fallback: typed "yes"/"confirm" resolves identically
+ *        via `pending_manage_action`, typed "cancel"/"never mind" aborts).
+ *        NEVER mutates on this turn — the row write is ONLY
+ *        `pending_manage_action`, never a BCH invoke.
+ *   Cancel (`execute_cancel`): re-verifies the payload's bookingId against
+ *     the CURRENT last_booking (defense against a stale tap after a NEW
+ *     booking replaced the row) -> BCH `scheduling_mutate` cancel -> success:
+ *     delete last_booking + confirmation string; failure: apologize, row
+ *     kept UNTOUCHED (retry by saying "confirm" again).
+ *   Reschedule (`execute_reschedule`): re-verify -> BCH `scheduling_propose`
+ *     (reusing the exact M8a action, keyed off the booking's stored
+ *     `appointment_type_id`) -> a NEW `scheduling_session` row
+ *     (`mode:'manage_reschedule'`, carrying the last_booking's
+ *     `coordinator_id`/`booking` snapshot) -> carousel (reuses
+ *     `buildSlotMessages`) -> slot pick (reuses `findChosenSlot`, dispatched
+ *     from `advanceScheduling`'s STAGE_PROPOSING case) -> BCH
+ *     `scheduling_mutate` reschedule with `newSlot` -> success: patch
+ *     last_booking's `slot_label` (booking_id is unchanged — a reschedule
+ *     moves the SAME booking); `slot_unavailable`/failure: apologize, END the
+ *     manage attempt (last_booking untouched — a fresh "reschedule" re-
+ *     proposes). Scope note: unlike M8a's book flow, M8b does NOT
+ *     auto-retry a slot conflict inline — not required by this subphase's
+ *     DONE line, and re-triggering "reschedule" already re-proposes fresh
+ *     slots against the SAME still-valid last_booking.
+ *   Universal in-flow cancel ("cancel"/"exit"/"quit"/"stop"/"never mind",
+ *   any stage) during an ACTIVE manage_reschedule session abandons the
+ *   RESCHEDULE ATTEMPT only — the underlying booking is untouched, and the
+ *   message says so explicitly (`DEFAULT_MANAGE_RESCHEDULE_ABORTED`), never
+ *   the book-flow's `DEFAULT_SCHEDULING_CANCELLED` text (which would
+ *   misleadingly imply the original appointment was cancelled).
+ *   Ambiguity rule (plan §6 M8b): manage-intent keywords/CTA are only
+ *   evaluated when NO scheduling_session is already active — an in-flight
+ *   book OR manage flow owns the turn first (index.js's existing
+ *   precedence), so "cancel" mid-book still means "abandon this booking
+ *   attempt", never "cancel my past appointment".
+ *   Escalation/rate-limit gates are unconditionally ahead of ALL scheduling
+ *   routing (index.js's existing pause-check + M-Hb block run before the
+ *   scheduling_session/manage checks) — unchanged by M8b, not re-derived.
+ *
+ * Scope boundary (disclosed): the C7 drain loop (coalesced rapid-fire
+ * messages during a lock hold) does not run manage-trigger DETECTION on
+ * drained free-text members — they still flow into the combined RAG turn as
+ * before M8b. Only the PRIMARY (non-drained) turn path detects a manage
+ * trigger. This subphase's DONE line ("complete E2E from a staging DM") does
+ * not require drain-loop integration; flagged here for a future follow-up.
  */
 
 const { GetCommand, PutCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
@@ -74,6 +189,32 @@ const { CAROUSEL_MAX } = require('./capabilities');
 const STATE_TYPE_SCHEDULING_SESSION = 'scheduling_session';
 /** G-P4 T1': idle TTL = 1 hour from last update, refreshed on each step. */
 const SCHEDULING_SESSION_TTL_SECONDS = 60 * 60;
+
+// M8b: the C4-additive `last_booking` row (see the M8b doc block above).
+const STATE_TYPE_LAST_BOOKING = 'last_booking';
+/** Bounded, matches M1b's 7-day history TTL (plan §3 fact 6) — not the 1h
+ * in-flow idle TTL above, which governs an ACTIVE book/manage session, not
+ * the durable link to a completed booking. Refreshed on every write. */
+const LAST_BOOKING_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+/**
+ * The exact booking fields Booking_Commit_Handler's scheduling_mutate /
+ * shared/scheduling/reschedule.js / cancel.js read via their `pick()` helper
+ * — copied VERBATIM from BSH's already-audited (NTH1) allowlist
+ * (Bedrock_Streaming_Handler_Staging/scheduling/schedulingFlow.js
+ * `_EXEC_BOOKING_FIELDS`), not re-derived. PII-minimized: only what the
+ * executor actually reads reaches the stored last_booking row.
+ */
+const MUTATE_BOOKING_FIELDS = [
+  'booking_id', 'bookingId', 'tenant_id', 'tenantId',
+  'coordinator_email', 'coordinatorEmail', 'resource_id', 'resourceId',
+  'external_event_id', 'externalEventId', 'conference_id', 'conferenceId',
+  'conference_provider', 'conferenceProvider', 'appointment_type_name', 'appointmentTypeName',
+  'attendee_email', 'attendeeEmail', 'attendee_first_name', 'attendeeFirstName',
+  'attendee_last_name', 'attendeeLastName', 'attendee_name', 'attendeeName',
+  'attendee_phone', 'attendeePhone', 'organization_name', 'organizationName',
+  'timezone', 'timeZone', 'deep_link', 'deepLink',
+];
 
 const STAGE_PROPOSING = 'proposing';
 const STAGE_CONTACT_EMAIL = 'contact_email';
@@ -98,6 +239,18 @@ const DEFAULT_SLOT_GONE = "That time was just taken — here are some fresh opti
 const DEFAULT_COMMIT_FAILED =
   "Sorry — something went wrong booking that time. You can reply \"confirm\" to try again, or \"cancel\" to stop.";
 
+// M8b — manage (reschedule/cancel) default strings. All overridable via C2's
+// additive MessengerStrings index signature (messenger_behavior.strings.*) —
+// no CB config.ts change needed (schema already permits additive keys).
+const DEFAULT_MANAGE_NOT_FOUND =
+  "I couldn't find a recent booking for you — please contact us directly, or say \"book an appointment\" to schedule a new one.";
+const DEFAULT_MANAGE_ABORTED = "No problem — I've left your appointment as it was.";
+const DEFAULT_MANAGE_RESCHEDULE_ABORTED = "No problem — I've left your appointment as it was.";
+const DEFAULT_MANAGE_MUTATE_FAILED =
+  "Sorry — something went wrong with that. Please try again in a bit, or contact us directly.";
+const DEFAULT_MANAGE_RESCHEDULED = "Done — you're rescheduled!";
+const DEFAULT_SLOT_GONE_MANAGE = 'That time was just taken. Say "reschedule" to see fresh options.';
+
 // ─── C2-style string precedence (small local copy — avoids a circular
 // require with index.js, which defines its own; mirrors formEngine.js) ─────
 function getMessengerString(config, channelType, key, fallback) {
@@ -115,6 +268,84 @@ function nowSec() {
 
 function refreshedExpiry(nowMs) {
   return Math.floor(nowMs / 1000) + SCHEDULING_SESSION_TTL_SECONDS;
+}
+
+function refreshedLastBookingExpiry(nowMs) {
+  return Math.floor(nowMs / 1000) + LAST_BOOKING_TTL_SECONDS;
+}
+
+// ─── M8b: booking-item unmarshal / projection (see the M8b doc block) ───────
+
+/**
+ * Minimal DynamoDB unmarshal (S only — Booking_Commit_Handler/booking-
+ * store.js's buildBookingItem writes every attribute via its local `s()`
+ * string wrapper, so a full @aws-sdk/util-dynamodb unmarshall is unneeded).
+ * Mirrors Scheduling_Page_Api/index.js's identical helper. Tolerates an
+ * already-plain object (defensive — a future non-string attribute, or a test
+ * fixture that passes plain values, is copied through unchanged).
+ */
+function unmarshallBookingItem(item) {
+  const out = {};
+  if (!item) return out;
+  for (const k of Object.keys(item)) {
+    const v = item[k];
+    if (v == null) continue;
+    if (typeof v === 'object' && v.S !== undefined) out[k] = v.S;
+    else if (typeof v !== 'object') out[k] = v;
+  }
+  return out;
+}
+
+/** Project a (possibly raw-DDB-wrapped) booking item down to MUTATE_BOOKING_FIELDS. */
+function projectBookingForMutate(rawBooking) {
+  const plain = unmarshallBookingItem(rawBooking);
+  const out = {};
+  for (const k of MUTATE_BOOKING_FIELDS) if (plain[k] !== undefined) out[k] = plain[k];
+  return out;
+}
+
+/** Mirrors BSH's schedulingFlow.js calendarIdOf/_executeViaExecutor precedence
+ * (minus the §B10 `binding.coordinator_id` fallback, which has no Messenger
+ * analogue — this processor has no session-binding row). */
+function coordinatorIdOfProjection(booking) {
+  return (
+    (booking && (booking.resource_id || booking.resourceId)) ||
+    (booking && (booking.coordinator_email || booking.coordinatorEmail)) ||
+    null
+  );
+}
+
+/**
+ * Build the last_booking row payload from a just-committed BCH response.
+ * Called from M8a's commitAndRecordConsent on BOOKED/ALREADY_CONFIRMED.
+ * @returns {{bookingId, slotLabel, appointmentTypeId, coordinatorId, booking, channel}}
+ */
+function buildLastBookingSnapshot({ bookingId, slotLabel, appointmentTypeId, rawBooking, channel }) {
+  const booking = projectBookingForMutate(rawBooking);
+  return {
+    bookingId,
+    slotLabel: slotLabel || null,
+    appointmentTypeId: appointmentTypeId || null,
+    coordinatorId: coordinatorIdOfProjection(booking),
+    booking,
+    channel,
+  };
+}
+
+/** Build the PINNED scheduling_mutate invoke payload (see the M8b doc block
+ * for the verbatim shape + source citations). `bookingCtx` is either a
+ * last_booking row or a manage_reschedule scheduling_session row — both
+ * carry `coordinator_id` + `booking` in the same shape. */
+function buildMutatePayload({ tenantId, mutation, bookingCtx, newSlot }) {
+  const payload = {
+    action: 'scheduling_mutate',
+    mutation,
+    tenantId,
+    coordinatorId: bookingCtx.coordinator_id,
+    booking: bookingCtx.booking,
+  };
+  if (mutation === 'reschedule' && newSlot) payload.newSlot = newSlot;
+  return payload;
 }
 
 // ─── C4 row CRUD (T1'/T2' pattern — mirrors formEngine's form_session CRUD) ─
@@ -166,6 +397,94 @@ async function deleteSchedulingSession({ client, tableName, sessionId }) {
   await client.send(
     new DeleteCommand({ TableName: tableName, Key: { sessionId, stateType: STATE_TYPE_SCHEDULING_SESSION } })
   );
+}
+
+// ─── M8b: last_booking row CRUD (T1'/T2' pattern, mirrors above) ────────────
+
+/**
+ * Load the last_booking row. An expired row (T2-style) is treated as ABSENT
+ * — filtered out here and best-effort deleted, same posture as
+ * loadSchedulingSession.
+ * @returns {Promise<object|null>}
+ */
+async function loadLastBooking({ client, tableName, sessionId, log }) {
+  const result = await client.send(
+    new GetCommand({ TableName: tableName, Key: { sessionId, stateType: STATE_TYPE_LAST_BOOKING } })
+  );
+  if (!result.Item) return null;
+
+  const cutoff = nowSec();
+  if (typeof result.Item.expires_at === 'number' && result.Item.expires_at <= cutoff) {
+    try {
+      await client.send(
+        new DeleteCommand({
+          TableName: tableName,
+          Key: { sessionId, stateType: STATE_TYPE_LAST_BOOKING },
+          ConditionExpression: 'expires_at <= :cutoff',
+          ExpressionAttributeValues: { ':cutoff': cutoff },
+        })
+      );
+    } catch (cleanupErr) {
+      if (cleanupErr.name !== 'ConditionalCheckFailedException') {
+        log && log('WARN', 'Stale last_booking cleanup failed (non-fatal — TTL sweep will catch it)', {
+          sessionId,
+          error: cleanupErr.message,
+        });
+      }
+    }
+    return null;
+  }
+  return result.Item;
+}
+
+/** Write/refresh the last_booking row from a buildLastBookingSnapshot() result. */
+async function saveLastBooking({ client, tableName, sessionId, bookingId, slotLabel, appointmentTypeId, coordinatorId, booking, channel }) {
+  const now = Date.now();
+  const item = {
+    sessionId,
+    stateType: STATE_TYPE_LAST_BOOKING,
+    booking_id: bookingId,
+    slot_label: slotLabel || null,
+    appointment_type_id: appointmentTypeId || null,
+    coordinator_id: coordinatorId || null,
+    booking: booking || {},
+    channel,
+    updated_at: now,
+    expires_at: refreshedLastBookingExpiry(now),
+    schema_version: 1,
+  };
+  await client.send(new PutCommand({ TableName: tableName, Item: item }));
+  return item;
+}
+
+async function deleteLastBooking({ client, tableName, sessionId }) {
+  await client.send(
+    new DeleteCommand({ TableName: tableName, Key: { sessionId, stateType: STATE_TYPE_LAST_BOOKING } })
+  );
+}
+
+/**
+ * Read-modify-write patch of the last_booking row (pending_manage_action
+ * set/clear, or the post-reschedule slot_label refresh). A key set to
+ * `undefined` in `patch` DELETES that attribute (DDB rejects literal
+ * `undefined` values on Put). No-op (logged) when the row is already gone —
+ * a patch must never resurrect a deleted/expired row.
+ */
+async function patchLastBooking({ client, tableName, sessionId, patch, log }) {
+  const current = await client.send(
+    new GetCommand({ TableName: tableName, Key: { sessionId, stateType: STATE_TYPE_LAST_BOOKING } })
+  );
+  if (!current.Item) {
+    log && log('WARN', 'patchLastBooking: no row to patch (already deleted/expired) — skipping', { sessionId });
+    return null;
+  }
+  const now = Date.now();
+  const next = { ...current.Item, ...patch, updated_at: now, expires_at: refreshedLastBookingExpiry(now) };
+  for (const k of Object.keys(patch)) {
+    if (patch[k] === undefined) delete next[k];
+  }
+  await client.send(new PutCommand({ TableName: tableName, Item: next }));
+  return next;
 }
 
 // ─── Appointment-type / program resolution ───────────────────────────────────
@@ -493,7 +812,21 @@ async function commitAndRecordConsent({ session, tenantId, sessionId, deps, log 
       }
     }
     log && log('INFO', 'Scheduling committed', { sessionId, status, bookingId: res.bookingId });
-    return { committed: true, session: null, bookingId: res.bookingId, messages: [{ kind: 'text', text: DEFAULT_BOOKED, quickReplies: [] }] };
+    // M8b: capture the just-committed booking (already in-hand on this same
+    // response — no extra read) so the manage flow can find it later. Never
+    // blocks/affects the booking outcome — a snapshot-build issue just means
+    // the manage flow won't find this booking (caller best-effort-writes it).
+    const bookingSnapshot = buildLastBookingSnapshot({
+      bookingId: res.bookingId,
+      slotLabel: session.selected_slot?.label,
+      appointmentTypeId: session.appointment_type?.id,
+      rawBooking: res.booking,
+      channel: session.channel,
+    });
+    return {
+      committed: true, session: null, bookingId: res.bookingId, bookingSnapshot,
+      messages: [{ kind: 'text', text: DEFAULT_BOOKED, quickReplies: [] }],
+    };
   }
 
   if (status === 'SLOT_UNAVAILABLE') {
@@ -578,7 +911,289 @@ async function handleConfirm({ session, schedPayload, rawText, tenantId, session
   }
 
   const result = await commitAndRecordConsent({ session, tenantId, sessionId, deps, log });
-  return { session: result.session, messages: result.messages, committed: result.committed, bookingId: result.bookingId };
+  return {
+    session: result.session, messages: result.messages, committed: result.committed,
+    bookingId: result.bookingId, bookingSnapshot: result.bookingSnapshot,
+  };
+}
+
+// ─── M8b: manage (reschedule/cancel) ──────────────────────────────────────
+
+/**
+ * Resolve the fresh candidate slots for a reschedule, re-invoking BCH
+ * `scheduling_propose` for the ORIGINAL booking's appointment type (stored on
+ * last_booking at M8a commit time — no CTA/program_id resolution needed, the
+ * booking already names its own type). On success, returns a NEW
+ * `scheduling_session` row (`mode:'manage_reschedule'`) carrying the
+ * last_booking's `coordinator_id`/`booking` snapshot forward, so the eventual
+ * `scheduling_mutate` call (at slot-pick time) needs no further lookup.
+ *
+ * @returns {Promise<{session: object|null, messages: Array<object>, started: boolean}>}
+ */
+async function beginManageReschedule({ lastBooking, tenantId, sessionId, config, channelType, deps = {}, log }) {
+  const apptTypeId = lastBooking.appointment_type_id;
+  if (!deps.invokeProposal) {
+    log && log('WARN', 'Reschedule propose seam not wired — declining', { sessionId });
+    return { session: null, messages: [{ kind: 'text', text: DEFAULT_SCHEDULING_UNAVAILABLE, quickReplies: [] }], started: false };
+  }
+  if (!apptTypeId) {
+    log && log('WARN', 'last_booking missing appointment_type_id — cannot re-propose', { sessionId });
+    return { session: null, messages: [{ kind: 'text', text: DEFAULT_MANAGE_MUTATE_FAILED, quickReplies: [] }], started: false };
+  }
+
+  const types = config?.scheduling?.appointment_types || {};
+  const apptType = types[apptTypeId] || {};
+  const userTimeZone =
+    apptType.timezone || apptType.time_zone || lastBooking.booking?.timezone || lastBooking.booking?.timeZone || 'UTC';
+
+  let res;
+  try {
+    res = await deps.invokeProposal({ action: 'scheduling_propose', tenantId, appointmentTypeId: apptTypeId, userTimeZone });
+  } catch (err) {
+    log && log('ERROR', 'Reschedule propose invoke failed', { sessionId, error_name: err?.name || 'unknown' });
+    return { session: null, messages: [{ kind: 'text', text: DEFAULT_SCHEDULING_UNAVAILABLE, quickReplies: [] }], started: false };
+  }
+  if (!res || res.outcome !== 'ok' || !Array.isArray(res.slots) || res.slots.length === 0) {
+    log && log('INFO', 'Reschedule propose returned no slots', { sessionId, outcome: res && res.outcome });
+    return { session: null, messages: [{ kind: 'text', text: DEFAULT_NO_SLOTS, quickReplies: [] }], started: false };
+  }
+
+  const now = Date.now();
+  const tzLabel = res.context?.tz_label || null;
+  const session = {
+    sessionId,
+    stateType: STATE_TYPE_SCHEDULING_SESSION,
+    mode: 'manage_reschedule',
+    booking_id: lastBooking.booking_id,
+    coordinator_id: lastBooking.coordinator_id,
+    booking: lastBooking.booking,
+    appointment_type_id: apptTypeId,
+    stage: STAGE_PROPOSING,
+    candidate_slots: res.slots,
+    tz_label: tzLabel,
+    channel: channelType,
+    started_at: now,
+    updated_at: now,
+    schema_version: 1,
+    expires_at: refreshedExpiry(now),
+  };
+  return { session, messages: buildSlotMessages(res.slots, tzLabel), started: true };
+}
+
+/** STAGE_PROPOSING dispatch for a `mode:'manage_reschedule'` session — a slot
+ * pick invokes BCH scheduling_mutate reschedule DIRECTLY (no email/phone/
+ * confirm stages: contact info is already on file from the original
+ * booking). Returns `lastBookingWrite` on success so the caller (index.js)
+ * refreshes last_booking's slot_label — the booking_id is unchanged, a
+ * reschedule moves the SAME booking, it never deletes the link. */
+async function handleManageReschedulePick({ session, schedPayload, rawText, tenantId, sessionId, deps = {}, log }) {
+  const chosen = findChosenSlot(session, schedPayload, rawText);
+  const now = Date.now();
+  if (!chosen) {
+    return {
+      session: { ...session, updated_at: now, expires_at: refreshedExpiry(now) },
+      messages: [{ kind: 'text', text: DEFAULT_SLOT_INVALID, quickReplies: [] }],
+    };
+  }
+  if (!deps.invokeMutate) {
+    log && log('WARN', 'Mutate seam not wired — cannot reschedule', { sessionId });
+    // T3'-style: leave the row untouched so a retry (once wired) can re-pick.
+    return { session: undefined, messages: [{ kind: 'text', text: DEFAULT_MANAGE_MUTATE_FAILED, quickReplies: [] }] };
+  }
+
+  const newSlot = { start: chosen.start, end: chosen.end };
+  let res;
+  try {
+    res = await deps.invokeMutate(buildMutatePayload({ tenantId, mutation: 'reschedule', bookingCtx: session, newSlot }));
+  } catch (err) {
+    log && log('ERROR', 'Reschedule mutate invoke failed', { sessionId, error_name: err?.name || 'unknown' });
+    return { session: null, messages: [{ kind: 'text', text: DEFAULT_MANAGE_MUTATE_FAILED, quickReplies: [] }] };
+  }
+
+  const outcome = res && res.outcome;
+  if (outcome === 'success' || outcome === 'pending_calendar_sync') {
+    log && log('INFO', 'Reschedule committed', { sessionId, bookingId: session.booking_id, outcome });
+    return {
+      session: null,
+      messages: [{ kind: 'text', text: DEFAULT_MANAGE_RESCHEDULED, quickReplies: [] }],
+      rescheduled: true,
+      lastBookingWrite: { patch: { slot_label: chosen.label } },
+    };
+  }
+  if (outcome === 'slot_unavailable') {
+    log && log('INFO', 'Reschedule slot no longer available', { sessionId, bookingId: session.booking_id });
+    return { session: null, messages: [{ kind: 'text', text: DEFAULT_SLOT_GONE_MANAGE, quickReplies: [] }] };
+  }
+  log && log('WARN', 'Reschedule mutate failed', { sessionId, bookingId: session.booking_id, outcome });
+  return { session: null, messages: [{ kind: 'text', text: DEFAULT_MANAGE_MUTATE_FAILED, quickReplies: [] }] };
+}
+
+/** Cancel the booking directly (single-shot — no session row involved). */
+async function executeManageCancel({ lastBooking, tenantId, sessionId, deps = {}, log }) {
+  if (!deps.invokeMutate) {
+    log && log('WARN', 'Mutate seam not wired — cannot cancel', { sessionId });
+    return { outcome: 'unwired', messages: [{ kind: 'text', text: DEFAULT_MANAGE_MUTATE_FAILED, quickReplies: [] }] };
+  }
+  let res;
+  try {
+    res = await deps.invokeMutate(buildMutatePayload({ tenantId, mutation: 'cancel', bookingCtx: lastBooking }));
+  } catch (err) {
+    log && log('ERROR', 'Cancel mutate invoke failed', { sessionId, error_name: err?.name || 'unknown' });
+    return { outcome: 'failed', messages: [{ kind: 'text', text: DEFAULT_MANAGE_MUTATE_FAILED, quickReplies: [] }] };
+  }
+  const outcome = res && res.outcome;
+  if (outcome === 'deleted' || outcome === 'pending_calendar_sync') {
+    log && log('INFO', 'Booking cancelled', { sessionId, bookingId: lastBooking.booking_id, outcome });
+    const label = lastBooking.slot_label || 'your';
+    return { outcome, messages: [{ kind: 'text', text: `Done — I've cancelled your ${label} appointment.`, quickReplies: [] }] };
+  }
+  log && log('WARN', 'Cancel mutate failed', { sessionId, bookingId: lastBooking.booking_id, outcome });
+  return { outcome: outcome || 'failed', messages: [{ kind: 'text', text: DEFAULT_MANAGE_MUTATE_FAILED, quickReplies: [] }] };
+}
+
+// KNOWN v1 DEVIATION (documented in the M8b doc block): keyword matching, not
+// NLU. Whole-message-independent (unlike formEngine's isCancelKeyword) — these
+// scan anywhere in a free-form sentence, since "reschedule my Tuesday thing"
+// is a realistic phrasing (unlike the anytime-cancel keyword, matched only
+// mid-flow against a short deliberate reply).
+const RESCHEDULE_INTENT_REGEX = /\breschedul\w*\b/i;
+const CANCEL_INTENT_REGEX = /\bcancel\b[^.!?]{0,30}\b(appointment|booking)\b/i;
+
+/** @returns {'cancel'|'reschedule'|null} */
+function detectManageIntent(text) {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (RESCHEDULE_INTENT_REGEX.test(trimmed)) return 'reschedule';
+  if (CANCEL_INTENT_REGEX.test(trimmed)) return 'cancel';
+  return null;
+}
+
+function manageConfirmMessage(config, channelType, action, lastBooking) {
+  const label = lastBooking.slot_label || 'upcoming';
+  const bookingId = lastBooking.booking_id;
+  if (action === 'cancel') {
+    const text = getMessengerString(config, channelType, 'manage_cancel_confirm', null) || `Your ${label} appointment — cancel it?`;
+    return {
+      kind: 'text', text,
+      quickReplies: [
+        { content_type: 'text', title: 'Yes, cancel it', payload: `PIC1:sched:mcancel:${bookingId}` },
+        { content_type: 'text', title: 'Never mind', payload: `PIC1:sched:mabort:${bookingId}` },
+      ],
+    };
+  }
+  const text = getMessengerString(config, channelType, 'manage_reschedule_confirm', null) || `Your ${label} appointment — want to reschedule it?`;
+  return {
+    kind: 'text', text,
+    quickReplies: [
+      { content_type: 'text', title: 'Yes, reschedule', payload: `PIC1:sched:mresched:${bookingId}` },
+      { content_type: 'text', title: 'Never mind', payload: `PIC1:sched:mabort:${bookingId}` },
+    ],
+  };
+}
+
+function manageMenuMessage(config, channelType, lastBooking) {
+  const label = lastBooking.slot_label || 'upcoming';
+  const bookingId = lastBooking.booking_id;
+  const text = getMessengerString(config, channelType, 'manage_menu', null) || `What would you like to do with your ${label} appointment?`;
+  return {
+    kind: 'text', text,
+    quickReplies: [
+      { content_type: 'text', title: 'Reschedule', payload: `PIC1:sched:mresched:${bookingId}` },
+      { content_type: 'text', title: 'Cancel', payload: `PIC1:sched:mcancel:${bookingId}` },
+    ],
+  };
+}
+
+/**
+ * Decide whether this turn is a manage-flow trigger, and which one. Called
+ * ONLY when no scheduling_session is already active (index.js's precedence).
+ * Never itself invokes anything — pure decision, zero side effects.
+ *
+ * @returns {{kind:'ask_cancel'|'ask_reschedule'|'ask_menu'|'abort_pending'
+ *            |'execute_cancel'|'execute_reschedule', bookingId?:string}|null}
+ */
+function resolveManageTrigger({ schedPayload, resumeSchedulingCta, rawText, lastBooking }) {
+  if (schedPayload) {
+    if (schedPayload.op === 'mcancel') return { kind: 'execute_cancel', bookingId: schedPayload.arg };
+    if (schedPayload.op === 'mresched') return { kind: 'execute_reschedule', bookingId: schedPayload.arg };
+    if (schedPayload.op === 'mabort') return { kind: 'abort_pending' };
+  }
+
+  if (lastBooking && lastBooking.pending_manage_action) {
+    if (formEngine.isConfirmKeyword(rawText)) {
+      return lastBooking.pending_manage_action === 'cancel'
+        ? { kind: 'execute_cancel', bookingId: lastBooking.booking_id }
+        : { kind: 'execute_reschedule', bookingId: lastBooking.booking_id };
+    }
+    if (formEngine.isCancelKeyword(rawText)) {
+      return { kind: 'abort_pending' };
+    }
+  }
+
+  if (resumeSchedulingCta) return { kind: 'ask_menu' };
+
+  const intent = detectManageIntent(rawText);
+  if (intent === 'cancel') return { kind: 'ask_cancel' };
+  if (intent === 'reschedule') return { kind: 'ask_reschedule' };
+
+  return null;
+}
+
+/**
+ * Execute the decision from resolveManageTrigger. Pure w.r.t. DDB (index.js
+ * performs the actual last_booking/scheduling_session writes per the
+ * returned `lastBookingWrite`/`startSession`) — mirrors the
+ * advance*SessionTurn wrapper split used for forms/book-scheduling.
+ *
+ * @returns {Promise<{messages: Array<object>, lastBookingWrite: ('delete'|{patch:object}|null),
+ *                     startSession: object|null}>}
+ */
+async function handleManageTrigger({ trigger, lastBooking, config, tenantId, sessionId, channelType, deps = {}, log }) {
+  const notFound = () => ({
+    messages: [{ kind: 'text', text: getMessengerString(config, channelType, 'manage_not_found', DEFAULT_MANAGE_NOT_FOUND), quickReplies: [] }],
+    lastBookingWrite: null,
+    startSession: null,
+  });
+
+  if (trigger.kind === 'ask_cancel' || trigger.kind === 'ask_reschedule') {
+    if (!lastBooking) return notFound();
+    const action = trigger.kind === 'ask_cancel' ? 'cancel' : 'reschedule';
+    return {
+      messages: [manageConfirmMessage(config, channelType, action, lastBooking)],
+      lastBookingWrite: { patch: { pending_manage_action: action } },
+      startSession: null,
+    };
+  }
+
+  if (trigger.kind === 'ask_menu') {
+    if (!lastBooking) return notFound();
+    return { messages: [manageMenuMessage(config, channelType, lastBooking)], lastBookingWrite: null, startSession: null };
+  }
+
+  if (trigger.kind === 'abort_pending') {
+    return {
+      messages: [{ kind: 'text', text: getMessengerString(config, channelType, 'manage_aborted', DEFAULT_MANAGE_ABORTED), quickReplies: [] }],
+      lastBookingWrite: { patch: { pending_manage_action: undefined } },
+      startSession: null,
+    };
+  }
+
+  // execute_cancel / execute_reschedule — re-verify the bookingId matches the
+  // CURRENTLY-tracked last_booking (defense: a stale tap/typed-confirm after
+  // a NEW booking replaced the row must never act on the wrong booking).
+  if (!lastBooking || lastBooking.booking_id !== trigger.bookingId) return notFound();
+
+  if (trigger.kind === 'execute_cancel') {
+    const result = await executeManageCancel({ lastBooking, tenantId, sessionId, deps, log });
+    const success = result.outcome === 'deleted' || result.outcome === 'pending_calendar_sync';
+    return { messages: result.messages, lastBookingWrite: success ? 'delete' : null, startSession: null };
+  }
+
+  // execute_reschedule: start the propose sub-flow — the mutate itself
+  // happens later, at slot-pick (handleManageReschedulePick above).
+  const begun = await beginManageReschedule({ lastBooking, tenantId, sessionId, config, channelType, deps, log });
+  return { messages: begun.messages, lastBookingWrite: null, startSession: begun.started ? begun.session : null };
 }
 
 /**
@@ -595,12 +1210,19 @@ async function advanceScheduling({ session, rawText, schedPayload, config, tenan
   // Universal cancel keyword/tap (any stage, mirrors formEngine's anytime-cancel).
   const isCancelTap = schedPayload && schedPayload.op === 'cancel';
   if (isCancelTap || (!schedPayload && formEngine.isCancelKeyword(rawText) && session.stage !== STAGE_CONFIRM)) {
-    return { session: null, messages: [{ kind: 'text', text: DEFAULT_SCHEDULING_CANCELLED, quickReplies: [] }] };
+    // M8b: a manage_reschedule session abandons only the RESCHEDULE ATTEMPT —
+    // the underlying booking is untouched; say so explicitly (never the
+    // book-flow text, which would misleadingly imply the booking itself was
+    // cancelled).
+    const abortText = session.mode === 'manage_reschedule' ? DEFAULT_MANAGE_RESCHEDULE_ABORTED : DEFAULT_SCHEDULING_CANCELLED;
+    return { session: null, messages: [{ kind: 'text', text: abortText, quickReplies: [] }] };
   }
 
   switch (session.stage) {
     case STAGE_PROPOSING:
-      return handleProposing({ session, schedPayload, rawText, log });
+      return session.mode === 'manage_reschedule'
+        ? handleManageReschedulePick({ session, schedPayload, rawText, tenantId, sessionId, deps, log })
+        : handleProposing({ session, schedPayload, rawText, log });
     case STAGE_CONTACT_EMAIL: {
       const consentLanguage = getMessengerString(config, session.channel, 'sms_consent', DEFAULT_SMS_CONSENT);
       return handleContactEmail({ session, rawText, consentLanguage });
@@ -641,9 +1263,35 @@ module.exports = {
   DEFAULT_BOOKED,
   DEFAULT_SCHEDULING_CANCELLED,
   DEFAULT_COMMIT_FAILED,
+  // M8b: last_booking row CRUD
+  loadLastBooking,
+  saveLastBooking,
+  deleteLastBooking,
+  patchLastBooking,
+  // M8b: manage (reschedule/cancel) entry + dispatch
+  resolveManageTrigger,
+  handleManageTrigger,
+  detectManageIntent,
+  // M8b: constants
+  STATE_TYPE_LAST_BOOKING,
+  LAST_BOOKING_TTL_SECONDS,
+  DEFAULT_MANAGE_NOT_FOUND,
+  DEFAULT_MANAGE_ABORTED,
+  DEFAULT_MANAGE_RESCHEDULE_ABORTED,
+  DEFAULT_MANAGE_MUTATE_FAILED,
+  DEFAULT_MANAGE_RESCHEDULED,
+  DEFAULT_SLOT_GONE_MANAGE,
   // internals exposed for unit tests
   buildSlotMessages,
   buildCommitPayload,
   confirmSummaryText,
   findChosenSlot,
+  buildLastBookingSnapshot,
+  buildMutatePayload,
+  projectBookingForMutate,
+  unmarshallBookingItem,
+  coordinatorIdOfProjection,
+  beginManageReschedule,
+  executeManageCancel,
+  handleManageReschedulePick,
 };
