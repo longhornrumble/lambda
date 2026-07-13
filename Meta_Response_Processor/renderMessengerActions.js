@@ -19,9 +19,12 @@
  *     config.ts:193/200) → quick reply (`PIC1:cta:{id}`); tapping it resolves
  *     via `resolveCtaPayload` below into `schedulingDriver.beginScheduling`
  *     (index.js wiring), mirroring the start_form precedent above.
- *     `resume_scheduling` is OUT OF SCOPE for M8a (scheduling: manage/M8b) —
- *     falls to the unmapped-action logged skip below, same as any other
- *     unhandled action type.
+ *   resume_scheduling (M8b — scheduling: manage; config.ts:194) → quick
+ *     reply (`PIC1:cta:{id}`), same shape as start_scheduling. Tapping it
+ *     resolves via `resolveCtaPayload` below into an ambiguous manage-menu
+ *     prompt (schedulingDriver.resolveManageTrigger's `ask_menu` — the CTA
+ *     itself doesn't say cancel vs reschedule, so the bot asks) when a
+ *     last_booking (C4) is found; index.js wiring, mirrors start_scheduling.
  *
  * Caps from C5 (capabilities.js): QR ≤13, titles truncated to 20 chars,
  * buttons ≤3 (overflow logged, V5 order wins).
@@ -104,6 +107,17 @@ function renderMessengerActions(actionIds, config, log) {
           payload: `PIC1:cta:${id}`,
         });
         break;
+      case 'resume_scheduling':
+        // M8b: same posture as start_scheduling — always a quick reply, no
+        // link-out override. A tap resolves via resolveCtaPayload (below)
+        // into the manage-menu entry (index.js wiring) when scheduling is
+        // enabled; otherwise falls back to RAG on the CTA label.
+        quickReplies.push({
+          content_type: 'text',
+          title: truncateTitle(cta.label || cta.text || id),
+          payload: `PIC1:cta:${id}`,
+        });
+        break;
       default:
         log('INFO', 'CTA skipped — unmapped action type for Messenger rendering', {
           ctaId: id,
@@ -153,7 +167,13 @@ function renderMessengerActions(actionIds, config, log) {
  * pre-M8a behavior (RAG on the CTA label), same posture as an unresolvable
  * start_form.
  *
- * @returns {{ turnText: string, ctaId: string, startFormId?: string, startScheduling?: boolean } | null}
+ * M8b addition: a `resume_scheduling` CTA returns `resumeScheduling: true` —
+ * the caller (index.js) checks for a last_booking (C4) and, when found,
+ * shows the manage menu (schedulingDriver's `ask_menu` trigger) instead of a
+ * RAG turn; otherwise falls back to the pre-M8b behavior (RAG on the CTA
+ * label), same posture as an unresolvable start_form/start_scheduling.
+ *
+ * @returns {{ turnText: string, ctaId: string, startFormId?: string, startScheduling?: boolean, resumeScheduling?: boolean } | null}
  */
 function resolveCtaPayload(payload, config) {
   if (typeof payload !== 'string' || !payload.startsWith('PIC1:cta:')) return null;
@@ -175,6 +195,8 @@ function resolveCtaPayload(payload, config) {
     }
     case 'start_scheduling':
       return { turnText: cta.label || ctaId, ctaId, startScheduling: true };
+    case 'resume_scheduling':
+      return { turnText: cta.label || ctaId, ctaId, resumeScheduling: true };
     default:
       // Commitment CTAs render as URL buttons (no postback round-trip); a
       // PIC1:cta payload for one is unexpected — answer about it via RAG.

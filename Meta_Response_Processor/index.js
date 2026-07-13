@@ -1632,7 +1632,14 @@ exports.handler = async function handler(event) {
     config?.feature_flags?.scheduling_enabled === true &&
     !!CONVERSATION_STATE_TABLE &&
     !!BOOKING_COMMIT_FUNCTION;
-  const schedulingInvokeDeps = { invokeProposal: invokeBookingExecutor, invokeCommit: invokeBookingExecutor };
+  // M8b: scheduling_mutate (reschedule/cancel) dispatches on the SAME BCH
+  // function via its own `action` field (Booking_Commit_Handler/index.js:606),
+  // exactly like propose/commit above — one invoke helper covers all three.
+  const schedulingInvokeDeps = {
+    invokeProposal: invokeBookingExecutor,
+    invokeCommit: invokeBookingExecutor,
+    invokeMutate: invokeBookingExecutor,
+  };
 
   // ── M6a: pause check — a prior escalation left the bot standing down for
   // this conversation while staff owns the thread (C4 pause row). Flag off
@@ -2429,6 +2436,31 @@ exports.handler = async function handler(event) {
       } catch (delErr) {
         log('WARN', 'Scheduling session delete failed', { sessionId: lockSessionId, error: delErr.message });
       }
+      // M8b: a successful commit hands back a bookingSnapshot (M8a's
+      // commitAndRecordConsent) — persist the C4-additive last_booking row
+      // so the manage flow can find it later. Best-effort: a write failure
+      // must never affect the booking confirmation already built above.
+      if (result.bookingSnapshot) {
+        try {
+          await schedulingDriver.saveLastBooking({
+            client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId: lockSessionId,
+            ...result.bookingSnapshot,
+          });
+        } catch (lbErr) {
+          log('WARN', 'last_booking save failed (manage flow will not find this booking)', {
+            sessionId: lockSessionId, error: lbErr.message,
+          });
+        }
+      }
+      // M8b: a manage_reschedule session's successful mutate returns
+      // lastBookingWrite (a slot_label patch — booking_id is unchanged).
+      if (result.lastBookingWrite) {
+        try {
+          await applyLastBookingWrite(result.lastBookingWrite, lockSessionId);
+        } catch (lbErr) {
+          log('WARN', 'last_booking update failed after scheduling turn', { sessionId: lockSessionId, error: lbErr.message });
+        }
+      }
       log('INFO', 'Scheduling session ended', {
         sessionId: lockSessionId,
         committed: !!result.committed,
@@ -2444,6 +2476,20 @@ exports.handler = async function handler(event) {
     }
 
     return { session: result.session, messages: result.messages, pendingSave: result.session };
+  }
+
+  /** M8b: apply a last_booking side-effect returned by the scheduling driver
+   * (either the manage-trigger dispatch or advanceSchedulingSessionTurn
+   * above) — 'delete' (cancel succeeded) or {patch:{...}} (pending-action
+   * set/cleared, or a post-reschedule slot_label refresh). */
+  async function applyLastBookingWrite(write, sessionId) {
+    if (write === 'delete') {
+      await schedulingDriver.deleteLastBooking({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId });
+      return;
+    }
+    if (write && write.patch) {
+      await schedulingDriver.patchLastBooking({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId, patch: write.patch, log });
+    }
   }
 
   function firstSchedulingText(messages, fallback) {
@@ -2764,6 +2810,94 @@ exports.handler = async function handler(event) {
     const schedStartDurationMs = Date.now() - startTime;
     log('INFO', 'Handler complete (scheduling started)', { pageId, psid, durationMs: schedStartDurationMs });
     return;
+  }
+
+  // ── M8b: scheduling manage (reschedule/cancel) — plan §6 M8b,
+  // schedulingDriver.js's M8b doc block. Reached only when NO active
+  // scheduling_session/form_session claimed the turn (both resolved to null
+  // above) — mirrors the M8a/M7a precedence exactly. Gated identically to
+  // M8a (schedulingEnabled — flag off ⇒ zero manage machinery, no GetItem).
+  if (schedulingEnabled) {
+    let lastBooking = null;
+    try {
+      lastBooking = await schedulingDriver.loadLastBooking({
+        client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId: lockSessionId, log,
+      });
+    } catch (lbErr) {
+      log('WARN', 'last_booking lookup failed — proceeding without manage routing (fail-open)', {
+        sessionId: lockSessionId, error: lbErr.message,
+      });
+    }
+
+    // mcancel/mresched/mabort taps arrive as PIC1:sched:* (pic1Payload,
+    // already resolved in 0b2 above); resume_scheduling arrives as a
+    // PIC1:cta:* payload resolved via resolveCtaPayload's `resumeScheduling`
+    // flag (0b2's pic1Payload/resolved handling above did NOT act on it —
+    // only startFormId/startScheduling are consumed there).
+    const manageSchedPayload = pic1Payload ? schedulingDriver.parseSchedPayload(pic1Payload) : null;
+    const resumeSchedulingCta = !!(pic1Payload && resolveCtaPayload(pic1Payload, config)?.resumeScheduling);
+    const manageTrigger = schedulingDriver.resolveManageTrigger({
+      schedPayload:
+        manageSchedPayload && ['mcancel', 'mresched', 'mabort'].includes(manageSchedPayload.op)
+          ? manageSchedPayload
+          : null,
+      resumeSchedulingCta,
+      rawText: sanitizedInput,
+      lastBooking,
+    });
+
+    if (manageTrigger) {
+      const manageOutcome = await schedulingDriver.handleManageTrigger({
+        trigger: manageTrigger,
+        lastBooking,
+        config,
+        tenantId,
+        sessionId: lockSessionId,
+        channelType,
+        deps: schedulingInvokeDeps,
+        log,
+      });
+
+      try {
+        await sendSchedulingMessages(pageId, psid, manageOutcome.messages, pageAccessToken, channelType);
+      } catch (sendErr) {
+        log('ERROR', 'Failed to deliver manage message — will retry', { sessionId: lockSessionId, error: sendErr.message });
+        throw sendErr;
+      }
+
+      if (manageOutcome.startSession) {
+        try {
+          await schedulingDriver.saveSchedulingSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: manageOutcome.startSession });
+        } catch (saveErr) {
+          log('ERROR', 'Failed to persist new manage-reschedule session', { sessionId: lockSessionId, error: saveErr.message });
+        }
+      } else if (manageOutcome.lastBookingWrite) {
+        try {
+          await applyLastBookingWrite(manageOutcome.lastBookingWrite, lockSessionId);
+        } catch (lbErr) {
+          log('WARN', 'last_booking update failed after manage turn', { sessionId: lockSessionId, error: lbErr.message });
+        }
+      }
+
+      try {
+        await storeConversationContext(pageId, psid, sanitizedInput, firstSchedulingText(manageOutcome.messages, '[scheduling]'), messageMid);
+      } catch (storeErr) {
+        log('WARN', 'Failed to store manage-turn context', { sessionId: lockSessionId, error: storeErr.message });
+      }
+      try {
+        await updateLastUserMessageAt(pageId, channelType);
+      } catch (updateErr) {
+        log('WARN', 'Failed to update lastUserMessageAt after manage turn', { pageId, channelType, error: updateErr.message });
+      }
+
+      await finalizeConversationLock(runTurn, {
+        schedulingState: manageOutcome.startSession ? { active: true, session: manageOutcome.startSession } : null,
+      });
+
+      const manageDurationMs = Date.now() - startTime;
+      log('INFO', 'Handler complete (manage turn)', { pageId, psid, durationMs: manageDurationMs });
+      return;
+    }
   }
 
   // ── 0c. Postback handling ────────────────────────────────────────────────

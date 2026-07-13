@@ -4331,4 +4331,497 @@ describe('M8a — scheduling: book', () => {
     const commitInvokes = seInvokePayloads().filter((p) => p.action !== 'scheduling_propose');
     expect(commitInvokes).toHaveLength(1); // exactly ONE commit — the drained duplicate fell through to RAG, not a second commit
   });
+
+  test('M8b: a successful commit persists a last_booking row (C4-additive) — booking_id, slot_label, coordinator_id, PII-minimized booking projection', async () => {
+    seWireInvoke({
+      commitResult: {
+        status: 'BOOKED', bookingId: 'bk_snapshot_1', resourceId: 'r1',
+        booking: {
+          tenantId: { S: 'TENANT_SCHED' },
+          booking_id: { S: 'bk_snapshot_1' },
+          coordinator_email: { S: 'coord@example.com' },
+          resource_id: { S: 'r1' },
+          attendee_email: { S: 'jane@example.com' },
+          appointment_type_name: { S: 'Consult' },
+          timezone: { S: 'America/Los_Angeles' },
+        },
+      },
+    });
+    seSetActiveSession({
+      stage: 'confirm',
+      contact: { email: 'jane@example.com' },
+      selected_slot: { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] },
+    });
+    await seHandler(seBuildEvent({ messageText: 'confirm', quickReplyPayload: 'PIC1:sched:confirm' }));
+
+    const puts = seDdbMock.commandCalls(sePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'last_booking');
+    expect(puts).toHaveLength(1);
+    const row = puts[0].args[0].input.Item;
+    expect(row.booking_id).toBe('bk_snapshot_1');
+    expect(row.slot_label).toBe('Sat, Aug 1 · 10:00 AM');
+    expect(row.appointment_type_id).toBe('consult');
+    expect(row.coordinator_id).toBe('r1'); // resource_id precedence over coordinator_email
+    expect(row.booking).toMatchObject({
+      tenantId: 'TENANT_SCHED', booking_id: 'bk_snapshot_1', coordinator_email: 'coord@example.com',
+      attendee_email: 'jane@example.com',
+    });
+    expect(typeof row.expires_at).toBe('number');
+  });
+});
+
+// ─── M8b — scheduling: manage (reschedule/cancel of a past booking) — own
+// isolated module instance, same harness shape as M8a above, plus a
+// last_booking (C4) row + BCH scheduling_mutate wiring. ─────────────────────
+describe('M8b — scheduling: manage', () => {
+  const SM_TABLE = 'picasso-conversation-state-test-manage';
+  const SM_SESSION_ID = 'meta:PAGE_MANAGE:PSID_MANAGE';
+  let smHandler;
+  let smDdbMock, smKmsMock, smBedrockMock, smSqsMock, smSesMock, smLambdaMock, smRawDdbMock;
+  let smLoadConfig, smRetrieveKB;
+  let smGetCommand, smPutCommand, smQueryCommand, smUpdateCommand, smDeleteCommand;
+  let smDecryptCommand, smInvokeCommand, smSendMessageCommand, smPutItemCommand;
+
+  beforeAll(() => {
+    jest.isolateModules(() => {
+      process.env.CONVERSATION_STATE_TABLE = SM_TABLE;
+      process.env.BOOKING_COMMIT_FUNCTION = 'Booking_Commit_Handler';
+
+      jest.doMock('../shared/bedrock-core', () => ({
+        loadConfig: jest.fn(),
+        retrieveKB: jest.fn(),
+        sanitizeUserInput: jest.fn((t) => t?.trim() || ''),
+      }));
+
+      const mc = mockClient;
+      const ddbLib = require('@aws-sdk/lib-dynamodb');
+      const rawDdbLib = require('@aws-sdk/client-dynamodb');
+      const kmsLib = require('@aws-sdk/client-kms');
+      const bedrockLib = require('@aws-sdk/client-bedrock-runtime');
+      const sqsLib = require('@aws-sdk/client-sqs');
+      const sesLib = require('@aws-sdk/client-ses');
+      const lambdaLib = require('@aws-sdk/client-lambda');
+
+      smGetCommand = ddbLib.GetCommand;
+      smPutCommand = ddbLib.PutCommand;
+      smQueryCommand = ddbLib.QueryCommand;
+      smUpdateCommand = ddbLib.UpdateCommand;
+      smDeleteCommand = ddbLib.DeleteCommand;
+      smDecryptCommand = kmsLib.DecryptCommand;
+      smInvokeCommand = lambdaLib.InvokeCommand;
+      smSendMessageCommand = sqsLib.SendMessageCommand;
+      smPutItemCommand = rawDdbLib.PutItemCommand;
+
+      smDdbMock = mc(ddbLib.DynamoDBDocumentClient);
+      smRawDdbMock = mc(rawDdbLib.DynamoDBClient);
+      smKmsMock = mc(kmsLib.KMSClient);
+      smBedrockMock = mc(bedrockLib.BedrockRuntimeClient);
+      smSqsMock = mc(sqsLib.SQSClient);
+      smSesMock = mc(sesLib.SESClient);
+      smLambdaMock = mc(lambdaLib.LambdaClient);
+
+      const bc = require('../shared/bedrock-core');
+      smLoadConfig = bc.loadConfig;
+      smRetrieveKB = bc.retrieveKB;
+
+      smHandler = require('./index').handler;
+    });
+  });
+
+  afterAll(() => {
+    delete process.env.CONVERSATION_STATE_TABLE;
+    delete process.env.BOOKING_COMMIT_FUNCTION;
+  });
+
+  const SM_CFG_BASE = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'Helpful.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true, scheduling_enabled: true },
+    cta_definitions: {
+      manage_cta: { label: 'Manage my appointment', action: 'resume_scheduling', type: 'scheduling_trigger', ai_available: true },
+    },
+    scheduling: {
+      appointment_types: {
+        consult: { name: 'Consult', timezone: 'America/Los_Angeles', conference_type: 'google_meet' },
+      },
+    },
+  };
+
+  function smChannelMappingItem(pageId) {
+    return {
+      Item: {
+        PK: `PAGE#${pageId}`,
+        SK: 'CHANNEL#messenger',
+        encryptedPageToken: Buffer.from('encrypted-blob').toString('base64'),
+        tenantId: 'TENANT_MANAGE',
+      },
+    };
+  }
+
+  function smProposeResult(overrides = {}) {
+    return {
+      outcome: 'ok',
+      poolSize: 3,
+      slots: [
+        { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] },
+      ],
+      context: { duration_minutes: 30, conference_type: 'google_meet', conference_label: 'Google Meet', tz_label: 'PDT' },
+      ...overrides,
+    };
+  }
+
+  function smBufferPayload(obj) {
+    return Buffer.from(JSON.stringify(obj));
+  }
+
+  /** Wires ONE Lambda invoke mock to answer propose vs. mutate vs. (unused)
+   * commit differently, dispatched on the payload's own `action` field. */
+  function smWireInvoke({ proposeResult, mutateResult } = {}) {
+    smLambdaMock.on(smInvokeCommand).callsFake((input) => {
+      const body = JSON.parse(Buffer.from(input.Payload).toString('utf-8'));
+      if (body.action === 'scheduling_propose') {
+        return { Payload: smBufferPayload(proposeResult ?? smProposeResult()) };
+      }
+      if (body.action === 'scheduling_mutate') {
+        return { Payload: smBufferPayload(mutateResult ?? { outcome: 'success' }) };
+      }
+      return { Payload: smBufferPayload({ status: 'BOOKED', bookingId: 'bk_default' }) };
+    });
+  }
+
+  beforeEach(() => {
+    smDdbMock.reset();
+    smRawDdbMock.reset();
+    smKmsMock.reset();
+    smBedrockMock.reset();
+    smSqsMock.reset();
+    smSesMock.reset();
+    smLambdaMock.reset();
+
+    smLoadConfig.mockResolvedValue(SM_CFG_BASE);
+    smRetrieveKB.mockResolvedValue('KB context.');
+
+    smSqsMock.on(smSendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
+    smKmsMock.on(smDecryptCommand).resolves({ Plaintext: Buffer.from('EAABtest_page_token') });
+    smRawDdbMock.on(smPutItemCommand).resolves({});
+    smDdbMock.on(smQueryCommand).resolves({ Items: [] });
+    smDdbMock.on(smPutCommand).resolves({});
+    smDdbMock.on(smUpdateCommand).resolves({ Attributes: {} });
+    smDdbMock.on(smDeleteCommand).resolves({});
+    smDdbMock
+      .on(smGetCommand, { Key: { PK: 'PAGE#PAGE_MANAGE', SK: 'CHANNEL#messenger' } })
+      .resolves(smChannelMappingItem('PAGE_MANAGE'));
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'pause' } }).resolves({});
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'scheduling_session' } }).resolves({});
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'form_session' } }).resolves({});
+    // No last_booking by default — individual tests override via smSetLastBooking.
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'last_booking' } }).resolves({});
+
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.test' }) });
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+  });
+
+  function smBuildEvent(overrides = {}) {
+    return {
+      psid: 'PSID_MANAGE',
+      messageText: 'Hello',
+      pageId: 'PAGE_MANAGE',
+      tenantId: 'TENANT_MANAGE',
+      tenantHash: 'def456defabc123def',
+      channelType: 'messenger',
+      messageMid: 'm_test_mid',
+      ...overrides,
+    };
+  }
+
+  function smLastBookingRow(overrides = {}) {
+    const now = Date.now();
+    return {
+      sessionId: SM_SESSION_ID,
+      stateType: 'last_booking',
+      booking_id: 'bk_existing_1',
+      slot_label: 'Sat, Aug 1 · 10:00 AM',
+      appointment_type_id: 'consult',
+      coordinator_id: 'coord@example.com',
+      booking: {
+        tenantId: 'TENANT_MANAGE', booking_id: 'bk_existing_1', coordinator_email: 'coord@example.com',
+        attendee_email: 'jane@example.com', appointment_type_name: 'Consult', timezone: 'America/Los_Angeles',
+      },
+      channel: 'messenger',
+      updated_at: now,
+      expires_at: Math.floor(now / 1000) + 7 * 24 * 60 * 60,
+      schema_version: 1,
+      ...overrides,
+    };
+  }
+
+  function smSetLastBooking(overrides = {}) {
+    smDdbMock
+      .on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'last_booking' } })
+      .resolves({ Item: smLastBookingRow(overrides) });
+  }
+
+  function smSchedulingSessionRow(overrides = {}) {
+    const now = Date.now();
+    return {
+      sessionId: SM_SESSION_ID,
+      stateType: 'scheduling_session',
+      mode: 'manage_reschedule',
+      booking_id: 'bk_existing_1',
+      coordinator_id: 'coord@example.com',
+      booking: smLastBookingRow().booking,
+      appointment_type_id: 'consult',
+      stage: 'proposing',
+      candidate_slots: [
+        { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] },
+      ],
+      channel: 'messenger',
+      started_at: now,
+      updated_at: now,
+      schema_version: 1,
+      expires_at: Math.floor(now / 1000) + 3600,
+      ...overrides,
+    };
+  }
+
+  function smSetActiveSchedulingSession(overrides = {}) {
+    smDdbMock
+      .on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'scheduling_session' } })
+      .resolves({ Item: smSchedulingSessionRow(overrides) });
+  }
+
+  function smSentTexts() {
+    return global.fetch.mock.calls
+      .map(([, opts]) => JSON.parse(opts.body)?.message)
+      .filter(Boolean);
+  }
+
+  function smInvokePayloads() {
+    return smLambdaMock.commandCalls(smInvokeCommand).map((c) => JSON.parse(Buffer.from(c.args[0].input.Payload).toString('utf-8')));
+  }
+
+  function smLastLastBookingPut() {
+    const puts = smDdbMock.commandCalls(smPutCommand).filter((c) => c.args[0].input.Item?.stateType === 'last_booking');
+    return puts.length ? puts[puts.length - 1].args[0].input.Item : undefined;
+  }
+
+  function smLastSchedulingSessionPut() {
+    const puts = smDdbMock.commandCalls(smPutCommand).filter((c) => c.args[0].input.Item?.stateType === 'scheduling_session');
+    return puts.length ? puts[puts.length - 1].args[0].input.Item : undefined;
+  }
+
+  test('cancel E2E: typed intent -> explicit confirm tap -> pinned mutate payload -> row deleted + confirmation string', async () => {
+    smSetLastBooking({});
+    smWireInvoke({ mutateResult: { outcome: 'deleted' } });
+
+    // Turn 1: free-text cancel intent. ZERO invokes; a pending_manage_action patch only.
+    await smHandler(smBuildEvent({ messageText: 'I need to cancel my appointment' }));
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    let sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /cancel it\?/i.test(m.text))).toBe(true);
+    const pendingPatch = smLastLastBookingPut();
+    expect(pendingPatch.pending_manage_action).toBe('cancel');
+    expect(pendingPatch.booking_id).toBe('bk_existing_1'); // link preserved, not touched otherwise
+
+    // Turn 2: explicit confirmation tap — the QR payload carries the bookingId.
+    smSetLastBooking({ pending_manage_action: 'cancel' });
+    await smHandler(smBuildEvent({ messageText: 'Yes, cancel it', quickReplyPayload: 'PIC1:sched:mcancel:bk_existing_1' }));
+
+    const mutateCalls = smInvokePayloads().filter((p) => p.action === 'scheduling_mutate');
+    expect(mutateCalls).toHaveLength(1);
+    expect(mutateCalls[0]).toEqual({
+      action: 'scheduling_mutate',
+      mutation: 'cancel',
+      tenantId: 'TENANT_MANAGE',
+      coordinatorId: 'coord@example.com',
+      booking: smLastBookingRow().booking,
+    });
+
+    const deletes = smDdbMock.commandCalls(smDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'last_booking');
+    expect(deletes).toHaveLength(1);
+    sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /cancelled your/i.test(m.text))).toBe(true);
+  });
+
+  test('reschedule E2E: confirm -> re-propose (reuses M8a scheduling_propose) -> carousel -> slot pick -> pinned mutate-with-newSlot shape -> last_booking slot_label patched', async () => {
+    smSetLastBooking({});
+    smWireInvoke({ proposeResult: smProposeResult(), mutateResult: { outcome: 'success' } });
+
+    // Turn 1: intent -> confirm prompt. ZERO invokes.
+    await smHandler(smBuildEvent({ messageText: 'I want to reschedule' }));
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    let sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /reschedule it\?/i.test(m.text))).toBe(true);
+
+    // Turn 2: explicit confirm tap -> re-propose + carousel; a NEW manage_reschedule session.
+    smSetLastBooking({ pending_manage_action: 'reschedule' });
+    await smHandler(smBuildEvent({ messageText: 'Yes, reschedule', quickReplyPayload: 'PIC1:sched:mresched:bk_existing_1' }));
+
+    const proposeCalls = smInvokePayloads().filter((p) => p.action === 'scheduling_propose');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]).toMatchObject({ action: 'scheduling_propose', tenantId: 'TENANT_MANAGE', appointmentTypeId: 'consult' });
+
+    const savedSession = smLastSchedulingSessionPut();
+    expect(savedSession.mode).toBe('manage_reschedule');
+    expect(savedSession.stage).toBe('proposing');
+    expect(savedSession.booking_id).toBe('bk_existing_1');
+
+    sent = smSentTexts();
+    const carouselMsg = sent.find((m) => m.attachment?.payload?.template_type === 'generic');
+    expect(carouselMsg).toBeDefined();
+
+    // Turn 3: slot pick (via the SAME scheduling_session mechanism M8a already
+    // routes through) -> mutate reschedule with the new slot.
+    smSetActiveSchedulingSession(savedSession);
+    await smHandler(smBuildEvent({ messageText: 'Pick this time', quickReplyPayload: 'PIC1:sched:slot:slot#1' }));
+
+    const mutateCalls = smInvokePayloads().filter((p) => p.action === 'scheduling_mutate');
+    expect(mutateCalls).toHaveLength(1);
+    expect(mutateCalls[0]).toEqual({
+      action: 'scheduling_mutate',
+      mutation: 'reschedule',
+      tenantId: 'TENANT_MANAGE',
+      coordinatorId: 'coord@example.com',
+      booking: smLastBookingRow().booking,
+      newSlot: { start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z' },
+    });
+
+    const lbPatch = smLastLastBookingPut();
+    expect(lbPatch.slot_label).toBe('Sat, Aug 1 · 10:00 AM');
+    expect(lbPatch.booking_id).toBe('bk_existing_1'); // unchanged — same booking, moved
+
+    sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /rescheduled/i.test(m.text))).toBe(true);
+  });
+
+  test('no last_booking (never booked, or already used) -> graceful decline, ZERO invokes', async () => {
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'last_booking' } }).resolves({});
+    await smHandler(smBuildEvent({ messageText: 'cancel my appointment' }));
+
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    const sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /couldn.t find/i.test(m.text))).toBe(true);
+  });
+
+  test('manage intent alone, without confirmation, never invokes propose/mutate (structural, not just convention)', async () => {
+    smSetLastBooking({});
+    await smHandler(smBuildEvent({ messageText: 'reschedule' }));
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+
+    smDdbMock.reset();
+    smLambdaMock.reset();
+    smLoadConfig.mockResolvedValue(SM_CFG_BASE);
+    smKmsMock.on(smDecryptCommand).resolves({ Plaintext: Buffer.from('EAABtest_page_token') });
+    smDdbMock.on(smQueryCommand).resolves({ Items: [] });
+    smDdbMock.on(smPutCommand).resolves({});
+    smDdbMock.on(smGetCommand, { Key: { PK: 'PAGE#PAGE_MANAGE', SK: 'CHANNEL#messenger' } }).resolves(smChannelMappingItem('PAGE_MANAGE'));
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'pause' } }).resolves({});
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'scheduling_session' } }).resolves({});
+    smDdbMock.on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'form_session' } }).resolves({});
+    smSetLastBooking({});
+    await smHandler(smBuildEvent({ messageText: 'cancel my appointment' }));
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+  });
+
+  test('C9 — typed-only cancel flow (no taps at all): "cancel my booking" -> "yes"', async () => {
+    smSetLastBooking({});
+    smWireInvoke({ mutateResult: { outcome: 'deleted' } });
+
+    await smHandler(smBuildEvent({ messageText: 'cancel my booking' }));
+    smSetLastBooking({ pending_manage_action: 'cancel' });
+    await smHandler(smBuildEvent({ messageText: 'yes' }));
+
+    const mutateCalls = smInvokePayloads().filter((p) => p.action === 'scheduling_mutate');
+    expect(mutateCalls).toHaveLength(1);
+    expect(mutateCalls[0].mutation).toBe('cancel');
+  });
+
+  test("T2' — expired last_booking is treated as absent (best-effort deleted); manage intent gets a graceful decline, ZERO invokes", async () => {
+    smDdbMock
+      .on(smGetCommand, { Key: { sessionId: SM_SESSION_ID, stateType: 'last_booking' } })
+      .resolves({ Item: smLastBookingRow({ expires_at: Math.floor(Date.now() / 1000) - 10 }) });
+
+    await smHandler(smBuildEvent({ messageText: 'cancel my appointment' }));
+
+    const deletes = smDdbMock.commandCalls(smDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'last_booking');
+    expect(deletes.length).toBeGreaterThanOrEqual(1);
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    const sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /couldn.t find/i.test(m.text))).toBe(true);
+  });
+
+  test('escalation intent wins over a manage-intent phrase — no manage routing, no last_booking read, no invokes', async () => {
+    smSetLastBooking({});
+    smLoadConfig.mockResolvedValue({ ...SM_CFG_BASE, messenger_behavior: { escalation_email: '' } });
+    await smHandler(smBuildEvent({ messageText: 'I want to talk to a person please' }));
+
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    const lastBookingGets = smDdbMock.commandCalls(smGetCommand).filter((c) => c.args[0].input.Key?.stateType === 'last_booking');
+    expect(lastBookingGets).toHaveLength(0);
+    const sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /connecting you with a person/i.test(m.text))).toBe(true);
+  });
+
+  test('mutate failure (BCH returns failed) -> apologize, last_booking row kept COMPLETELY untouched (no delete, no patch)', async () => {
+    smSetLastBooking({ pending_manage_action: 'cancel' });
+    smWireInvoke({ mutateResult: { outcome: 'failed', error: 'executor_error' } });
+
+    await smHandler(smBuildEvent({ messageText: 'yes' }));
+
+    const sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /something went wrong/i.test(m.text))).toBe(true);
+    const deletes = smDdbMock.commandCalls(smDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'last_booking');
+    expect(deletes).toHaveLength(0);
+    const patches = smDdbMock.commandCalls(smPutCommand).filter((c) => c.args[0].input.Item?.stateType === 'last_booking');
+    expect(patches).toHaveLength(0);
+  });
+
+  test('scheduling_enabled flag OFF -> manage intent never routes: zero invokes, zero last_booking reads', async () => {
+    smLoadConfig.mockResolvedValue({ ...SM_CFG_BASE, feature_flags: { MESSENGER_CHANNEL: true, scheduling_enabled: false } });
+    await smHandler(smBuildEvent({ messageText: 'cancel my appointment' }));
+
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    const lastBookingGets = smDdbMock.commandCalls(smGetCommand).filter((c) => c.args[0].input.Key?.stateType === 'last_booking');
+    expect(lastBookingGets).toHaveLength(0);
+  });
+
+  test('mabort ("Never mind" tap) aborts a pending confirm — no invoke, pending_manage_action cleared, booking link preserved', async () => {
+    smSetLastBooking({ pending_manage_action: 'cancel' });
+    await smHandler(smBuildEvent({ messageText: 'Never mind', quickReplyPayload: 'PIC1:sched:mabort:bk_existing_1' }));
+
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    const patch = smLastLastBookingPut();
+    expect(patch.pending_manage_action).toBeUndefined();
+    expect(patch.booking_id).toBe('bk_existing_1');
+    const sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /left your appointment/i.test(m.text))).toBe(true);
+  });
+
+  test('resume_scheduling CTA tap shows an ambiguous menu (found booking) -> a menu QR tap executes cancel directly', async () => {
+    smSetLastBooking({});
+    smWireInvoke({ mutateResult: { outcome: 'deleted' } });
+
+    await smHandler(smBuildEvent({ messageText: 'Manage my appointment', quickReplyPayload: 'PIC1:cta:manage_cta', isPostback: false }));
+    let sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /what would you like to do/i.test(m.text))).toBe(true);
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0); // the menu alone never invokes
+
+    smSetLastBooking({});
+    await smHandler(smBuildEvent({ messageText: 'Cancel', quickReplyPayload: 'PIC1:sched:mcancel:bk_existing_1' }));
+    const mutateCalls = smInvokePayloads().filter((p) => p.action === 'scheduling_mutate');
+    expect(mutateCalls).toHaveLength(1);
+    expect(mutateCalls[0].mutation).toBe('cancel');
+  });
+
+  test('stale mcancel tap whose bookingId no longer matches last_booking -> not-found, ZERO invokes (defense-in-depth)', async () => {
+    smSetLastBooking({ booking_id: 'bk_NEW_replacement' });
+    await smHandler(smBuildEvent({ messageText: 'Yes, cancel it', quickReplyPayload: 'PIC1:sched:mcancel:bk_STALE_old' }));
+
+    expect(smLambdaMock.commandCalls(smInvokeCommand)).toHaveLength(0);
+    const sent = smSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /couldn.t find/i.test(m.text))).toBe(true);
+  });
 });
