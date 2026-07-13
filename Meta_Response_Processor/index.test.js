@@ -355,6 +355,30 @@ describe('Meta_Response_Processor handler', () => {
     });
   });
 
+  describe('Instagram send path', () => {
+    test('IG replies use graph.facebook.com /me/messages with the Page token (no Bearer)', async () => {
+      // Instagram Messaging via Messenger Platform sends through the SAME
+      // Facebook Send API as Messenger. graph.instagram.com would need an
+      // Instagram-Login user token we don't hold (live 401, 2026-07-12).
+      fetchMock = makeFetchMock([
+        // Typing indicator is skipped for instagram — first call IS the send.
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.ig' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ channelType: 'instagram', pageId: 'IG_ACCT_999' }));
+
+      const sendCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('/messages'));
+      expect(sendCalls.length).toBe(1);
+      const [url, options] = sendCalls[0];
+      expect(url).toMatch(/^https:\/\/graph\.facebook\.com\/v[\d.]+\/me\/messages$/);
+      expect(options.headers.Authorization).toBeUndefined();
+      const body = JSON.parse(options.body);
+      expect(body.access_token).toBe(PLAINTEXT_TOKEN);
+      expect(body.recipient.id).toBe('PSID_123');
+    });
+  });
+
   describe('Error handling — Meta Send API', () => {
     test('retries on 5xx and succeeds on second attempt (typing indicator path)', async () => {
       // callMetaSendApi (used for the typing indicator) retries on 5xx.
