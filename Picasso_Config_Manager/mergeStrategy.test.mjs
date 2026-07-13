@@ -31,18 +31,18 @@ import {
 // EDITABLE_SECTIONS allowlist — the list every other behavior keys off.
 // ---------------------------------------------------------------------------
 
-test('getSectionInfo pins the current section categorization (19 editable, card_inventory read-only)', () => {
+test('getSectionInfo pins the current section categorization (20 editable, card_inventory read-only)', () => {
   const info = getSectionInfo();
-  // 19 entries today. T2a adds `messenger_behavior` → this becomes 20 and is
-  // the assertion T2a intentionally updates.
-  assert.equal(info.editable.length, 19);
+  // 20 entries: the original 19 + messenger_behavior (added by T2a).
+  assert.equal(info.editable.length, 20);
   assert.ok(info.editable.includes('feature_flags'));
   assert.ok(info.editable.includes('notification_settings'));
+  assert.ok(info.editable.includes('messenger_behavior'));
   assert.deepEqual(info.readOnly, ['card_inventory']);
 });
 
-test('messenger_behavior is NOT an editable section today (Landmine 2 — T2a fixes this)', () => {
-  assert.equal(isEditableSection('messenger_behavior'), false);
+test('messenger_behavior IS an editable section (T2a)', () => {
+  assert.equal(isEditableSection('messenger_behavior'), true);
   assert.equal(isEditableSection('feature_flags'), true);
   assert.equal(isReadOnlySection('card_inventory'), true);
   assert.equal(isReadOnlySection('feature_flags'), false);
@@ -68,15 +68,35 @@ test('mergeConfigSections does WHOLESALE-REPLACE per section — a partial send 
   assert.equal('MESSENGER_CHANNEL' in merged.feature_flags, false);
 });
 
-test('mergeConfigSections SILENTLY DROPS an unknown/unlisted section (Landmine 2 — messenger_behavior today)', () => {
+test('mergeConfigSections ROUND-TRIPS messenger_behavior now that it is editable (T2a)', () => {
   const base = { tenant_id: 'T1', tone_prompt: 'hi' };
   const edited = { messenger_behavior: { escalation_email: 'notify@myrecruiter.ai' } };
 
   const merged = mergeConfigSections(base, edited);
 
-  // Not in EDITABLE_SECTIONS today → never copied into the merged config.
-  // This is exactly why an edit "appears to save then vanishes" pre-T2a.
-  assert.equal('messenger_behavior' in merged, false);
+  // Now in EDITABLE_SECTIONS → persisted (pre-T2a it was silently dropped).
+  assert.deepEqual(merged.messenger_behavior, { escalation_email: 'notify@myrecruiter.ai' });
+});
+
+test('messenger_behavior is WHOLESALE-REPLACED — a partial send wipes siblings (always-send-whole discipline)', () => {
+  const base = {
+    tenant_id: 'T1',
+    messenger_behavior: { escalation_email: 'notify@myrecruiter.ai', tone_override: 'warm' },
+  };
+  // Client sends only escalation_email.
+  const edited = { messenger_behavior: { escalation_email: 'new@myrecruiter.ai' } };
+
+  const merged = mergeConfigSections(base, edited);
+
+  // tone_override is GONE — the whole section is replaced. Every writer of
+  // messenger_behavior MUST send the complete object (T2b/T2c/T3c bake this in).
+  assert.deepEqual(merged.messenger_behavior, { escalation_email: 'new@myrecruiter.ai' });
+  assert.equal('tone_override' in merged.messenger_behavior, false);
+});
+
+test('an unknown/unlisted section is still silently dropped (allowlist still enforced post-T2a)', () => {
+  const merged = mergeConfigSections({ tenant_id: 'T1' }, { totally_unknown_section: { x: 1 } });
+  assert.equal('totally_unknown_section' in merged, false);
 });
 
 test('mergeConfigSections preserves read-only + untouched sections from base', () => {
@@ -115,7 +135,7 @@ test('mergeConfigSections stamps a fresh last_updated ISO timestamp and defaults
 // ---------------------------------------------------------------------------
 
 test('validateEditedSections WARNS-only on an unknown section (isValid stays true) — the drop is silent to the caller', () => {
-  const res = validateEditedSections({ messenger_behavior: { escalation_email: 'x' } });
+  const res = validateEditedSections({ totally_unknown_section: { x: 1 } });
   // Critical: validation does NOT flag the section that the merge will silently
   // drop. Caller gets isValid:true, then the write loses the data.
   assert.equal(res.isValid, true);
@@ -145,14 +165,14 @@ test('extractEditableSections returns editable + metadata, excludes read-only an
     tone_prompt: 'hi',
     feature_flags: { V5_SINGLE_PASS: true },
     card_inventory: { extracted: [] }, // read-only → excluded
-    messenger_behavior: { escalation_email: 'x' }, // unknown today → excluded
+    messenger_behavior: { escalation_email: 'x' }, // editable (T2a) → included
   };
   const editable = extractEditableSections(full);
 
   assert.equal(editable.tenant_id, 'T1');
   assert.deepEqual(editable.feature_flags, { V5_SINGLE_PASS: true });
   assert.equal('card_inventory' in editable, false);
-  assert.equal('messenger_behavior' in editable, false); // T2a flips this
+  assert.deepEqual(editable.messenger_behavior, { escalation_email: 'x' }); // T2a: now included
 });
 
 // ---------------------------------------------------------------------------
