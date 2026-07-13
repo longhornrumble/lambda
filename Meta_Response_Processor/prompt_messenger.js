@@ -36,7 +36,7 @@ const DEFAULT_TONE = 'You are a helpful assistant.';
 // buildMessengerPrompt STRICT RULES — short-form is the channel's nature,
 // not a tenant preference.
 const MESSENGER_BASE_RULES =
-  'You are responding via a mobile messaging app (Facebook Messenger or Instagram DM) where the chat window is very small. STRICT RULES: Respond in 2-3 short sentences maximum. Be friendly but direct. No lists, no bullet points, no headers, no markdown. Never write more than 3 sentences in a single response. If the user wants more detail, they will ask a follow-up question.';
+  'You are responding via a mobile messaging app (Facebook Messenger or Instagram DM) where the chat window is very small. STRICT RULES: Respond in 2-3 short sentences maximum. Be friendly but direct. No lists, no bullet points, no headers, no markdown, no asterisks or formatting symbols - plain conversational text only (Messenger and Instagram render formatting characters literally). Never write more than 3 sentences in a single response. If the user wants more detail, they will ask a follow-up question.';
 
 /** Resolve the persona layer per C6 (replace, never concatenate). */
 function resolveMessengerTone(config, channelType) {
