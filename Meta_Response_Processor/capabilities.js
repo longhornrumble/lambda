@@ -14,4 +14,16 @@ const MESSAGE_CHAR_LIMITS = {
   instagram: 1000,
 };
 
-module.exports = { MESSAGE_CHAR_LIMITS };
+/** Quick replies: max count and title length (C5 — distinct from message caps). */
+const QUICK_REPLY_MAX = 13;
+const QUICK_REPLY_TITLE_MAX = 20;
+
+/** Button template: max buttons per template (C5). */
+const BUTTON_TEMPLATE_MAX = 3;
+
+module.exports = {
+  MESSAGE_CHAR_LIMITS,
+  QUICK_REPLY_MAX,
+  QUICK_REPLY_TITLE_MAX,
+  BUTTON_TEMPLATE_MAX,
+};

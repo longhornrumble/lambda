@@ -252,3 +252,35 @@ describe('C7 handler-level serialization', () => {
     expect(fetchMock).toHaveBeenCalled(); // reply sent despite lock outage
   });
 });
+
+describe('M4 × C7 — coalesced PIC1 taps route through C3 in the drain', () => {
+  test('drained quick-reply tap contributes the CTA query, not the tap label', async () => {
+    loadConfig.mockResolvedValue({
+      model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+      tone_prompt: 'T.',
+      streaming: { max_tokens: 500, temperature: 0 },
+      feature_flags: { MESSENGER_CHANNEL: true },
+      cta_definitions: {
+        learn_x: { label: 'Our Programs', action: 'send_query', query: 'tell me about programs', ai_available: true },
+      },
+    });
+    ddbMock.on(PutCommand, { TableName: STATE_TABLE }, false).resolves({});
+    ddbMock
+      .on(UpdateCommand, { TableName: STATE_TABLE }, false)
+      .resolvesOnce({ Attributes: { pending: [
+        { text: 'Our Programs', quickReplyPayload: 'PIC1:cta:learn_x', mid: 'm_tap', timestamp: 2 },
+      ] } })
+      .resolves({ Attributes: {} });
+    ddbMock.on(DeleteCommand, { TableName: STATE_TABLE }, false).resolves({});
+    bedrockMock.on(InvokeModelCommand).resolves({
+      body: Buffer.from(JSON.stringify({ content: [{ type: 'text', text: 'Answer.\n<<<ACTIONS []>>>' }] })),
+    });
+
+    await handler(buildEvent());
+
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 2);
+    const drainBody = JSON.parse(Buffer.from(bedrockMock.commandCalls(InvokeModelCommand)[1].args[0].input.body).toString());
+    const drainTurn = drainBody.messages[drainBody.messages.length - 1].content[0].text;
+    expect(drainTurn).toBe('tell me about programs'); // C7 step 3: canonical query, not "Our Programs"
+  });
+});
