@@ -45,6 +45,8 @@ const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
+const conversationLock = require('./conversationLock');
+const crypto = require('crypto');
 
 // ─── AWS client initialisation ────────────────────────────────────────────────
 
@@ -68,6 +70,8 @@ const CHANNEL_MAPPINGS_TABLE =
   process.env.CHANNEL_MAPPINGS_TABLE || 'picasso-channel-mappings';
 const RECENT_MESSAGES_TABLE =
   process.env.RECENT_MESSAGES_TABLE || 'picasso-recent-messages';
+// C7 serialization (M1c). Empty ⇒ serialization disabled (fail-open for local/dev).
+const CONVERSATION_STATE_TABLE = process.env.CONVERSATION_STATE_TABLE || '';
 const KMS_KEY_ID = process.env.KMS_KEY_ID || 'alias/picasso-channel-tokens';
 const ANALYTICS_QUEUE_URL =
   process.env.ANALYTICS_QUEUE_URL ||
@@ -81,6 +85,9 @@ const DEFAULT_FALLBACK_MESSAGE =
 // ── M1b (messenger_behavior strings, C2) — defaults; config overrides win ──
 const DEFAULT_DISCLOSURE_LINE =
   "Just a heads up — you're chatting with an automated assistant.";
+
+/** Default C7 drain-cap reply (config: messenger_behavior.strings.rate_limited) */
+const DEFAULT_RATE_LIMITED = "You're sending messages faster than I can keep up — one moment please.";
 const DEFAULT_UNSUPPORTED_INPUT_FALLBACK =
   "Sorry, I can't read that kind of message yet — could you type it instead?";
 
@@ -1040,6 +1047,122 @@ exports.handler = async function handler(event) {
     is_postback: event.isPostback === true,
   });
 
+  // ── 1a. Per-conversation serialization (contract C7, M1c) ────────────────
+  // One winner per sessionId runs turns; concurrent invokes coalesce their
+  // message onto the winner's pending list and exit. Fail-open: lock-table
+  // errors must never block replies (serialization is an optimization of
+  // correctness, not a gate on it).
+  const lockSessionId = `meta:${pageId}:${psid}`;
+  let lockCtx = null;
+  let inheritedPending = [];
+  if (CONVERSATION_STATE_TABLE) {
+    const lockOwner = crypto.randomUUID();
+    try {
+      const gate = await conversationLock.acquireOrCoalesce({
+        client: dynamodb,
+        tableName: CONVERSATION_STATE_TABLE,
+        sessionId: lockSessionId,
+        owner: lockOwner,
+        pendingItem: {
+          timestamp: typeof event.timestamp === 'number' ? event.timestamp : Date.now(),
+          mid: messageMid,
+          text: sanitizedInput,
+          ...(event.eventKind ? { eventKind: event.eventKind } : {}),
+          ...(event.quickReplyPayload ? { quickReplyPayload: event.quickReplyPayload } : {}),
+        },
+      });
+      if (gate.role === 'coalesced') {
+        log('INFO', 'Coalesced onto the in-flight turn — exiting (C7)', {
+          sessionId: lockSessionId,
+        });
+        return;
+      }
+      lockCtx = {
+        client: dynamodb,
+        tableName: CONVERSATION_STATE_TABLE,
+        sessionId: lockSessionId,
+        owner: lockOwner,
+      };
+      inheritedPending = Array.isArray(gate.inheritedPending) ? gate.inheritedPending : [];
+      if (gate.degraded) {
+        log('WARN', 'Lock races exhausted — proceeding unserialized (C7 no-drop over serialization)', {
+          sessionId: lockSessionId,
+        });
+        lockCtx = null; // we do not own the row — never drain/release it
+      }
+      if (inheritedPending.length > 0) {
+        log('INFO', 'Inherited pending items from a stale lock takeover', {
+          sessionId: lockSessionId,
+          count: inheritedPending.length,
+        });
+      }
+    } catch (lockErr) {
+      log('WARN', 'Serialization lock error — proceeding unserialized (fail-open)', {
+        sessionId: lockSessionId,
+        error: lockErr.message,
+      });
+      lockCtx = null;
+    }
+  }
+
+  /**
+   * Drain-and-release (C7 steps 3-6). Runs after the winner's own turn (and
+   * at early-return sites): claims coalesced pending items, answers them in
+   * combined turns (Bedrock) up to DRAIN_CAP cycles, then answers further
+   * bursts with the rate_limited string (bounded spend, no drops), and
+   * finally releases the lock CONDITIONALLY on the pending list being empty.
+   */
+  async function finalizeConversationLock(runTurnFn) {
+    if (!lockCtx) return;
+    let batch = inheritedPending;
+    inheritedPending = [];
+    let bedrockCycles = 0;
+    for (let guard = 0; guard < conversationLock.DRAIN_CAP + 5; guard++) {
+      try {
+        if (batch.length === 0) {
+          batch = await conversationLock.claimPending(lockCtx);
+        }
+        if (batch.length === 0) {
+          const { released } = await conversationLock.releaseIfIdle(lockCtx);
+          if (released) return;
+          continue; // new pending raced in between claim and release — drain again
+        }
+        const texts = batch
+          .map((i) => (i && typeof i.text === 'string' ? i.text : null))
+          .filter((t) => t && t.length > 0);
+        const lastMid = batch.length > 0 ? batch[batch.length - 1].mid || null : null;
+        batch = [];
+        if (texts.length === 0) continue;
+        bedrockCycles++;
+        if (bedrockCycles <= conversationLock.DRAIN_CAP && runTurnFn) {
+          await runTurnFn(texts.join('\n'), lastMid, { withTyping: false, withDisclosure: false });
+        } else {
+          const rateLimitedText = getMessengerString(
+            config,
+            channelType,
+            'rate_limited',
+            DEFAULT_RATE_LIMITED
+          );
+          await sendResponseMessages(pageId, psid, rateLimitedText, pageAccessToken, channelType);
+          log('WARN', 'Drain cap exceeded — answered burst with rate_limited (no Bedrock)', {
+            sessionId: lockSessionId,
+            bedrockCycles,
+          });
+        }
+      } catch (drainErr) {
+        // Leave the lock for TTL takeover (the next winner inherits pending).
+        log('WARN', 'Drain/release error — leaving lock to TTL self-heal', {
+          sessionId: lockSessionId,
+          error: drainErr.message,
+        });
+        return;
+      }
+    }
+    log('WARN', 'Drain guard bound hit — leaving lock to TTL self-heal', {
+      sessionId: lockSessionId,
+    });
+  }
+
   // ── 1. Load page access token ────────────────────────────────────────────
   let pageAccessToken;
   try {
@@ -1050,6 +1173,18 @@ exports.handler = async function handler(event) {
       channelType,
       error: tokenErr.message,
     });
+    // Release the lock if idle; with pending present we leave it to TTL
+    // takeover (every coalesced invoke would fail on the same missing token).
+    if (lockCtx) {
+      try {
+        await conversationLock.releaseIfIdle(lockCtx);
+      } catch (releaseErr) {
+        log('WARN', 'Lock release after token failure failed — TTL will heal', {
+          sessionId: lockSessionId,
+          error: releaseErr.message,
+        });
+      }
+    }
     // Non-retryable: no token means we cannot respond
     return;
   }
@@ -1113,154 +1248,178 @@ exports.handler = async function handler(event) {
       });
     }
 
+    // Drain any messages that coalesced while we handled the postback, then
+    // release (C7) — runTurn is hoisted, and config/token are loaded above.
+    await finalizeConversationLock(runTurn);
+
     const durationMs = Date.now() - startTime;
     log('INFO', 'Handler complete (GET_STARTED postback)', { pageId, psid, durationMs });
     return;
   }
 
-  // ── 2. Send typing indicator (best-effort) ───────────────────────────────
-  await sendTypingIndicator(pageId, psid, pageAccessToken, channelType);
-
-  // Start typing-indicator refresh so the indicator stays alive while Bedrock
-  // processes (Meta expires typing_on after ~10 s; we refresh every 8 s).
-  const typingRefreshInterval = setInterval(async () => {
-    try {
+  /**
+   * One full conversational turn — steps 2–7 (typing, history, RAG, disclosure,
+   * send, store, lastUserMessageAt). Extracted so C7 drain cycles can answer
+   * coalesced bursts through the identical pipeline (M1c). Drain cycles skip
+   * typing + disclosure.
+   */
+  async function runTurn(turnText, turnMid, { withTyping = true, withDisclosure = true } = {}) {
+    // ── 2. Send typing indicator (best-effort) ─────────────────────────────
+    let typingRefreshInterval = null;
+    if (withTyping) {
       await sendTypingIndicator(pageId, psid, pageAccessToken, channelType);
-    } catch (e) {
-      // Non-fatal — don't disrupt the main pipeline
-      log('WARN', 'Typing indicator refresh failed', { pageId, psid, error: e.message });
+
+      // Start typing-indicator refresh so the indicator stays alive while
+      // Bedrock processes (Meta expires typing_on after ~10 s; refresh 8 s).
+      typingRefreshInterval = setInterval(async () => {
+        try {
+          await sendTypingIndicator(pageId, psid, pageAccessToken, channelType);
+        } catch (e) {
+          // Non-fatal — don't disrupt the main pipeline
+          log('WARN', 'Typing indicator refresh failed', { pageId, psid, error: e.message });
+        }
+      }, TYPING_REFRESH_INTERVAL_MS);
     }
-  }, TYPING_REFRESH_INTERVAL_MS);
 
-  // ── 3. Load conversation context ─────────────────────────────────────────
-  let conversationHistory = [];
-  try {
-    conversationHistory = await loadConversationContext(pageId, psid);
-  } catch (ctxErr) {
-    // Non-fatal: proceed without history
-    log('WARN', 'Failed to load conversation context', {
-      pageId,
-      psid,
-      error: ctxErr.message,
-    });
-  }
-
-  // ── 4. RAG pipeline: retrieve KB → generate response ─────────────────────
-  // Config was already loaded in step 0b.
-  let responseText;
-  let kbContextLength = 0;
-
-  try {
-    const kbContext = await retrieveKB(sanitizedInput, config);
-    kbContextLength = kbContext?.length || 0;
-
-    log('INFO', 'KB retrieval complete', {
-      tenantHash: tenantHash.substring(0, 8),
-      kbContextLength,
-    });
-
-    responseText = await generateBedrockResponse(
-      sanitizedInput,
-      kbContext,
-      conversationHistory,
-      config
-    );
-  } catch (bedrockErr) {
-    log('ERROR', 'Bedrock pipeline failed — sending fallback message', {
-      tenantHash: tenantHash.substring(0, 8),
-      error: bedrockErr.message,
-    });
-    responseText =
-      config.bedrock_instructions?.fallback_message || DEFAULT_FALLBACK_MESSAGE;
-  }
-
-  if (!responseText || responseText.trim().length === 0) {
-    responseText = config.bedrock_instructions?.fallback_message || DEFAULT_FALLBACK_MESSAGE;
-  }
-
-  // ── 5. Stop typing refresh and send response via Meta Send API ───────────
-  clearInterval(typingRefreshInterval);
-
-  // ── 4b. Disclosure line (C2 strings, C8 session-first-turn) ──────────────
-  // Flag-gated: sent as its own message, BEFORE the normal reply, only on the
-  // first turn of a session (empty loaded history). Flag off ⇒ no disclosure
-  // (byte-identical to pre-program baseline).
-  if (config.feature_flags?.MESSENGER_CHANNEL === true && conversationHistory.length === 0) {
-    const disclosureText = getMessengerString(
-      config,
-      channelType,
-      'disclosure_line',
-      DEFAULT_DISCLOSURE_LINE
-    );
+    // ── 3. Load conversation context ───────────────────────────────────────
+    let conversationHistory = [];
     try {
-      await sendResponseMessages(pageId, psid, disclosureText, pageAccessToken, channelType);
-      log('INFO', 'Sent disclosure line (first turn of session)', {
+      conversationHistory = await loadConversationContext(pageId, psid);
+    } catch (ctxErr) {
+      // Non-fatal: proceed without history
+      log('WARN', 'Failed to load conversation context', {
         pageId,
         psid,
-        sessionId: `meta:${pageId}:${psid}`,
+        error: ctxErr.message,
       });
-    } catch (discErr) {
-      // Non-fatal: don't block the real reply on the disclosure send failing.
-      log('WARN', 'Failed to send disclosure line — continuing with reply', {
+    }
+
+    // ── 4. RAG pipeline: retrieve KB → generate response ───────────────────
+    // Config was already loaded in step 0b.
+    let responseText;
+    let kbContextLength = 0;
+
+    try {
+      const kbContext = await retrieveKB(turnText, config);
+      kbContextLength = kbContext?.length || 0;
+
+      log('INFO', 'KB retrieval complete', {
+        tenantHash: tenantHash.substring(0, 8),
+        kbContextLength,
+      });
+
+      responseText = await generateBedrockResponse(
+        turnText,
+        kbContext,
+        conversationHistory,
+        config
+      );
+    } catch (bedrockErr) {
+      log('ERROR', 'Bedrock pipeline failed — sending fallback message', {
+        tenantHash: tenantHash.substring(0, 8),
+        error: bedrockErr.message,
+      });
+      responseText =
+        config.bedrock_instructions?.fallback_message || DEFAULT_FALLBACK_MESSAGE;
+    }
+
+    if (!responseText || responseText.trim().length === 0) {
+      responseText = config.bedrock_instructions?.fallback_message || DEFAULT_FALLBACK_MESSAGE;
+    }
+
+    // ── 5. Stop typing refresh and send response via Meta Send API ─────────
+    if (typingRefreshInterval) clearInterval(typingRefreshInterval);
+
+    // ── 4b. Disclosure line (C2 strings, C8 session-first-turn) ────────────
+    // Flag-gated: sent as its own message, BEFORE the normal reply, only on
+    // the first turn of a session (empty loaded history). Flag off ⇒ no
+    // disclosure (byte-identical to pre-program baseline).
+    if (
+      withDisclosure &&
+      config.feature_flags?.MESSENGER_CHANNEL === true &&
+      conversationHistory.length === 0
+    ) {
+      const disclosureText = getMessengerString(
+        config,
+        channelType,
+        'disclosure_line',
+        DEFAULT_DISCLOSURE_LINE
+      );
+      try {
+        await sendResponseMessages(pageId, psid, disclosureText, pageAccessToken, channelType);
+        log('INFO', 'Sent disclosure line (first turn of session)', {
+          pageId,
+          psid,
+          sessionId: `meta:${pageId}:${psid}`,
+        });
+      } catch (discErr) {
+        // Non-fatal: don't block the real reply on the disclosure send failing.
+        log('WARN', 'Failed to send disclosure line — continuing with reply', {
+          pageId,
+          psid,
+          error: discErr.message,
+        });
+      }
+    }
+
+    try {
+      await sendResponseMessages(pageId, psid, responseText, pageAccessToken, channelType);
+      log('INFO', 'Response delivered to Messenger', {
         pageId,
         psid,
-        error: discErr.message,
+        responseLength: responseText.length,
+      });
+
+      // Emit MESSENGER_RESPONSE_SENT after successful delivery (best-effort)
+      emitAnalyticsEvent('MESSENGER_RESPONSE_SENT', {
+        session_id: `meta:${pageId}:${psid}`,
+        tenant_id: tenantId,
+        channel_type: channelType,
+        page_id: pageId,
+        psid,
+        response_length: responseText.length,
+        model_used: config.model_id || DEFAULT_MODEL_ID,
+        kb_context_length: kbContextLength,
+      });
+    } catch (sendErr) {
+      // Re-throw so Lambda retries (or DLQ captures)
+      log('ERROR', 'Failed to deliver response to Messenger — will retry', {
+        pageId,
+        psid,
+        error: sendErr.message,
+      });
+      throw sendErr;
+    }
+
+    // ── 6. Store conversation context ───────────────────────────────────────
+    try {
+      await storeConversationContext(pageId, psid, turnText, responseText, turnMid);
+    } catch (storeErr) {
+      // Non-fatal: log and continue
+      log('WARN', 'Failed to store conversation context', {
+        pageId,
+        psid,
+        error: storeErr.message,
+      });
+    }
+
+    // ── 7. Update lastUserMessageAt ─────────────────────────────────────────
+    try {
+      await updateLastUserMessageAt(pageId, channelType);
+    } catch (updateErr) {
+      // Non-fatal: log and continue
+      log('WARN', 'Failed to update lastUserMessageAt', {
+        pageId,
+        channelType,
+        error: updateErr.message,
       });
     }
   }
 
-  try {
-    await sendResponseMessages(pageId, psid, responseText, pageAccessToken, channelType);
-    log('INFO', 'Response delivered to Messenger', {
-      pageId,
-      psid,
-      responseLength: responseText.length,
-    });
+  await runTurn(sanitizedInput, messageMid);
 
-    // Emit MESSENGER_RESPONSE_SENT after successful delivery (best-effort)
-    emitAnalyticsEvent('MESSENGER_RESPONSE_SENT', {
-      session_id: `meta:${pageId}:${psid}`,
-      tenant_id: tenantId,
-      channel_type: channelType,
-      page_id: pageId,
-      psid,
-      response_length: responseText.length,
-      model_used: config.model_id || DEFAULT_MODEL_ID,
-      kb_context_length: kbContextLength,
-    });
-  } catch (sendErr) {
-    // Re-throw so Lambda retries (or DLQ captures)
-    log('ERROR', 'Failed to deliver response to Messenger — will retry', {
-      pageId,
-      psid,
-      error: sendErr.message,
-    });
-    throw sendErr;
-  }
-
-  // ── 6. Store conversation context ─────────────────────────────────────────
-  try {
-    await storeConversationContext(pageId, psid, sanitizedInput, responseText, messageMid);
-  } catch (storeErr) {
-    // Non-fatal: log and continue
-    log('WARN', 'Failed to store conversation context', {
-      pageId,
-      psid,
-      error: storeErr.message,
-    });
-  }
-
-  // ── 7. Update lastUserMessageAt ───────────────────────────────────────────
-  try {
-    await updateLastUserMessageAt(pageId, channelType);
-  } catch (updateErr) {
-    // Non-fatal: log and continue
-    log('WARN', 'Failed to update lastUserMessageAt', {
-      pageId,
-      channelType,
-      error: updateErr.message,
-    });
-  }
+  // ── 8. Drain coalesced messages + conditional release (C7, M1c) ──────────
+  await finalizeConversationLock(runTurn);
 
   const durationMs = Date.now() - startTime;
   log('INFO', 'Handler complete', {
