@@ -554,10 +554,10 @@ jobs:
             staging_function: Meta_OAuth_Handler
             handler: lambda_function.lambda_handler
             runtime: python
-            # scripts/*.py = the M5 operator re-push script; tracked, so the
-            # zip-manifest guard requires it in the allowlist (it is inert in
-            # the runtime zip - operator-invoked only).
-            include_globs: 'lambda_function.py scripts/*.py'
+            # scripts/*.py (the M5 operator re-push tool) is NON-DEPLOYED
+            # operator tooling — excluded from the zip-manifest guard by the
+            # scripts/ exclusion, NOT forced into the runtime zip.
+            include_globs: 'lambda_function.py'
             env_vars: ''
             # Smoke skipped: routes are signed-state-JWT / Clerk-JWT gated;
             # a bare probe is non-deterministic. Real validation is Phase C1
@@ -1002,7 +1002,7 @@ jobs:
               echo "::error file=$f::Tracked runtime file missing from deploy zip — add it to include_globs (in BOTH deploy-staging.yml and deploy-production.yml)"
               MISSING=1
             fi
-          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)((test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)|analytics_writer_contract\.json)$')
+          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)((test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)|analytics_writer_contract\.json|scripts/[^/]*\.(py|json))$')
           if [ "$MISSING" -eq 0 ]; then echo "Zip-manifest guard: all tracked runtime files present."; fi
           exit $MISSING
 
