@@ -69,9 +69,9 @@ global.awslambda = {
 const { loadConfig, retrieveKB } = require('../../shared/bedrock-core');
 const { enhanceResponse } = require('../response_enhancer');
 const { runSchedulingTurn } = require('../scheduling/schedulingFlow');
-const { V5_TURN_PROMPT_VERSION, V5_TURN_INFERENCE_PARAMS } = require('../prompt_v5');
-const { V4_STEP2_INFERENCE_PARAMS } = require('../prompt_v4');
-const { SENTINEL_OPEN } = require('../streamTail');
+const { V5_TURN_PROMPT_VERSION, V5_TURN_INFERENCE_PARAMS } = require('../../shared/prompt/prompt_v5');
+const { V4_STEP2_INFERENCE_PARAMS } = require('../../shared/prompt/prompt_v4');
+const { SENTINEL_OPEN } = require('../../shared/prompt/streamTail');
 
 const V5_CONFIG = {
   tenant_id: 'TEST123',

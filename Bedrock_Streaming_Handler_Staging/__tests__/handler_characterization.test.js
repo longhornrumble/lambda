@@ -105,8 +105,8 @@ function loadHandler(streaming) {
       loadTenantConfig: (...a) => spies.loadTenantConfig(...a),
     }));
     jest.doMock('../analytics_writer', () => ({ writeSessionSummary: (...a) => spies.writeSessionSummary(...a) }));
-    jest.doMock('../prompt_v4', () => {
-      const actual = jest.requireActual('../prompt_v4');
+    jest.doMock('../../shared/prompt/prompt_v4', () => {
+      const actual = jest.requireActual('../../shared/prompt/prompt_v4');
       return {
         ...actual,
         classifyTopic: (...a) => spies.classifyTopic(...a),

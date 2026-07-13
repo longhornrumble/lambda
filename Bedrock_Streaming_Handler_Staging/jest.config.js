@@ -20,9 +20,6 @@ module.exports = {
     'index.js',
     'responsePipeline.js',
     'clerk_helper.js',
-    'prompt_v4.js',
-    'prompt_v5.js',
-    'streamTail.js',
     '!node_modules/**',
     '!coverage/**',
     '!__tests__/**'
@@ -35,44 +32,15 @@ module.exports = {
   // Current (as of 2026-04-16): statements 57%, branches 47%, funcs 66%, lines 58%.
   // The 80% target from the original config remains aspirational — reaching it
   // requires significant new coverage for index.js (currently ~40%).
+  // The prompt trio (prompt_v4/prompt_v5/streamTail) moved to shared/prompt
+  // in M2 — its coverage gates live in shared/prompt/jest.config.js and run
+  // via the shared-prompt-tests CI job (pr-checks.yml).
   coverageThreshold: {
     global: {
       branches: 45,
       functions: 60,
       lines: 55,
       statements: 55,
-    },
-    // prompt_v4.js: comprehensive coverage added per audit B7
-    // (project_scheduling_subphase_a_phase_completion_audit_2026-05-24).
-    // The new __tests__/prompt_v4_full.test.js covers selectActionsV4 +
-    // classifyTopic + selectCTAsFromPool + validateTopicDefinitions +
-    // determineDepthPreference + buildTopicClassificationPrompt + the
-    // buildV4ConversationPrompt formatting chain. Current measured:
-    // stmts 99.15 / br 89.55 / fns 100 / ln 100. Ratchet set just below
-    // the floor per this config's convention.
-    './prompt_v4.js': {
-      branches: 88,
-      functions: 95,
-      lines: 95,
-      statements: 95,
-    },
-    // streamTail.js: V5.1 pure tail parser — exhaustive suite in
-    // __tests__/stream_tail.test.js; the chunking-invariance sweeps exercise
-    // every boundary path. Ratchet just below the measured floor per this
-    // config's convention.
-    './streamTail.js': {
-      branches: 95,
-      functions: 95,
-      lines: 95,
-      statements: 95,
-    },
-    // prompt_v5.js: V5.2 single-pass prompt composer — small module, fully
-    // exercised by __tests__/prompt_v5.test.js.
-    './prompt_v5.js': {
-      branches: 95,
-      functions: 95,
-      lines: 95,
-      statements: 95,
     },
   },
   setupFilesAfterEnv: ['<rootDir>/__tests__/setup.js'],

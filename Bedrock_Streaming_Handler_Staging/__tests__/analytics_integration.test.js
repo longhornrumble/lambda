@@ -19,7 +19,7 @@
 const {
   V4_CONVERSATION_PROMPT_VERSION,
   ACTION_SELECTOR_PROMPT_VERSION,
-} = require('../prompt_v4');
+} = require('../../shared/prompt/prompt_v4');
 
 // ─────────────────────────────────────────────────────────────────────
 // Gap 1: handleAnalyticsEvent no-op guard

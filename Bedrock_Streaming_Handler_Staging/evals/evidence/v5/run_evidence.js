@@ -33,14 +33,15 @@ const fs = require('fs');
 const path = require('path');
 
 const BSH = path.join(__dirname, '..', '..', '..');
-const { buildV5TurnPrompt, V5_TURN_INFERENCE_PARAMS } = require(path.join(BSH, 'prompt_v5.js'));
-const { createTailParser } = require(path.join(BSH, 'streamTail.js'));
+const SHARED_PROMPT = path.join(BSH, '..', 'shared', 'prompt');
+const { buildV5TurnPrompt, V5_TURN_INFERENCE_PARAMS } = require(path.join(SHARED_PROMPT, 'prompt_v5.js'));
+const { createTailParser } = require(path.join(SHARED_PROMPT, 'streamTail.js'));
 const {
   buildV4ConversationPrompt,
   selectActionsV4,
   sanitizeTonePromptV4,
   V4_STEP2_INFERENCE_PARAMS,
-} = require(path.join(BSH, 'prompt_v4.js'));
+} = require(path.join(SHARED_PROMPT, 'prompt_v4.js'));
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 
 const OUT_JSONL = path.join(__dirname, 'results.jsonl');

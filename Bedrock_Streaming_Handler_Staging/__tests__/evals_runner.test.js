@@ -27,8 +27,8 @@ const {
   CURRENT_PROMPT_VERSIONS,
 } = require('../evals/run');
 const { renderReport } = require('../evals/report');
-const { V5_TURN_PROMPT_VERSION, V5_TURN_INFERENCE_PARAMS } = require('../prompt_v5');
-const { SENTINEL_OPEN } = require('../streamTail');
+const { V5_TURN_PROMPT_VERSION, V5_TURN_INFERENCE_PARAMS } = require('../../shared/prompt/prompt_v5');
+const { SENTINEL_OPEN } = require('../../shared/prompt/streamTail');
 
 const CONFIG = {
   cta_definitions: {
