@@ -43,6 +43,9 @@
  *   META_APP_ID              — M6b: this Lambda's own Meta App ID, to tell our own echoed
  *                              sends apart from a foreign (staff/other-tool) reply on the
  *                              same thread; '' (default) disables echo-watch (matches nothing)
+ *   MFS_FUNCTION             — M7a: Master_Function_Staging function name/ARN for the S1
+ *                              direct IAM invoke that submits a completed form (formEngine.js);
+ *                              '' (default) makes confirmForm fail closed (session kept for retry)
  */
 
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -51,11 +54,13 @@ const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, DeleteCom
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { SESClient } = require('@aws-sdk/client-ses');
+const { LambdaClient } = require('@aws-sdk/client-lambda');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
 const escalation = require('./escalation');
 const rateLimits = require('./rateLimits');
+const formEngine = require('./formEngine');
 const { classifyMetaSendError } = require('./metaSendErrors');
 const { buildMessengerV5Prompt, resolveMessengerModelId } = require('./prompt_messenger');
 const { renderMessengerActions, resolveCtaPayload } = require('./renderMessengerActions');
@@ -85,6 +90,9 @@ const sqs = new SQSClient({ region: AWS_REGION });
 // module scope, Source resolved per-send by escalation.js from SES_FROM_EMAIL).
 const sesClient = new SESClient({ region: AWS_REGION });
 
+// M7a: direct IAM invoke of MFS for form submission (S1 — never a public lane).
+const lambdaClient = new LambdaClient({ region: AWS_REGION });
+
 // ─── Configuration constants ──────────────────────────────────────────────────
 
 const CHANNEL_MAPPINGS_TABLE =
@@ -99,6 +107,8 @@ const CONVERSATION_STATE_TABLE = process.env.CONVERSATION_STATE_TABLE || '';
 // config load or DDB write can ever fire; a one-time note is logged below
 // (after `log` is defined) so a cold start makes the disabled state visible.
 const META_APP_ID = process.env.META_APP_ID || '';
+// M7a (S1): '' disables submission — confirmForm fails closed, session kept for retry.
+const MFS_FUNCTION = process.env.MFS_FUNCTION || '';
 const KMS_KEY_ID = process.env.KMS_KEY_ID || 'alias/picasso-channel-tokens';
 const ANALYTICS_QUEUE_URL =
   process.env.ANALYTICS_QUEUE_URL ||
@@ -1642,7 +1652,7 @@ exports.handler = async function handler(event) {
    * hold — any further pending is claimed and silently discarded, same as
    * the top-level escalation's own post-escalation drain.
    */
-  async function finalizeConversationLock(runTurnFn, { silentDrain: initialSilentDrain = false } = {}) {
+  async function finalizeConversationLock(runTurnFn, { silentDrain: initialSilentDrain = false, formState = null } = {}) {
     if (!lockCtx) return;
     let silentDrain = initialSilentDrain;
     let batch = inheritedPending;
@@ -1666,7 +1676,124 @@ exports.handler = async function handler(event) {
           batch = [];
           continue;
         }
-        const rawBatch = batch;
+        let rawBatch = batch;
+        batch = [];
+
+        // M7a: while a form is active, pending items are form input — applied
+        // SEQUENTIALLY (never joined into one combined Bedrock turn, unlike
+        // the RAG path below). Peels items off the FRONT of this batch until
+        // either the batch is exhausted, the form ends (submit/cancel), an
+        // escalation hit, or the per-hold drain cap is reached; any items
+        // AFTER that point fall through to the normal joined-turn handling
+        // below (the form is no longer active for them), or — for the
+        // escalation/cap exits — are silently discarded (see below).
+        if (formState && formState.active) {
+          let consumed = 0;
+          let formCycles = 0;
+          for (const item of rawBatch) {
+            const itemText = typeof item?.text === 'string' ? item.text : '';
+            const itemIsPic1Tap =
+              typeof item?.quickReplyPayload === 'string' && item.quickReplyPayload.startsWith('PIC1:');
+
+            // M6a: escalation intent wins over form input too — checked per
+            // drained free-text member, same exclusion as the RAG-path
+            // batch check below (a PIC1 tap is a CTA/ffld/fctl route, never
+            // free-typed human intent).
+            if (messengerFlagOn && !itemIsPic1Tap && escalation.detectEscalationIntent(itemText)) {
+              log('INFO', 'Escalation intent detected in a coalesced drain batch mid-form — escalating; form session left intact', {
+                sessionId: lockSessionId,
+                formId: formState.session?.form_id,
+              });
+              await handleEscalation({
+                pageId,
+                psid,
+                channelType,
+                tenantId,
+                config,
+                pageAccessToken,
+                sessionId: lockSessionId,
+                turnText: itemText,
+                turnMid: item?.mid || null,
+              });
+              // DECISION: the form_session row is left INTACT — neither
+              // deleted nor advanced. Escalation's own pause row is what
+              // actually stands the bot down; the form is orthogonal state
+              // the user can resume on the same field after staff ends the
+              // interaction, or that idle-TTLs out (1h) on its own like any
+              // other abandoned session. Matches the top-level escalation's
+              // own post-escalation drain rule: staff now owns the thread,
+              // so the REST of this batch (and any further pending on this
+              // lock hold) is silently discarded, not answered.
+              silentDrain = true;
+              consumed = rawBatch.length;
+              break;
+            }
+
+            const itemFfld =
+              typeof item?.quickReplyPayload === 'string' ? formEngine.parseFfldPayload(item.quickReplyPayload) : null;
+            const itemFctl =
+              typeof item?.quickReplyPayload === 'string' ? formEngine.parseFctlPayload(item.quickReplyPayload) : null;
+
+            // M-Hb-mirrored bounded-cost posture: at most DRAIN_CAP
+            // sequential drained answers applied per lock hold. Beyond that,
+            // answer ONCE with rate_limited and silently discard the rest —
+            // simpler and equally correct vs. re-appending the remainder,
+            // and matches the RAG path's own drain-cap fallback below.
+            formCycles++;
+            if (formCycles > conversationLock.DRAIN_CAP) {
+              const rateLimitedText = getMessengerString(config, channelType, 'rate_limited', DEFAULT_RATE_LIMITED);
+              try {
+                await sendResponseMessages(pageId, psid, rateLimitedText, pageAccessToken, channelType);
+              } catch (sendErr) {
+                log('WARN', 'Failed to deliver drain-cap rate_limited reply mid-form', {
+                  sessionId: lockSessionId,
+                  error: sendErr.message,
+                });
+              }
+              log('WARN', 'Form drain cap exceeded — answered burst with rate_limited (no further answers applied)', {
+                sessionId: lockSessionId,
+                formCycles,
+              });
+              silentDrain = true;
+              consumed = rawBatch.length;
+              break;
+            }
+
+            const stepResult = await advanceFormSession({
+              session: formState.session,
+              form: formState.form,
+              rawText: itemText,
+              ffld: itemFfld,
+              fctl: itemFctl,
+            });
+            formState.session = stepResult.session;
+            formState.active = !!stepResult.session;
+            consumed++;
+
+            try {
+              await sendResponseMessages(
+                pageId,
+                psid,
+                stepResult.message.text,
+                pageAccessToken,
+                channelType,
+                stepResult.message.quickReplies?.length ? { quickReplies: stepResult.message.quickReplies } : null
+              );
+            } catch (sendErr) {
+              log('WARN', 'Failed to deliver a drained form message', { sessionId: lockSessionId, error: sendErr.message });
+            }
+            try {
+              await storeConversationContext(pageId, psid, itemText, stepResult.message.text, item?.mid || null);
+            } catch (_storeErr) {
+              // non-fatal — same tolerance as the rest of this drain loop
+            }
+
+            if (!formState.active) break; // form ended — remaining items (if any) are RAG turns
+          }
+          rawBatch = rawBatch.slice(consumed);
+          if (rawBatch.length === 0) continue; // whole batch was form input (or silently discarded above)
+        }
+
         // C7 step 3: structured members (quick_reply with a PIC1 payload)
         // route via their C3 handlers individually — the canonical CTA text
         // joins the combined turn, not the raw tap label.
@@ -1874,6 +2001,165 @@ exports.handler = async function handler(event) {
     }
   }
 
+  /**
+   * M7a: apply ONE piece of form input (free text, or a resolved ffld/fctl
+   * tap) against the given session, returning the updated session (null once
+   * the form ends — submitted or cancelled) and the message to send. Single
+   * entry point shared by the main-turn form path below AND the C7 drain
+   * loop (finalizeConversationLock) — drained form input is applied
+   * SEQUENTIALLY, one item at a time, never joined into one combined turn
+   * (unlike the RAG path, where a coalesced burst becomes one Bedrock call).
+   *
+   * D1/X3: only formId/fieldKey/status are ever logged here — never a
+   * rawText/value.
+   */
+  async function advanceFormSession({ session, form, rawText, ffld, fctl }) {
+    const safeFfld = ffld && ffld.formId === session.form_id ? ffld : null;
+    const safeFctl = fctl && fctl.formId === session.form_id ? fctl : null;
+
+    // Cancel wins at ANY stage, from either the fctl:cancel tap or the exact
+    // typed word — checked ONLY against genuinely free-typed text (not an
+    // ffld tap's option value, which could coincidentally be "cancel").
+    if ((safeFctl && safeFctl.op === 'cancel') || (!safeFfld && formEngine.isCancelKeyword(rawText))) {
+      try {
+        await formEngine.deleteFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId: lockSessionId });
+      } catch (delErr) {
+        log('WARN', 'Form session delete on cancel failed', { sessionId: lockSessionId, error: delErr.message });
+      }
+      log('INFO', 'Form cancelled', { sessionId: lockSessionId, formId: session.form_id });
+      const text = getMessengerString(config, channelType, 'form_cancelled', formEngine.DEFAULT_FORM_CANCELLED);
+      return { session: null, message: { text, quickReplies: [] } };
+    }
+
+    if (session.current_field === formEngine.SUMMARY_STAGE) {
+      const isConfirm = (safeFctl && safeFctl.op === 'confirm') || (!safeFfld && !safeFctl && formEngine.isConfirmKeyword(rawText));
+      if (isConfirm) {
+        const result = await formEngine.confirmForm({
+          session,
+          config,
+          channelType,
+          tenantHash,
+          lambdaClient,
+          functionName: MFS_FUNCTION,
+          client: dynamodb,
+          tableName: CONVERSATION_STATE_TABLE,
+          log,
+        });
+        log('INFO', 'Form submission attempted', {
+          sessionId: lockSessionId,
+          formId: session.form_id,
+          submitted: result.submitted,
+        });
+        return { session: result.submitted ? null : session, message: result.message };
+      }
+      // Anything else at the summary stage: re-show it (also counts as
+      // activity — refresh the idle TTL, distinct from confirmForm's T3
+      // no-touch-on-failure rule).
+      const touched = formEngine.touchSession(session);
+      try {
+        await formEngine.saveFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: touched });
+      } catch (saveErr) {
+        log('WARN', 'Form session TTL refresh failed at summary stage', { sessionId: lockSessionId, error: saveErr.message });
+      }
+      return { session: touched, message: formEngine.buildSummary(touched, form, config, channelType) };
+    }
+
+    // Field-collection stage. A resolved ffld tap supplies its option value
+    // directly ONLY when it targets the session's CURRENT field — a stale
+    // tap for a different/already-answered field falls back to rawText.
+    const value = safeFfld && safeFfld.fieldKey === session.current_field ? safeFfld.value : rawText;
+    const result = formEngine.handleAnswer({ session, form, config, channelType, rawText: value });
+    try {
+      await formEngine.saveFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: result.session });
+    } catch (saveErr) {
+      log('WARN', 'Form session save failed — proceeding (in-memory state may lag DDB)', {
+        sessionId: lockSessionId,
+        error: saveErr.message,
+      });
+    }
+    log('INFO', 'Form answer processed', {
+      sessionId: lockSessionId,
+      formId: session.form_id,
+      fieldKey: session.current_field,
+      status: result.status,
+    });
+    return { session: result.session, message: result.message };
+  }
+
+  // ── M7a: active conversational-form session (C4 form_session; T2 — an
+  // expired row is treated as absent). Flag- and table-gated ("flag off ⇒
+  // zero form machinery" — no GetItem at all). Checked AFTER pause/lock/
+  // escalation/rate-limit (those always win over a form turn) and BEFORE
+  // 0b2 CTA routing / GET_STARTED / the RAG pipeline — when active, this
+  // turn belongs to the form engine and never reaches V5/Bedrock.
+  let formSession = null;
+  if (messengerFlagOn && CONVERSATION_STATE_TABLE) {
+    try {
+      formSession = await formEngine.loadFormSession({
+        client: dynamodb,
+        tableName: CONVERSATION_STATE_TABLE,
+        sessionId: lockSessionId,
+        log,
+      });
+    } catch (formLoadErr) {
+      log('WARN', 'Form-session lookup failed — proceeding without form routing (fail-open)', {
+        sessionId: lockSessionId,
+        error: formLoadErr.message,
+      });
+      formSession = null;
+    }
+    if (formSession && !config?.conversational_forms?.[formSession.form_id]) {
+      log('WARN', 'Active form session references a form no longer in config — abandoning session', {
+        sessionId: lockSessionId,
+        formId: formSession.form_id,
+      });
+      try {
+        await formEngine.deleteFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, sessionId: lockSessionId });
+      } catch (abandonErr) {
+        log('WARN', 'Failed to delete orphaned form session', { sessionId: lockSessionId, error: abandonErr.message });
+      }
+      formSession = null;
+    }
+  }
+
+  if (formSession) {
+    const form = config.conversational_forms[formSession.form_id];
+    const ffld = typeof event.quickReplyPayload === 'string' ? formEngine.parseFfldPayload(event.quickReplyPayload) : null;
+    const fctl = typeof event.quickReplyPayload === 'string' ? formEngine.parseFctlPayload(event.quickReplyPayload) : null;
+
+    const outcome = await advanceFormSession({ session: formSession, form, rawText: sanitizedInput, ffld, fctl });
+
+    try {
+      await sendResponseMessages(
+        pageId,
+        psid,
+        outcome.message.text,
+        pageAccessToken,
+        channelType,
+        outcome.message.quickReplies?.length ? { quickReplies: outcome.message.quickReplies } : null
+      );
+    } catch (sendErr) {
+      log('ERROR', 'Failed to deliver form message — will retry', { sessionId: lockSessionId, error: sendErr.message });
+      throw sendErr;
+    }
+    try {
+      await storeConversationContext(pageId, psid, sanitizedInput, outcome.message.text, messageMid);
+    } catch (storeErr) {
+      log('WARN', 'Failed to store form-turn context', { sessionId: lockSessionId, error: storeErr.message });
+    }
+    try {
+      await updateLastUserMessageAt(pageId, channelType);
+    } catch (updateErr) {
+      log('WARN', 'Failed to update lastUserMessageAt after form turn', { pageId, channelType, error: updateErr.message });
+    }
+
+    await finalizeConversationLock(runTurn, { formState: { active: !!outcome.session, session: outcome.session, form } });
+
+    const formDurationMs = Date.now() - startTime;
+    log('INFO', 'Handler complete (form turn)', { pageId, psid, durationMs: formDurationMs });
+    return;
+  }
+
   // ── 0b2. Structured payload routing (contract C3, M4) ────────────────────
   // A PIC1:cta quick-reply tap or postback resolves to the free text its CTA
   // stands for (send_query -> query, show_info -> prompt). Anything that
@@ -1885,16 +2171,74 @@ exports.handler = async function handler(event) {
       : event.isPostback === true && typeof messageText === 'string' && messageText.startsWith('PIC1:')
         ? messageText
         : null;
+  let startFormId = null;
   if (pic1Payload) {
     const resolved = resolveCtaPayload(pic1Payload, config);
     if (resolved) {
-      sanitizedInput = sanitizeUserInput(resolved.turnText) || resolved.turnText;
-      log('INFO', 'PIC1 payload routed to CTA turn text', { ctaId: resolved.ctaId });
+      // M7a: a start_form CTA whose formId resolves in conversational_forms
+      // begins the form engine below instead of a RAG turn. Also requires
+      // the state table (nowhere to persist the session without it) — when
+      // either gate is off, fall back to the pre-M7 behavior (RAG on label).
+      if (resolved.startFormId && messengerFlagOn && CONVERSATION_STATE_TABLE) {
+        startFormId = resolved.startFormId;
+      } else {
+        sanitizedInput = sanitizeUserInput(resolved.turnText) || resolved.turnText;
+        log('INFO', 'PIC1 payload routed to CTA turn text', { ctaId: resolved.ctaId });
+      }
     } else {
       log('INFO', 'Unresolvable PIC1 payload — treating as free text (C3)', {
         payloadPrefix: pic1Payload.slice(0, 24),
       });
     }
+  }
+
+  if (startFormId) {
+    const form = config.conversational_forms[startFormId];
+    const { session: newSession, message } = formEngine.beginForm({
+      sessionId: lockSessionId,
+      formId: startFormId,
+      form,
+      config,
+      channelType,
+    });
+    try {
+      await formEngine.saveFormSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: newSession });
+    } catch (saveErr) {
+      log('ERROR', 'Failed to persist new form session — form will not track state', {
+        sessionId: lockSessionId,
+        formId: startFormId,
+        error: saveErr.message,
+      });
+    }
+    try {
+      await sendResponseMessages(
+        pageId,
+        psid,
+        message.text,
+        pageAccessToken,
+        channelType,
+        message.quickReplies?.length ? { quickReplies: message.quickReplies } : null
+      );
+    } catch (sendErr) {
+      log('ERROR', 'Failed to deliver form-start message — will retry', { sessionId: lockSessionId, error: sendErr.message });
+      throw sendErr;
+    }
+    try {
+      await storeConversationContext(pageId, psid, sanitizedInput, message.text, messageMid);
+    } catch (storeErr) {
+      log('WARN', 'Failed to store form-start context', { sessionId: lockSessionId, error: storeErr.message });
+    }
+    try {
+      await updateLastUserMessageAt(pageId, channelType);
+    } catch (updateErr) {
+      log('WARN', 'Failed to update lastUserMessageAt after form start', { pageId, channelType, error: updateErr.message });
+    }
+
+    await finalizeConversationLock(runTurn, { formState: { active: true, session: newSession, form } });
+
+    const startDurationMs = Date.now() - startTime;
+    log('INFO', 'Handler complete (form started)', { pageId, psid, durationMs: startDurationMs });
+    return;
   }
 
   // ── 0c. Postback handling ────────────────────────────────────────────────

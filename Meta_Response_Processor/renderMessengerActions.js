@@ -6,12 +6,14 @@
  * this module implements it, it does not re-derive it:
  *
  *   send_query / show_info (suggestion class) → quick replies (transient)
- *   external_link / start_form (commitment)   → button-template web_url
+ *   external_link (commitment)                → button-template web_url
  *                                                buttons (persistent)
- *
- * start_form interim (pre-M7): rendered as a URL button only when the CTA
- * carries a `url` (link-out per C9); without one there is nothing to link —
- * skipped with a log (never silently).
+ *   start_form (M7a replacement of the pre-M7 interim named in C9):
+ *     - carries a `url` → still a button (tenant explicitly wants a link-out
+ *       instead of the in-Messenger form engine — override preserved)
+ *     - no `url` → quick reply (`PIC1:cta:{id}`); tapping it resolves via
+ *       `resolveCtaPayload` below into `formEngine.beginForm` when the CTA's
+ *       formId matches a `conversational_forms` entry (index.js wiring)
  *
  * Caps from C5 (capabilities.js): QR ≤13, titles truncated to 20 chars,
  * buttons ≤3 (overflow logged, V5 order wins).
@@ -49,7 +51,6 @@ function renderMessengerActions(actionIds, config, log) {
         });
         break;
       case 'external_link':
-      case 'start_form':
         if (cta.url) {
           buttons.push({
             type: 'web_url',
@@ -57,10 +58,27 @@ function renderMessengerActions(actionIds, config, log) {
             title: truncateTitle(cta.label || cta.text || id),
           });
         } else {
-          // start_form without a link-out URL: nothing to render until M7.
-          log('INFO', 'CTA skipped — no url for commitment rendering (pre-M7 interim)', {
-            ctaId: id,
-            action: cta.action,
+          log('INFO', 'CTA skipped — external_link missing url', { ctaId: id, action: cta.action });
+        }
+        break;
+      case 'start_form':
+        if (cta.url) {
+          // Explicit link-out override — tenant wants an external page
+          // instead of the in-Messenger form engine.
+          buttons.push({
+            type: 'web_url',
+            url: cta.url,
+            title: truncateTitle(cta.label || cta.text || id),
+          });
+        } else {
+          // M7a: replaces the pre-M7 logged-skip interim (C9) — start_form
+          // without a url now renders as a quick reply. A tap resolves via
+          // resolveCtaPayload (below) into formEngine.beginForm when the
+          // CTA's formId matches a configured conversational_forms entry.
+          quickReplies.push({
+            content_type: 'text',
+            title: truncateTitle(cta.label || cta.text || id),
+            payload: `PIC1:cta:${id}`,
           });
         }
         break;
@@ -96,7 +114,15 @@ function renderMessengerActions(actionIds, config, log) {
  * cta route — the caller then treats the payload as free text into RAG
  * (C3's unknown-payload rule, which also covers stale buttons forever).
  *
- * @returns {{ turnText: string, ctaId: string } | null}
+ * M7a addition: a `start_form` CTA whose formId resolves in the tenant's
+ * `conversational_forms` returns `startFormId` in addition to `turnText` —
+ * the caller (index.js) begins the form engine instead of a RAG turn when
+ * MESSENGER_CHANNEL + the state table are both available; an unresolvable
+ * formId (mistyped, or the form was removed from config) falls back to the
+ * pre-M7 behavior below (RAG on the CTA label) exactly like any other
+ * unmapped case.
+ *
+ * @returns {{ turnText: string, ctaId: string, startFormId?: string } | null}
  */
 function resolveCtaPayload(payload, config) {
   if (typeof payload !== 'string' || !payload.startsWith('PIC1:cta:')) return null;
@@ -109,6 +135,13 @@ function resolveCtaPayload(payload, config) {
       return { turnText: cta.query || cta.label || ctaId, ctaId };
     case 'show_info':
       return { turnText: cta.prompt || cta.label || ctaId, ctaId };
+    case 'start_form': {
+      const formId = cta.formId || cta.form_id;
+      if (formId && config?.conversational_forms?.[formId]) {
+        return { turnText: cta.label || ctaId, ctaId, startFormId: formId };
+      }
+      return { turnText: cta.label || ctaId, ctaId };
+    }
     default:
       // Commitment CTAs render as URL buttons (no postback round-trip); a
       // PIC1:cta payload for one is unexpected — answer about it via RAG.
