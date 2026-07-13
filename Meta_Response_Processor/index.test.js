@@ -1564,3 +1564,64 @@ describe('M3b — Messenger V5 wiring', () => {
     expect(sentTexts().some((t) => t.includes('Plain reply.'))).toBe(true);
   });
 });
+
+// ─── M3b review follow-ups ───────────────────────────────────────────────────
+
+describe('M3b — review follow-ups', () => {
+  const V5_FLAG_CONFIG2 = {
+    model_id: 'config-model',
+    tone_prompt: 'T.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    cta_definitions: { volunteer_form: { label: 'V', action: 'start_form', ai_available: true } },
+  };
+
+  test('returning user after >24h gap gets the disclosure line AGAIN (C8: each session)', async () => {
+    loadConfig.mockResolvedValue(V5_FLAG_CONFIG2);
+    const now = Date.now();
+    ddbMock.on(QueryCommand).resolves({
+      Items: [
+        { role: 'user', content: 'old', messageTimestamp: now - 30 * 3600 * 1000 },
+        { role: 'assistant', content: 'old reply', messageTimestamp: now - 29 * 3600 * 1000 },
+      ],
+    });
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Welcome back!\n<<<ACTIONS []>>>'));
+
+    await handler(buildEvent());
+
+    const texts = fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message && typeof b.message.text === 'string')
+      .map((b) => b.message.text);
+    expect(texts.some((t) => t.includes('automated assistant'))).toBe(true); // disclosure re-fired
+  });
+
+  test('C6 model precedence: channel override wins in the V5 request', async () => {
+    loadConfig.mockResolvedValue({
+      ...V5_FLAG_CONFIG2,
+      messenger_behavior: { model_id: 'section-model', channel_overrides: { messenger: { model_id: 'channel-model' } } },
+    });
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+
+    await handler(buildEvent());
+
+    expect(bedrockMock.commandCalls(InvokeModelCommand)[0].args[0].input.modelId).toBe('channel-model');
+  });
+
+  test('hallucinated sentinel with NO catalog still never leaks (always-parse hardening)', async () => {
+    loadConfig.mockResolvedValue({ ...V5_FLAG_CONFIG2, cta_definitions: {} });
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
+    bedrockMock.on(InvokeModelCommand).resolves(
+      makeBedrockResponse('Copied from KB: <<<ACTIONS ["whatever"]>>> end.')
+    );
+
+    await handler(buildEvent());
+
+    const texts = fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message && typeof b.message.text === 'string')
+      .map((b) => b.message.text);
+    for (const t of texts) expect(t).not.toContain('<<<ACTIONS');
+  });
+});

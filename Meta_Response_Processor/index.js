@@ -47,7 +47,7 @@ const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
 const { classifyMetaSendError } = require('./metaSendErrors');
-const { buildMessengerV5Prompt } = require('./prompt_messenger');
+const { buildMessengerV5Prompt, resolveMessengerModelId } = require('./prompt_messenger');
 const { computeSessionWindow } = require('./sessionWindow');
 const { createTailParser } = require('../shared/prompt/streamTail');
 const { validateActionIds } = require('../shared/prompt/prompt_v5');
@@ -825,7 +825,8 @@ function stripFormattingMarkers(text) {
  * @returns {Promise<{responseText: string, actionIds: string[], tailStatus: string}>}
  */
 async function generateMessengerV5Response(userInput, kbContext, sessionHistory, config, channelType) {
-  const modelId = config.model_id || DEFAULT_MODEL_ID;
+  // C6 model precedence: channel override -> messenger_behavior -> config -> default.
+  const modelId = resolveMessengerModelId(config, channelType, DEFAULT_MODEL_ID);
   const maxTokens = config.streaming?.max_tokens || 1000;
   const temperature = config.streaming?.temperature ?? 0;
 
@@ -861,15 +862,18 @@ async function generateMessengerV5Response(userInput, kbContext, sessionHistory,
   const responseBody = JSON.parse(Buffer.from(result.body).toString('utf-8'));
   const rawText = responseBody.content?.[0]?.text || responseBody.completion || '';
 
-  if (!v5Active) {
-    // No ai_available CTAs: plain short-form prompt, no tail to parse.
-    return { responseText: stripFormattingMarkers(rawText), actionIds: [], tailStatus: 'no_catalog' };
-  }
-
+  // ALWAYS parse — the no-leak guarantee must hold even when the prompt never
+  // asked for a tail (a sentinel could arrive via KB content or hallucination;
+  // review finding: this was the one unguarded branch).
   const parser = createTailParser();
   const released = parser.feed(rawText);
   const tail = parser.end();
   const visible = stripFormattingMarkers(released + (tail.remainingText || ''));
+
+  if (!v5Active) {
+    // No ai_available CTAs: nothing to act on, whatever the model emitted.
+    return { responseText: visible, actionIds: [], tailStatus: 'no_catalog' };
+  }
 
   if (tail.status === 'actions') {
     const ids = validateActionIds(tail.actionIds, config);

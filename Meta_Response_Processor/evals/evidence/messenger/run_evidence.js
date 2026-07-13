@@ -221,7 +221,7 @@ async function main() {
           sentences: countSentences(visible),
           chars: visible.length,
           markdown: hasMarkdown(visible),
-          advancesFunnel: /apply|application|sign.?up|next step|discovery|register/i.test(visible),
+          advancesFunnel: /apply|application|sign.?up|next step|discovery|register|get started|learn more/i.test(visible),
           turnCheckFired: scenario.turnCheckFired === true,
           tailStatus: tail ? tail.status : 'missing',
           actionCount: Array.isArray(validIds) ? validIds.length : null,
