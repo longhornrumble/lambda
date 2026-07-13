@@ -34,8 +34,12 @@
  *   ENVIRONMENT              — staging | production (default: staging)
  *   CHANNEL_MAPPINGS_TABLE   — DynamoDB table for page tokens
  *   RECENT_MESSAGES_TABLE    — DynamoDB table for conversation context
+ *   CONVERSATION_STATE_TABLE — C4 table (serialization lock + M6a pause row); '' disables both
  *   KMS_KEY_ID               — KMS key alias or ARN for page token decryption
  *   AWS_REGION               — AWS region (default: us-east-1)
+ *   SES_FROM_EMAIL           — M6a staff-escalation sender; '' disables the email (escalation.js)
+ *   FB_INBOX_APP_ID          — M6a pass_thread_control target for Messenger (escalation.js)
+ *   IG_INBOX_APP_ID          — M6a pass_thread_control target for Instagram (escalation.js)
  */
 
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -43,9 +47,11 @@ const { DynamoDBClient, GetItemCommand, PutItemCommand, UpdateItemCommand } = re
 const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand } = require('@aws-sdk/lib-dynamodb');
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+const { SESClient } = require('@aws-sdk/client-ses');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
+const escalation = require('./escalation');
 const { classifyMetaSendError } = require('./metaSendErrors');
 const { buildMessengerV5Prompt, resolveMessengerModelId } = require('./prompt_messenger');
 const { renderMessengerActions, resolveCtaPayload } = require('./renderMessengerActions');
@@ -70,6 +76,10 @@ const dynamodb = DynamoDBDocumentClient.from(dynamodbRaw, {
 const kms = new KMSClient({ region: AWS_REGION });
 
 const sqs = new SQSClient({ region: AWS_REGION });
+
+// M6a: staff-notification email (BSH form_handler.js pattern — client at
+// module scope, Source resolved per-send by escalation.js from SES_FROM_EMAIL).
+const sesClient = new SESClient({ region: AWS_REGION });
 
 // ─── Configuration constants ──────────────────────────────────────────────────
 
@@ -100,6 +110,10 @@ const DEFAULT_RATE_LIMITED = "You're sending messages faster than I can keep up 
 const DEFAULT_BUTTON_INTRO = 'Tap below to take the next step:';
 const DEFAULT_UNSUPPORTED_INPUT_FALLBACK =
   "Sorry, I can't read that kind of message yet — could you type it instead?";
+
+/** M6a (config: messenger_behavior.strings.escalation_confirmation) */
+const DEFAULT_ESCALATION_CONFIRMATION =
+  "Of course — I'm connecting you with a person from the team now. They'll reply right here.";
 
 const META_GRAPH_VERSION = 'v21.0';
 const META_SEND_API_BASE = `https://graph.facebook.com/${META_GRAPH_VERSION}`;
@@ -478,6 +492,43 @@ function getMessengerString(config, channelType, key, fallback) {
 }
 
 /**
+ * M6a: is this conversation currently paused (staff owns the thread, C4
+ * pause row)? Shared by BOTH reply paths that could otherwise send while
+ * paused — the main text/quick_reply turn AND the v2 attachment/sticker/
+ * unsupported 30-second-fallback path (code review finding: the fallback
+ * path used to run before any pause check existed, so a paused conversation
+ * still got a bot reply on a sticker).
+ *
+ * Table-gated (mirrors the C7 lock's own gate) and fail-open: an unset
+ * CONVERSATION_STATE_TABLE or a lookup error both resolve to "not paused"
+ * (proceed normally) — the pause check is a courtesy, never an availability
+ * gate. Callers additionally gate this on the MESSENGER_CHANNEL flag so
+ * flag-off tenants issue no GetItem at all (byte-identical baseline).
+ *
+ * @param {string} sessionId — `meta:{pageId}:{psid}`
+ * @returns {Promise<boolean>}
+ */
+async function isConversationPaused(sessionId) {
+  if (!CONVERSATION_STATE_TABLE) return false;
+  try {
+    const pauseResult = await dynamodb.send(
+      new GetCommand({
+        TableName: CONVERSATION_STATE_TABLE,
+        Key: { sessionId, stateType: 'pause' },
+      })
+    );
+    const nowSec = Math.floor(Date.now() / 1000);
+    return !!(pauseResult.Item && pauseResult.Item.expires_at > nowSec);
+  } catch (pauseErr) {
+    log('WARN', 'Pause-state lookup failed — proceeding normally (fail-open)', {
+      sessionId,
+      error: pauseErr.message,
+    });
+    return false;
+  }
+}
+
+/**
  * Handle an unsupported-input event (attachment/sticker/unsupported, C1) when
  * `feature_flags.MESSENGER_CHANNEL` is on: reply with the configured fallback
  * string (30-second rule) — no Bedrock call, no history write.
@@ -515,6 +566,107 @@ async function handleUnsupportedInputFallback({ pageId, psid, channelType, confi
     });
     throw sendErr;
   }
+}
+
+// ─── Escalation: transfer + notify (M6a, C2/C4) ──────────────────────────────
+
+/**
+ * "Talk to a human" escalation: send the confirmation, hand off thread
+ * control to the tenant's inbox app, write the C4 pause row, best-effort
+ * email staff, then store the turn to history for continuity. Every step
+ * after the confirmation send is defensive — a thread-control or email
+ * failure must never leave the user without the confirmation or the bot
+ * still holding the conversation, but a pause-row write failure IS logged
+ * loudly (a silently-missing pause row is a correctness bug, not a
+ * cosmetic one: the next inbound would get a normal turn instead of
+ * standing down for staff).
+ *
+ * @param {object} params
+ * @returns {Promise<void>}
+ */
+async function handleEscalation({
+  pageId,
+  psid,
+  channelType,
+  tenantId,
+  config,
+  pageAccessToken,
+  sessionId,
+  turnText,
+  turnMid,
+}) {
+  const confirmationText = getMessengerString(
+    config,
+    channelType,
+    'escalation_confirmation',
+    DEFAULT_ESCALATION_CONFIRMATION
+  );
+
+  try {
+    await sendResponseMessages(pageId, psid, confirmationText, pageAccessToken, channelType);
+  } catch (sendErr) {
+    // Non-fatal: the handoff/pause/email below still give the user a human —
+    // they just may not see this specific confirmation text.
+    log('ERROR', 'Failed to send escalation confirmation — continuing with handoff', {
+      sessionId,
+      error: sendErr.message,
+    });
+  }
+
+  const transferResult = await escalation.passThreadControl({
+    pageId,
+    psid,
+    channelType,
+    accessToken: pageAccessToken,
+    metadata: `picasso-escalation tenant=${tenantId}`,
+  });
+  if (!transferResult.ok) {
+    log('WARN', 'pass_thread_control did not succeed — email + pause still proceed', {
+      sessionId,
+      channelType,
+    });
+  }
+
+  if (CONVERSATION_STATE_TABLE) {
+    try {
+      await escalation.writePauseRow({
+        client: dynamodb,
+        tableName: CONVERSATION_STATE_TABLE,
+        sessionId,
+      });
+    } catch (pauseErr) {
+      log('ERROR', 'Failed to write escalation pause row — bot will NOT stand down', {
+        sessionId,
+        error: pauseErr.message,
+      });
+    }
+  }
+
+  await escalation.sendEscalationEmail({
+    sesClient,
+    config,
+    tenantId,
+    channelType,
+    sessionId,
+    pageId,
+  });
+
+  try {
+    await storeConversationContext(pageId, psid, turnText, confirmationText, turnMid);
+  } catch (storeErr) {
+    log('WARN', 'Failed to store escalation turn context', {
+      sessionId,
+      error: storeErr.message,
+    });
+  }
+
+  emitAnalyticsEvent('MESSENGER_ESCALATED', {
+    session_id: sessionId,
+    tenant_id: tenantId,
+    channel_type: channelType,
+    page_id: pageId,
+    psid,
+  });
 }
 
 // ─── Channel-mapping metadata update ─────────────────────────────────────────
@@ -1150,6 +1302,17 @@ exports.handler = async function handler(event) {
       }
 
       if (v2Config.feature_flags?.MESSENGER_CHANNEL === true) {
+        // M6a: a paused (escalated, staff-owned) conversation must not get a
+        // bot reply on ANY event kind — this path used to run before any
+        // pause check existed, so a sticker/attachment during an active
+        // escalation still got the 30-second fallback (code review finding).
+        if (await isConversationPaused(sessionId)) {
+          log('INFO', 'Bot paused — escalated conversation, standing down (fallback reply suppressed)', {
+            sessionId,
+            eventKind,
+          });
+          return;
+        }
         await handleUnsupportedInputFallback({
           pageId: v2PageId,
           psid: v2Psid,
@@ -1221,12 +1384,45 @@ exports.handler = async function handler(event) {
     is_postback: event.isPostback === true,
   });
 
+  // ── 0b. Load tenant config early (needed for the M6a pause-check/escalation
+  // flag gate below, ahead of the C7 lock) ─────────────────────────────────
+  let config = {};
+  try {
+    config = await loadConfig(tenantHash);
+    if (!config) {
+      log('WARN', 'loadConfig returned null — using defaults', { tenantHash });
+      config = {};
+    }
+  } catch (configErr) {
+    log('WARN', 'Failed to load tenant config — using defaults', {
+      tenantHash,
+      error: configErr.message,
+    });
+    config = {};
+  }
+
+  const lockSessionId = `meta:${pageId}:${psid}`;
+  const messengerFlagOn = config.feature_flags?.MESSENGER_CHANNEL === true;
+
+  // ── M6a: pause check — a prior escalation left the bot standing down for
+  // this conversation while staff owns the thread (C4 pause row). Flag off
+  // ⇒ isConversationPaused is never called at all (byte-identical baseline,
+  // no GetItem issued); the helper itself no-ops when CONVERSATION_STATE_TABLE
+  // is unset and fails open on a lookup error (courtesy check, never a gate
+  // on availability).
+  if (messengerFlagOn && (await isConversationPaused(lockSessionId))) {
+    log('INFO', 'Bot paused — escalated conversation, standing down', {
+      sessionId: lockSessionId,
+    });
+    return;
+  }
+
   // ── 1a. Per-conversation serialization (contract C7, M1c) ────────────────
   // One winner per sessionId runs turns; concurrent invokes coalesce their
   // message onto the winner's pending list and exit. Fail-open: lock-table
   // errors must never block replies (serialization is an optimization of
-  // correctness, not a gate on it).
-  const lockSessionId = `meta:${pageId}:${psid}`;
+  // correctness, not a gate on it). lockSessionId/messengerFlagOn/config were
+  // resolved above (0b) so the M6a pause-check could gate on the flag.
   let lockCtx = null;
   let inheritedPending = [];
   if (CONVERSATION_STATE_TABLE) {
@@ -1285,9 +1481,31 @@ exports.handler = async function handler(event) {
    * combined turns (Bedrock) up to DRAIN_CAP cycles, then answers further
    * bursts with the rate_limited string (bounded spend, no drops), and
    * finally releases the lock CONDITIONALLY on the pending list being empty.
+   *
+   * M6a `silentDrain` mode (runTurnFn is null in this mode — escalation
+   * calls it that way): the conversation was JUST paused (C4 pause row
+   * written this same invocation) — staff, not the bot, owns it now. Pending
+   * items that coalesced during the escalation are claimed and discarded
+   * with NO reply of any kind: no Bedrock turn (consistent with any other
+   * time runTurnFn is absent), and deliberately NOT the rate_limited string
+   * either, because replying at all here would contradict the escalation
+   * confirmation the user just received and would come from the bot the
+   * user just asked to stop talking to. This mirrors the pause-check's own
+   * no-sends/no-history behavior for a paused session.
+   *
+   * M6a mid-drain escalation detection (code review finding): a coalesced
+   * burst can itself contain a "talk to a human" message anywhere in it
+   * (e.g. it's the SECOND of two rapid messages) — that must escalate
+   * instead of joining the combined Bedrock turn. Checked per free-text
+   * member of each claimed batch (flag-gated; PIC1 quick-reply taps are
+   * excluded, same as the top-level check). Once a batch escalates, this
+   * function switches itself into silentDrain for the REST of the lock
+   * hold — any further pending is claimed and silently discarded, same as
+   * the top-level escalation's own post-escalation drain.
    */
-  async function finalizeConversationLock(runTurnFn) {
+  async function finalizeConversationLock(runTurnFn, { silentDrain: initialSilentDrain = false } = {}) {
     if (!lockCtx) return;
+    let silentDrain = initialSilentDrain;
     let batch = inheritedPending;
     inheritedPending = [];
     let bedrockCycles = 0;
@@ -1301,10 +1519,19 @@ exports.handler = async function handler(event) {
           if (released) return;
           continue; // new pending raced in between claim and release — drain again
         }
+        if (silentDrain) {
+          log('INFO', 'Silently discarding pending items — conversation paused mid-drain (M6a)', {
+            sessionId: lockSessionId,
+            count: batch.length,
+          });
+          batch = [];
+          continue;
+        }
+        const rawBatch = batch;
         // C7 step 3: structured members (quick_reply with a PIC1 payload)
         // route via their C3 handlers individually — the canonical CTA text
         // joins the combined turn, not the raw tap label.
-        const texts = batch
+        const texts = rawBatch
           .map((i) => {
             if (!i) return null;
             if (typeof i.quickReplyPayload === 'string' && i.quickReplyPayload.startsWith('PIC1:')) {
@@ -1314,8 +1541,41 @@ exports.handler = async function handler(event) {
             return typeof i.text === 'string' ? i.text : null;
           })
           .filter((t) => t && t.length > 0);
-        const lastMid = batch.length > 0 ? batch[batch.length - 1].mid || null : null;
+        const lastMid = rawBatch.length > 0 ? rawBatch[rawBatch.length - 1].mid || null : null;
         batch = [];
+
+        // M6a: escalation intent anywhere in this drained batch (a PIC1 tap
+        // is a CTA, never free-typed human intent — same exclusion as the
+        // top-level check).
+        const escalationHit =
+          messengerFlagOn &&
+          rawBatch.some((i) => {
+            if (!i || typeof i.text !== 'string') return false;
+            if (typeof i.quickReplyPayload === 'string' && i.quickReplyPayload.startsWith('PIC1:')) return false;
+            return escalation.detectEscalationIntent(i.text);
+          });
+        if (escalationHit) {
+          log('INFO', 'Escalation intent detected in a coalesced drain batch — escalating instead of the combined turn (M6a)', {
+            sessionId: lockSessionId,
+          });
+          await handleEscalation({
+            pageId,
+            psid,
+            channelType,
+            tenantId,
+            config,
+            pageAccessToken,
+            sessionId: lockSessionId,
+            turnText: texts.join('\n'),
+            turnMid: lastMid,
+          });
+          // Staff now owns the thread — any further pending on this same
+          // lock hold is silently discarded, not answered (matches the
+          // top-level escalation's own post-escalation drain behavior).
+          silentDrain = true;
+          continue;
+        }
+
         if (texts.length === 0) continue;
         bedrockCycles++;
         if (bedrockCycles <= conversationLock.DRAIN_CAP && runTurnFn) {
@@ -1373,22 +1633,47 @@ exports.handler = async function handler(event) {
     return;
   }
 
-  // ── 0b. Load tenant config (needed for postback handling and RAG) ─────────
-  // Config is loaded early so the GET_STARTED postback can read welcome_message
-  // without running the full RAG pipeline.
-  let config = {};
-  try {
-    config = await loadConfig(tenantHash);
-    if (!config) {
-      log('WARN', 'loadConfig returned null — using defaults', { tenantHash });
-      config = {};
-    }
-  } catch (configErr) {
-    log('WARN', 'Failed to load tenant config — using defaults', {
-      tenantHash,
-      error: configErr.message,
+  // (config was loaded early at 0b, above the C7 lock, so the M6a pause-check
+  // could gate on feature_flags.MESSENGER_CHANNEL before acquiring the lock.)
+
+  // ── M6a: escalation intent (flag-gated; text/quick_reply turns only — a
+  // postback tap, e.g. GET_STARTED or a PIC1 CTA button, is never free-typed
+  // human intent). Checked on the raw sanitized input, BEFORE 0b2 rewrites it
+  // to a CTA's canonical query text. A structured PIC1 quick-reply tap is
+  // ALSO excluded (code review finding): a CTA titled "Talk to a person"
+  // must resolve its own payload via 0b2, not escalate on its tap label.
+  // Runs under the C7 lock like any other turn: winner escalates, losers
+  // already coalesced above and exited.
+  const isPic1QuickReplyTap =
+    typeof event.quickReplyPayload === 'string' && event.quickReplyPayload.startsWith('PIC1:');
+  if (
+    messengerFlagOn &&
+    event.isPostback !== true &&
+    !isPic1QuickReplyTap &&
+    escalation.detectEscalationIntent(sanitizedInput)
+  ) {
+    await handleEscalation({
+      pageId,
+      psid,
+      channelType,
+      tenantId,
+      config,
+      pageAccessToken,
+      sessionId: lockSessionId,
+      turnText: sanitizedInput,
+      turnMid: messageMid,
     });
-    config = {};
+
+    // The conversation now belongs to staff (pause row just written) — any
+    // input that coalesced onto this lock during the escalation itself is
+    // silently absorbed, not answered (matches the pause-check's own
+    // no-sends/no-Bedrock behavior; answering with rate_limited would
+    // contradict the confirmation we just sent).
+    await finalizeConversationLock(null, { silentDrain: true });
+
+    const durationMs = Date.now() - startTime;
+    log('INFO', 'Handler complete (escalation)', { pageId, psid, durationMs });
+    return;
   }
 
   // ── 0b2. Structured payload routing (contract C3, M4) ────────────────────

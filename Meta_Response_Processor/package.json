@@ -12,6 +12,7 @@
     "@aws-sdk/client-dynamodb": "^3.600.0",
     "@aws-sdk/client-kms": "^3.600.0",
     "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-ses": "^3.600.0",
     "@aws-sdk/client-sqs": "^3.600.0",
     "@aws-sdk/credential-providers": "^3.1049.0",
     "@aws-sdk/lib-dynamodb": "^3.600.0"

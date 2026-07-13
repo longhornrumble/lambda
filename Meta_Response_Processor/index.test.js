@@ -29,6 +29,7 @@ const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, DeleteCom
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+const { SESClient, SendEmailCommand } = require('@aws-sdk/client-ses');
 
 // ─── Mock shared bedrock-core before requiring the handler ────────────────────
 jest.mock('../shared/bedrock-core', () => ({
@@ -44,6 +45,7 @@ const ddbMock = mockClient(DynamoDBDocumentClient);
 const kmsMock = mockClient(KMSClient);
 const bedrockMock = mockClient(BedrockRuntimeClient);
 const sqsMock = mockClient(SQSClient);
+const sesMock = mockClient(SESClient);
 
 // ─── Fetch mock ───────────────────────────────────────────────────────────────
 let fetchMock;
@@ -121,10 +123,17 @@ beforeEach(() => {
   kmsMock.reset();
   bedrockMock.reset();
   sqsMock.reset();
+  sesMock.reset();
   jest.clearAllMocks();
+  delete process.env.SES_FROM_EMAIL; // M6a default: unset ⇒ email disabled unless a test opts in
 
   // Default SQS stub: analytics emissions succeed silently
   sqsMock.on(SendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
+
+  // Default SES stub (M6a escalation email) — tests that want it disabled
+  // leave SES_FROM_EMAIL unset; tests that want it sent set the env AND rely
+  // on this default success stub.
+  sesMock.on(SendEmailCommand).resolves({ MessageId: 'mock-ses-id' });
 
   // Default: loadConfig returns a minimal config
   loadConfig.mockResolvedValue({
@@ -1855,5 +1864,755 @@ describe('M4 — review follow-ups', () => {
       return i.text;
     });
     expect(texts).toEqual(['tell me about programs', 'and a typed question']);
+  });
+});
+
+// ─── M6a — Escalation: transfer + notify (C2 escalation_confirmation, C4 pause) ─
+//
+// "Talk to a human" intent → confirmation → pass_thread_control → pause row →
+// staff email, all defensive on the side effects (never on the confirmation).
+// Adversarial focus (plan §6 M6a): intent false-positives ("how do humans
+// apply?" must NOT escalate) and the never-share-IAM-roles rule (new
+// permissions land on this Lambda's own role only — IAM ships in the picasso
+// repo, out of scope here).
+
+const escalation = require('./escalation');
+
+const DEFAULT_ESCALATION_CONFIRMATION =
+  "Of course — I'm connecting you with a person from the team now. They'll reply right here.";
+
+describe('M6a — detectEscalationIntent (intent table)', () => {
+  const POSITIVE = [
+    'Can I talk to a human?',
+    'I want to speak with a person',
+    'I need to chat with an agent',
+    "I'd like to talk to a representative",
+    'let me talk to someone',
+    'please speak to a human',
+    'connect me to a human agent',
+    'transfer me to a human please',
+    'speak to staff',
+    'real human please',
+    'connect me with a representative',
+  ];
+
+  const NEGATIVE = [
+    'how do humans apply?',
+    'what do your agents do?',
+    'the person I mentor is great',
+    'How can I talk about the weather',
+    'I want to become a volunteer',
+    'can I speak at the event',
+    'Is there a human resources department?',
+    'What programs do you have for humans in need?',
+    'I need help with my application',
+    'Please transfer my file to another department',
+    'I want to chat about the schedule',
+    // Code review — negation guard (HIGH): a negated request must not escalate.
+    'I do not want to talk to a human',
+    'no thanks I do not need to speak with a person',
+    'I would rather not talk to an agent right now',
+    // Code review — connect me / transfer me need the same human-noun
+    // gating as the main pattern (MEDIUM).
+    'connect me to the volunteer page',
+    'connect me with more information',
+    'please transfer me some documents',
+  ];
+
+  test.each(POSITIVE)('MATCHES: %j', (text) => {
+    expect(escalation.detectEscalationIntent(text)).toBe(true);
+  });
+
+  test.each(NEGATIVE)('does NOT match: %j', (text) => {
+    expect(escalation.detectEscalationIntent(text)).toBe(false);
+  });
+
+  test('non-string / empty input never matches', () => {
+    expect(escalation.detectEscalationIntent('')).toBe(false);
+    expect(escalation.detectEscalationIntent('   ')).toBe(false);
+    expect(escalation.detectEscalationIntent(undefined)).toBe(false);
+    expect(escalation.detectEscalationIntent(null)).toBe(false);
+  });
+});
+
+describe('M6a — escalation.js unit tests (pass_thread_control / pause row / SES)', () => {
+  afterEach(() => {
+    delete global.fetch;
+    delete process.env.FB_INBOX_APP_ID;
+    delete process.env.IG_INBOX_APP_ID;
+    delete process.env.SES_FROM_EMAIL;
+  });
+
+  describe('passThreadControl', () => {
+    test('Messenger (FB): POSTs to /me/pass_thread_control with the FB inbox app id, content-free metadata', async () => {
+      const fetchSpy = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ success: true }) });
+      global.fetch = fetchSpy;
+
+      const result = await escalation.passThreadControl({
+        pageId: 'PAGE_456',
+        psid: 'PSID_123',
+        channelType: 'messenger',
+        accessToken: 'page-token',
+        metadata: 'picasso-escalation tenant=TENANT_789',
+      });
+
+      expect(result).toEqual({ ok: true });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, opts] = fetchSpy.mock.calls[0];
+      expect(url).toContain('/me/pass_thread_control');
+      // access_token rides the JSON body (code review: match this file's
+      // existing convention — never the URL query string).
+      expect(url).not.toContain('access_token');
+      const body = JSON.parse(opts.body);
+      expect(body.access_token).toBe('page-token');
+      expect(body.recipient.id).toBe('PSID_123');
+      expect(body.target_app_id).toBe(escalation.DEFAULT_FB_INBOX_APP_ID);
+      expect(body.metadata).toBe('picasso-escalation tenant=TENANT_789');
+      // Metadata must never carry conversation content.
+      expect(body.metadata).not.toMatch(/talk|human|speak/i);
+    });
+
+    test('Instagram: uses the IG inbox app id', async () => {
+      const fetchSpy = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ success: true }) });
+      global.fetch = fetchSpy;
+
+      await escalation.passThreadControl({
+        pageId: 'PAGE_456',
+        psid: 'IGSID_123',
+        channelType: 'instagram',
+        accessToken: 'page-token',
+        metadata: 'picasso-escalation tenant=TENANT_789',
+      });
+
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.target_app_id).toBe(escalation.DEFAULT_IG_INBOX_APP_ID);
+    });
+
+    test('env overrides win over the built-in default app ids', async () => {
+      process.env.FB_INBOX_APP_ID = 'custom-fb-app-id';
+      const fetchSpy = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({}) });
+      global.fetch = fetchSpy;
+
+      await escalation.passThreadControl({
+        pageId: 'PAGE_456', psid: 'PSID_123', channelType: 'messenger', accessToken: 't', metadata: 'm',
+      });
+
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.target_app_id).toBe('custom-fb-app-id');
+    });
+
+    test('non-2xx response (tenant has not configured Conversation Routing) → {ok:false}, never throws', async () => {
+      const fetchSpy = jest.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: { message: 'default app not set' } }),
+      });
+      global.fetch = fetchSpy;
+
+      await expect(
+        escalation.passThreadControl({
+          pageId: 'PAGE_456', psid: 'PSID_123', channelType: 'messenger', accessToken: 't', metadata: 'm',
+        })
+      ).resolves.toEqual({ ok: false });
+    });
+
+    test('network error → {ok:false}, never throws', async () => {
+      global.fetch = jest.fn().mockRejectedValue(new Error('ENOTFOUND'));
+
+      await expect(
+        escalation.passThreadControl({
+          pageId: 'PAGE_456', psid: 'PSID_123', channelType: 'messenger', accessToken: 't', metadata: 'm',
+        })
+      ).resolves.toEqual({ ok: false });
+    });
+  });
+
+  describe('writePauseRow (C4 pause row shape)', () => {
+    test('PutCommand carries the C4 shape with a ~24h expires_at', async () => {
+      const sendSpy = jest.fn().mockResolvedValue({});
+      const fakeClient = { send: sendSpy };
+      const before = Date.now();
+
+      await escalation.writePauseRow({
+        client: fakeClient,
+        tableName: 'picasso-conversation-state',
+        sessionId: 'meta:PAGE_456:PSID_123',
+      });
+
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      const putInput = sendSpy.mock.calls[0][0].input;
+      expect(putInput.TableName).toBe('picasso-conversation-state');
+      const item = putInput.Item;
+      expect(item.sessionId).toBe('meta:PAGE_456:PSID_123');
+      expect(item.stateType).toBe('pause');
+      expect(item.reason).toBe('escalation');
+      expect(item.schema_version).toBe(1);
+      expect(typeof item.paused_at).toBe('number');
+      expect(typeof item.updated_at).toBe('number');
+      // ~24h TTL (epoch seconds) — allow a small scheduling slop window.
+      const expectedExpiry = Math.floor(before / 1000) + 24 * 60 * 60;
+      expect(item.expires_at).toBeGreaterThanOrEqual(expectedExpiry - 5);
+      expect(item.expires_at).toBeLessThanOrEqual(expectedExpiry + 5);
+    });
+
+    test('DDB failure propagates to the caller (index.js decides how loud to be)', async () => {
+      const fakeClient = { send: jest.fn().mockRejectedValue(new Error('ProvisionedThroughputExceeded')) };
+      await expect(
+        escalation.writePauseRow({ client: fakeClient, tableName: 't', sessionId: 's' })
+      ).rejects.toThrow('ProvisionedThroughputExceeded');
+    });
+  });
+
+  describe('sendEscalationEmail (G-P2 — content-free, PII-minimal)', () => {
+    const FIXTURE_MESSAGE = 'I need help finding my SECRET_CASE_FILE_9182 please talk to a human';
+    const FIXTURE_PSID = 'PSID_SUPER_SECRET_555';
+    const FIXTURE_SESSION_ID = `meta:PAGE_456:${FIXTURE_PSID}`;
+
+    test('recipient + SES_FROM_EMAIL configured → sends; body has NO psid, NO sessionId, NO message content; only PAGE ID + metadata', async () => {
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      const sendSpy = jest.fn().mockResolvedValue({ MessageId: 'ses-1' });
+      const fakeSesClient = { send: sendSpy };
+      const config = { messenger_behavior: { escalation_email: 'staff@tenant.org' } };
+
+      const result = await escalation.sendEscalationEmail({
+        sesClient: fakeSesClient,
+        config,
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: FIXTURE_SESSION_ID,
+        pageId: 'PAGE_456',
+      });
+
+      expect(result).toEqual({ sent: true });
+      expect(sendSpy).toHaveBeenCalledTimes(1);
+      const emailInput = sendSpy.mock.calls[0][0].input;
+      expect(emailInput.Destination.ToAddresses).toEqual(['staff@tenant.org']);
+      expect(emailInput.Source).toBe('notify@myrecruiter.ai');
+
+      const wholeEmail = JSON.stringify(emailInput);
+      // G-P2 pin: grep-style assertion that content/psid/session id never leak.
+      expect(wholeEmail).not.toContain(FIXTURE_PSID);
+      expect(wholeEmail).not.toContain(FIXTURE_SESSION_ID);
+      expect(wholeEmail).not.toContain('meta:');
+      expect(wholeEmail).not.toContain(FIXTURE_MESSAGE);
+      expect(wholeEmail).not.toContain('SECRET_CASE_FILE_9182');
+      // Approved content-free refinement: page id IS allowed (business metadata).
+      expect(wholeEmail).toContain('PAGE_456');
+      expect(wholeEmail).toContain('business.facebook.com/latest/inbox');
+      expect(wholeEmail).toContain('TENANT_789');
+    });
+
+    test('never logs the recipient address (only emailSent + tenantId)', async () => {
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      const fakeSesClient = { send: jest.fn().mockResolvedValue({ MessageId: 'ses-1' }) };
+      const config = { messenger_behavior: { escalation_email: 'staff-secret-address@tenant.org' } };
+      const logSpy = jest.spyOn(console, 'log');
+      const errSpy = jest.spyOn(console, 'error');
+
+      await escalation.sendEscalationEmail({
+        sesClient: fakeSesClient,
+        config,
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: 'meta:PAGE_456:PSID_123',
+        pageId: 'PAGE_456',
+      });
+
+      const allLogged = [...logSpy.mock.calls, ...errSpy.mock.calls]
+        .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+        .join('\n');
+      expect(allLogged).not.toContain('staff-secret-address@tenant.org');
+      expect(allLogged).toContain('"emailSent":true');
+      expect(allLogged).toContain('TENANT_789');
+    });
+
+    test('escalation_email absent → skipped, SES never called', async () => {
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      const sendSpy = jest.fn();
+      const result = await escalation.sendEscalationEmail({
+        sesClient: { send: sendSpy },
+        config: {},
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: 'meta:PAGE_456:PSID_123',
+      });
+      expect(result).toEqual({ skipped: true, reason: 'no_recipient' });
+      expect(sendSpy).not.toHaveBeenCalled();
+    });
+
+    test('SES_FROM_EMAIL unset → skipped even with a recipient configured, SES never called', async () => {
+      const sendSpy = jest.fn();
+      const result = await escalation.sendEscalationEmail({
+        sesClient: { send: sendSpy },
+        config: { messenger_behavior: { escalation_email: 'staff@tenant.org' } },
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: 'meta:PAGE_456:PSID_123',
+      });
+      expect(result).toEqual({ skipped: true, reason: 'ses_disabled' });
+      expect(sendSpy).not.toHaveBeenCalled();
+    });
+
+    test('SES send failure is caught — never throws', async () => {
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      const result = await escalation.sendEscalationEmail({
+        sesClient: { send: jest.fn().mockRejectedValue(new Error('SES throttled')) },
+        config: { messenger_behavior: { escalation_email: 'staff@tenant.org' } },
+        tenantId: 'TENANT_789',
+        channelType: 'messenger',
+        sessionId: 'meta:PAGE_456:PSID_123',
+      });
+      expect(result).toEqual({ failed: true });
+    });
+  });
+});
+
+describe('M6a — escalation E2E through the handler (CONVERSATION_STATE_TABLE unset — no lock)', () => {
+  const ESCALATION_CFG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'You are a helpful recruiter assistant.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    messenger_behavior: { escalation_email: 'staff@tenant.org' },
+  };
+
+  beforeEach(() => {
+    process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+    loadConfig.mockResolvedValue(ESCALATION_CFG);
+  });
+
+  function makeEscalationFetchMock(passThreadControlResp = { ok: true, status: 200, body: { success: true } }) {
+    return jest.fn().mockImplementation((url) => {
+      if (typeof url === 'string' && url.includes('pass_thread_control')) {
+        return Promise.resolve({
+          ok: passThreadControlResp.ok,
+          status: passThreadControlResp.status,
+          json: () => Promise.resolve(passThreadControlResp.body),
+        });
+      }
+      // Confirmation send (and any other /messages call).
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ message_id: 'mid.confirmation' }) });
+    });
+  }
+
+  test('flag ON + "talk to a human" → confirmation sent, pass_thread_control POSTed (FB app id), email sent, MESSENGER_ESCALATED emitted, NO Bedrock call', async () => {
+    fetchMock = makeEscalationFetchMock();
+    global.fetch = fetchMock;
+
+    await handler(buildEvent({ messageText: 'Can I talk to a human?' }));
+
+    // Confirmation text sent via the Send API.
+    const sendCalls = fetchMock.mock.calls.filter(([url]) => !url.includes('pass_thread_control'));
+    const confirmationBody = JSON.parse(sendCalls[0][1].body);
+    expect(confirmationBody.message.text).toBe(DEFAULT_ESCALATION_CONFIRMATION);
+
+    // pass_thread_control POSTed with the FB inbox app id.
+    const transferCall = fetchMock.mock.calls.find(([url]) => url.includes('pass_thread_control'));
+    expect(transferCall).toBeDefined();
+    const transferBody = JSON.parse(transferCall[1].body);
+    expect(transferBody.target_app_id).toBe(escalation.DEFAULT_FB_INBOX_APP_ID);
+    expect(transferBody.recipient.id).toBe('PSID_123');
+
+    // Staff email sent.
+    expect(sesMock).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    const emailCall = sesMock.commandCalls(SendEmailCommand)[0];
+    expect(emailCall.args[0].input.Destination.ToAddresses).toEqual(['staff@tenant.org']);
+
+    // Analytics: MESSENGER_ESCALATED emitted, content-minimal payload.
+    const sqsCalls = sqsMock.commandCalls(SendMessageCommand);
+    const escalatedEvent = sqsCalls
+      .map((c) => JSON.parse(c.args[0].input.MessageBody))
+      .find((b) => b.event.type === 'MESSENGER_ESCALATED');
+    expect(escalatedEvent).toBeDefined();
+    expect(escalatedEvent.event.payload.session_id).toBe('meta:PAGE_456:PSID_123');
+    expect(escalatedEvent.event.payload.tenant_id).toBe('TENANT_789');
+    expect(escalatedEvent.event.payload.channel_type).toBe('messenger');
+
+    // No Bedrock call — escalation happens INSTEAD of the RAG turn.
+    expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+  });
+
+  test('Instagram channel → pass_thread_control uses the IG inbox app id', async () => {
+    fetchMock = makeEscalationFetchMock();
+    global.fetch = fetchMock;
+
+    await handler(buildEvent({ messageText: 'I want to speak with a person', channelType: 'instagram' }));
+
+    const transferCall = fetchMock.mock.calls.find(([url]) => url.includes('pass_thread_control'));
+    const transferBody = JSON.parse(transferCall[1].body);
+    expect(transferBody.target_app_id).toBe(escalation.DEFAULT_IG_INBOX_APP_ID);
+  });
+
+  test('pass_thread_control returns 400 (Conversation Routing not configured) → email + confirmation still happen, handler does not throw', async () => {
+    fetchMock = makeEscalationFetchMock({ ok: false, status: 400, body: { error: { message: 'no default app' } } });
+    global.fetch = fetchMock;
+
+    await expect(handler(buildEvent({ messageText: 'transfer me to a human please' }))).resolves.not.toThrow();
+
+    expect(sesMock).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    const sendCalls = fetchMock.mock.calls.filter(([url]) => !url.includes('pass_thread_control'));
+    expect(sendCalls.length).toBeGreaterThan(0);
+    expect(JSON.parse(sendCalls[0][1].body).message.text).toBe(DEFAULT_ESCALATION_CONFIRMATION);
+  });
+
+  test('escalation_email absent from config → transfer + confirmation still proceed, email skipped', async () => {
+    loadConfig.mockResolvedValue({ ...ESCALATION_CFG, messenger_behavior: undefined });
+    fetchMock = makeEscalationFetchMock();
+    global.fetch = fetchMock;
+
+    await handler(buildEvent({ messageText: 'speak to staff' }));
+
+    expect(sesMock).not.toHaveReceivedCommand(SendEmailCommand);
+    const transferCall = fetchMock.mock.calls.find(([url]) => url.includes('pass_thread_control'));
+    expect(transferCall).toBeDefined();
+  });
+
+  test('flag OFF → "I want to talk to a human" runs the normal RAG turn (byte-identical baseline, no escalation machinery)', async () => {
+    loadConfig.mockResolvedValue({ ...ESCALATION_CFG, feature_flags: {} });
+    fetchMock = makeFetchMock([
+      { ok: true, body: {} }, // typing
+      { ok: true, body: { message_id: 'mid.reply' } }, // reply
+    ]);
+    global.fetch = fetchMock;
+
+    await handler(buildEvent({ messageText: 'I want to talk to a human' }));
+
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('pass_thread_control'))).toBe(false);
+    expect(sesMock).not.toHaveReceivedCommand(SendEmailCommand);
+  });
+
+  test('flag ON + false-positive-risk phrasing "how do humans apply?" → normal RAG turn, no escalation', async () => {
+    fetchMock = makeFetchMock([
+      { ok: true, body: {} },
+      { ok: true, body: { message_id: 'mid.reply' } },
+    ]);
+    global.fetch = fetchMock;
+
+    await handler(buildEvent({ messageText: 'how do humans apply?' }));
+
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('pass_thread_control'))).toBe(false);
+    expect(sesMock).not.toHaveReceivedCommand(SendEmailCommand);
+  });
+
+  test('flag ON + PIC1 quick-reply tap whose label reads "Talk to a person" → resolves the CTA payload, does NOT escalate (code review finding)', async () => {
+    // A CTA titled "Talk to a person" is a structured tap (C3 `PIC1:cta:` route),
+    // not free-typed human intent — it must resolve through 0b2/RAG like any
+    // other CTA, never trip the escalation machinery on its tap label.
+    fetchMock = makeFetchMock([
+      { ok: true, body: {} }, // typing
+      { ok: true, body: { message_id: 'mid.reply' } }, // reply
+    ]);
+    global.fetch = fetchMock;
+
+    await handler(buildEvent({
+      messageText: 'Talk to a person',
+      isPostback: false,
+      quickReplyPayload: 'PIC1:cta:talk_to_person',
+    }));
+
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+    expect(fetchMock.mock.calls.some(([url]) => url.includes('pass_thread_control'))).toBe(false);
+    expect(sesMock).not.toHaveReceivedCommand(SendEmailCommand);
+  });
+});
+
+// ─── M6a — pause check + escalation-writes-the-pause-row, with serialization
+// (CONVERSATION_STATE_TABLE) enabled ─────────────────────────────────────────
+//
+// Both the pause check and the pause-row write inside escalation are gated on
+// CONVERSATION_STATE_TABLE (same env var C7 serialization uses) — empty ⇒
+// disabled, matching the rest of this file's convention (index.test.js
+// deliberately leaves it unset elsewhere; conversationLock.integration.test.js
+// is the existing sibling pattern for env-var-at-module-load tests). Rather
+// than adding a new test file, this block uses jest.isolateModules to get a
+// second, independently-configured instance of the handler within this file.
+describe('M6a — pause check (CONVERSATION_STATE_TABLE enabled)', () => {
+  const ST_TABLE = 'picasso-conversation-state-test';
+  let stHandler;
+  let stDdbMock, stKmsMock, stBedrockMock, stSqsMock, stSesMock;
+  let stLoadConfig, stRetrieveKB;
+  let stGetCommand, stPutCommand, stQueryCommand, stUpdateCommand, stDeleteCommand;
+  let stInvokeModelCommand, stSendMessageCommand, stDecryptCommand, stSendEmailCommand;
+
+  beforeAll(() => {
+    jest.isolateModules(() => {
+      process.env.CONVERSATION_STATE_TABLE = ST_TABLE;
+      process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+
+      jest.doMock('../shared/bedrock-core', () => ({
+        loadConfig: jest.fn(),
+        retrieveKB: jest.fn(),
+        sanitizeUserInput: jest.fn((t) => t?.trim() || ''),
+      }));
+
+      // Reuse the OUTER mockClient (not re-required) — aws-sdk-client-mock-jest's
+      // matchers check `instanceof` against the outer package's AwsClientStub;
+      // an inner-registry copy of 'aws-sdk-client-mock' would produce stub
+      // objects the outer matchers don't recognize ("must be a client mock
+      // instance"). The classes being wrapped DO need to be the inner-registry
+      // copies (to match what the freshly-required './index' uses internally).
+      const mc = mockClient;
+      const ddbLib = require('@aws-sdk/lib-dynamodb');
+      const kmsLib = require('@aws-sdk/client-kms');
+      const bedrockLib = require('@aws-sdk/client-bedrock-runtime');
+      const sqsLib = require('@aws-sdk/client-sqs');
+      const sesLib = require('@aws-sdk/client-ses');
+
+      stGetCommand = ddbLib.GetCommand;
+      stPutCommand = ddbLib.PutCommand;
+      stQueryCommand = ddbLib.QueryCommand;
+      stUpdateCommand = ddbLib.UpdateCommand;
+      stDeleteCommand = ddbLib.DeleteCommand;
+      stInvokeModelCommand = bedrockLib.InvokeModelCommand;
+      stSendMessageCommand = sqsLib.SendMessageCommand;
+      stDecryptCommand = kmsLib.DecryptCommand;
+      stSendEmailCommand = sesLib.SendEmailCommand;
+
+      stDdbMock = mc(ddbLib.DynamoDBDocumentClient);
+      stKmsMock = mc(kmsLib.KMSClient);
+      stBedrockMock = mc(bedrockLib.BedrockRuntimeClient);
+      stSqsMock = mc(sqsLib.SQSClient);
+      stSesMock = mc(sesLib.SESClient);
+
+      const bc = require('../shared/bedrock-core');
+      stLoadConfig = bc.loadConfig;
+      stRetrieveKB = bc.retrieveKB;
+
+      stHandler = require('./index').handler;
+    });
+  });
+
+  afterAll(() => {
+    delete process.env.CONVERSATION_STATE_TABLE;
+    delete process.env.SES_FROM_EMAIL;
+  });
+
+  const ST_CFG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'Helpful.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+  };
+
+  function stChannelMappingItem() {
+    return {
+      Item: {
+        PK: 'PAGE#PAGE_456',
+        SK: 'CHANNEL#messenger',
+        encryptedPageToken: Buffer.from('encrypted-blob').toString('base64'),
+        tenantId: 'TENANT_789',
+      },
+    };
+  }
+
+  beforeEach(() => {
+    stDdbMock.reset();
+    stKmsMock.reset();
+    stBedrockMock.reset();
+    stSqsMock.reset();
+    stSesMock.reset();
+
+    stLoadConfig.mockResolvedValue(ST_CFG);
+    stRetrieveKB.mockResolvedValue('KB context.');
+
+    stSqsMock.on(stSendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
+    stSesMock.on(stSendEmailCommand).resolves({ MessageId: 'mock-ses-id' });
+    stKmsMock.on(stDecryptCommand).resolves({ Plaintext: Buffer.from('EAABtest_page_token') });
+    stDdbMock.on(stQueryCommand).resolves({ Items: [] });
+    stDdbMock.on(stPutCommand).resolves({});
+    stDdbMock.on(stUpdateCommand).resolves({});
+    stDdbMock.on(stDeleteCommand).resolves({});
+    // Channel-mapping GetCommand (Key: {PK,SK}) — pause-row GetCommand (Key:
+    // {sessionId, stateType}) is stubbed per-test since it varies.
+    stDdbMock.on(stGetCommand, { Key: { PK: 'PAGE#PAGE_456', SK: 'CHANNEL#messenger' } }).resolves(stChannelMappingItem());
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+  });
+
+  function stBuildEvent(overrides = {}) {
+    return {
+      psid: 'PSID_123',
+      messageText: 'Hello, what services do you offer?',
+      pageId: 'PAGE_456',
+      tenantId: 'TENANT_789',
+      tenantHash: 'abc123defabc123def',
+      channelType: 'messenger',
+      messageMid: 'm_test_mid',
+      ...overrides,
+    };
+  }
+
+  function stMakeBedrockResponse(text) {
+    return { body: Buffer.from(JSON.stringify({ content: [{ type: 'text', text }], usage: {} })) };
+  }
+
+  test('active (non-expired) pause row → bot stands down: zero sends, zero Bedrock, zero history writes', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    stDdbMock
+      .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+      .resolves({ Item: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause', reason: 'escalation', expires_at: nowSec + 3600 } });
+    global.fetch = jest.fn();
+
+    await expect(stHandler(stBuildEvent())).resolves.toBeUndefined();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(stBedrockMock).not.toHaveReceivedCommand(stInvokeModelCommand);
+    expect(stDdbMock).not.toHaveReceivedCommand(stPutCommand); // no history rows, no lock row
+  });
+
+  test('expired pause row (expires_at in the past) → normal turn proceeds', async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    stDdbMock
+      .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+      .resolves({ Item: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause', reason: 'escalation', expires_at: nowSec - 10 } });
+    stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('Sure, happy to help!\n<<<ACTIONS []>>>'));
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.1' }) });
+
+    await stHandler(stBuildEvent());
+
+    expect(stBedrockMock).toHaveReceivedCommandTimes(stInvokeModelCommand, 1);
+    expect(global.fetch).toHaveBeenCalled();
+  });
+
+  test('no pause row at all → normal turn proceeds (first-ever message)', async () => {
+    stDdbMock
+      .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+      .resolves({});
+    stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('Hi there!\n<<<ACTIONS []>>>'));
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.1' }) });
+
+    await stHandler(stBuildEvent());
+
+    expect(stBedrockMock).toHaveReceivedCommandTimes(stInvokeModelCommand, 1);
+  });
+
+  test('flag OFF (table enabled) → no pause-check GetItem for stateType "pause" is ever issued', async () => {
+    stLoadConfig.mockResolvedValue({ ...ST_CFG, feature_flags: {} });
+    stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.1' }) });
+
+    await stHandler(stBuildEvent());
+
+    const getCalls = stDdbMock.commandCalls(stGetCommand);
+    expect(getCalls.every((c) => c.args[0].input.Key?.stateType !== 'pause')).toBe(true);
+  });
+
+  test('escalation through the full handler (table enabled) writes a real C4 pause row', async () => {
+    stDdbMock
+      .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+      .resolves({});
+    global.fetch = jest.fn().mockImplementation((url) => {
+      if (typeof url === 'string' && url.includes('pass_thread_control')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ success: true }) });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ message_id: 'mid.confirmation' }) });
+    });
+
+    await stHandler(stBuildEvent({ messageText: 'Can I talk to a human?' }));
+
+    const pauseRowPut = stDdbMock
+      .commandCalls(stPutCommand)
+      .find((c) => c.args[0].input.Item?.stateType === 'pause');
+    expect(pauseRowPut).toBeDefined();
+    expect(pauseRowPut.args[0].input.TableName).toBe(ST_TABLE);
+    expect(pauseRowPut.args[0].input.Item.sessionId).toBe('meta:PAGE_456:PSID_123');
+    expect(pauseRowPut.args[0].input.Item.reason).toBe('escalation');
+    expect(pauseRowPut.args[0].input.Item.schema_version).toBe(1);
+    expect(stBedrockMock).not.toHaveReceivedCommand(stInvokeModelCommand);
+  });
+
+  // ── Code review [HIGH] — pause must cover the attachment/sticker/unsupported
+  // fallback path too (that v2 lane used to send a fallback reply BEFORE any
+  // pause check existed) ───────────────────────────────────────────────────
+  test('paused + attachment event (v2 fixture) → zero sends, fallback suppressed', async () => {
+    const { classifyMessagingEvent } = require('../Meta_Webhook_Handler/classify');
+    const WEBHOOK_FIXTURES = require('../Meta_Webhook_Handler/__fixtures__/messagingEvents');
+    const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbAttachmentImage);
+    const sessionId = `meta:${WEBHOOK_FIXTURES.PAGE_ID}:${classification.psid}`;
+    const nowSec = Math.floor(Date.now() / 1000);
+
+    stDdbMock
+      .on(stGetCommand, { Key: { sessionId, stateType: 'pause' } })
+      .resolves({ Item: { sessionId, stateType: 'pause', reason: 'escalation', expires_at: nowSec + 3600 } });
+    global.fetch = jest.fn();
+
+    const event = {
+      psid: classification.psid,
+      messageText: classification.messageText,
+      pageId: WEBHOOK_FIXTURES.PAGE_ID,
+      tenantId: 'TENANT_789',
+      tenantHash: 'abc123defabc123def',
+      channelType: 'messenger',
+      messageMid: classification.messageMid,
+      isPostback: classification.isPostback,
+      v: 2,
+      eventKind: classification.eventKind,
+      timestamp: Date.now(),
+      quickReplyPayload: classification.quickReplyPayload,
+      appId: classification.appId,
+      attachmentTypes: classification.attachmentTypes,
+      targetMid: classification.targetMid,
+      editedText: classification.editedText,
+      replyTo: classification.replyTo,
+      isStandby: classification.isStandby,
+    };
+
+    await expect(stHandler(event)).resolves.toBeUndefined();
+
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(stBedrockMock).not.toHaveReceivedCommand(stInvokeModelCommand);
+    // No PutCommand at all — handleUnsupportedInputFallback (and any of its
+    // side effects) never ran; the pause check short-circuited before it.
+    expect(stDdbMock).not.toHaveReceivedCommand(stPutCommand);
+  });
+
+  // ── Code review [MEDIUM] — coalesced escalation: a burst where the SECOND
+  // message is the escalation request must escalate instead of joining the
+  // combined Bedrock turn ───────────────────────────────────────────────────
+  test('coalesced burst: escalation intent in the SECOND drained message escalates instead of the combined Bedrock turn', async () => {
+    stDdbMock
+      .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+      .resolves({});
+    // claimPending is an UpdateCommand keyed on the LOCK row (stateType:'lock').
+    // First claim returns a 2-item pending batch; every claim after that is
+    // empty so the drain loop can release and return.
+    stDdbMock
+      .on(stUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'lock' } })
+      .resolvesOnce({
+        Attributes: {
+          pending: [
+            { timestamp: 1000, mid: 'm1', text: 'What are your hours?' },
+            { timestamp: 2000, mid: 'm2', text: 'I want to talk to a human' },
+          ],
+        },
+      })
+      .resolves({});
+    stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('We are open 9-5.\n<<<ACTIONS []>>>'));
+    global.fetch = jest.fn().mockImplementation((url) => {
+      if (typeof url === 'string' && url.includes('pass_thread_control')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ success: true }) });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ message_id: 'mid.x' }) });
+    });
+
+    // The winner's OWN turn is an unrelated message — the escalation request
+    // is buried in the coalesced batch that drains afterward.
+    await stHandler(stBuildEvent({ messageText: 'Hi there' }));
+
+    // Exactly ONE Bedrock call — the winner's own turn. The drained batch
+    // escalates instead of producing a second (combined) Bedrock call.
+    expect(stBedrockMock).toHaveReceivedCommandTimes(stInvokeModelCommand, 1);
+
+    // Escalation side effects fired from the drain: pass_thread_control POST
+    // + a written pause row.
+    expect(global.fetch.mock.calls.some(([url]) => url.includes('pass_thread_control'))).toBe(true);
+    const pauseRowPut = stDdbMock
+      .commandCalls(stPutCommand)
+      .find((c) => c.args[0].input.Item?.stateType === 'pause');
+    expect(pauseRowPut).toBeDefined();
   });
 });

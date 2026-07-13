@@ -98,6 +98,7 @@ interface MessengerBehaviorConfig {
   model_id?: string;             // Messenger model override (C6 precedence)
   max_history_turns?: number;    // default 5 (processor MAX_HISTORY_TURNS)
   strings?: MessengerStrings;    // ALL user-facing strings (D10 — Spanish i18n localizes by config)
+  escalation_email?: string;     // staff notification recipient for "talk to a human" (M6a); absent ⇒ email step skipped, transfer + pause still proceed
   welcome?: MessengerWelcomeConfig;      // M5: ice breakers (≤4) + persistent menu source
   channel_overrides?: {          // per-channel deltas; same shape, applied last (C6)
     messenger?: MessengerChannelOverride;
@@ -254,6 +255,8 @@ Mechanism (row shape in C4 `lock`):
 
 Exact conditional expressions, retry jitter, and metrics are M1c implementation detail; frozen here: the mechanism (lock+coalesce), the row shape (C4), the no-drop guarantee (incl. conditional release), the drain semantics and cap, the TTL invariant, and per-sessionId scope.
 
+**v1.1 (M6a):** one sanctioned exception to no-drop — once an escalation's pause row is written (staff now owns the thread), pending items already coalesced onto that same lock hold are claimed and silently discarded with no bot reply. This does not violate no-drop: the messages themselves already reached Meta's inbox (visible to staff there); only the bot's reply is intentionally withheld, because replying would contradict the escalation confirmation just sent.
+
 ---
 
 ## C8 — Session-boundary definition · v1.0 (2026-07-13)
@@ -300,3 +303,5 @@ Attachment rule: renderings attach to the **same turn's send sequence** (no cros
 | 2026-07-13 | C1–C9 v1.0 frozen (M0), after tech-lead-reviewer adversarial pass — 3 blocking + 4 should-fix findings applied pre-freeze (echo `psid` inversion; C7 conditional release + drain semantics + TTL invariant; C4 pending shape carries v2 fields; metadata-only-event skip rule; `replyTo` context; C9 split-reply rule) | lambda#433 |
 | 2026-07-13 | **C1 → v1.1** (M1a implementation findings, additive clarifications): echo `messageText` always null (loop guard — legacy processor would answer our own echoed replies during the deploy gap); `timestamp` falls back to receipt time when Meta omits it; `'standby'` removed from the eventKind enum (standby-ness rides `isStandby`, matching the prose rule); NOTE for M1b: edit/delete bypass webhook dedup, so Meta redeliveries double-invoke — processor edit/delete handling MUST be idempotent | (M1a PR) |
 | 2026-07-13 | **C9 → v1.1** (M4 implementation finding): mixed-turn placement — quick replies attach to the turn's LAST message (button template when present; Meta shows QRs only on the most recent message); `show_info` classified suggestion-class alongside `send_query` | lambda M4 PR |
+| 2026-07-13 | **C2 → v1.1**: additive `escalation_email` field (M6a) — staff-notification recipient for the "talk to a human" escalation path; absent ⇒ SES step skipped, thread-control handoff + pause row still proceed (G-P2 advisory: recipient/content never logged; email body is content-free — channel/tenant/page/timestamp + inbox deep link only, no psid/session id/message text) | lambda M6a PR |
+| 2026-07-13 | **C7 → v1.1 (M6a): sanctioned silent-drain exception during escalation** — once an escalation's pause row is written, pending items already coalesced onto that lock hold are claimed and silently discarded with no bot reply; not a no-drop violation (the messages already reached Meta's inbox, visible to staff there — only the bot's reply is withheld) | lambda M6a PR |
