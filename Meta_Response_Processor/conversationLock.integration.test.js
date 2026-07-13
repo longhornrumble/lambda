@@ -265,8 +265,14 @@ describe('M4 × C7 — coalesced PIC1 taps route through C3 in the drain', () =>
       },
     });
     ddbMock.on(PutCommand, { TableName: STATE_TABLE }, false).resolves({});
+    // Matched on the lock row's Key specifically (not just TableName) so
+    // M-Hb's rate-limit counter UpdateCommands (Key: rl_user:*/rl_day:*,
+    // also issued against STATE_TABLE, now that MESSENGER_CHANNEL is on)
+    // don't consume this queue out of order — aws-sdk-client-mock prefers
+    // the most specific matching stub, so those fall through to the
+    // module-level generic `ddbMock.on(UpdateCommand).resolves({})` default.
     ddbMock
-      .on(UpdateCommand, { TableName: STATE_TABLE }, false)
+      .on(UpdateCommand, { TableName: STATE_TABLE, Key: { sessionId: SESSION_ID, stateType: 'lock' } }, false)
       .resolvesOnce({ Attributes: { pending: [
         { text: 'Our Programs', quickReplyPayload: 'PIC1:cta:learn_x', mid: 'm_tap', timestamp: 2 },
       ] } })
