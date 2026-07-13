@@ -505,6 +505,21 @@ async function handlePost(rawBody, headers) {
     const pageId    = entry.id;
     const messaging = Array.isArray(entry.messaging) ? entry.messaging : [];
 
+    if (objectType === 'instagram') {
+      // Shape-only diagnostics (field names, never values — no PII): live IG
+      // DMs are arriving only as message_edit messaging events; log the full
+      // entry layout to find where the real `messages` events live.
+      const changeFields = Array.isArray(entry.changes)
+        ? entry.changes.map((c) => c?.field)
+        : null;
+      console.log(
+        `[Meta_Webhook_Handler] IG entry shape | entryKeys=${JSON.stringify(Object.keys(entry || {}))} ` +
+        `messagingCount=${messaging.length} ` +
+        `messagingEventKeys=${JSON.stringify(messaging.map((e) => Object.keys(e || {})))} ` +
+        `changeFields=${JSON.stringify(changeFields)}`
+      );
+    }
+
     for (const messagingEvent of messaging) {
       eventPromises.push(processMessagingEvent(messagingEvent, pageId, objectType));
     }
