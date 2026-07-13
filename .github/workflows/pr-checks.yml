@@ -86,6 +86,7 @@ jobs:
       applier:        ${{ steps.filter.outputs.applier }}
       notification_hub: ${{ steps.filter.outputs.notification_hub }}
       scheduled_message_sender: ${{ steps.filter.outputs.scheduled_message_sender }}
+      config_manager: ${{ steps.filter.outputs.config_manager }}
       # Shared module — triggers full Node.js test run when changed
       shared:         ${{ steps.filter.outputs.shared }}
       # True when shared/ changed (forces all Node.js tests)
@@ -165,6 +166,10 @@ jobs:
               # §E3 gate shared/scheduling/channels.js, so a shared/** change must retest it.
               - 'Scheduled_Message_Sender/**'
               - 'shared/**'
+            config_manager:
+              # Messenger Product Surface P0a. node:test runner. Self-contained
+              # (mergeStrategy.mjs has no shared/ imports), so no shared/** trigger.
+              - 'Picasso_Config_Manager/**'
             scheduling_synthetic_monitor:
               # WS-E-CI6 synthetic monitor. Self-contained; no shared/** trigger.
               - 'Scheduling_Synthetic_Monitor/**'
@@ -674,7 +679,8 @@ jobs:
     if: |
       needs.detect-changes.outputs.applier == 'true' ||
       needs.detect-changes.outputs.notification_hub == 'true' ||
-      needs.detect-changes.outputs.scheduled_message_sender == 'true'
+      needs.detect-changes.outputs.scheduled_message_sender == 'true' ||
+      needs.detect-changes.outputs.config_manager == 'true'
 
     strategy:
       fail-fast: false
@@ -686,6 +692,8 @@ jobs:
             changed: ${{ needs.detect-changes.outputs.notification_hub }}
           - lambda: Scheduled_Message_Sender
             changed: ${{ needs.detect-changes.outputs.scheduled_message_sender }}
+          - lambda: Picasso_Config_Manager
+            changed: ${{ needs.detect-changes.outputs.config_manager }}
 
     steps:
       - name: Skip unchanged lambda
@@ -746,7 +754,7 @@ jobs:
           - lambda: Bedrock_Streaming_Handler_Staging
           - lambda: Meta_Webhook_Handler
           - lambda: Meta_Response_Processor
-          - lambda: Picasso_Config_Manager   # No tests, but has dependencies to audit
+          - lambda: Picasso_Config_Manager   # node:test covers mergeStrategy logic (P0a); audit covers deps
           - lambda: SMS_Sender
           - lambda: SMS_Webhook_Handler
           - lambda: kb_proposal_applier      # node:test covers logic; audit covers deps
