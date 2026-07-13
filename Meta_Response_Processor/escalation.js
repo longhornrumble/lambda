@@ -32,6 +32,9 @@
  *     published Page Inbox app id, 263902037430900)
  *   IG_INBOX_APP_ID — target_app_id for Instagram DM (default: 1217981644879628)
  *   SES_FROM_EMAIL  — verified SES sender; '' (default) disables staff email
+ *   ESCALATION_EMAIL — platform-default staff recipient used when a tenant
+ *     has no messenger_behavior.escalation_email (temporary; see
+ *     sendEscalationEmail). Unset ⇒ no fallback.
  */
 
 const { SendEmailCommand } = require('@aws-sdk/client-ses');
@@ -251,6 +254,11 @@ async function deleteExpiredPauseRow({ client, tableName, sessionId, nowSec }) {
  * into any log line this function emits (only a boolean emailSent + tenantId
  * are logged — never the recipient address).
  *
+ * Recipient resolution: per-tenant `messenger_behavior.escalation_email`
+ * first, else the `ESCALATION_EMAIL` env fallback (a platform default —
+ * TEMPORARY until Config Builder / the analytics portal manage the per-tenant
+ * field; both TBD). Absent both ⇒ skipped.
+ *
  * Never throws: absent recipient, unset SES_FROM_EMAIL, or an SES failure
  * all resolve to a logged outcome, never an exception.
  *
@@ -258,14 +266,14 @@ async function deleteExpiredPauseRow({ client, tableName, sessionId, nowSec }) {
  * @returns {Promise<{skipped: true, reason: string}|{sent: true}|{failed: true}>}
  */
 async function sendEscalationEmail({ sesClient, config, tenantId, channelType, sessionId, pageId }) {
-  const recipient = config?.messenger_behavior?.escalation_email;
+  const recipient = config?.messenger_behavior?.escalation_email || process.env.ESCALATION_EMAIL;
   const fromEmail = process.env.SES_FROM_EMAIL || '';
 
   if (!recipient) {
     console.log(
       JSON.stringify({
         level: 'INFO',
-        message: 'Escalation email skipped — no messenger_behavior.escalation_email configured',
+        message: 'Escalation email skipped — no escalation_email (tenant config or ESCALATION_EMAIL env)',
         service: 'MetaResponseProcessor',
         tenantId,
         emailSent: false,
