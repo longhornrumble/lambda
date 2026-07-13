@@ -431,15 +431,18 @@ async function sendMessengerMessage(pageId, psid, text, accessToken, channelType
   let url, headers, body;
 
   if (channelType === 'instagram') {
-    // Instagram uses graph.instagram.com with Bearer auth
-    url = 'https://graph.instagram.com/v25.0/me/messages';
-    headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${accessToken}`,
-    };
+    // Instagram Messaging via Messenger Platform: SAME Send API as Messenger
+    // (graph.facebook.com + Page access token). '/me' resolves to the Page the
+    // token belongs to — the IG-account id from entry.id is NOT addressable
+    // here. graph.instagram.com expects an Instagram-Login user token, which
+    // this Page-linked integration does not hold (401 "Cannot parse access
+    // token", found live 2026-07-12).
+    url = `${META_SEND_API_BASE}/me/messages`;
+    headers = { 'Content-Type': 'application/json' };
     body = JSON.stringify({
       recipient: { id: psid },
       message: { text },
+      access_token: accessToken,
     });
   } else {
     // Facebook Messenger uses graph.facebook.com with access_token in body
