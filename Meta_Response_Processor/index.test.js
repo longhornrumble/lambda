@@ -2840,23 +2840,32 @@ describe('M6a/M6b — pause check, resume, echo-watch (CONVERSATION_STATE_TABLE 
     });
 
     test('expired pause row read → stale-row cleanup DeleteCommand issued, conditioned on expires_at <= now', async () => {
-      const nowSec = Math.floor(Date.now() / 1000);
-      stDdbMock
-        .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
-        .resolves({ Item: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause', reason: 'escalation', expires_at: nowSec - 10 } });
-      stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
-      global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.1' }) });
+      // Freeze the clock: the handler computes its own Math.floor(Date.now()/1000)
+      // (index.js) for :nowSec, and asserting it .toBe(a separately-read nowSec)
+      // flakes when the two reads straddle a 1-second boundary. Pin both.
+      const FIXED_NOW_MS = 1_700_000_000_000;
+      const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(FIXED_NOW_MS);
+      const nowSec = Math.floor(FIXED_NOW_MS / 1000);
+      try {
+        stDdbMock
+          .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+          .resolves({ Item: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause', reason: 'escalation', expires_at: nowSec - 10 } });
+        stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+        global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.1' }) });
 
-      await stHandler(stBuildEvent());
+        await stHandler(stBuildEvent());
 
-      const cleanupDelete = stDdbMock
-        .commandCalls(stDeleteCommand)
-        .find((c) => c.args[0].input.Key?.stateType === 'pause');
-      expect(cleanupDelete).toBeDefined();
-      expect(cleanupDelete.args[0].input.ConditionExpression).toBe('expires_at <= :nowSec');
-      expect(cleanupDelete.args[0].input.ExpressionAttributeValues[':nowSec']).toBe(nowSec);
-      // Cleanup never blocks or changes the outcome of the normal turn.
-      expect(stBedrockMock).toHaveReceivedCommandTimes(stInvokeModelCommand, 1);
+        const cleanupDelete = stDdbMock
+          .commandCalls(stDeleteCommand)
+          .find((c) => c.args[0].input.Key?.stateType === 'pause');
+        expect(cleanupDelete).toBeDefined();
+        expect(cleanupDelete.args[0].input.ConditionExpression).toBe('expires_at <= :nowSec');
+        expect(cleanupDelete.args[0].input.ExpressionAttributeValues[':nowSec']).toBe(nowSec);
+        // Cleanup never blocks or changes the outcome of the normal turn.
+        expect(stBedrockMock).toHaveReceivedCommandTimes(stInvokeModelCommand, 1);
+      } finally {
+        nowSpy.mockRestore();
+      }
     });
 
     test('stale-row cleanup delete races a fresh pause (ConditionalCheckFailedException) → swallowed, no throw, turn still proceeds', async () => {
