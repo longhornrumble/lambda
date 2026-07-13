@@ -76,7 +76,7 @@
  */
 
 const { InvokeModelWithResponseStreamCommand } = require('@aws-sdk/client-bedrock-runtime');
-const { sanitizeTonePromptV4, V4_STEP2_INFERENCE_PARAMS } = require('../prompt_v4');
+const { sanitizeTonePromptV4, V4_STEP2_INFERENCE_PARAMS } = require('../../shared/prompt/prompt_v4');
 const {
   AGENT_TOOL_DEFINITIONS,
   executeGetAvailableTimes,

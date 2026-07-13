@@ -28,8 +28,8 @@ const {
   selectCTAsFromPool,
   selectActionsV4,
   validateTopicDefinitions,
-} = require('./prompt_v4');
-const { validateActionIds } = require('./prompt_v5');
+} = require('../shared/prompt/prompt_v4');
+const { validateActionIds } = require('../shared/prompt/prompt_v5');
 const { redactPII } = require('./redactPII');
 const { runSchedulingTurn } = require('./scheduling/schedulingFlow');
 const { runNewBookingEntry } = require('./scheduling/newBookingEntry');

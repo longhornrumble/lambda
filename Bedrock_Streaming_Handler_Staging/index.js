@@ -29,7 +29,7 @@ const {
   sanitizeTonePromptV4,
   V4_CONVERSATION_PROMPT_VERSION,
   ACTION_SELECTOR_PROMPT_VERSION,
-} = require('./prompt_v4');
+} = require('../shared/prompt/prompt_v4');
 // V5 single-pass turn (feature_flags.V5_SINGLE_PASS, V5.5): ONE streaming call
 // produces the reply AND selects actions via a machine-read stream tail. The
 // tail parser strips the sentinel before anything reaches the client or
@@ -40,8 +40,8 @@ const {
   validateActionIds,
   V5_TURN_PROMPT_VERSION,
   V5_TURN_INFERENCE_PARAMS,
-} = require('./prompt_v5');
-const { createTailParser } = require('./streamTail');
+} = require('../shared/prompt/prompt_v5');
+const { createTailParser } = require('../shared/prompt/streamTail');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 // WS-C2 (scheduling §5.6): same-session form-data injection. Read-only fetch +
 // sanitize + <user_application_context> block. Prompt-injection surface.

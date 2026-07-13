@@ -103,9 +103,10 @@ jobs:
             bedrock:
               - 'Bedrock_Streaming_Handler_Staging/**'
             eval_gate:
-              - 'Bedrock_Streaming_Handler_Staging/prompt_v4.js'
-              - 'Bedrock_Streaming_Handler_Staging/prompt_v5.js'
-              - 'Bedrock_Streaming_Handler_Staging/streamTail.js'
+              # M2: the prompt trio lives in shared/prompt/ now.
+              - 'shared/prompt/prompt_v4.js'
+              - 'shared/prompt/prompt_v5.js'
+              - 'shared/prompt/streamTail.js'
               - 'Bedrock_Streaming_Handler_Staging/scheduling/agentTurn.js'
               - 'Bedrock_Streaming_Handler_Staging/evals/**'
             meta_webhook:
@@ -437,6 +438,45 @@ jobs:
         with:
           name: coverage-shared-scheduling
           path: shared/scheduling/coverage/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Job 1c: shared/prompt library tests (M2 — the V5/V4 prompt trio lifted
+  # from BSH). Carries the trio's coverage ratchets (transplanted from BSH's
+  # jest.config.js). Pure modules, no SDK mocks/open handles — the plain jest
+  # exit code is reliable here AND enforces the coverage thresholds (unlike
+  # the JSON-gate pattern above, which is for suites with open-handle noise).
+  #
+  shared-prompt-tests:
+    name: Node Tests — shared/prompt
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.shared == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: shared/prompt/package-lock.json
+
+      - name: Install dependencies
+        working-directory: shared/prompt
+        run: npm install
+
+      - name: Run Jest tests (coverage thresholds enforced)
+        working-directory: shared/prompt
+        run: npx jest --no-cache --coverage --coverageReporters=text --coverageReporters=lcov
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-shared-prompt
+          path: shared/prompt/coverage/
           retention-days: 7
 
   # ---------------------------------------------------------------------------

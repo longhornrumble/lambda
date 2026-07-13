@@ -1,0 +1,17 @@
+{
+  "name": "picasso-shared-prompt",
+  "version": "1.0.0",
+  "description": "Shared V5/V4 prompt machinery — prompt_v5, prompt_v4, streamTail (lifted from BSH in M2; consumers: Bedrock_Streaming_Handler_Staging, Meta_Response_Processor)",
+  "main": "prompt_v5.js",
+  "private": true,
+  "scripts": {
+    "test": "jest",
+    "test:coverage": "jest --coverage --coverageReporters=text --coverageReporters=lcov"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-runtime": "^3.600.0"
+  },
+  "devDependencies": {
+    "jest": "^30.2.0"
+  }
+}
