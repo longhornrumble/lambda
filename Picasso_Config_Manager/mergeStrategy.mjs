@@ -26,6 +26,7 @@ const EDITABLE_SECTIONS = [
   'form_settings',
   'monitor',
   'notification_settings',
+  'messenger_behavior',
 ];
 
 /**
