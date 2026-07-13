@@ -320,7 +320,13 @@ function handleVerification(queryParams) {
 async function processMessagingEvent(messagingEvent, pageId, objectType) {
   const sender = messagingEvent.sender?.id;
   if (!sender) {
-    console.warn('[Meta_Webhook_Handler] messaging event missing sender.id — skipping');
+    // Shape-only diagnostics (field names, never values — no PII): live IG
+    // events are reaching this skip path with an unrecognised layout.
+    console.warn(
+      `[Meta_Webhook_Handler] messaging event missing sender.id — skipping | ` +
+      `object=${objectType} keys=${JSON.stringify(Object.keys(messagingEvent || {}))} ` +
+      `senderKeys=${JSON.stringify(Object.keys(messagingEvent?.sender || {}))}`
+    );
     return;
   }
 
