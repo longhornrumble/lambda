@@ -28,6 +28,8 @@ Environment variables:
     KMS_KEY_ID              — KMS key alias or ARN (e.g. alias/picasso-channel-tokens)
     META_LOGIN_CONFIG_ID    — Facebook Login for Business configuration ID
                               (optional; when set, dialog sends config_id, not scope)
+    TENANT_REGISTRY_TABLE   — tenant registry table for platform tenantHash lookup
+                              (optional; unset = legacy computed hash)
     AWS_REGION              — AWS region (set automatically by Lambda runtime)
 """
 
@@ -70,6 +72,7 @@ _CHANNEL_MAPPINGS_TABLE = os.environ.get(
     "CHANNEL_MAPPINGS_TABLE", "picasso-channel-mappings"
 )
 _KMS_KEY_ID = os.environ.get("KMS_KEY_ID", "alias/picasso-channel-tokens")
+_TENANT_REGISTRY_TABLE = os.environ.get("TENANT_REGISTRY_TABLE", "")
 
 _GRAPH_API_VERSION = "v21.0"
 _GRAPH_BASE = f"https://graph.facebook.com/{_GRAPH_API_VERSION}"
@@ -308,9 +311,27 @@ def _channel_table():
 
 def _tenant_hash(tenant_id: str) -> str:
     """
-    Derive a stable, short hash from the tenant_id used as a GSI sort key.
-    This is a lightweight hash for data locality — not a security primitive.
+    Resolve the tenant's PLATFORM tenantHash from the tenant registry.
+
+    bedrock-core resolves configs by the registry hash (TenantHashIndex →
+    tenant_id → tenants/<id>/<id>-config.json). A locally computed hash
+    matches nothing downstream — the Response Processor then silently loads
+    defaults and answers without KB grounding (found live 2026-07-12).
+
+    Falls back to the legacy sha256 derivation only when the registry is
+    unavailable or has no row (keeps the module usable standalone).
     """
+    if _TENANT_REGISTRY_TABLE:
+        try:
+            response = _dynamodb.Table(_TENANT_REGISTRY_TABLE).get_item(
+                Key={"tenantId": tenant_id}
+            )
+            registry_hash = (response.get("Item") or {}).get("tenantHash")
+            if registry_hash:
+                return registry_hash
+            print(f"[WARN] No registry tenantHash for tenant_id={tenant_id}; using computed fallback")
+        except Exception as exc:
+            print(f"[WARN] Registry hash lookup failed for tenant_id={tenant_id}: {exc}; using computed fallback")
     return hashlib.sha256(tenant_id.encode()).hexdigest()[:16]
 
 

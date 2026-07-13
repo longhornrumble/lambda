@@ -284,6 +284,54 @@ class TestOAuthCallback(unittest.TestCase):
         self.assertIn("No Facebook Pages found", response["body"])
 
     @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    @patch("lambda_function._graph_post")
+    @patch("lambda_function._encrypt_token", return_value="ENCRYPTED_TOKEN_BASE64")
+    @patch("lambda_function._channel_table")
+    @patch("lambda_function._dynamodb")
+    def test_tenant_hash_resolved_from_registry(
+        self, mock_ddb, mock_table, mock_encrypt, mock_post, mock_get, _mock_secret
+    ):
+        """Stored tenantHash must be the PLATFORM registry hash, not the
+        computed sha256 (bedrock-core resolves configs by the registry hash)."""
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_ddb.Table.return_value.get_item.return_value = {
+            "Item": {"tenantId": "TENANT_XYZ", "tenantHash": "reg1234567890abc"}
+        }
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},
+            {"data": [{"id": "PAGE_001", "name": "My Test Page", "access_token": "PAGE_TOKEN_XYZ"}]},
+        ]
+        mock_post.return_value = {"success": True}
+        mock_table.return_value.put_item = MagicMock()
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        with patch.object(lf, "_TENANT_REGISTRY_TABLE", "picasso-tenant-registry-test"):
+            response = lf.lambda_handler(event, _make_context())
+
+        self.assertIn("META_OAUTH_SUCCESS", response["body"])
+        item = mock_table.return_value.put_item.call_args[1]["Item"]
+        self.assertEqual(item["tenantHash"], "reg1234567890abc")
+
+    def test_tenant_hash_falls_back_to_computed_when_registry_empty(self):
+        """No registry row (or table unset) → legacy computed hash."""
+        import hashlib
+        import lambda_function as lf
+
+        with patch.object(lf, "_TENANT_REGISTRY_TABLE", "picasso-tenant-registry-test"), \
+             patch.object(lf, "_dynamodb") as mock_ddb:
+            mock_ddb.Table.return_value.get_item.return_value = {}
+            result = lf._tenant_hash("TENANT_XYZ")
+        self.assertEqual(result, hashlib.sha256(b"TENANT_XYZ").hexdigest()[:16])
+
+        with patch.object(lf, "_TENANT_REGISTRY_TABLE", ""):
+            result = lf._tenant_hash("TENANT_XYZ")
+        self.assertEqual(result, hashlib.sha256(b"TENANT_XYZ").hexdigest()[:16])
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
     def test_expired_state_jwt(self, _mock_secret):
         import jwt
         import lambda_function as lf
