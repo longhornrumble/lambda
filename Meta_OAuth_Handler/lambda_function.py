@@ -30,6 +30,11 @@ Environment variables:
                               (optional; when set, dialog sends config_id, not scope)
     TENANT_REGISTRY_TABLE   — tenant registry table for platform tenantHash lookup
                               (optional; unset = legacy computed hash)
+    CONFIG_BUCKET           — S3 bucket holding tenant configs, used to push
+                              Messenger welcome surfaces (ice breakers +
+                              persistent menu) on connect (optional; unset =
+                              welcome-surface push disabled, no other behavior
+                              change — M5)
     AWS_REGION              — AWS region (set automatically by Lambda runtime)
 """
 
@@ -47,6 +52,7 @@ from typing import Any, Optional
 
 import boto3
 import jwt  # PyJWT — must be in deployment package or Lambda Layer
+from botocore.exceptions import ClientError
 
 # ---------------------------------------------------------------------------
 # Module-level singletons — initialised once per Lambda cold start
@@ -56,6 +62,7 @@ _region = os.environ.get("AWS_REGION", "us-east-1")
 _secrets_client = boto3.client("secretsmanager", region_name=_region)
 _dynamodb = boto3.resource("dynamodb", region_name=_region)
 _kms_client = boto3.client("kms", region_name=_region)
+_s3_client = boto3.client("s3", region_name=_region)
 
 # Cached app secret — populated on first use, survives warm invocations
 _meta_app_secret: Optional[str] = None
@@ -73,6 +80,16 @@ _CHANNEL_MAPPINGS_TABLE = os.environ.get(
 )
 _KMS_KEY_ID = os.environ.get("KMS_KEY_ID", "alias/picasso-channel-tokens")
 _TENANT_REGISTRY_TABLE = os.environ.get("TENANT_REGISTRY_TABLE", "")
+
+# M5 welcome-surface push — unset (default) means the feature is disabled
+# entirely (no S3 read attempted), a safe no-op for envs that haven't wired
+# the env var / IAM grant yet.
+_CONFIG_BUCKET = os.environ.get("CONFIG_BUCKET", "")
+
+# C5: ice breakers cap at 4 (both channels); persistent_menu title cap
+# mirrors the C5 quick-reply title cap (20 chars).
+_MAX_ICE_BREAKERS = 4
+_MAX_MENU_TITLE_CHARS = 20
 
 _GRAPH_API_VERSION = "v21.0"
 _GRAPH_BASE = f"https://graph.facebook.com/{_GRAPH_API_VERSION}"
@@ -346,6 +363,163 @@ def _query_channels_by_tenant(tenant_id: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# M5 — Welcome surfaces (ice breakers + persistent menu)
+# ---------------------------------------------------------------------------
+
+
+def _load_tenant_config_for_welcome(tenant_id: str) -> Optional[dict]:
+    """
+    Load the tenant config JSON from S3 for the welcome-surface push.
+
+    Tries `tenants/{tenant_id}/config.json` then the legacy
+    `tenants/{tenant_id}/{tenant_id}-config.json` shape. Never raises —
+    any miss or parse failure logs a WARN and returns None (schema
+    discipline: this is a best-effort read, not the OAuth flow's critical
+    path).
+    """
+    for key in (
+        f"tenants/{tenant_id}/config.json",
+        f"tenants/{tenant_id}/{tenant_id}-config.json",
+    ):
+        try:
+            obj = _s3_client.get_object(Bucket=_CONFIG_BUCKET, Key=key)
+        except ClientError as exc:
+            error_code = exc.response.get("Error", {}).get("Code", "")
+            if error_code in ("NoSuchKey", "404"):
+                continue
+            print(f"[WARN] S3 error loading config s3://{_CONFIG_BUCKET}/{key}: {exc}")
+            return None
+        except Exception as exc:
+            print(f"[WARN] Unexpected error loading config s3://{_CONFIG_BUCKET}/{key}: {exc}")
+            return None
+
+        try:
+            return json.loads(obj["Body"].read())
+        except json.JSONDecodeError as exc:
+            print(f"[WARN] Invalid JSON in tenant config s3://{_CONFIG_BUCKET}/{key}: {exc}")
+            return None
+
+    print(f"[WARN] No tenant config found in S3 for tenant_id={tenant_id}")
+    return None
+
+
+def _build_welcome_profile_payload(welcome: dict, tenant_id: str) -> tuple:
+    """
+    Translate C2 `messenger_behavior.welcome` into a Messenger Profile API
+    payload. Always includes `get_started`. Malformed ice-breaker/menu
+    entries are skipped (logged), never raised.
+
+    Returns (payload, ice_breaker_count, menu_item_count).
+    """
+    payload: dict = {"get_started": {"payload": "GET_STARTED"}}
+
+    raw_ice_breakers = welcome.get("ice_breakers") or []
+    if len(raw_ice_breakers) > _MAX_ICE_BREAKERS:
+        print(
+            f"[INFO] Truncating ice_breakers to {_MAX_ICE_BREAKERS} for "
+            f"tenant_id={tenant_id} (config had {len(raw_ice_breakers)})"
+        )
+    ice_breakers = []
+    for entry in raw_ice_breakers[:_MAX_ICE_BREAKERS]:
+        question = entry.get("question")
+        ib_payload = entry.get("payload")
+        if not question or not ib_payload:
+            print(f"[WARN] Skipping malformed ice breaker for tenant_id={tenant_id}: {entry}")
+            continue
+        ice_breakers.append({"question": question, "payload": ib_payload})
+    if ice_breakers:
+        payload["ice_breakers"] = [{"call_to_actions": ice_breakers, "locale": "default"}]
+
+    raw_menu = welcome.get("persistent_menu") or []
+    menu_items = []
+    for entry in raw_menu:
+        title = entry.get("title")
+        item_payload = entry.get("payload")
+        url = entry.get("url")
+        if not title or not (item_payload or url):
+            print(f"[WARN] Skipping malformed persistent_menu item for tenant_id={tenant_id}: {entry}")
+            continue
+        truncated_title = title[:_MAX_MENU_TITLE_CHARS]
+        if item_payload:
+            menu_items.append({"type": "postback", "title": truncated_title, "payload": item_payload})
+        else:
+            menu_items.append({"type": "web_url", "title": truncated_title, "url": url})
+    if menu_items:
+        payload["persistent_menu"] = [
+            {
+                "locale": "default",
+                "composer_input_disabled": False,
+                "call_to_actions": menu_items,
+            }
+        ]
+
+    return payload, len(ice_breakers), len(menu_items)
+
+
+def push_welcome_surfaces(page_access_token: str, tenant_id: str) -> dict:
+    """
+    Push ice breakers + persistent menu (C2 `messenger_behavior.welcome`) to
+    the Messenger Profile API. The same Page access token configures the
+    profile for both Facebook Messenger and Page-linked Instagram DM.
+
+    BEST-EFFORT — this must NEVER raise into the OAuth callback flow. Every
+    failure path (missing config, flag off, S3 miss, Graph error) returns a
+    summary dict instead of raising.
+    """
+    try:
+        if not _CONFIG_BUCKET:
+            print("[INFO] CONFIG_BUCKET not configured — welcome-surface push disabled")
+            return {"skipped": "config bucket not configured"}
+
+        config = _load_tenant_config_for_welcome(tenant_id)
+        if config is None:
+            return {"skipped": "tenant config not found or unreadable"}
+
+        feature_flags = config.get("feature_flags") or {}
+        if feature_flags.get("MESSENGER_CHANNEL") is not True:
+            print(
+                f"[INFO] MESSENGER_CHANNEL flag off for tenant_id={tenant_id} — "
+                f"skipping welcome-surface push"
+            )
+            return {"skipped": "MESSENGER_CHANNEL flag not enabled"}
+
+        welcome = (config.get("messenger_behavior") or {}).get("welcome") or {}
+        if not welcome.get("ice_breakers") and not welcome.get("persistent_menu"):
+            print(f"[INFO] No welcome surfaces configured for tenant_id={tenant_id}")
+            return {"skipped": "no welcome surfaces configured"}
+
+        profile_payload, ice_breaker_count, menu_item_count = _build_welcome_profile_payload(
+            welcome, tenant_id
+        )
+
+        try:
+            _graph_post(
+                "/me/messenger_profile",
+                {"access_token": page_access_token},
+                json_body=profile_payload,
+            )
+        except Exception as exc:
+            # _graph_post already logged the Graph error body (no token) for
+            # HTTPError; this just short-circuits the OAuth flow safely.
+            print(f"[ERROR] Messenger profile push failed for tenant_id={tenant_id}: {exc}")
+            return {"error": str(exc)}
+
+        summary = {
+            "pushed": {
+                "get_started": True,
+                "ice_breakers": ice_breaker_count,
+                "persistent_menu": menu_item_count,
+            }
+        }
+        print(f"[INFO] Welcome surfaces pushed for tenant_id={tenant_id}: {summary}")
+        return summary
+    except Exception as exc:  # pylint: disable=broad-except
+        # Final safety net — welcome-surface push must never fail OAuth.
+        print(f"[ERROR] Unexpected error pushing welcome surfaces for tenant_id={tenant_id}: {exc}")
+        return {"error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
 
@@ -562,10 +736,17 @@ def _handle_oauth_callback(event: dict) -> dict:
 
     try:
         _channel_table().put_item(Item=item)
-        print(f"[INFO] DynamoDB channel mapping written for page_id={page_id}, tenant_id={tenant_id}")
     except Exception as exc:
         print(f"[ERROR] DynamoDB write failed for tenant_id={tenant_id}: {exc}")
         return _html_error_popup("Failed to save channel mapping — please try again")
+
+    # --- Push welcome surfaces (M5, best-effort — never fails the OAuth flow) ---
+    # Plaintext page_access_token is still in hand here — no KMS decrypt needed.
+    welcome_summary = push_welcome_surfaces(page_access_token, tenant_id)
+    print(
+        f"[INFO] DynamoDB channel mapping written for page_id={page_id}, tenant_id={tenant_id} | "
+        f"welcome_surfaces={welcome_summary}"
+    )
 
     # --- Instagram channel row (Page-linked IG Professional account) ---
     # IG DM webhooks arrive with entry.id = the IG ACCOUNT id, and the webhook
@@ -590,8 +771,10 @@ def _handle_oauth_callback(event: dict) -> dict:
                 }
             )
             _channel_table().put_item(Item=ig_item)
+            ig_welcome_summary = push_welcome_surfaces(page_access_token, tenant_id)
             print(
-                f"[INFO] Instagram channel mapping written for ig_account_id={ig_account_id}, tenant_id={tenant_id}"
+                f"[INFO] Instagram channel mapping written for ig_account_id={ig_account_id}, "
+                f"tenant_id={tenant_id} | welcome_surfaces={ig_welcome_summary}"
             )
         else:
             print(f"[INFO] No Instagram Professional account linked to page_id={page_id} — messenger only")
