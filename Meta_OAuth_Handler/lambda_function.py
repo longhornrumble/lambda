@@ -26,6 +26,8 @@ Environment variables:
     OAUTH_CALLBACK_URL      — Publicly reachable callback URL for this Lambda
     CHANNEL_MAPPINGS_TABLE  — DynamoDB table (e.g. picasso-channel-mappings)
     KMS_KEY_ID              — KMS key alias or ARN (e.g. alias/picasso-channel-tokens)
+    META_LOGIN_CONFIG_ID    — Facebook Login for Business configuration ID
+                              (optional; when set, dialog sends config_id, not scope)
     AWS_REGION              — AWS region (set automatically by Lambda runtime)
 """
 
@@ -77,6 +79,12 @@ _GRAPH_BASE = f"https://graph.facebook.com/{_GRAPH_API_VERSION}"
 # as of July 2024 — instagram_basic and instagram_manage_messages are sufficient
 # for direct Instagram DM access when the account is a Professional account.
 _OAUTH_SCOPES = "pages_show_list,pages_messaging,pages_read_engagement,instagram_basic,instagram_manage_messages"
+
+# Facebook Login for Business configuration ID. Use-case ("business type") Meta
+# apps commit asset grants through a saved login configuration; for them the
+# dialog must send config_id INSTEAD of scope (Meta docs: "config_id has
+# replaced scope (which should not be used)"). Unset → legacy scope dialog.
+_META_LOGIN_CONFIG_ID = os.environ.get("META_LOGIN_CONFIG_ID", "")
 
 # State JWT lifetime in seconds (10 minutes)
 _STATE_JWT_TTL = 600
@@ -347,19 +355,59 @@ def _handle_get_oauth_url(event: dict) -> dict:
         print(f"[ERROR] Failed to generate state JWT: {exc}")
         return _error_response(500, "Failed to generate OAuth state token")
 
-    oauth_params = urllib.parse.urlencode(
-        {
-            "client_id": _META_APP_ID,
-            "redirect_uri": _OAUTH_CALLBACK_URL,
-            "scope": _OAUTH_SCOPES,
-            "state": state,
-            "response_type": "code",
-        }
-    )
+    dialog_params = {
+        "client_id": _META_APP_ID,
+        "redirect_uri": _OAUTH_CALLBACK_URL,
+        "state": state,
+        "response_type": "code",
+    }
+    if _META_LOGIN_CONFIG_ID:
+        dialog_params["config_id"] = _META_LOGIN_CONFIG_ID
+    else:
+        dialog_params["scope"] = _OAUTH_SCOPES
+    oauth_params = urllib.parse.urlencode(dialog_params)
     oauth_url = f"https://www.facebook.com/{_GRAPH_API_VERSION}/dialog/oauth?{oauth_params}"
 
     print(f"[INFO] OAuth URL generated for tenant_id={tenant_id}")
     return _json_response(200, {"oauth_url": oauth_url})
+
+
+def _list_pages_via_granular_scopes(user_access_token: str, app_secret: str) -> list:
+    """
+    Fallback Page discovery for Facebook Login for Business grants.
+
+    /me/accounts returns an empty list for business-portfolio-owned Pages
+    granted via an FLB login configuration, even when the grant provably
+    includes the Page (visible in debug_token granular_scopes). Recover the
+    granted Page IDs from debug_token and fetch each Page directly — the
+    direct node lookup DOES honour the granular grant and returns the Page
+    access token.
+    """
+    app_token = f"{_META_APP_ID}|{app_secret}"
+    debug_response = _graph_get(
+        "/debug_token",
+        {"input_token": user_access_token, "access_token": app_token},
+    )
+    granular_scopes = (debug_response.get("data") or {}).get("granular_scopes") or []
+    target_ids = []
+    for entry in granular_scopes:
+        if entry.get("scope") == "pages_show_list":
+            target_ids = entry.get("target_ids") or []
+            break
+
+    pages = []
+    for page_id in target_ids:
+        try:
+            page = _graph_get(
+                f"/{page_id}",
+                {"fields": "id,name,access_token", "access_token": user_access_token},
+            )
+        except Exception as exc:
+            print(f"[WARN] Granular-scope Page fetch failed for page_id={page_id}: {exc}")
+            continue
+        if page.get("id") and page.get("access_token"):
+            pages.append(page)
+    return pages
 
 
 def _handle_oauth_callback(event: dict) -> dict:
@@ -429,6 +477,12 @@ def _handle_oauth_callback(event: dict) -> dict:
             {"access_token": user_access_token},
         )
         pages = accounts_response.get("data", [])
+        if not pages:
+            # FLB grants on business-portfolio-owned Pages: /me/accounts is
+            # empty even though the grant includes the Page — recover it from
+            # debug_token granular scopes instead.
+            print(f"[INFO] /me/accounts empty for tenant_id={tenant_id}; trying granular-scope fallback")
+            pages = _list_pages_via_granular_scopes(user_access_token, app_secret)
         if not pages:
             return _html_error_popup(
                 "No Facebook Pages found — please ensure you manage at least one Page"
