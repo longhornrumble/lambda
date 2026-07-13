@@ -290,3 +290,130 @@ describe('M4 × C7 — coalesced PIC1 taps route through C3 in the drain', () =>
     expect(drainTurn).toBe('tell me about programs'); // C7 step 3: canonical query, not "Our Programs"
   });
 });
+
+// ─── M7a × C7 — mid-form races (adversarial focus named in the plan: "two
+// rapid answers — C7 must serialize"). Reuses this file's shared handler/mocks
+// (CONVERSATION_STATE_TABLE already set at module load above) rather than a
+// fresh isolated instance — no MFS_FUNCTION needed since these races never
+// reach the confirm/submit step.
+describe('M7a × C7 — mid-form races', () => {
+  const FORM_CFG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'Helpful.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    conversational_forms: {
+      race_form: {
+        form_id: 'race_form',
+        fields: [
+          { id: 'a', type: 'text', label: 'A', prompt: 'First field?', required: true },
+          { id: 'b', type: 'text', label: 'B', prompt: 'Second field?', required: true },
+        ],
+      },
+    },
+  };
+
+  function activeSessionItem(overrides = {}) {
+    const now = Date.now();
+    return {
+      sessionId: SESSION_ID,
+      stateType: 'form_session',
+      form_id: 'race_form',
+      current_field: 'a',
+      answers: {},
+      attempts: 0,
+      started_at: now,
+      updated_at: now,
+      schema_version: 1,
+      expires_at: Math.floor(now / 1000) + 3600,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    loadConfig.mockResolvedValue(FORM_CFG);
+    ddbMock.on(GetCommand, { Key: { sessionId: SESSION_ID, stateType: 'pause' } }, false).resolves({});
+  });
+
+  test('two rapid answers (winner + coalesced loser) apply SEQUENTIALLY against the evolving session — both fields land correctly, zero Bedrock calls', async () => {
+    ddbMock
+      .on(GetCommand, { Key: { sessionId: SESSION_ID, stateType: 'form_session' } }, false)
+      .resolves({ Item: activeSessionItem() });
+    // Winner acquires the lock; the second (racing) invoke coalesces its
+    // answer onto pending instead of running concurrently.
+    // Scoped to the LOCK row's own Put specifically (not just TableName) so
+    // this doesn't also consume the form-engine's form_session Put, which
+    // targets the same STATE_TABLE (mirrors the M4×C7 test's own note above
+    // about UpdateCommand matching specificity).
+    ddbMock.on(PutCommand, { TableName: STATE_TABLE, Item: { stateType: 'lock' } }, false).resolvesOnce({}).rejects(ccfe());
+    // Winner's own answer ("first answer") advances a -> b; the coalesced
+    // drain claim then delivers the loser's text ("second answer") against
+    // field b.
+    ddbMock
+      // UpdateExpression discriminates claimPending's REMOVE from the racing
+      // loser's own coalesce-append SET list_append(...) call — both target
+      // the same Key, and a genuine Promise.all race means either could fire
+      // first; the generic default stub (outer beforeEach) harmlessly
+      // answers the append (its return value is never read).
+      .on(
+        UpdateCommand,
+        { TableName: STATE_TABLE, Key: { sessionId: SESSION_ID, stateType: 'lock' }, UpdateExpression: 'REMOVE pending SET updated_at = :now' },
+        false
+      )
+      .resolvesOnce({ Attributes: { pending: [{ text: 'second answer', mid: 'm_b', timestamp: 2 }] } })
+      .resolves({ Attributes: {} });
+    ddbMock.on(DeleteCommand, { TableName: STATE_TABLE }, false).resolves({});
+
+    await Promise.all([
+      handler(buildEvent({ messageMid: 'm_a', messageText: 'first answer' })),
+      handler(buildEvent({ messageMid: 'm_a2', messageText: 'first answer racer' })),
+    ]);
+
+    // Neither racing message ever reached Bedrock/RAG — both were form input.
+    expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+
+    const formPuts = ddbMock
+      .commandCalls(PutCommand)
+      .filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    expect(formPuts.length).toBeGreaterThanOrEqual(2);
+    const finalPut = formPuts[formPuts.length - 1].args[0].input.Item;
+    // Both fields answered, in order, with no lost update — 'a' from the
+    // winner's own turn, 'b' from the coalesced drain of the racing message.
+    expect(finalPut.answers).toEqual({ a: 'first answer', b: 'second answer' });
+    expect(finalPut.current_field).toBe('__summary__');
+  });
+
+  test('a coalesced ffld tap racing mid-form is applied via the form engine, not treated as free text into RAG', async () => {
+    ddbMock
+      .on(GetCommand, { Key: { sessionId: SESSION_ID, stateType: 'form_session' } }, false)
+      .resolves({ Item: activeSessionItem() });
+    // Scoped to the LOCK row's own Put specifically (not just TableName) so
+    // this doesn't also consume the form-engine's form_session Put, which
+    // targets the same STATE_TABLE (mirrors the M4×C7 test's own note above
+    // about UpdateCommand matching specificity).
+    ddbMock.on(PutCommand, { TableName: STATE_TABLE, Item: { stateType: 'lock' } }, false).resolvesOnce({}).rejects(ccfe());
+    ddbMock
+      .on(
+        UpdateCommand,
+        { TableName: STATE_TABLE, Key: { sessionId: SESSION_ID, stateType: 'lock' }, UpdateExpression: 'REMOVE pending SET updated_at = :now' },
+        false
+      )
+      .resolvesOnce({
+        Attributes: { pending: [{ text: 'Racer', quickReplyPayload: 'PIC1:ffld:race_form:b:racer-value', mid: 'm_b', timestamp: 2 }] },
+      })
+      .resolves({ Attributes: {} });
+    ddbMock.on(DeleteCommand, { TableName: STATE_TABLE }, false).resolves({});
+
+    await Promise.all([
+      handler(buildEvent({ messageMid: 'm_a', messageText: 'first answer' })),
+      handler(buildEvent({ messageMid: 'm_a2', messageText: 'tap' })),
+    ]);
+
+    expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    const formPuts = ddbMock
+      .commandCalls(PutCommand)
+      .filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    const finalPut = formPuts[formPuts.length - 1].args[0].input.Item;
+    expect(finalPut.answers.b).toBe('racer-value'); // the ffld tap's option value, not the tap's label text
+  });
+});

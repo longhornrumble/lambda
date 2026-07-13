@@ -1701,6 +1701,7 @@ describe('M4 — rendering matrix (renderMessengerActions)', () => {
       form_nourl: { label: 'Sign Up', action: 'start_form', formId: 'f1', ai_available: true },
       form_url: { label: 'Sign Up Online', action: 'start_form', formId: 'f1', url: 'https://x.org/form', ai_available: true },
     },
+    conversational_forms: { f1: { form_id: 'f1', fields: [] } },
   };
 
   test('suggestion class → quick replies with PIC1 payloads; commitment class → web_url buttons', () => {
@@ -1711,12 +1712,27 @@ describe('M4 — rendering matrix (renderMessengerActions)', () => {
     expect(r.buttons.every((b) => b.type === 'web_url')).toBe(true);
   });
 
-  test('start_form without url: skipped with a log, never silently', () => {
+  test('M7a: start_form without url renders as a quick reply (replaces the pre-M7 logged-skip interim)', () => {
+    const r = renderMessengerActions(['form_nourl'], CFG, () => {});
+    expect(r.quickReplies).toEqual([
+      { content_type: 'text', title: 'Sign Up', payload: 'PIC1:cta:form_nourl' },
+    ]);
+    expect(r.buttons).toHaveLength(0);
+  });
+
+  test('M7a: start_form WITH url still renders as a button (link-out override preserved)', () => {
+    const r = renderMessengerActions(['form_url'], CFG, () => {});
+    expect(r.buttons).toEqual([{ type: 'web_url', url: 'https://x.org/form', title: 'Sign Up Online' }]);
+    expect(r.quickReplies).toHaveLength(0);
+  });
+
+  test('external_link without url is skipped with a log (unchanged from pre-M7)', () => {
     const logs = [];
-    const r = renderMessengerActions(['form_nourl'], CFG, (lvl, msg, meta) => logs.push({ lvl, msg, meta }));
+    const cfg = { cta_definitions: { bad_link: { label: 'Broken', action: 'external_link' } } };
+    const r = renderMessengerActions(['bad_link'], cfg, (lvl, msg, meta) => logs.push({ lvl, msg, meta }));
     expect(r.quickReplies).toHaveLength(0);
     expect(r.buttons).toHaveLength(0);
-    expect(logs.some((l) => l.msg.includes('no url') && l.meta.ctaId === 'form_nourl')).toBe(true);
+    expect(logs.some((l) => l.meta.ctaId === 'bad_link')).toBe(true);
   });
 
   test('titles truncated to the C5 20-char cap', () => {
@@ -1747,6 +1763,18 @@ describe('M4 — rendering matrix (renderMessengerActions)', () => {
     expect(resolveCtaPayload('PIC1:cta:nope', CFG)).toBeNull();
     expect(resolveCtaPayload('PIC2:cta:learn_x', CFG)).toBeNull();
     expect(resolveCtaPayload('GET_STARTED', CFG)).toBeNull();
+  });
+
+  test('M7a: resolveCtaPayload returns startFormId for a start_form CTA whose formId resolves in config', () => {
+    const resolved = resolveCtaPayload('PIC1:cta:form_nourl', CFG);
+    expect(resolved.startFormId).toBe('f1');
+  });
+
+  test('M7a: resolveCtaPayload falls back to RAG-on-label when the formId does not resolve', () => {
+    const cfg = { cta_definitions: { ghost: { label: 'Ghost Form', action: 'start_form', formId: 'nope' } } };
+    const resolved = resolveCtaPayload('PIC1:cta:ghost', cfg);
+    expect(resolved.startFormId).toBeUndefined();
+    expect(resolved.turnText).toBe('Ghost Form');
   });
 });
 
@@ -3188,5 +3216,457 @@ describe('M-Hb — abuse & cost controls (rate limiting)', () => {
     // spend model: the combined turn is already ONE Bedrock call's worth of
     // accounting, decided once at the top of the winning invocation).
     expect(rlUpdateCalls()).toHaveLength(2);
+  });
+});
+
+// ─── M7a — form engine (own isolated module instance: CONVERSATION_STATE_TABLE
+// + MFS_FUNCTION + a mocked LambdaClient for the S1 direct invoke) ───────────
+describe('M7a — conversational form engine', () => {
+  const FE_TABLE = 'picasso-conversation-state-test-formengine';
+  const FE_SESSION_ID = 'meta:PAGE_456:PSID_123';
+  let feHandler;
+  let feDdbMock, feKmsMock, feBedrockMock, feSqsMock, feSesMock, feLambdaMock;
+  let feLoadConfig, feRetrieveKB;
+  let feGetCommand, fePutCommand, feQueryCommand, feUpdateCommand, feDeleteCommand;
+  let feDecryptCommand, feInvokeCommand, feSendMessageCommand, feInvokeModelCommand;
+
+  beforeAll(() => {
+    jest.isolateModules(() => {
+      process.env.CONVERSATION_STATE_TABLE = FE_TABLE;
+      process.env.MFS_FUNCTION = 'Master_Function_Staging';
+
+      jest.doMock('../shared/bedrock-core', () => ({
+        loadConfig: jest.fn(),
+        retrieveKB: jest.fn(),
+        sanitizeUserInput: jest.fn((t) => t?.trim() || ''),
+      }));
+
+      const mc = mockClient;
+      const ddbLib = require('@aws-sdk/lib-dynamodb');
+      const kmsLib = require('@aws-sdk/client-kms');
+      const bedrockLib = require('@aws-sdk/client-bedrock-runtime');
+      const sqsLib = require('@aws-sdk/client-sqs');
+      const sesLib = require('@aws-sdk/client-ses');
+      const lambdaLib = require('@aws-sdk/client-lambda');
+
+      feGetCommand = ddbLib.GetCommand;
+      fePutCommand = ddbLib.PutCommand;
+      feQueryCommand = ddbLib.QueryCommand;
+      feUpdateCommand = ddbLib.UpdateCommand;
+      feDeleteCommand = ddbLib.DeleteCommand;
+      feDecryptCommand = kmsLib.DecryptCommand;
+      feInvokeCommand = lambdaLib.InvokeCommand;
+      feSendMessageCommand = sqsLib.SendMessageCommand;
+      feInvokeModelCommand = bedrockLib.InvokeModelCommand;
+
+      feDdbMock = mc(ddbLib.DynamoDBDocumentClient);
+      feKmsMock = mc(kmsLib.KMSClient);
+      feBedrockMock = mc(bedrockLib.BedrockRuntimeClient);
+      feSqsMock = mc(sqsLib.SQSClient);
+      feSesMock = mc(sesLib.SESClient);
+      feLambdaMock = mc(lambdaLib.LambdaClient);
+
+      const bc = require('../shared/bedrock-core');
+      feLoadConfig = bc.loadConfig;
+      feRetrieveKB = bc.retrieveKB;
+
+      feHandler = require('./index').handler;
+    });
+  });
+
+  afterAll(() => {
+    delete process.env.CONVERSATION_STATE_TABLE;
+    delete process.env.MFS_FUNCTION;
+  });
+
+  const FE_FORM = {
+    form_id: 'apply',
+    fields: [
+      { id: 'name', type: 'text', label: 'Name', prompt: 'What is your name?', required: true },
+      {
+        id: 'interest',
+        type: 'select',
+        label: 'Interest',
+        prompt: 'Which program interests you?',
+        required: true,
+        options: [
+          { value: 'mentoring', label: 'Mentoring' },
+          { value: 'tutoring', label: 'Tutoring' },
+        ],
+      },
+      { id: 'email', type: 'email', label: 'Email', prompt: 'What is your email?', required: true },
+    ],
+  };
+
+  const FE_CFG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'Helpful.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    cta_definitions: {
+      apply_cta: { label: 'Apply', action: 'start_form', formId: 'apply', ai_available: true },
+    },
+    conversational_forms: { apply: FE_FORM },
+  };
+
+  function feChannelMappingItem() {
+    return {
+      Item: {
+        PK: 'PAGE#PAGE_456',
+        SK: 'CHANNEL#messenger',
+        encryptedPageToken: Buffer.from('encrypted-blob').toString('base64'),
+        tenantId: 'TENANT_789',
+      },
+    };
+  }
+
+  function feMfsSuccessPayload(submissionId = 'sub_1') {
+    return Buffer.from(JSON.stringify({ statusCode: 200, body: JSON.stringify({ success: true, submission_id: submissionId }) }));
+  }
+
+  function feMfsFailurePayload() {
+    return Buffer.from(JSON.stringify({ statusCode: 502, body: JSON.stringify({ success: false, error: 'form_processing_failed' }) }));
+  }
+
+  beforeEach(() => {
+    feDdbMock.reset();
+    feKmsMock.reset();
+    feBedrockMock.reset();
+    feSqsMock.reset();
+    feSesMock.reset();
+    feLambdaMock.reset();
+
+    feLoadConfig.mockResolvedValue(FE_CFG);
+    feRetrieveKB.mockResolvedValue('KB context.');
+
+    feSqsMock.on(feSendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
+    feKmsMock.on(feDecryptCommand).resolves({ Plaintext: Buffer.from('EAABtest_page_token') });
+    feDdbMock.on(feQueryCommand).resolves({ Items: [] });
+    feDdbMock.on(fePutCommand).resolves({});
+    feDdbMock.on(feUpdateCommand).resolves({ Attributes: {} }); // C7 lock claim/release plumbing
+    feDdbMock.on(feDeleteCommand).resolves({});
+    feDdbMock
+      .on(feGetCommand, { Key: { PK: 'PAGE#PAGE_456', SK: 'CHANNEL#messenger' } })
+      .resolves(feChannelMappingItem());
+    // No pause row by default.
+    feDdbMock.on(feGetCommand, { Key: { sessionId: FE_SESSION_ID, stateType: 'pause' } }).resolves({});
+    // No active form session by default — individual tests override.
+    feDdbMock.on(feGetCommand, { Key: { sessionId: FE_SESSION_ID, stateType: 'form_session' } }).resolves({});
+
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.test' }) });
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+  });
+
+  function feBuildEvent(overrides = {}) {
+    return {
+      psid: 'PSID_123',
+      messageText: 'Hello',
+      pageId: 'PAGE_456',
+      tenantId: 'TENANT_789',
+      tenantHash: 'abc123defabc123def',
+      channelType: 'messenger',
+      messageMid: 'm_test_mid',
+      ...overrides,
+    };
+  }
+
+  function feSessionRow(overrides = {}) {
+    const now = Date.now();
+    return {
+      sessionId: FE_SESSION_ID,
+      stateType: 'form_session',
+      form_id: 'apply',
+      current_field: 'name',
+      answers: {},
+      attempts: 0,
+      started_at: now,
+      updated_at: now,
+      schema_version: 1,
+      expires_at: Math.floor(now / 1000) + 3600,
+      ...overrides,
+    };
+  }
+
+  function feSetActiveSession(overrides = {}) {
+    feDdbMock
+      .on(feGetCommand, { Key: { sessionId: FE_SESSION_ID, stateType: 'form_session' } })
+      .resolves({ Item: feSessionRow(overrides) });
+  }
+
+  /** Every fetch() call this handler made to the Meta Send API (message texts). */
+  function feSentTexts() {
+    return global.fetch.mock.calls.map(([, opts]) => JSON.parse(opts.body)?.message?.text).filter(Boolean);
+  }
+
+  /** The most recent PutCommand that wrote a form_session row (recent-messages
+   * PutCommands for storeConversationContext also land in fePutCommand, so a
+   * plain "last call" grab is unsafe — always filter by stateType). */
+  function feLastFormSessionPut() {
+    const puts = feDdbMock.commandCalls(fePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    return puts.length ? puts[puts.length - 1].args[0].input.Item : undefined;
+  }
+
+  test('start_form CTA tap begins a session and prompts the first field', async () => {
+    await feHandler(feBuildEvent({ messageText: 'Apply', quickReplyPayload: 'PIC1:cta:apply_cta', isPostback: false }));
+
+    const saved = feDdbMock.commandCalls(fePutCommand).find((c) => c.args[0].input.Item?.stateType === 'form_session');
+    expect(saved).toBeDefined();
+    expect(saved.args[0].input.Item.form_id).toBe('apply');
+    expect(saved.args[0].input.Item.current_field).toBe('name');
+    expect(feSentTexts()[0]).toContain('What is your name?');
+    // Never reached V5/Bedrock for a form-start turn.
+    expect(feBedrockMock.commandCalls(feInvokeModelCommand)).toHaveLength(0);
+  });
+
+  test('happy path E2E: text field, enum via ffld tap, typed-equivalent enum, email, confirm -> MFS invoke matches the pinned S2 fixture, session deleted, success string sent', async () => {
+    feLambdaMock.on(feInvokeCommand).resolves({ Payload: feMfsSuccessPayload('sub_42') });
+
+    // 1) name (typed)
+    feSetActiveSession({ current_field: 'name', answers: {} });
+    await feHandler(feBuildEvent({ messageText: 'Jane Doe' }));
+
+    // 2) interest via ffld tap (structured)
+    feSetActiveSession({ current_field: 'interest', answers: { name: 'Jane Doe' } });
+    await feHandler(
+      feBuildEvent({ messageText: 'Mentoring', quickReplyPayload: 'PIC1:ffld:apply:interest:mentoring' })
+    );
+    const afterTap = feLastFormSessionPut();
+    expect(afterTap.answers.interest).toBe('mentoring');
+    expect(afterTap.current_field).toBe('email');
+
+    // 3) email (typed)
+    feSetActiveSession({ current_field: 'email', answers: { name: 'Jane Doe', interest: 'mentoring' } });
+    await feHandler(feBuildEvent({ messageText: 'jane@example.com' }));
+    const afterEmail = feLastFormSessionPut();
+    expect(afterEmail.current_field).toBe('__summary__');
+    expect(feSentTexts().slice(-1)[0]).toContain('Jane Doe');
+
+    // 4) confirm via fctl tap
+    feSetActiveSession({
+      current_field: '__summary__',
+      answers: { name: 'Jane Doe', interest: 'mentoring', email: 'jane@example.com' },
+    });
+    await feHandler(feBuildEvent({ messageText: 'Confirm', quickReplyPayload: 'PIC1:fctl:apply:confirm' }));
+
+    expect(feLambdaMock).toHaveReceivedCommandTimes(feInvokeCommand, 1);
+    const invokeArgs = feLambdaMock.commandCalls(feInvokeCommand)[0].args[0].input;
+    expect(invokeArgs.FunctionName).toBe('Master_Function_Staging');
+    expect(invokeArgs.InvocationType).toBe('RequestResponse');
+    const sentEvent = JSON.parse(Buffer.from(invokeArgs.Payload).toString('utf-8'));
+    expect(sentEvent.queryStringParameters).toEqual({ action: 'chat', t: 'abc123defabc123def' });
+    const sentBody = JSON.parse(sentEvent.body);
+    expect(sentBody).toMatchObject({
+      tenant_hash: 'abc123defabc123def',
+      form_mode: true,
+      action: 'submit_form',
+      form_id: 'apply',
+      form_data: { name: 'Jane Doe', interest: 'mentoring', email: 'jane@example.com' },
+      session_id: FE_SESSION_ID,
+      conversation_id: FE_SESSION_ID,
+    });
+
+    // Session row deleted after successful submission.
+    const sessionDeletes = feDdbMock
+      .commandCalls(feDeleteCommand)
+      .filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(sessionDeletes).toHaveLength(1);
+    expect(feSentTexts().slice(-1)[0]).toMatch(/received|thanks/i);
+  });
+
+  test('invalid email re-prompts the field, and no answer VALUE appears in any log line (D1/X3)', async () => {
+    feSetActiveSession({ current_field: 'email', answers: { name: 'Jane Doe', interest: 'mentoring' } });
+    const logSpy = jest.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      await feHandler(feBuildEvent({ messageText: 'not-an-email' }));
+    } finally {
+      const allLogLines = logSpy.mock.calls.map((c) => c.join(' ')).join('\n');
+      logSpy.mockRestore();
+      expect(allLogLines).not.toContain('not-an-email');
+    }
+    expect(feSentTexts().slice(-1)[0]).toMatch(/valid email/i);
+    const saved = feLastFormSessionPut();
+    expect(saved.current_field).toBe('email'); // unchanged
+    expect(saved.attempts).toBe(1);
+  });
+
+  test('3 consecutive invalid attempts -> gentle cancel-or-retry nudge', async () => {
+    feSetActiveSession({ current_field: 'email', answers: {}, attempts: 2 });
+    await feHandler(feBuildEvent({ messageText: 'still not an email' }));
+    expect(feSentTexts().slice(-1)[0]).toMatch(/cancel/i);
+    const saved = feLastFormSessionPut();
+    expect(saved.attempts).toBe(0);
+  });
+
+  test('cancel typed at field 2 deletes the session row and sends the cancellation string', async () => {
+    feSetActiveSession({ current_field: 'interest', answers: { name: 'Jane Doe' } });
+    await feHandler(feBuildEvent({ messageText: 'cancel' }));
+
+    const sessionDeletes = feDdbMock
+      .commandCalls(feDeleteCommand)
+      .filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(sessionDeletes).toHaveLength(1);
+    expect(feSentTexts().slice(-1)[0]).toMatch(/cancel/i);
+    expect(feLambdaMock.commandCalls(feInvokeCommand)).toHaveLength(0);
+  });
+
+  test('user_email quick reply is present only for the email field on the messenger (FB) channel — C5', async () => {
+    feSetActiveSession({ current_field: 'email', answers: {} });
+    await feHandler(feBuildEvent({ messageText: 'hi' }));
+    // no active session yet on the prior test — begin fresh instead for clarity:
+    const lastCall = global.fetch.mock.calls.slice(-1)[0];
+    const body = JSON.parse(lastCall[1].body);
+    expect(body.message.quick_replies).toContainEqual({ content_type: 'user_email' });
+  });
+
+  test('a plain-text message at the email field validates identically whether typed or delivered via a tapped user_email QR (E1) — no separate code path', async () => {
+    feSetActiveSession({ current_field: 'email', answers: { name: 'Jane Doe', interest: 'mentoring' } });
+    // Meta delivers a tapped user_email QR as ordinary text (no quick_reply.payload) —
+    // indistinguishable at this layer from typing the address.
+    await feHandler(feBuildEvent({ messageText: 'jane@example.com' }));
+    const saved = feLastFormSessionPut();
+    expect(saved.answers.email).toBe('jane@example.com');
+    expect(saved.current_field).toBe('__summary__');
+  });
+
+  test('T2: an expired form_session row is treated as absent — turn falls through to a normal RAG reply, and the stale row is cleaned up', async () => {
+    feDdbMock.on(feGetCommand, { Key: { sessionId: FE_SESSION_ID, stateType: 'form_session' } }).resolves({
+      Item: feSessionRow({ expires_at: Math.floor(Date.now() / 1000) - 10 }),
+    });
+    feBedrockMock.on(feInvokeModelCommand).resolves({
+      body: Buffer.from(JSON.stringify({ content: [{ type: 'text', text: 'Hi!\n<<<ACTIONS []>>>' }] })),
+    });
+
+    await feHandler(feBuildEvent({ messageText: 'hello again' }));
+
+    expect(feBedrockMock).toHaveReceivedCommandTimes(feInvokeModelCommand, 1);
+    const staleDeletes = feDdbMock
+      .commandCalls(feDeleteCommand)
+      .filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(staleDeletes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  test('T3: a failed submission keeps the session row untouched (no save/extend); retrying confirm succeeds', async () => {
+    feLambdaMock.on(feInvokeCommand).resolvesOnce({ Payload: feMfsFailurePayload() }).resolves({ Payload: feMfsSuccessPayload() });
+    feSetActiveSession({ current_field: '__summary__', answers: { name: 'Jane Doe', interest: 'mentoring', email: 'jane@example.com' } });
+
+    await feHandler(feBuildEvent({ messageText: 'confirm' }));
+    expect(feSentTexts().slice(-1)[0]).toMatch(/didn't go through|something went wrong/i);
+    // T3: no save/put of the session row on a failed submission.
+    const formSaves = feDdbMock.commandCalls(fePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    expect(formSaves).toHaveLength(0);
+    let formDeletes = feDdbMock.commandCalls(feDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(formDeletes).toHaveLength(0);
+
+    // Retry — same (unchanged) session row still resolves, second confirm succeeds.
+    await feHandler(feBuildEvent({ messageText: 'confirm' }));
+    expect(feSentTexts().slice(-1)[0]).toMatch(/received|thanks/i);
+    formDeletes = feDdbMock.commandCalls(feDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(formDeletes).toHaveLength(1);
+  });
+
+  test('escalation phrase mid-form wins over the form turn (human access is never blocked)', async () => {
+    feSetActiveSession({ current_field: 'email', answers: {} });
+    await feHandler(feBuildEvent({ messageText: 'I want to talk to a human' }));
+
+    expect(global.fetch.mock.calls.some(([url]) => url.includes('pass_thread_control'))).toBe(true);
+    // No form-session save/delete happened — escalation short-circuited before the form check.
+    const formTouches = feDdbMock
+      .commandCalls(fePutCommand)
+      .filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    expect(formTouches).toHaveLength(0);
+  });
+
+  test('flag OFF -> zero form machinery: no form_session GetItem at all, even with an active session row present', async () => {
+    feLoadConfig.mockResolvedValue({ ...FE_CFG, feature_flags: {} });
+    feSetActiveSession({ current_field: 'email', answers: {} });
+    feBedrockMock.on(feInvokeModelCommand).resolves({
+      body: Buffer.from(JSON.stringify({ content: [{ type: 'text', text: 'Hi.' }] })),
+    });
+
+    await feHandler(feBuildEvent({ messageText: 'hello' }));
+
+    const formSessionGets = feDdbMock
+      .commandCalls(feGetCommand)
+      .filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(formSessionGets).toHaveLength(0);
+  });
+
+  test('drain: a second coalesced message mid-form is applied as the NEXT sequential answer, not joined into one RAG turn', async () => {
+    feSetActiveSession({ current_field: 'name', answers: {} });
+    feDdbMock
+      .on(feUpdateCommand, { TableName: FE_TABLE, Key: { sessionId: FE_SESSION_ID, stateType: 'lock' } }, false)
+      .resolvesOnce({
+        Attributes: {
+          pending: [{ text: 'Mentoring', quickReplyPayload: 'PIC1:ffld:apply:interest:mentoring', mid: 'm2', timestamp: 2 }],
+        },
+      })
+      .resolves({ Attributes: {} });
+
+    await feHandler(feBuildEvent({ messageText: 'Jane Doe' }));
+
+    // Zero Bedrock calls — every drained item was form input, never a RAG turn.
+    expect(feBedrockMock.commandCalls(feInvokeModelCommand)).toHaveLength(0);
+    const puts = feDdbMock.commandCalls(fePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    // name recorded first, then interest via the drained ffld tap — final saved row has both.
+    const finalSave = puts.slice(-1)[0].args[0].input.Item;
+    expect(finalSave.answers).toEqual({ name: 'Jane Doe', interest: 'mentoring' });
+    expect(finalSave.current_field).toBe('email');
+  });
+
+  test('escalation phrase as a SECOND coalesced message mid-form escalates instead of being applied as an answer — form session left INTACT', async () => {
+    feSetActiveSession({ current_field: 'name', answers: {} });
+    feDdbMock
+      .on(feUpdateCommand, { TableName: FE_TABLE, Key: { sessionId: FE_SESSION_ID, stateType: 'lock' } }, false)
+      .resolvesOnce({ Attributes: { pending: [{ text: 'I want to talk to a human', mid: 'm2', timestamp: 2 }] } })
+      .resolves({ Attributes: {} });
+
+    await feHandler(feBuildEvent({ messageText: 'Jane Doe' }));
+
+    // Escalation actually fired (thread-control handoff to Meta's inbox app).
+    expect(global.fetch.mock.calls.some(([url]) => url.includes('pass_thread_control'))).toBe(true);
+    // Only ONE form_session save (the winner's own 'name' answer) — the
+    // coalesced escalation message never reached the form engine as an
+    // answer, and the row is never deleted (left intact for the user to
+    // resume, or idle-TTL out, per the coordinator's decision).
+    const formSaves = feDdbMock.commandCalls(fePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    expect(formSaves).toHaveLength(1);
+    expect(formSaves[0].args[0].input.Item.answers).toEqual({ name: 'Jane Doe' });
+    const formDeletes = feDdbMock.commandCalls(feDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(formDeletes).toHaveLength(0);
+  });
+
+  test('rate-limited user mid-form -> polite message sent, form session left completely untouched', async () => {
+    feSetActiveSession({ current_field: 'email', answers: { name: 'Jane Doe', interest: 'mentoring' } });
+    // Any rate-limit counter bump (per-user-hourly or per-tenant-daily —
+    // same UpdateExpression for both) reports a count over the default
+    // per-user-hourly limit (30) but within the polite-reply margin (+3).
+    feDdbMock
+      .on(
+        feUpdateCommand,
+        {
+          TableName: FE_TABLE,
+          UpdateExpression:
+            'ADD turn_count :one SET updated_at = :now, schema_version = if_not_exists(schema_version, :one), expires_at = if_not_exists(expires_at, :expiresAt)',
+        },
+        false
+      )
+      .resolves({ Attributes: { turn_count: 31 } });
+
+    await feHandler(feBuildEvent({ messageText: 'jane@example.com' }));
+
+    expect(feSentTexts().slice(-1)[0]).toMatch(/faster than i can keep up|one moment/i);
+    // Rate limiting short-circuits BEFORE the form-session check even runs —
+    // no read, no save, no delete of the form_session row.
+    const formGets = feDdbMock.commandCalls(feGetCommand).filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(formGets).toHaveLength(0);
+    const formSaves = feDdbMock.commandCalls(fePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'form_session');
+    expect(formSaves).toHaveLength(0);
+    const formDeletes = feDdbMock.commandCalls(feDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'form_session');
+    expect(formDeletes).toHaveLength(0);
+    // No Bedrock call either — rate limiting suppresses the reply before RAG.
+    expect(feBedrockMock.commandCalls(feInvokeModelCommand)).toHaveLength(0);
   });
 });
