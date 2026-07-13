@@ -20,6 +20,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from botocore.exceptions import ClientError
+
 # Set required env vars before importing the module under test
 os.environ.setdefault("ENVIRONMENT", "test")
 os.environ.setdefault("META_APP_ID", "TEST_APP_ID")
@@ -521,6 +523,238 @@ class TestListChannels(unittest.TestCase):
         self.assertEqual(response["statusCode"], 200)
         body = json.loads(response["body"])
         self.assertEqual(body["channels"], [])
+
+
+class TestPushWelcomeSurfaces(unittest.TestCase):
+    """M5: push_welcome_surfaces() — Messenger Profile API push on connect."""
+
+    @staticmethod
+    def _s3_get_object_response(config: dict) -> dict:
+        return {"Body": MagicMock(read=MagicMock(return_value=json.dumps(config).encode()))}
+
+    def test_config_bucket_not_configured_skips(self):
+        import lambda_function as lf
+
+        with patch.object(lf, "_CONFIG_BUCKET", ""), \
+             patch("lambda_function._graph_post") as mock_post:
+            result = lf.push_welcome_surfaces("PAGE_TOKEN", "TENANT_XYZ")
+
+        self.assertEqual(result, {"skipped": "config bucket not configured"})
+        mock_post.assert_not_called()
+
+    def test_config_s3_miss_skips_and_flow_would_still_succeed(self):
+        import lambda_function as lf
+
+        not_found = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "not found"}}, "GetObject"
+        )
+        with patch.object(lf, "_CONFIG_BUCKET", "test-bucket"), \
+             patch.object(lf, "_s3_client") as mock_s3, \
+             patch("lambda_function._graph_post") as mock_post:
+            mock_s3.get_object.side_effect = not_found
+            result = lf.push_welcome_surfaces("PAGE_TOKEN", "TENANT_XYZ")
+
+        self.assertEqual(result, {"skipped": "tenant config not found or unreadable"})
+        mock_post.assert_not_called()
+
+    def test_flag_off_skips_and_makes_no_graph_call(self):
+        import lambda_function as lf
+
+        config = {
+            "feature_flags": {"MESSENGER_CHANNEL": False},
+            "messenger_behavior": {
+                "welcome": {"ice_breakers": [{"question": "Q", "payload": "PIC1:cta:x"}]}
+            },
+        }
+        with patch.object(lf, "_CONFIG_BUCKET", "test-bucket"), \
+             patch.object(lf, "_s3_client") as mock_s3, \
+             patch("lambda_function._graph_post") as mock_post:
+            mock_s3.get_object.return_value = self._s3_get_object_response(config)
+            result = lf.push_welcome_surfaces("PAGE_TOKEN", "TENANT_XYZ")
+
+        self.assertEqual(result, {"skipped": "MESSENGER_CHANNEL flag not enabled"})
+        mock_post.assert_not_called()
+
+    def test_welcome_absent_skips_and_makes_no_graph_call(self):
+        import lambda_function as lf
+
+        config = {"feature_flags": {"MESSENGER_CHANNEL": True}}
+        with patch.object(lf, "_CONFIG_BUCKET", "test-bucket"), \
+             patch.object(lf, "_s3_client") as mock_s3, \
+             patch("lambda_function._graph_post") as mock_post:
+            mock_s3.get_object.return_value = self._s3_get_object_response(config)
+            result = lf.push_welcome_surfaces("PAGE_TOKEN", "TENANT_XYZ")
+
+        self.assertEqual(result, {"skipped": "no welcome surfaces configured"})
+        mock_post.assert_not_called()
+
+    def test_flag_on_pushes_capped_ice_breakers_and_menu(self):
+        """5 configured ice breakers -> capped to 4 (C5); menu mixes postback
+        (payload) + web_url (url) items; a malformed menu item (neither) is
+        skipped; titles are truncated to 20 chars; payloads pass through
+        verbatim (routing is M4's job)."""
+        import lambda_function as lf
+
+        config = {
+            "feature_flags": {"MESSENGER_CHANNEL": True},
+            "messenger_behavior": {
+                "welcome": {
+                    "ice_breakers": [
+                        {"question": f"Q{i}", "payload": f"PIC1:cta:ib{i}"} for i in range(5)
+                    ],
+                    "persistent_menu": [
+                        {"title": "This Title Is Way Too Long For Meta", "payload": "PIC1:cta:menu1"},
+                        {"title": "Visit Site", "url": "https://example.com"},
+                        {"title": "Bad Item"},  # malformed: no payload AND no url
+                    ],
+                }
+            },
+        }
+        with patch.object(lf, "_CONFIG_BUCKET", "test-bucket"), \
+             patch.object(lf, "_s3_client") as mock_s3, \
+             patch("lambda_function._graph_post") as mock_post:
+            mock_s3.get_object.return_value = self._s3_get_object_response(config)
+            mock_post.return_value = {"success": True}
+            result = lf.push_welcome_surfaces("PAGE_TOKEN", "TENANT_XYZ")
+
+        mock_post.assert_called_once()
+        call_args, call_kwargs = mock_post.call_args
+        path, params = call_args[0], call_args[1]
+        profile_payload = call_kwargs["json_body"]
+
+        self.assertEqual(path, "/me/messenger_profile")
+        self.assertEqual(params, {"access_token": "PAGE_TOKEN"})
+        self.assertEqual(profile_payload["get_started"], {"payload": "GET_STARTED"})
+
+        # Capped at 4 of the 5 configured ice breakers; payloads verbatim
+        ice_ctas = profile_payload["ice_breakers"][0]["call_to_actions"]
+        self.assertEqual(len(ice_ctas), 4)
+        self.assertEqual(ice_ctas[0], {"question": "Q0", "payload": "PIC1:cta:ib0"})
+        self.assertEqual(ice_ctas[3], {"question": "Q3", "payload": "PIC1:cta:ib3"})
+
+        # Menu: postback + web_url items; malformed item skipped; title capped
+        menu_ctas = profile_payload["persistent_menu"][0]["call_to_actions"]
+        self.assertEqual(len(menu_ctas), 2)
+        self.assertEqual(menu_ctas[0]["type"], "postback")
+        self.assertEqual(menu_ctas[0]["payload"], "PIC1:cta:menu1")
+        self.assertLessEqual(len(menu_ctas[0]["title"]), 20)
+        self.assertEqual(
+            menu_ctas[1], {"type": "web_url", "title": "Visit Site", "url": "https://example.com"}
+        )
+
+        self.assertEqual(
+            result,
+            {"pushed": {"get_started": True, "ice_breakers": 4, "persistent_menu": 2}},
+        )
+
+    def test_graph_error_on_push_returns_error_dict_never_raises(self):
+        import lambda_function as lf
+
+        config = {
+            "feature_flags": {"MESSENGER_CHANNEL": True},
+            "messenger_behavior": {
+                "welcome": {"ice_breakers": [{"question": "Q", "payload": "PIC1:cta:x"}]}
+            },
+        }
+        with patch.object(lf, "_CONFIG_BUCKET", "test-bucket"), \
+             patch.object(lf, "_s3_client") as mock_s3, \
+             patch("lambda_function._graph_post", side_effect=Exception("HTTP 400: Bad Request")):
+            mock_s3.get_object.return_value = self._s3_get_object_response(config)
+            result = lf.push_welcome_surfaces("PAGE_TOKEN", "TENANT_XYZ")
+
+        self.assertIn("error", result)
+
+
+class TestWelcomeSurfacesOAuthWiring(unittest.TestCase):
+    """M5: push_welcome_surfaces() is called best-effort from the OAuth
+    callback and must never affect the callback's own success/failure."""
+
+    def _valid_state(self, tenant_id="TENANT_XYZ"):
+        import jwt
+        payload = {
+            "tenant_id": tenant_id,
+            "nonce": "abc123",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 600,
+        }
+        return jwt.encode(payload, _FAKE_APP_SECRET, algorithm="HS256")
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    @patch("lambda_function._graph_post")
+    @patch("lambda_function._encrypt_token", return_value="ENCRYPTED_TOKEN_BASE64")
+    @patch("lambda_function._channel_table")
+    def test_flag_off_oauth_flow_still_succeeds_no_profile_push(
+        self, mock_table, mock_encrypt, mock_post, mock_get, _mock_secret
+    ):
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},
+            {"data": [{"id": "PAGE_001", "name": "My Test Page", "access_token": "PAGE_TOKEN_XYZ"}]},
+            {},  # instagram_business_account lookup — none linked
+        ]
+        mock_post.return_value = {"success": True}
+        mock_table.return_value.put_item = MagicMock()
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        with patch.object(lf, "_CONFIG_BUCKET", ""):
+            response = lf.lambda_handler(event, _make_context())
+
+        self.assertIn("META_OAUTH_SUCCESS", response["body"])
+        # CONFIG_BUCKET unset -> push_welcome_surfaces() never calls Graph.
+        # The only messenger_profile POST left is the pre-existing Get
+        # Started button config, which targets /{page_id}/messenger_profile
+        # (distinct path from push_welcome_surfaces's /me/messenger_profile).
+        profile_paths = [c.args[0] for c in mock_post.call_args_list]
+        self.assertNotIn("/me/messenger_profile", profile_paths)
+        self.assertIn("/PAGE_001/messenger_profile", profile_paths)
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    @patch("lambda_function._graph_post")
+    @patch("lambda_function._encrypt_token", return_value="ENCRYPTED_TOKEN_BASE64")
+    @patch("lambda_function._channel_table")
+    @patch("lambda_function._s3_client")
+    def test_graph_400_on_profile_push_oauth_flow_still_succeeds(
+        self, mock_s3, mock_table, mock_encrypt, mock_post, mock_get, _mock_secret
+    ):
+        """D1/D2-style pin: a Graph error on the welcome-surface push must
+        NEVER surface as an OAuth callback failure (best-effort)."""
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        config = {
+            "feature_flags": {"MESSENGER_CHANNEL": True},
+            "messenger_behavior": {
+                "welcome": {"ice_breakers": [{"question": "Q", "payload": "PIC1:cta:x"}]}
+            },
+        }
+        mock_s3.get_object.return_value = TestPushWelcomeSurfaces._s3_get_object_response(config)
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},
+            {"data": [{"id": "PAGE_001", "name": "My Test Page", "access_token": "PAGE_TOKEN_XYZ"}]},
+            {},  # instagram_business_account lookup — none linked
+        ]
+
+        def graph_post_side_effect(path, params, json_body=None):
+            if path == "/me/messenger_profile":
+                raise Exception("HTTP 400: Bad Request")
+            return {"success": True}
+
+        mock_post.side_effect = graph_post_side_effect
+        mock_table.return_value.put_item = MagicMock()
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        with patch.object(lf, "_CONFIG_BUCKET", "test-bucket"):
+            response = lf.lambda_handler(event, _make_context())
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertIn("META_OAUTH_SUCCESS", response["body"])
 
 
 class TestCorsAndRouting(unittest.TestCase):
