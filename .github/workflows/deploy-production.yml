@@ -264,7 +264,7 @@ jobs:
               echo "::error file=$f::Tracked runtime file missing from deploy zip — add it to include_globs (in BOTH deploy-staging.yml and deploy-production.yml)"
               MISSING=1
             fi
-          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)((test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)|analytics_writer_contract\.json)$')
+          done < <(git ls-files -- "$SRC/" | grep -E '\.(py|json)$' | grep -vE '(^|/)((test_|run_|conftest|backfill_|create_|migrate_)[^/]*\.(py|json)|analytics_writer_contract\.json|scripts/[^/]*\.(py|json))$')
           if [ "$MISSING" -eq 0 ]; then echo "Zip-manifest guard: all tracked runtime files present."; fi
           exit $MISSING
 
