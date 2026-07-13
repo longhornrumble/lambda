@@ -10,10 +10,9 @@
  * What the LIVE model runs measure (deterministic C8 session-boundary and C6
  * precedence behavior is pinned by prompt_messenger.test.js — no model calls
  * needed there):
- *   1. BREVITY — replies ≤ 3 sentences with the 14-CTA catalog spliced in
- *      (arm B), vs the legacy short-form prompt (arm A baseline).
- *   2. TAIL EMISSION — arm B replies end with exactly one well-formed
- *      ACTION tail (parsed with the real createTailParser, chunking-invariant
+ *   1. BREVITY — replies <= 3 sentences with the 14-CTA catalog spliced in.
+ *   2. TAIL EMISSION — replies end with exactly one well-formed ACTION tail
+ *      (parsed with the real createTailParser, chunking-invariant
  *      feed(full)+end()).
  *   3. TAIL VALIDITY — tail ids validate against the catalog
  *      (validateActionIds, cap 4).
@@ -75,6 +74,16 @@ const SCENARIOS = [
   { id: 'factual_hours', restraintExpected: false, history: [], user: 'how often do mentors meet with their youth?' },
   { id: 'long_answer_bait', restraintExpected: false, history: [], user: 'can you explain everything about all your programs, requirements, time commitments, and how to get started with each one?' },
   { id: 'donation_interest', restraintExpected: false, history: [], user: 'how can I donate to support the work?' },
+  // TURN CHECK fired live (M3a gate condition): two session-scoped assistant
+  // questions put buildTurnCheckBlock at threshold — the block is IN the
+  // system prompt for these calls. Gate: the reply must NOT end with another
+  // exploration question.
+  { id: 'turn_check_at_threshold', restraintExpected: false, turnCheckFired: true, history: [
+      { role: 'assistant', content: 'What draws you to mentoring?' },
+      { role: 'user', content: 'i love working with teens' },
+      { role: 'assistant', content: 'Have you mentored before?' },
+      { role: 'user', content: 'yes, two years at my church' },
+    ], user: 'so what do you think, am i a good fit?' },
 ];
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -100,7 +109,16 @@ async function invoke(systemContent, messages) {
 }
 
 function countSentences(text) {
+  // Known blind spot (gate review, M3a): abbreviation periods ("vs.") count
+  // as sentence enders (inflates counts -> conservative for the brevity
+  // gate); a terminator immediately followed by a closing quote/paren is
+  // missed. Harden before certification-scale runs.
   return (text.match(/[.!?](\s|$)/g) || []).length || (text.trim() ? 1 : 0);
+}
+
+/** Markdown/formatting leakage — instrumented gate (was manual in round 2). */
+function hasMarkdown(text) {
+  return /\*\*|__|^#+\s|^[-*]\s|^\d+\.\s/m.test(text);
 }
 
 /** Parse the action tail the chunking-invariant way the processor will (M3b). */
@@ -198,6 +216,9 @@ async function main() {
           v5Active,
           sentences: countSentences(visible),
           chars: visible.length,
+          markdown: hasMarkdown(visible),
+          endsWithQuestion: visible.trim().endsWith('?'),
+          turnCheckFired: scenario.turnCheckFired === true,
           tailStatus: tail ? tail.status : 'missing',
           actionCount: Array.isArray(validIds) ? validIds.length : null,
           validIds,
@@ -220,6 +241,9 @@ async function main() {
   const restraintRows = rows.filter((r) => r.restraintExpected);
   const restraintOk = restraintRows.filter((r) => (r.actionCount ?? 0) === 0).length;
   const capOk = rows.filter((r) => (r.actionCount ?? 0) <= 4).length;
+  const markdownClean = rows.filter((r) => !r.markdown).length;
+  const tcRows = rows.filter((r) => r.turnCheckFired);
+  const tcOk = tcRows.filter((r) => !r.endsWithQuestion).length;
 
   const summary = {
     model_id: MODEL_ID,
@@ -230,6 +254,8 @@ async function main() {
       tail_emitted_valid: { pass: tailEmitted, n, rate: tailEmitted / n, cp95_lower: cpLowerBound(tailEmitted, n) },
       restraint_zero_actions_on_smalltalk: { pass: restraintOk, n: restraintRows.length, rate: restraintRows.length ? restraintOk / restraintRows.length : null, cp95_lower: cpLowerBound(restraintOk, restraintRows.length) },
       action_cap_le_4: { pass: capOk, n, rate: capOk / n },
+      markdown_free: { pass: markdownClean, n, rate: markdownClean / n, cp95_lower: cpLowerBound(markdownClean, n) },
+      turn_check_no_more_questions: { pass: tcOk, n: tcRows.length, rate: tcRows.length ? tcOk / tcRows.length : null, cp95_lower: cpLowerBound(tcOk, tcRows.length) },
     },
     note: 'Deterministic C8 session-boundary + C6 precedence behavior is pinned by prompt_messenger.test.js (no model calls). generated_by CI messenger-evidence workflow.',
   };

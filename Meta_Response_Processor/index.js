@@ -47,6 +47,11 @@ const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
 const { classifyMetaSendError } = require('./metaSendErrors');
+const { buildMessengerV5Prompt } = require('./prompt_messenger');
+const { computeSessionWindow } = require('./sessionWindow');
+const { createTailParser } = require('../shared/prompt/streamTail');
+const { validateActionIds } = require('../shared/prompt/prompt_v5');
+const { selectActionsV4 } = require('../shared/prompt/prompt_v4');
 const crypto = require('crypto');
 
 // ─── AWS client initialisation ────────────────────────────────────────────────
@@ -269,6 +274,9 @@ async function loadConversationContext(pageId, psid) {
     role: item.role || 'user',
     content: item.content || '',
     timestamp: item.messageTimestamp ? new Date(item.messageTimestamp).toISOString() : '',
+    // C8 session windowing needs the raw epoch (sessionWindow.js); additive —
+    // prompt builders read role/content only.
+    messageTimestamp: typeof item.messageTimestamp === 'number' ? item.messageTimestamp : undefined,
   }));
   log('INFO', 'Conversation context loaded', { sessionId, messageCount: messages.length });
   return messages;
@@ -792,6 +800,95 @@ function buildMessengerPrompt(userInput, kbContext, history, config) {
   });
 
   return { systemContent, messages };
+}
+
+/**
+ * Strip residual markdown formatting markers the model may emit despite the
+ * plain-text rule (M3a evidence: 0/40 post-hardening, this is belt-and-
+ * suspenders) - Messenger/IG render these characters literally.
+ */
+function stripFormattingMarkers(text) {
+  return String(text || '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1');
+}
+
+/**
+ * Messenger V5 single-pass turn (M3b): build the Messenger V5 prompt over
+ * SESSION-SCOPED history (C8), invoke buffered, then parse the ACTION tail
+ * the chunking-invariant way (feed(full)+end()).
+ *
+ * Fallback ladder (frozen, mirrors BSH): valid tail -> validateActionIds;
+ * malformed/missing tail while CTAs exist -> ONE selectActionsV4 call ->
+ * on any failure, no actions. The reply text is always served.
+ *
+ * @returns {Promise<{responseText: string, actionIds: string[], tailStatus: string}>}
+ */
+async function generateMessengerV5Response(userInput, kbContext, sessionHistory, config, channelType) {
+  const modelId = config.model_id || DEFAULT_MODEL_ID;
+  const maxTokens = config.streaming?.max_tokens || 1000;
+  const temperature = config.streaming?.temperature ?? 0;
+
+  const { systemContent, messages, v5Active } = buildMessengerV5Prompt(
+    userInput,
+    kbContext,
+    config,
+    sessionHistory,
+    channelType
+  );
+
+  const requestBody = {
+    anthropic_version: 'bedrock-2023-05-31',
+    max_tokens: maxTokens,
+    temperature,
+    system: systemContent,
+    messages,
+  };
+
+  log('INFO', 'Calling Bedrock InvokeModel (Messenger V5)', {
+    modelId,
+    v5Active,
+    sessionTurns: Math.floor(messages.length / 2),
+  });
+
+  const command = new InvokeModelCommand({
+    modelId,
+    contentType: 'application/json',
+    accept: 'application/json',
+    body: JSON.stringify(requestBody),
+  });
+  const result = await bedrockRuntime.send(command);
+  const responseBody = JSON.parse(Buffer.from(result.body).toString('utf-8'));
+  const rawText = responseBody.content?.[0]?.text || responseBody.completion || '';
+
+  if (!v5Active) {
+    // No ai_available CTAs: plain short-form prompt, no tail to parse.
+    return { responseText: stripFormattingMarkers(rawText), actionIds: [], tailStatus: 'no_catalog' };
+  }
+
+  const parser = createTailParser();
+  const released = parser.feed(rawText);
+  const tail = parser.end();
+  const visible = stripFormattingMarkers(released + (tail.remainingText || ''));
+
+  if (tail.status === 'actions') {
+    const ids = validateActionIds(tail.actionIds, config);
+    log('INFO', 'Messenger V5 tail parsed', { tailStatus: tail.status, selected: ids });
+    return { responseText: visible, actionIds: ids, tailStatus: tail.status };
+  }
+
+  // Malformed or missing tail: ONE fail-soft V4 selector call, then give up
+  // on actions (never on the reply).
+  log('WARN', 'Messenger V5 tail missing/malformed - fail-soft selectActionsV4', {
+    tailStatus: tail.status,
+  });
+  try {
+    const ids = await selectActionsV4(visible, sessionHistory, config, bedrockRuntime);
+    return { responseText: visible, actionIds: Array.isArray(ids) ? ids : [], tailStatus: tail.status };
+  } catch (fallbackErr) {
+    log('WARN', 'selectActionsV4 fallback failed - no actions', { error: fallbackErr.message });
+    return { responseText: visible, actionIds: [], tailStatus: tail.status };
+  }
 }
 
 /**
@@ -1326,6 +1423,15 @@ exports.handler = async function handler(event) {
     // Config was already loaded in step 0b.
     let responseText;
     let kbContextLength = 0;
+    let selectedActionIds = [];
+
+    // C8 session window (flag-gated lane only): prompt history, turn-check
+    // counting, and the disclosure trigger all see the CURRENT SESSION, never
+    // the lifetime thread.
+    const messengerFlagOn = config.feature_flags?.MESSENGER_CHANNEL === true;
+    const sessionWindow = messengerFlagOn
+      ? computeSessionWindow(conversationHistory)
+      : { sessionMessages: conversationHistory, isSessionFirstTurn: conversationHistory.length === 0 };
 
     try {
       const kbContext = await retrieveKB(turnText, config);
@@ -1336,12 +1442,32 @@ exports.handler = async function handler(event) {
         kbContextLength,
       });
 
-      responseText = await generateBedrockResponse(
-        turnText,
-        kbContext,
-        conversationHistory,
-        config
-      );
+      if (messengerFlagOn) {
+        // Messenger V5 single-pass turn (M3b). Until M4 renders them, the
+        // validated action ids are logged only.
+        const v5 = await generateMessengerV5Response(
+          turnText,
+          kbContext,
+          sessionWindow.sessionMessages,
+          config,
+          channelType
+        );
+        responseText = v5.responseText;
+        selectedActionIds = v5.actionIds;
+        if (selectedActionIds.length > 0) {
+          log('INFO', 'Messenger V5 actions selected (rendered from M4)', {
+            selected: selectedActionIds,
+            tailStatus: v5.tailStatus,
+          });
+        }
+      } else {
+        responseText = await generateBedrockResponse(
+          turnText,
+          kbContext,
+          conversationHistory,
+          config
+        );
+      }
     } catch (bedrockErr) {
       log('ERROR', 'Bedrock pipeline failed — sending fallback message', {
         tenantHash: tenantHash.substring(0, 8),
@@ -1364,8 +1490,8 @@ exports.handler = async function handler(event) {
     // disclosure (byte-identical to pre-program baseline).
     if (
       withDisclosure &&
-      config.feature_flags?.MESSENGER_CHANNEL === true &&
-      conversationHistory.length === 0
+      messengerFlagOn &&
+      sessionWindow.isSessionFirstTurn
     ) {
       const disclosureText = getMessengerString(
         config,
