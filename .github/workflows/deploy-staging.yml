@@ -554,7 +554,10 @@ jobs:
             staging_function: Meta_OAuth_Handler
             handler: lambda_function.lambda_handler
             runtime: python
-            include_globs: 'lambda_function.py'
+            # scripts/*.py = the M5 operator re-push script; tracked, so the
+            # zip-manifest guard requires it in the allowlist (it is inert in
+            # the runtime zip - operator-invoked only).
+            include_globs: 'lambda_function.py scripts/*.py'
             env_vars: ''
             # Smoke skipped: routes are signed-state-JWT / Clerk-JWT gated;
             # a bare probe is non-deterministic. Real validation is Phase C1
