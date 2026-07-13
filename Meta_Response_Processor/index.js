@@ -55,6 +55,7 @@ const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
 const escalation = require('./escalation');
+const rateLimits = require('./rateLimits');
 const { classifyMetaSendError } = require('./metaSendErrors');
 const { buildMessengerV5Prompt, resolveMessengerModelId } = require('./prompt_messenger');
 const { renderMessengerActions, resolveCtaPayload } = require('./renderMessengerActions');
@@ -1812,6 +1813,65 @@ exports.handler = async function handler(event) {
     const durationMs = Date.now() - startTime;
     log('INFO', 'Handler complete (escalation)', { pageId, psid, durationMs });
     return;
+  }
+
+  // ── M-Hb: abuse & cost controls (docs/messenger/CONTRACTS.md C4; plan §6
+  // M-Hb) — the threat is an unauthenticated public path into Bedrock spend.
+  // Flag-gated (messengerFlagOn), checked AFTER the pause check and AFTER
+  // lock acquisition (coalesced losers already produce no Bedrock — they
+  // exited above) and AFTER the escalation check above (human access is
+  // never throttled: a rate-limited user asking for a human still
+  // escalates). Checked exactly ONCE per winning invocation — not once per
+  // drained message — because a C7 drain cycle already combines a
+  // coalesced burst into a single Bedrock call (C7's spend model); one
+  // increment here is the correct unit of cost accounting for the whole
+  // lock hold, including whatever this invocation goes on to drain.
+  if (messengerFlagOn && CONVERSATION_STATE_TABLE) {
+    const rl = await rateLimits.incrementAndCheck({
+      client: dynamodb,
+      tableName: CONVERSATION_STATE_TABLE,
+      sessionId: lockSessionId,
+      tenantId,
+      config,
+    });
+    if (rl.limited) {
+      if (rl.userLimited) {
+        log('WARN', 'RATE_LIMITED user', {
+          sessionId: lockSessionId,
+          tenantId,
+          userCount: rl.userCount,
+        });
+      }
+      if (rl.tenantLimited) {
+        log('WARN', 'TENANT_DAILY_CAP', {
+          tenantId,
+          tenantCount: rl.tenantCount,
+        });
+      }
+      if (rl.shouldReplyPolitely) {
+        const rateLimitedText = getMessengerString(
+          config,
+          channelType,
+          'rate_limited',
+          DEFAULT_RATE_LIMITED
+        );
+        try {
+          await sendResponseMessages(pageId, psid, rateLimitedText, pageAccessToken, channelType);
+        } catch (sendErr) {
+          log('WARN', 'Failed to send rate_limited reply — dropping the turn anyway', {
+            sessionId: lockSessionId,
+            error: sendErr.message,
+          });
+        }
+      }
+      // No history write, no Bedrock call. Silently discard anything that
+      // coalesced onto this lock hold too — answering it would just be more
+      // spend from the same flood this check exists to stop.
+      await finalizeConversationLock(null, { silentDrain: true });
+      const rlDurationMs = Date.now() - startTime;
+      log('INFO', 'Handler complete (rate limited)', { pageId, psid, durationMs: rlDurationMs });
+      return;
+    }
   }
 
   // ── 0b2. Structured payload routing (contract C3, M4) ────────────────────

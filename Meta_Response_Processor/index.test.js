@@ -2863,3 +2863,330 @@ describe('M6b — review follow-ups (error branches + in-flight race semantic)',
     expect(texts.some((t) => t.includes('Owed reply.'))).toBe(true);
   });
 });
+
+// ─── M-Hb — abuse & cost controls (docs/messenger/CONTRACTS.md C4; plan §6
+// M-Hb) ───────────────────────────────────────────────────────────────────
+//
+// Needs its own CONVERSATION_STATE_TABLE-enabled handler instance (module-
+// load-time env var), same jest.isolateModules pattern as the M6a/M6b block
+// above — its own table name so the two instances never share DDB-mock
+// state.
+describe('M-Hb — abuse & cost controls (rate limiting)', () => {
+  const MHB_TABLE = 'picasso-conversation-state-test-mhb';
+  let mhbHandler;
+  let mhbDdbMock, mhbKmsMock, mhbBedrockMock, mhbSqsMock, mhbSesMock;
+  let mhbLoadConfig, mhbRetrieveKB;
+  let mhbGetCommand, mhbPutCommand, mhbQueryCommand, mhbUpdateCommand, mhbDeleteCommand;
+  let mhbInvokeModelCommand, mhbSendMessageCommand, mhbDecryptCommand;
+
+  beforeAll(() => {
+    jest.isolateModules(() => {
+      process.env.CONVERSATION_STATE_TABLE = MHB_TABLE;
+
+      jest.doMock('../shared/bedrock-core', () => ({
+        loadConfig: jest.fn(),
+        retrieveKB: jest.fn(),
+        sanitizeUserInput: jest.fn((t) => t?.trim() || ''),
+      }));
+
+      const mc = mockClient;
+      const ddbLib = require('@aws-sdk/lib-dynamodb');
+      const kmsLib = require('@aws-sdk/client-kms');
+      const bedrockLib = require('@aws-sdk/client-bedrock-runtime');
+      const sqsLib = require('@aws-sdk/client-sqs');
+      const sesLib = require('@aws-sdk/client-ses');
+
+      mhbGetCommand = ddbLib.GetCommand;
+      mhbPutCommand = ddbLib.PutCommand;
+      mhbQueryCommand = ddbLib.QueryCommand;
+      mhbUpdateCommand = ddbLib.UpdateCommand;
+      mhbDeleteCommand = ddbLib.DeleteCommand;
+      mhbInvokeModelCommand = bedrockLib.InvokeModelCommand;
+      mhbSendMessageCommand = sqsLib.SendMessageCommand;
+      mhbDecryptCommand = kmsLib.DecryptCommand;
+
+      mhbDdbMock = mc(ddbLib.DynamoDBDocumentClient);
+      mhbKmsMock = mc(kmsLib.KMSClient);
+      mhbBedrockMock = mc(bedrockLib.BedrockRuntimeClient);
+      mhbSqsMock = mc(sqsLib.SQSClient);
+      mhbSesMock = mc(sesLib.SESClient);
+
+      const bc = require('../shared/bedrock-core');
+      mhbLoadConfig = bc.loadConfig;
+      mhbRetrieveKB = bc.retrieveKB;
+
+      mhbHandler = require('./index').handler;
+    });
+  });
+
+  afterAll(() => {
+    delete process.env.CONVERSATION_STATE_TABLE;
+  });
+
+  const MHB_CFG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'Helpful.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+  };
+
+  function mhbChannelMappingItem() {
+    return {
+      Item: {
+        PK: 'PAGE#PAGE_456',
+        SK: 'CHANNEL#messenger',
+        encryptedPageToken: Buffer.from('encrypted-blob').toString('base64'),
+        tenantId: 'TENANT_789',
+      },
+    };
+  }
+
+  beforeEach(() => {
+    mhbDdbMock.reset();
+    mhbKmsMock.reset();
+    mhbBedrockMock.reset();
+    mhbSqsMock.reset();
+    mhbSesMock.reset();
+
+    mhbLoadConfig.mockResolvedValue(MHB_CFG);
+    mhbRetrieveKB.mockResolvedValue('KB context.');
+
+    mhbSqsMock.on(mhbSendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
+    mhbKmsMock.on(mhbDecryptCommand).resolves({ Plaintext: Buffer.from('EAABtest_page_token') });
+    mhbDdbMock.on(mhbQueryCommand).resolves({ Items: [] });
+    mhbDdbMock.on(mhbPutCommand).resolves({});
+    // Generic default for any Update on the state table (lock claim, rate
+    // counters, etc.) — Attributes.turn_count:1 keeps every rate counter
+    // safely under the default limits unless a test overrides it below.
+    mhbDdbMock.on(mhbUpdateCommand).resolves({ Attributes: { turn_count: 1 } });
+    mhbDdbMock.on(mhbDeleteCommand).resolves({});
+    mhbDdbMock
+      .on(mhbGetCommand, { Key: { PK: 'PAGE#PAGE_456', SK: 'CHANNEL#messenger' } })
+      .resolves(mhbChannelMappingItem());
+    // Pause row: never paused by default (M6a check runs before rate limiting).
+    mhbDdbMock
+      .on(mhbGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+      .resolves({});
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+    jest.useRealTimers();
+  });
+
+  function mhbBuildEvent(overrides = {}) {
+    return {
+      psid: 'PSID_123',
+      messageText: 'Hello, what services do you offer?',
+      pageId: 'PAGE_456',
+      tenantId: 'TENANT_789',
+      tenantHash: 'abc123defabc123def',
+      channelType: 'messenger',
+      messageMid: 'm_test_mid',
+      ...overrides,
+    };
+  }
+
+  function mhbBedrockResponse(text) {
+    return { body: Buffer.from(JSON.stringify({ content: [{ type: 'text', text }], usage: {} })) };
+  }
+
+  function mhbOkFetch() {
+    return jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.test' }) });
+  }
+
+  /** Rate-limit counter UpdateCommands only — excludes the C7 lock's own
+   * claimPending/append Updates (stateType 'lock'). */
+  function rlUpdateCalls() {
+    return mhbDdbMock
+      .commandCalls(mhbUpdateCommand)
+      .filter((c) => String(c.args[0].input.Key?.stateType || '').startsWith('rl_'));
+  }
+
+  test('under limit → normal turn proceeds; both counters incremented via ADD with correct bucket-key shapes', async () => {
+    mhbBedrockMock.on(mhbInvokeModelCommand).resolves(mhbBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    expect(mhbBedrockMock).toHaveReceivedCommandTimes(mhbInvokeModelCommand, 1);
+    const rlCalls = rlUpdateCalls();
+    expect(rlCalls).toHaveLength(2);
+    const userCall = rlCalls.find((c) => c.args[0].input.Key.sessionId === 'meta:PAGE_456:PSID_123');
+    const tenantCall = rlCalls.find((c) => c.args[0].input.Key.sessionId === 'tenant:TENANT_789');
+    expect(userCall).toBeDefined();
+    expect(tenantCall).toBeDefined();
+    expect(userCall.args[0].input.Key.stateType).toMatch(/^rl_user:\d{10}$/);
+    expect(tenantCall.args[0].input.Key.stateType).toMatch(/^rl_day:\d{8}$/);
+    expect(userCall.args[0].input.UpdateExpression).toContain('ADD turn_count :one');
+    expect(tenantCall.args[0].input.UpdateExpression).toContain('ADD turn_count :one');
+  });
+
+  test('user over hourly limit (first breach) → polite rate_limited reply, NO Bedrock call, no history write', async () => {
+    mhbLoadConfig.mockResolvedValue({ ...MHB_CFG, messenger_behavior: { rate_limits: { per_user_hourly: 2 } } });
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123' } }, false)
+      .resolves({ Attributes: { turn_count: 3 } }); // 3 > 2, within the +3 polite margin
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    expect(mhbBedrockMock).not.toHaveReceivedCommand(mhbInvokeModelCommand);
+    expect(global.fetch).toHaveBeenCalled();
+    const sentBody = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(sentBody.message.text).toBe(
+      "You're sending messages faster than I can keep up — one moment please."
+    );
+    const historyPuts = mhbDdbMock
+      .commandCalls(mhbPutCommand)
+      .filter((c) => c.args[0].input.TableName === 'picasso-recent-messages');
+    expect(historyPuts).toHaveLength(0);
+  });
+
+  test('breach beyond the polite margin (4th+ over-limit turn) → fully silent, no reply at all', async () => {
+    mhbLoadConfig.mockResolvedValue({ ...MHB_CFG, messenger_behavior: { rate_limits: { per_user_hourly: 2 } } });
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123' } }, false)
+      .resolves({ Attributes: { turn_count: 6 } }); // limit(2) + margin(3) = 5; 6 > 5 → silent
+    global.fetch = jest.fn();
+
+    await mhbHandler(mhbBuildEvent());
+
+    expect(mhbBedrockMock).not.toHaveReceivedCommand(mhbInvokeModelCommand);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  test('boundary: turn_count exactly at limit+3 still gets the polite reply (inclusive margin)', async () => {
+    mhbLoadConfig.mockResolvedValue({ ...MHB_CFG, messenger_behavior: { rate_limits: { per_user_hourly: 2 } } });
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123' } }, false)
+      .resolves({ Attributes: { turn_count: 5 } }); // exactly limit(2) + margin(3)
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    expect(mhbBedrockMock).not.toHaveReceivedCommand(mhbInvokeModelCommand);
+    expect(global.fetch).toHaveBeenCalled();
+  });
+
+  test('tenant daily cap exceeded → polite reply + TENANT_DAILY_CAP marker logged', async () => {
+    mhbLoadConfig.mockResolvedValue({ ...MHB_CFG, messenger_behavior: { rate_limits: { tenant_daily: 5 } } });
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'tenant:TENANT_789' } }, false)
+      .resolves({ Attributes: { turn_count: 6 } }); // 6 > 5, within the +3 margin
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    expect(mhbBedrockMock).not.toHaveReceivedCommand(mhbInvokeModelCommand);
+    expect(global.fetch).toHaveBeenCalled();
+    const markers = warnSpy.mock.calls.map(([line]) => line).filter((l) => typeof l === 'string');
+    expect(markers.some((l) => l.includes('TENANT_DAILY_CAP'))).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  test('config overrides (messenger_behavior.rate_limits) are honored over the code defaults', async () => {
+    mhbLoadConfig.mockResolvedValue({
+      ...MHB_CFG,
+      messenger_behavior: { rate_limits: { per_user_hourly: 1, tenant_daily: 1000 } },
+    });
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123' } }, false)
+      .resolves({ Attributes: { turn_count: 2 } }); // 2 > override(1), but well under default(30)
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    // Only limited because the override (1) is honored — under the 30
+    // default this same count would proceed normally (see the first test).
+    expect(mhbBedrockMock).not.toHaveReceivedCommand(mhbInvokeModelCommand);
+  });
+
+  test('DDB failure on the rate-limit counters fails OPEN: normal turn proceeds, WARN logged', async () => {
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123' } }, false)
+      .rejects(new Error('state table unavailable'));
+    mhbBedrockMock.on(mhbInvokeModelCommand).resolves(mhbBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    expect(mhbBedrockMock).toHaveReceivedCommandTimes(mhbInvokeModelCommand, 1);
+    const loggedFailOpen = warnSpy.mock.calls.some(
+      ([line]) => typeof line === 'string' && line.includes('failing open')
+    );
+    expect(loggedFailOpen).toBe(true);
+    warnSpy.mockRestore();
+  });
+
+  test('escalation bypasses rate limiting — an over-limit user asking for a human still escalates', async () => {
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123' } }, false)
+      .resolves({ Attributes: { turn_count: 999 } }); // deeply over-limit, if it were ever checked
+    global.fetch = jest.fn().mockImplementation((url) => {
+      if (typeof url === 'string' && url.includes('pass_thread_control')) {
+        return Promise.resolve({ ok: true, status: 200, json: async () => ({ success: true }) });
+      }
+      return Promise.resolve({ ok: true, status: 200, json: async () => ({ message_id: 'mid.esc' }) });
+    });
+
+    await mhbHandler(mhbBuildEvent({ messageText: 'I want to talk to a human' }));
+
+    expect(global.fetch.mock.calls.some(([url]) => url.includes('pass_thread_control'))).toBe(true);
+    const pauseRowPut = mhbDdbMock
+      .commandCalls(mhbPutCommand)
+      .find((c) => c.args[0].input.Item?.stateType === 'pause');
+    expect(pauseRowPut).toBeDefined();
+    // Escalation returns before the rate-limit check ever runs — zero rl_* calls.
+    expect(rlUpdateCalls()).toHaveLength(0);
+  });
+
+  test('flag OFF → zero rate-limit UpdateCommands; normal turn proceeds unaffected', async () => {
+    mhbLoadConfig.mockResolvedValue({ ...MHB_CFG, feature_flags: {} });
+    mhbBedrockMock.on(mhbInvokeModelCommand).resolves(mhbBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    expect(mhbBedrockMock).toHaveReceivedCommandTimes(mhbInvokeModelCommand, 1);
+    expect(rlUpdateCalls()).toHaveLength(0);
+  });
+
+  test('bucket keys use UTC — a frozen Date produces exact stateType strings', async () => {
+    jest.useFakeTimers({
+      doNotFake: ['nextTick', 'setImmediate', 'setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'],
+    });
+    jest.setSystemTime(new Date('2026-07-13T04:15:30.000Z'));
+    mhbBedrockMock.on(mhbInvokeModelCommand).resolves(mhbBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    const rlCalls = rlUpdateCalls();
+    const userCall = rlCalls.find((c) => c.args[0].input.Key.sessionId === 'meta:PAGE_456:PSID_123');
+    const tenantCall = rlCalls.find((c) => c.args[0].input.Key.sessionId === 'tenant:TENANT_789');
+    expect(userCall.args[0].input.Key.stateType).toBe('rl_user:2026071304');
+    expect(tenantCall.args[0].input.Key.stateType).toBe('rl_day:20260713');
+  });
+
+  test('coalesced burst counted ONCE against the rate limiter (drain cycle does not re-check/re-increment)', async () => {
+    mhbDdbMock
+      .on(mhbUpdateCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'lock' } }, false)
+      .resolvesOnce({ Attributes: { pending: [{ text: 'second message', mid: 'm2', timestamp: Date.now() }] } })
+      .resolves({ Attributes: {} });
+    mhbBedrockMock.on(mhbInvokeModelCommand).resolves(mhbBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+    global.fetch = mhbOkFetch();
+
+    await mhbHandler(mhbBuildEvent());
+
+    // Winner's own turn + one combined drain cycle = 2 Bedrock calls...
+    expect(mhbBedrockMock).toHaveReceivedCommandTimes(mhbInvokeModelCommand, 2);
+    // ...but only ONE increment of each counter for the whole invocation —
+    // the drain cycle does not re-run the rate-limit check (C7's batched
+    // spend model: the combined turn is already ONE Bedrock call's worth of
+    // accounting, decided once at the top of the winning invocation).
+    expect(rlUpdateCalls()).toHaveLength(2);
+  });
+});
