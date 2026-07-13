@@ -76,8 +76,12 @@ const SCENARIOS = [
   { id: 'donation_interest', restraintExpected: false, history: [], user: 'how can I donate to support the work?' },
   // TURN CHECK fired live (M3a gate condition): two session-scoped assistant
   // questions put buildTurnCheckBlock at threshold — the block is IN the
-  // system prompt for these calls. Gate: the reply must NOT end with another
-  // exploration question.
+  // system prompt for these calls. Gate (V5 proposal-judge shape): the reply
+  // must ADVANCE THE FUNNEL — name the concrete next step AND attach an
+  // action. NOTE an ending '?' is fine: the block PRESCRIBES ending with an
+  // invitation ("Ready to apply?"); it prohibits further EXPLORATION
+  // questions (round-3 finding: an ends-with-question metric mis-scored 5/5
+  // perfect advances as failures).
   { id: 'turn_check_at_threshold', restraintExpected: false, turnCheckFired: true, history: [
       { role: 'assistant', content: 'What draws you to mentoring?' },
       { role: 'user', content: 'i love working with teens' },
@@ -217,7 +221,7 @@ async function main() {
           sentences: countSentences(visible),
           chars: visible.length,
           markdown: hasMarkdown(visible),
-          endsWithQuestion: visible.trim().endsWith('?'),
+          advancesFunnel: /apply|application|sign.?up|next step|discovery|register/i.test(visible),
           turnCheckFired: scenario.turnCheckFired === true,
           tailStatus: tail ? tail.status : 'missing',
           actionCount: Array.isArray(validIds) ? validIds.length : null,
@@ -243,7 +247,7 @@ async function main() {
   const capOk = rows.filter((r) => (r.actionCount ?? 0) <= 4).length;
   const markdownClean = rows.filter((r) => !r.markdown).length;
   const tcRows = rows.filter((r) => r.turnCheckFired);
-  const tcOk = tcRows.filter((r) => !r.endsWithQuestion).length;
+  const tcOk = tcRows.filter((r) => r.advancesFunnel && (r.actionCount ?? 0) >= 1).length;
 
   const summary = {
     model_id: MODEL_ID,
@@ -255,7 +259,7 @@ async function main() {
       restraint_zero_actions_on_smalltalk: { pass: restraintOk, n: restraintRows.length, rate: restraintRows.length ? restraintOk / restraintRows.length : null, cp95_lower: cpLowerBound(restraintOk, restraintRows.length) },
       action_cap_le_4: { pass: capOk, n, rate: capOk / n },
       markdown_free: { pass: markdownClean, n, rate: markdownClean / n, cp95_lower: cpLowerBound(markdownClean, n) },
-      turn_check_no_more_questions: { pass: tcOk, n: tcRows.length, rate: tcRows.length ? tcOk / tcRows.length : null, cp95_lower: cpLowerBound(tcOk, tcRows.length) },
+      turn_check_advances_funnel: { pass: tcOk, n: tcRows.length, rate: tcRows.length ? tcOk / tcRows.length : null, cp95_lower: cpLowerBound(tcOk, tcRows.length) },
     },
     note: 'Deterministic C8 session-boundary + C6 precedence behavior is pinned by prompt_messenger.test.js (no model calls). generated_by CI messenger-evidence workflow.',
   };
