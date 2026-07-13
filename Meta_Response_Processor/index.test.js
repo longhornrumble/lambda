@@ -1377,3 +1377,50 @@ describe('M1b — failure paths and guards (code-review findings)', () => {
     expect(sendBodies[0].message.text.length).toBe(1000);
   });
 });
+
+// ─── M-Ha — channel health: send-error classification (G1) ──────────────────
+
+describe('M-Ha — META_SEND_FAILURE classification', () => {
+  const { classifyMetaSendError, CLASSIFICATIONS } = require('./metaSendErrors');
+
+  test.each([
+    ['token dead', { error: { code: 190 } }, 'token_dead'],
+    ['user unavailable', { error: { code: 551 } }, 'user_unavailable'],
+    ['rate limited', { error: { code: 613 } }, 'rate_limited'],
+    ['window closed', { error: { code: 10, error_subcode: 1545041 } }, 'window_closed'],
+    ['page restricted', { error: { code: 10, error_subcode: 1893063 } }, 'page_restricted'],
+    ['unknown code', { error: { code: 42 } }, 'unclassified'],
+    ['code 10 unknown subcode', { error: { code: 10, error_subcode: 99 } }, 'unclassified'],
+    ['malformed body', {}, 'unclassified'],
+    ['null body', null, 'unclassified'],
+  ])('%s → %s', (_n, body, expected) => {
+    expect(classifyMetaSendError(body).classification).toBe(expected);
+  });
+
+  test('failed reply send emits a structured META_SEND_FAILURE line with the class', async () => {
+    const errSpy = jest.spyOn(console, 'error');
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi' }]));
+    fetchMock = makeFetchMock([
+      { ok: true, body: {} }, // typing
+      { ok: false, status: 400, body: { error: { code: 190, message: 'Error validating access token' } } },
+    ]);
+    global.fetch = fetchMock;
+
+    await expect(handler(buildEvent())).rejects.toThrow();
+
+    const allErr = errSpy.mock.calls
+      .map((args) => args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+      .join('\n');
+    expect(allErr).toContain('META_SEND_FAILURE');
+    expect(allErr).toContain('token_dead');
+    // never leak the raw token-bearing error message into the structured line
+    const structured = errSpy.mock.calls.find((args) => String(args[0]).includes('META_SEND_FAILURE'));
+    expect(JSON.stringify(structured)).not.toContain('access_token');
+  });
+
+  test('CLASSIFICATIONS surface is the frozen five + unclassified', () => {
+    expect(Object.values(CLASSIFICATIONS).sort()).toEqual([
+      'page_restricted', 'rate_limited', 'token_dead', 'unclassified', 'user_unavailable', 'window_closed',
+    ].sort());
+  });
+});
