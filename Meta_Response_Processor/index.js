@@ -46,6 +46,7 @@ const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
+const { classifyMetaSendError } = require('./metaSendErrors');
 const crypto = require('crypto');
 
 // ─── AWS client initialisation ────────────────────────────────────────────────
@@ -543,7 +544,7 @@ async function updateLastUserMessageAt(pageId, channelType) {
  * @returns {Promise<object>} — Parsed JSON response from Meta
  * @throws on 4xx (no retry) or after exhausting 5xx retries
  */
-async function callMetaSendApi(pageId, payload, accessToken, attempt = 1) {
+async function callMetaSendApi(pageId, payload, accessToken, attempt = 1, channelType = 'messenger') {
   const url = `${META_SEND_API_BASE}/${pageId}/messages`;
   const MAX_RETRIES = 3;
 
@@ -574,8 +575,22 @@ async function callMetaSendApi(pageId, payload, accessToken, attempt = 1) {
     const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
     log('WARN', 'Meta Send API 5xx — retrying', { pageId, status, attempt, delayMs: delay });
     await sleep(delay);
-    return callMetaSendApi(pageId, payload, accessToken, attempt + 1);
+    return callMetaSendApi(pageId, payload, accessToken, attempt + 1, channelType);
   }
+
+  // M-Ha channel health: classified, structured failure line — CloudWatch
+  // metric filters (ops-alarms-meta-staging) turn these into per-class
+  // metrics + alarms (token_dead/page_restricted = channel death signals).
+  const { classification, code, subcode } = classifyMetaSendError(errorBody);
+  log('ERROR', 'META_SEND_FAILURE', {
+    classification,
+    code,
+    subcode,
+    status,
+    pageId,
+    channelType,
+    attempt,
+  });
 
   log('ERROR', 'Meta Send API error', { pageId, status, attempt, errorBody });
   throw new Error(
@@ -649,6 +664,19 @@ async function sendMessengerMessage(pageId, psid, text, accessToken, channelType
   const response = await fetch(url, { method: 'POST', headers, body });
   if (!response.ok) {
     const error = await response.json().catch(() => ({}));
+    // M-Ha channel health: this is the path real replies take (typing rides
+    // callMetaSendApi) — classify + emit the structured failure line the
+    // ops-alarms metric filters watch (token_dead/page_restricted = channel
+    // death signals).
+    const { classification, code, subcode } = classifyMetaSendError(error);
+    log('ERROR', 'META_SEND_FAILURE', {
+      classification,
+      code,
+      subcode,
+      status: response.status,
+      pageId,
+      channelType: channelType === 'instagram' ? 'instagram' : 'messenger',
+    });
     throw new Error(`Meta Send API error: ${response.status} — ${JSON.stringify(error)}`);
   }
   return response.json();
