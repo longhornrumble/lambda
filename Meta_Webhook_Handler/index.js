@@ -22,6 +22,7 @@ const crypto = require('crypto');
 const { DynamoDBClient, GetItemCommand, PutItemCommand } = require('@aws-sdk/client-dynamodb');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+const { classifyMessagingEvent } = require('./classify');
 
 // ─── AWS clients (created once at module load, reused across warm invocations) ───
 
@@ -300,71 +301,45 @@ function handleVerification(queryParams) {
 /**
  * Process a single messaging event from the Meta webhook payload.
  *
- * Supports:
- *   - Standard text messages (messaging[].message.text)
- *   - Postback events    (messaging[].postback.payload)
+ * Classifies every inbound shape per contract C1 (docs/messenger/CONTRACTS.md)
+ * into a typed payload-v2 invoke or a logged intentional skip — nothing is
+ * dropped silently (Meta 30-second any-input rule).
  *
  * Flow:
- *   1. Resolve pageId → tenantId via DynamoDB channel-mappings
- *   2. Guard against duplicates via dedup table (conditional PutItem)
- *   3. Async-invoke Meta_Response_Processor with normalised payload
+ *   1. Classify the event (classify.js — pure, never throws)
+ *   2. Resolve pageId → tenantId via DynamoDB channel-mappings
+ *   3. Guard against duplicates via dedup table (conditional PutItem);
+ *      edit/delete events bypass dedup — their downstream handling is
+ *      idempotent and they can legitimately share a mid with the original
+ *      message (and with each other, e.g. a second edit of the same mid)
+ *   4. Async-invoke Meta_Response_Processor with the v2 payload
  *
  * Returns silently (no throw) on all recoverable errors so the caller
  * can always return 200 to Meta.
  *
- * @param {object} messagingEvent  - Single entry from entry.messaging[].
+ * @param {object} messagingEvent  - Single entry from entry.messaging[] / entry.standby[].
  * @param {string} pageId          - The Facebook Page ID from entry.id.
  * @param {string} [objectType]    - The webhook object type ('page' or 'instagram').
+ * @param {boolean} [isStandby]    - True when the event came from entry.standby[].
  * @returns {Promise<void>}
  */
-async function processMessagingEvent(messagingEvent, pageId, objectType) {
-  const sender = messagingEvent.sender?.id;
-  if (!sender) {
-    // Shape-only diagnostics (field names, never values — no PII): live IG
-    // events are reaching this skip path with an unrecognised layout.
-    console.warn(
-      `[Meta_Webhook_Handler] messaging event missing sender.id — skipping | ` +
-      `object=${objectType} keys=${JSON.stringify(Object.keys(messagingEvent || {}))} ` +
-      `senderKeys=${JSON.stringify(Object.keys(messagingEvent?.sender || {}))}`
-    );
-    return;
-  }
+async function processMessagingEvent(messagingEvent, pageId, objectType, isStandby = false) {
+  const classifications = classifyMessagingEvent(messagingEvent, isStandby);
 
-  // Determine event type and extract content
-  let messageText = null;
-  let messageMid  = null;
-  let isPostback  = false;
-
-  if (messagingEvent.message) {
-    // Standard inbound message
-    messageText = messagingEvent.message.text || null;
-    messageMid  = messagingEvent.message.mid  || null;
-
-    // Ignore delivery/read receipts (no text, no mid of interest)
-    if (!messageText && !messagingEvent.message.attachments) {
-      console.log('[Meta_Webhook_Handler] Skipping echo/receipt event');
-      return;
+  for (const c of classifications) {
+    if (c.skip) {
+      // Logged intentional skip (C1) — shape/reason only, never content values.
+      console.log(`[Meta_Webhook_Handler] Intentional skip (${c.skip}) | object=${objectType} standby=${isStandby}`);
+      continue;
     }
-
-    // Ignore message echoes (sent by the page itself)
-    if (messagingEvent.message.is_echo) {
-      return;
-    }
-  } else if (messagingEvent.postback) {
-    // Postback from a persistent menu or button template
-    messageText = messagingEvent.postback.payload || null;
-    messageMid  = `postback_${sender}_${Date.now()}`;
-    isPostback  = true;
-  } else {
-    // Delivery reports, seen events, reactions — silently skip
-    return;
+    await forwardClassifiedEvent(c, messagingEvent, pageId, objectType);
   }
+}
 
-  if (!messageText) {
-    console.log('[Meta_Webhook_Handler] No text content — skipping event from psid:', sender);
-    return;
-  }
-
+/**
+ * Resolve mapping, dedup, and async-invoke the processor for one classified event.
+ */
+async function forwardClassifiedEvent(c, messagingEvent, pageId, objectType) {
   // ── 1. Channel mapping lookup ──
   const channelType = objectType === 'instagram' ? 'instagram' : 'messenger';
   let mapping;
@@ -385,11 +360,11 @@ async function processMessagingEvent(messagingEvent, pageId, objectType) {
     return;
   }
 
-  // ── 2. Idempotency guard ──
-  if (messageMid) {
+  // ── 2. Idempotency guard (edit/delete bypass — idempotent downstream) ──
+  if (c.messageMid && c.eventKind !== 'edit' && c.eventKind !== 'delete') {
     let isNew;
     try {
-      isNew = await recordDedupOrSkip(messageMid);
+      isNew = await recordDedupOrSkip(c.messageMid);
     } catch (err) {
       console.error('[Meta_Webhook_Handler] Dedup table error:', err.message);
       // On dedup failure, allow processing to continue — better to process
@@ -398,28 +373,42 @@ async function processMessagingEvent(messagingEvent, pageId, objectType) {
     }
 
     if (!isNew) {
-      console.log(`[Meta_Webhook_Handler] Duplicate mid=${messageMid} — skipping`);
+      console.log(`[Meta_Webhook_Handler] Duplicate mid=${c.messageMid} — skipping`);
       return;
     }
   }
 
-  // ── 3. Async invoke response processor ──
+  // ── 3. Async invoke response processor (payload v2 — contract C1) ──
   const processorPayload = {
-    psid:        sender,
-    messageText,
+    // v1 fields — names/shapes byte-preserved
+    psid:        c.psid,
+    messageText: c.messageText,
     pageId,
     tenantId:    mapping.tenantId,
     tenantHash:  mapping.tenantHash,
-    channelType: objectType === 'instagram' ? 'instagram' : 'messenger',
-    messageMid,
-    isPostback,
+    channelType,
+    messageMid:  c.messageMid,
+    isPostback:  c.isPostback,
+    // v2 additions (all additive)
+    v: 2,
+    eventKind: c.eventKind,
+    // Meta's event timestamp (epoch ms); receipt time when Meta omits it —
+    // required in every v2 payload (24h-window guard input).
+    timestamp: typeof messagingEvent.timestamp === 'number' ? messagingEvent.timestamp : Date.now(),
+    quickReplyPayload: c.quickReplyPayload,
+    appId: c.appId,
+    attachmentTypes: c.attachmentTypes,
+    targetMid: c.targetMid,
+    editedText: c.editedText,
+    replyTo: c.replyTo,
+    isStandby: c.isStandby,
   };
 
   try {
     await invokeResponseProcessor(processorPayload);
     console.log(
-      `[Meta_Webhook_Handler] Queued message for processing — psid=${sender} ` +
-      `tenantId=${mapping.tenantId} mid=${messageMid} isPostback=${isPostback}`
+      `[Meta_Webhook_Handler] Queued ${c.eventKind} event for processing — psid=${c.psid} ` +
+      `tenantId=${mapping.tenantId} mid=${c.messageMid} isPostback=${c.isPostback} standby=${c.isStandby}`
     );
   } catch (err) {
     // Log but do NOT propagate — the response processor has its own DLQ.
@@ -522,6 +511,14 @@ async function handlePost(rawBody, headers) {
 
     for (const messagingEvent of messaging) {
       eventPromises.push(processMessagingEvent(messagingEvent, pageId, objectType));
+    }
+
+    // Standby channel (Conversation Routing): events delivered while another
+    // app holds thread control arrive under entry.standby[] — same shapes,
+    // classified identically with isStandby=true (contract C1).
+    const standby = Array.isArray(entry.standby) ? entry.standby : [];
+    for (const standbyEvent of standby) {
+      eventPromises.push(processMessagingEvent(standbyEvent, pageId, objectType, true));
     }
   }
 

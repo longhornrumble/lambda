@@ -789,3 +789,71 @@ describe('Meta_Response_Processor handler', () => {
     });
   });
 });
+
+// ─── Payload v2 legacy-gap contract (C1 deploy ordering §2/§4) ─────────────────
+//
+// The M1a webhook ships payload v2 BEFORE this processor learns the new event
+// kinds (webhook-deploys-first rule). C1 guarantees: v2 payloads for new kinds
+// (messageText:null) hit validateEvent, drop cleanly — no crash, no retry, no
+// Bedrock call, no Meta send, and NO reply generated from echo text (loop
+// guard). This suite pins that guarantee using the REAL classifier + fixture
+// library from the webhook, so a change to either side breaks CI here.
+
+describe('payload v2 legacy-gap contract (C1)', () => {
+  const { classifyMessagingEvent } = require('../Meta_Webhook_Handler/classify');
+  const WEBHOOK_FIXTURES = require('../Meta_Webhook_Handler/__fixtures__/messagingEvents');
+
+  /** Mirror of the webhook's forwardClassifiedEvent payload construction. */
+  function v2Payload(classification, fixture) {
+    return {
+      psid: classification.psid,
+      messageText: classification.messageText,
+      pageId: WEBHOOK_FIXTURES.PAGE_ID,
+      tenantId: 'TENANT_ABC',
+      tenantHash: 'abc123',
+      channelType: 'messenger',
+      messageMid: classification.messageMid,
+      isPostback: classification.isPostback,
+      v: 2,
+      eventKind: classification.eventKind,
+      timestamp: typeof fixture.timestamp === 'number' ? fixture.timestamp : Date.now(),
+      quickReplyPayload: classification.quickReplyPayload,
+      appId: classification.appId,
+      attachmentTypes: classification.attachmentTypes,
+      targetMid: classification.targetMid,
+      editedText: classification.editedText,
+      replyTo: classification.replyTo,
+      isStandby: classification.isStandby,
+    };
+  }
+
+  test.each([
+    ['attachment', WEBHOOK_FIXTURES.fbAttachmentImage],
+    ['sticker', WEBHOOK_FIXTURES.fbStickerPostMigration],
+    ['edit', WEBHOOK_FIXTURES.fbEdit],
+    ['delete (IG is_deleted)', WEBHOOK_FIXTURES.igDelete],
+    ['echo', WEBHOOK_FIXTURES.fbEcho],
+    ['unsupported', WEBHOOK_FIXTURES.fbUnsupportedFutureContent],
+  ])('legacy processor drops %s payloads without crash, Bedrock, or sends', async (_name, fixture) => {
+    const [classification] = classifyMessagingEvent(fixture);
+    expect(classification.skip).toBeUndefined();
+    // The loop-guard invariant that makes the gap safe: no respondable text
+    expect(classification.messageText).toBeNull();
+
+    // Note: fixture timestamps are fixed/old — but a stale timestamp only makes
+    // the drop happen EARLIER (24h guard); validateEvent is the guarantee for
+    // fresh events, so pin with a fresh timestamp.
+    const event = { ...v2Payload(classification, fixture), timestamp: Date.now() };
+    await expect(handler(event)).resolves.not.toThrow();
+
+    expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  test('v2 text payload still processes normally (v1 fields intact)', async () => {
+    const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbText);
+    const event = { ...v2Payload(classification, WEBHOOK_FIXTURES.fbText), timestamp: Date.now() };
+    await expect(handler(event)).resolves.not.toThrow();
+    expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 1);
+  });
+});
