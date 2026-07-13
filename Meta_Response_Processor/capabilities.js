@@ -21,9 +21,13 @@ const QUICK_REPLY_TITLE_MAX = 20;
 /** Button template: max buttons per template (C5). */
 const BUTTON_TEMPLATE_MAX = 3;
 
+/** Generic template (carousel): max cards per template (C5 — M8a scheduling slots). */
+const CAROUSEL_MAX = 10;
+
 module.exports = {
   MESSAGE_CHAR_LIMITS,
   QUICK_REPLY_MAX,
   QUICK_REPLY_TITLE_MAX,
   BUTTON_TEMPLATE_MAX,
+  CAROUSEL_MAX,
 };

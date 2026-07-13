@@ -54,13 +54,14 @@ const { DynamoDBDocumentClient, GetCommand, PutCommand, UpdateCommand, DeleteCom
 const { KMSClient, DecryptCommand } = require('@aws-sdk/client-kms');
 const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
 const { SESClient } = require('@aws-sdk/client-ses');
-const { LambdaClient } = require('@aws-sdk/client-lambda');
+const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
 const { loadConfig, retrieveKB, sanitizeUserInput } = require('../shared/bedrock-core');
 const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
 const escalation = require('./escalation');
 const rateLimits = require('./rateLimits');
 const formEngine = require('./formEngine');
+const schedulingDriver = require('./schedulingDriver');
 const { classifyMetaSendError } = require('./metaSendErrors');
 const { buildMessengerV5Prompt, resolveMessengerModelId } = require('./prompt_messenger');
 const { renderMessengerActions, resolveCtaPayload } = require('./renderMessengerActions');
@@ -93,6 +94,29 @@ const sesClient = new SESClient({ region: AWS_REGION });
 // M7a: direct IAM invoke of MFS for form submission (S1 — never a public lane).
 const lambdaClient = new LambdaClient({ region: AWS_REGION });
 
+/**
+ * M8a: RequestResponse invoke of Booking_Commit_Handler — reused for BOTH
+ * scheduling_propose (read-only slot discovery) and the default commit route;
+ * BCH's own handler dispatches on the payload's `action` field (present for
+ * propose, absent for commit), so one invoke helper covers both, exactly like
+ * BSH's `invokeSchedulingExecutor` (Bedrock_Streaming_Handler_Staging/index.js).
+ * Never throws past FunctionError — surfaces it so schedulingDriver's
+ * try/catch degrades to an apology instead of an unhandled rejection.
+ */
+async function invokeBookingExecutor(payload) {
+  const out = await lambdaClient.send(
+    new InvokeCommand({
+      FunctionName: BOOKING_COMMIT_FUNCTION,
+      InvocationType: 'RequestResponse',
+      Payload: Buffer.from(JSON.stringify(payload)),
+    })
+  );
+  if (out.FunctionError) {
+    throw new Error(`booking commit executor FunctionError: ${out.FunctionError}`);
+  }
+  return out.Payload ? JSON.parse(Buffer.from(out.Payload).toString('utf-8')) : null;
+}
+
 // ─── Configuration constants ──────────────────────────────────────────────────
 
 const CHANNEL_MAPPINGS_TABLE =
@@ -109,6 +133,13 @@ const CONVERSATION_STATE_TABLE = process.env.CONVERSATION_STATE_TABLE || '';
 const META_APP_ID = process.env.META_APP_ID || '';
 // M7a (S1): '' disables submission — confirmForm fails closed, session kept for retry.
 const MFS_FUNCTION = process.env.MFS_FUNCTION || '';
+// M8a: Booking_Commit_Handler function name for BOTH the read-only
+// scheduling_propose route AND the default commit route (distinguished by
+// the invoke payload's own `action` field — mirrors BSH's
+// schedulingFlow.js/newBookingFlow.js, which invoke the identical function
+// for both). '' disables scheduling entirely (beginScheduling/handleConfirm
+// degrade to an apologetic message, never a crash).
+const BOOKING_COMMIT_FUNCTION = process.env.BOOKING_COMMIT_FUNCTION || '';
 const KMS_KEY_ID = process.env.KMS_KEY_ID || 'alias/picasso-channel-tokens';
 const ANALYTICS_QUEUE_URL =
   process.env.ANALYTICS_QUEUE_URL ||
@@ -1092,6 +1123,38 @@ async function sendResponseMessages(pageId, psid, text, accessToken, channelType
   }
 }
 
+/**
+ * M8a: send a schedulingDriver message list. Each message is either
+ * `{kind:'text', text, quickReplies}` (via sendResponseMessages, same as the
+ * form engine's messages) or `{kind:'generic_template', elements}` — the C5
+ * carousel (≤10 cards, capped in schedulingDriver.buildSlotMessages), sent as
+ * its own Send API call (a template message is structurally separate from a
+ * text message, same posture as the button-template send above).
+ */
+async function sendSchedulingMessages(pageId, psid, messages, accessToken, channelType) {
+  for (const msg of messages || []) {
+    if (msg.kind === 'generic_template') {
+      await sendStructuredMessage(
+        pageId,
+        psid,
+        { attachment: { type: 'template', payload: { template_type: 'generic', elements: msg.elements } } },
+        accessToken,
+        channelType
+      );
+      log('INFO', 'Sent scheduling carousel', { pageId, psid, cards: msg.elements.length });
+    } else {
+      await sendResponseMessages(
+        pageId,
+        psid,
+        msg.text,
+        accessToken,
+        channelType,
+        msg.quickReplies?.length ? { quickReplies: msg.quickReplies } : null
+      );
+    }
+  }
+}
+
 // ─── RAG pipeline ─────────────────────────────────────────────────────────────
 
 /**
@@ -1558,6 +1621,18 @@ exports.handler = async function handler(event) {
 
   const lockSessionId = `meta:${pageId}:${psid}`;
   const messengerFlagOn = config.feature_flags?.MESSENGER_CHANNEL === true;
+  // M8a — C2-style 3-gate: MESSENGER_CHANNEL, the tenant's own
+  // feature_flags.scheduling_enabled (CB config.ts:570 — same flag Booking_
+  // Commit_Handler gates on server-side, defense-in-depth), the state table
+  // (nowhere to persist a scheduling_session without it), and the BCH invoke
+  // function (nothing to invoke without it). All four gate BOTH the CTA-tap
+  // entry point AND the active-session precedence check below.
+  const schedulingEnabled =
+    messengerFlagOn &&
+    config?.feature_flags?.scheduling_enabled === true &&
+    !!CONVERSATION_STATE_TABLE &&
+    !!BOOKING_COMMIT_FUNCTION;
+  const schedulingInvokeDeps = { invokeProposal: invokeBookingExecutor, invokeCommit: invokeBookingExecutor };
 
   // ── M6a: pause check — a prior escalation left the bot standing down for
   // this conversation while staff owns the thread (C4 pause row). Flag off
@@ -1658,7 +1733,7 @@ exports.handler = async function handler(event) {
    * hold — any further pending is claimed and silently discarded, same as
    * the top-level escalation's own post-escalation drain.
    */
-  async function finalizeConversationLock(runTurnFn, { silentDrain: initialSilentDrain = false, formState = null } = {}) {
+  async function finalizeConversationLock(runTurnFn, { silentDrain: initialSilentDrain = false, formState = null, schedulingState = null } = {}) {
     if (!lockCtx) return;
     let silentDrain = initialSilentDrain;
     let batch = inheritedPending;
@@ -1815,6 +1890,106 @@ exports.handler = async function handler(event) {
           }
           rawBatch = rawBatch.slice(consumed);
           if (rawBatch.length === 0) continue; // whole batch was form input (or silently discarded above)
+        }
+
+        // M8a: while a scheduling session is active, pending items are
+        // scheduling input — applied SEQUENTIALLY, never joined into one
+        // combined Bedrock turn (mirrors the formState block above exactly,
+        // including the escalation-wins check and the drain cap). This is
+        // the mechanism that makes rapid double-confirm taps safe: if BOTH
+        // taps land in the SAME coalesced batch, the first one commits
+        // (schedulingState.active flips false) and the SECOND one falls
+        // through this loop (schedulingState.active is false) into the
+        // generic PIC1 resolution below — which has no active session to
+        // resolve against, so it becomes an unresolved payload → free text
+        // into RAG (C3's forever-rule; acceptable, never a double commit).
+        if (schedulingState && schedulingState.active) {
+          let consumed = 0;
+          let schedCycles = 0;
+          for (const item of rawBatch) {
+            const itemText = typeof item?.text === 'string' ? item.text : '';
+            const itemIsPic1Tap =
+              typeof item?.quickReplyPayload === 'string' && item.quickReplyPayload.startsWith('PIC1:');
+
+            if (messengerFlagOn && !itemIsPic1Tap && escalation.detectEscalationIntent(itemText)) {
+              log('INFO', 'Escalation intent detected in a coalesced drain batch mid-scheduling — escalating; scheduling session left intact', {
+                sessionId: lockSessionId,
+              });
+              await handleEscalation({
+                pageId,
+                psid,
+                channelType,
+                tenantId,
+                config,
+                pageAccessToken,
+                sessionId: lockSessionId,
+                turnText: itemText,
+                turnMid: item?.mid || null,
+              });
+              silentDrain = true;
+              consumed = rawBatch.length;
+              break;
+            }
+
+            const itemSchedPayload =
+              typeof item?.quickReplyPayload === 'string' ? schedulingDriver.parseSchedPayload(item.quickReplyPayload) : null;
+
+            schedCycles++;
+            if (schedCycles > conversationLock.DRAIN_CAP) {
+              const rateLimitedText = getMessengerString(config, channelType, 'rate_limited', DEFAULT_RATE_LIMITED);
+              try {
+                await sendResponseMessages(pageId, psid, rateLimitedText, pageAccessToken, channelType);
+              } catch (sendErr) {
+                log('WARN', 'Failed to deliver drain-cap rate_limited reply mid-scheduling', {
+                  sessionId: lockSessionId,
+                  error: sendErr.message,
+                });
+              }
+              log('WARN', 'Scheduling drain cap exceeded — answered burst with rate_limited (no further answers applied)', {
+                sessionId: lockSessionId,
+                schedCycles,
+              });
+              silentDrain = true;
+              consumed = rawBatch.length;
+              break;
+            }
+
+            const stepOutcome = await advanceSchedulingSessionTurn({
+              session: schedulingState.session,
+              rawText: itemText,
+              schedPayload: itemSchedPayload,
+            });
+            schedulingState.session = stepOutcome.session;
+            schedulingState.active = !!stepOutcome.session;
+            consumed++;
+
+            let drainedSendOk = true;
+            try {
+              await sendSchedulingMessages(pageId, psid, stepOutcome.messages, pageAccessToken, channelType);
+            } catch (sendErr) {
+              drainedSendOk = false;
+              log('WARN', 'Failed to deliver a drained scheduling message', { sessionId: lockSessionId, error: sendErr.message });
+            }
+            if (drainedSendOk && stepOutcome.pendingSave) {
+              try {
+                await schedulingDriver.saveSchedulingSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: stepOutcome.pendingSave });
+              } catch (saveErr) {
+                log('WARN', 'Scheduling session save failed mid-drain — proceeding (in-memory state may lag DDB)', {
+                  sessionId: lockSessionId,
+                  error: saveErr.message,
+                });
+              }
+            }
+            try {
+              await storeConversationContext(pageId, psid, itemText, firstSchedulingText(stepOutcome.messages, '[scheduling]'), item?.mid || null);
+            } catch (_storeErr) {
+              // non-fatal — same tolerance as the rest of this drain loop
+            }
+
+            if (!schedulingState.active) break; // scheduling ended — remaining items (if any) are RAG turns
+          }
+          rawBatch = rawBatch.slice(consumed);
+          if (rawBatch.length === 0) continue; // whole batch was scheduling input (or silently discarded above)
         }
 
         // C7 step 3: structured members (quick_reply with a PIC1 payload)
@@ -2213,6 +2388,139 @@ exports.handler = async function handler(event) {
     return { session: result.session, messages: [result.message], pendingSave: result.session };
   }
 
+  /**
+   * M8a: apply ONE piece of scheduling input against the given
+   * scheduling_session. Thin DDB-CRUD wrapper around schedulingDriver's pure
+   * `advanceScheduling` dispatcher — shared by the main-turn scheduling path
+   * below AND the C7 drain loop, mirroring `advanceFormSession` exactly.
+   *
+   * schedulingDriver's 3-way `session` contract:
+   *   - `null`      → terminal (cancelled or committed) — EAGER delete
+   *                   (state-escape rule, same posture as forms' cancel).
+   *   - `undefined` → T3' terminal failure — the row is left COMPLETELY
+   *                   untouched (no save, no TTL bump); the ORIGINAL session
+   *                   is still active for the caller (a retry can re-confirm).
+   *   - object      → non-terminal advance — SEND-then-SAVE (deferred
+   *                   `pendingSave`), same save-ordering discipline as
+   *                   `advanceFormSession` (a send failure must not leave the
+   *                   row pointing past what the user was actually shown).
+   *
+   * @returns {Promise<{session: object|null, messages: Array<object>, pendingSave: object|null}>}
+   */
+  async function advanceSchedulingSessionTurn({ session, rawText, schedPayload }) {
+    const result = await schedulingDriver.advanceScheduling({
+      session,
+      rawText,
+      schedPayload,
+      config,
+      tenantId,
+      sessionId: lockSessionId,
+      deps: schedulingInvokeDeps,
+      log,
+    });
+
+    if (result.session === null) {
+      try {
+        await schedulingDriver.deleteSchedulingSession({
+          client: dynamodb,
+          tableName: CONVERSATION_STATE_TABLE,
+          sessionId: lockSessionId,
+        });
+      } catch (delErr) {
+        log('WARN', 'Scheduling session delete failed', { sessionId: lockSessionId, error: delErr.message });
+      }
+      log('INFO', 'Scheduling session ended', {
+        sessionId: lockSessionId,
+        committed: !!result.committed,
+        bookingId: result.bookingId,
+      });
+      return { session: null, messages: result.messages, pendingSave: null };
+    }
+
+    if (result.session === undefined) {
+      // T3': leave the row exactly as loaded — return the ORIGINAL (still
+      // truthy) session so the caller knows scheduling is still active.
+      return { session, messages: result.messages, pendingSave: null };
+    }
+
+    return { session: result.session, messages: result.messages, pendingSave: result.session };
+  }
+
+  function firstSchedulingText(messages, fallback) {
+    const withText = (messages || []).find((m) => typeof m.text === 'string');
+    return withText ? withText.text : fallback;
+  }
+
+  // ── M8a: active scheduling_session (C4; T1'/T2' — an expired row is
+  // treated as absent). Flag- and table-gated (schedulingEnabled — "flag off
+  // ⇒ zero scheduling machinery", no GetItem at all). Checked AFTER pause/
+  // lock/escalation/rate-limit (those always win over a scheduling turn) and
+  // BEFORE the form_session check / CTA routing / GET_STARTED / the RAG
+  // pipeline — when active, this turn belongs to the scheduling driver and
+  // never reaches V5/Bedrock (plan §6 M8a: "active scheduling session owns
+  // the turn", mirrors the M7a form_session precedence exactly).
+  let schedulingSession = null;
+  if (schedulingEnabled) {
+    try {
+      schedulingSession = await schedulingDriver.loadSchedulingSession({
+        client: dynamodb,
+        tableName: CONVERSATION_STATE_TABLE,
+        sessionId: lockSessionId,
+        log,
+      });
+    } catch (schedLoadErr) {
+      log('WARN', 'Scheduling-session lookup failed — proceeding without scheduling routing (fail-open)', {
+        sessionId: lockSessionId,
+        error: schedLoadErr.message,
+      });
+      schedulingSession = null;
+    }
+  }
+
+  if (schedulingSession) {
+    const schedPayload =
+      typeof event.quickReplyPayload === 'string'
+        ? schedulingDriver.parseSchedPayload(event.quickReplyPayload)
+        : event.isPostback === true && typeof messageText === 'string'
+          ? schedulingDriver.parseSchedPayload(messageText)
+          : null;
+
+    const outcome = await advanceSchedulingSessionTurn({ session: schedulingSession, rawText: sanitizedInput, schedPayload });
+
+    try {
+      await sendSchedulingMessages(pageId, psid, outcome.messages, pageAccessToken, channelType);
+    } catch (sendErr) {
+      log('ERROR', 'Failed to deliver scheduling message — will retry', { sessionId: lockSessionId, error: sendErr.message });
+      throw sendErr;
+    }
+    if (outcome.pendingSave) {
+      try {
+        await schedulingDriver.saveSchedulingSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: outcome.pendingSave });
+      } catch (saveErr) {
+        log('WARN', 'Scheduling session save failed — proceeding (in-memory state may lag DDB)', {
+          sessionId: lockSessionId,
+          error: saveErr.message,
+        });
+      }
+    }
+    try {
+      await storeConversationContext(pageId, psid, sanitizedInput, firstSchedulingText(outcome.messages, '[scheduling]'), messageMid);
+    } catch (storeErr) {
+      log('WARN', 'Failed to store scheduling-turn context', { sessionId: lockSessionId, error: storeErr.message });
+    }
+    try {
+      await updateLastUserMessageAt(pageId, channelType);
+    } catch (updateErr) {
+      log('WARN', 'Failed to update lastUserMessageAt after scheduling turn', { pageId, channelType, error: updateErr.message });
+    }
+
+    await finalizeConversationLock(runTurn, { schedulingState: { active: !!outcome.session, session: outcome.session } });
+
+    const schedDurationMs = Date.now() - startTime;
+    log('INFO', 'Handler complete (scheduling turn)', { pageId, psid, durationMs: schedDurationMs });
+    return;
+  }
+
   // ── M7a: active conversational-form session (C4 form_session; T2 — an
   // expired row is treated as absent). Flag- and table-gated ("flag off ⇒
   // zero form machinery" — no GetItem at all). Checked AFTER pause/lock/
@@ -2314,23 +2622,51 @@ exports.handler = async function handler(event) {
         ? messageText
         : null;
   let startFormId = null;
+  // M8a entry: the appointment type to propose, resolved either from a
+  // start_scheduling CTA tap (primary — the config.ts marker) or the C3
+  // `PIC1:sched:start:{apptTypeId}` route directly (secondary — lets a
+  // non-CTA surface, e.g. an ice-breaker payload, start scheduling by naming
+  // the type explicitly; reachable only when no scheduling_session is
+  // already active — schedulingSession was resolved to null above, or this
+  // code would already have returned).
+  let startSchedulingApptTypeId = null;
   if (pic1Payload) {
-    const resolved = resolveCtaPayload(pic1Payload, config);
-    if (resolved) {
-      // M7a: a start_form CTA whose formId resolves in conversational_forms
-      // begins the form engine below instead of a RAG turn. Also requires
-      // the state table (nowhere to persist the session without it) — when
-      // either gate is off, fall back to the pre-M7 behavior (RAG on label).
-      if (resolved.startFormId && messengerFlagOn && CONVERSATION_STATE_TABLE) {
-        startFormId = resolved.startFormId;
-      } else {
-        sanitizedInput = sanitizeUserInput(resolved.turnText) || resolved.turnText;
-        log('INFO', 'PIC1 payload routed to CTA turn text', { ctaId: resolved.ctaId });
-      }
+    const schedStart = schedulingEnabled ? schedulingDriver.parseSchedPayload(pic1Payload) : null;
+    if (schedStart && schedStart.op === 'start' && schedStart.arg) {
+      startSchedulingApptTypeId = schedStart.arg;
     } else {
-      log('INFO', 'Unresolvable PIC1 payload — treating as free text (C3)', {
-        payloadPrefix: pic1Payload.slice(0, 24),
-      });
+      const resolved = resolveCtaPayload(pic1Payload, config);
+      if (resolved) {
+        // M7a: a start_form CTA whose formId resolves in conversational_forms
+        // begins the form engine below instead of a RAG turn. Also requires
+        // the state table (nowhere to persist the session without it) — when
+        // either gate is off, fall back to the pre-M7 behavior (RAG on label).
+        if (resolved.startFormId && messengerFlagOn && CONVERSATION_STATE_TABLE) {
+          startFormId = resolved.startFormId;
+        } else if (resolved.startScheduling && schedulingEnabled) {
+          // M8a: resolve the CTA's associated appointment type (its
+          // program_id, or the sole configured type — schedulingDriver's v1
+          // SIMPLE resolution). Unresolvable ⇒ fall back to RAG on the CTA
+          // label, same posture as an unresolvable start_form.
+          const cta = config?.cta_definitions?.[resolved.ctaId];
+          const apptTypeId = schedulingDriver.resolveAppointmentTypeId({ config, cta });
+          if (apptTypeId) {
+            startSchedulingApptTypeId = apptTypeId;
+          } else {
+            log('WARN', 'start_scheduling CTA could not resolve an appointment type — falling back to RAG on label', {
+              ctaId: resolved.ctaId,
+            });
+            sanitizedInput = sanitizeUserInput(resolved.turnText) || resolved.turnText;
+          }
+        } else {
+          sanitizedInput = sanitizeUserInput(resolved.turnText) || resolved.turnText;
+          log('INFO', 'PIC1 payload routed to CTA turn text', { ctaId: resolved.ctaId });
+        }
+      } else {
+        log('INFO', 'Unresolvable PIC1 payload — treating as free text (C3)', {
+          payloadPrefix: pic1Payload.slice(0, 24),
+        });
+      }
     }
   }
 
@@ -2380,6 +2716,53 @@ exports.handler = async function handler(event) {
 
     const startDurationMs = Date.now() - startTime;
     log('INFO', 'Handler complete (form started)', { pageId, psid, durationMs: startDurationMs });
+    return;
+  }
+
+  if (startSchedulingApptTypeId) {
+    const begun = await schedulingDriver.beginScheduling({
+      sessionId: lockSessionId,
+      tenantId,
+      appointmentTypeId: startSchedulingApptTypeId,
+      config,
+      channelType,
+      deps: schedulingInvokeDeps,
+      log,
+    });
+
+    try {
+      await sendSchedulingMessages(pageId, psid, begun.messages, pageAccessToken, channelType);
+    } catch (sendErr) {
+      log('ERROR', 'Failed to deliver scheduling-start message — will retry', { sessionId: lockSessionId, error: sendErr.message });
+      throw sendErr;
+    }
+    if (begun.started && begun.session) {
+      try {
+        await schedulingDriver.saveSchedulingSession({ client: dynamodb, tableName: CONVERSATION_STATE_TABLE, session: begun.session });
+      } catch (saveErr) {
+        log('ERROR', 'Failed to persist new scheduling session — scheduling will not track state', {
+          sessionId: lockSessionId,
+          error: saveErr.message,
+        });
+      }
+    }
+    try {
+      await storeConversationContext(pageId, psid, sanitizedInput, firstSchedulingText(begun.messages, '[scheduling]'), messageMid);
+    } catch (storeErr) {
+      log('WARN', 'Failed to store scheduling-start context', { sessionId: lockSessionId, error: storeErr.message });
+    }
+    try {
+      await updateLastUserMessageAt(pageId, channelType);
+    } catch (updateErr) {
+      log('WARN', 'Failed to update lastUserMessageAt after scheduling start', { pageId, channelType, error: updateErr.message });
+    }
+
+    await finalizeConversationLock(runTurn, {
+      schedulingState: begun.started ? { active: true, session: begun.session } : null,
+    });
+
+    const schedStartDurationMs = Date.now() - startTime;
+    log('INFO', 'Handler complete (scheduling started)', { pageId, psid, durationMs: schedStartDurationMs });
     return;
   }
 

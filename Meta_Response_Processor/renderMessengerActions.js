@@ -14,6 +14,14 @@
  *     - no `url` → quick reply (`PIC1:cta:{id}`); tapping it resolves via
  *       `resolveCtaPayload` below into `formEngine.beginForm` when the CTA's
  *       formId matches a `conversational_forms` entry (index.js wiring)
+ *   start_scheduling (M8a — the CB config.ts `CTAActionType`/`CTAType`
+ *     marker: `action:'start_scheduling'`, `type:'scheduling_trigger'`,
+ *     config.ts:193/200) → quick reply (`PIC1:cta:{id}`); tapping it resolves
+ *     via `resolveCtaPayload` below into `schedulingDriver.beginScheduling`
+ *     (index.js wiring), mirroring the start_form precedent above.
+ *     `resume_scheduling` is OUT OF SCOPE for M8a (scheduling: manage/M8b) —
+ *     falls to the unmapped-action logged skip below, same as any other
+ *     unhandled action type.
  *
  * Caps from C5 (capabilities.js): QR ≤13, titles truncated to 20 chars,
  * buttons ≤3 (overflow logged, V5 order wins).
@@ -82,6 +90,20 @@ function renderMessengerActions(actionIds, config, log) {
           });
         }
         break;
+      case 'start_scheduling':
+        // M8a: always a quick reply — scheduling has no link-out override
+        // (unlike start_form, there is no `url` escape hatch on this CTA
+        // shape; config.ts's CTADefinition has no `url` semantics for
+        // start_scheduling). A tap resolves via resolveCtaPayload (below)
+        // into schedulingDriver.beginScheduling (index.js wiring) when
+        // scheduling is enabled for the tenant; otherwise it falls back to
+        // RAG on the CTA label like any other unresolvable PIC1 payload.
+        quickReplies.push({
+          content_type: 'text',
+          title: truncateTitle(cta.label || cta.text || id),
+          payload: `PIC1:cta:${id}`,
+        });
+        break;
       default:
         log('INFO', 'CTA skipped — unmapped action type for Messenger rendering', {
           ctaId: id,
@@ -122,7 +144,16 @@ function renderMessengerActions(actionIds, config, log) {
  * pre-M7 behavior below (RAG on the CTA label) exactly like any other
  * unmapped case.
  *
- * @returns {{ turnText: string, ctaId: string, startFormId?: string } | null}
+ * M8a addition: a `start_scheduling` CTA returns `startScheduling: true` in
+ * addition to `turnText` — the caller (index.js) resolves the appointment
+ * type (schedulingDriver.resolveAppointmentTypeId, using the CTA's own
+ * `program_id` field) and begins the scheduling driver instead of a RAG turn
+ * when MESSENGER_CHANNEL + scheduling_enabled + the state table + the BCH
+ * invoke function are all available; otherwise this falls back to the
+ * pre-M8a behavior (RAG on the CTA label), same posture as an unresolvable
+ * start_form.
+ *
+ * @returns {{ turnText: string, ctaId: string, startFormId?: string, startScheduling?: boolean } | null}
  */
 function resolveCtaPayload(payload, config) {
   if (typeof payload !== 'string' || !payload.startsWith('PIC1:cta:')) return null;
@@ -142,6 +173,8 @@ function resolveCtaPayload(payload, config) {
       }
       return { turnText: cta.label || ctaId, ctaId };
     }
+    case 'start_scheduling':
+      return { turnText: cta.label || ctaId, ctaId, startScheduling: true };
     default:
       // Commitment CTAs render as URL buttons (no postback round-trip); a
       // PIC1:cta payload for one is unexpected — answer about it via RAG.

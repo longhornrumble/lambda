@@ -3911,3 +3911,424 @@ describe('M7a — conversational form engine', () => {
     expect(saved.answers.name).toBe('Jane Doe');
   });
 });
+
+// ─── M8a — scheduling: book (own isolated module instance: CONVERSATION_STATE_TABLE
+// + BOOKING_COMMIT_FUNCTION + a mocked LambdaClient for the propose/commit invokes,
+// + a mocked raw DynamoDBClient for shared/scheduling/consent.js's own writer) ────
+describe('M8a — scheduling: book', () => {
+  const SE_TABLE = 'picasso-conversation-state-test-scheduling';
+  const SE_SESSION_ID = 'meta:PAGE_SCHED:PSID_SCHED';
+  let seHandler;
+  let seDdbMock, seKmsMock, seBedrockMock, seSqsMock, seSesMock, seLambdaMock, seRawDdbMock;
+  let seLoadConfig, seRetrieveKB;
+  let seGetCommand, sePutCommand, seQueryCommand, seUpdateCommand, seDeleteCommand;
+  let seDecryptCommand, seInvokeCommand, seSendMessageCommand, sePutItemCommand;
+
+  beforeAll(() => {
+    jest.isolateModules(() => {
+      process.env.CONVERSATION_STATE_TABLE = SE_TABLE;
+      process.env.BOOKING_COMMIT_FUNCTION = 'Booking_Commit_Handler';
+
+      jest.doMock('../shared/bedrock-core', () => ({
+        loadConfig: jest.fn(),
+        retrieveKB: jest.fn(),
+        sanitizeUserInput: jest.fn((t) => t?.trim() || ''),
+      }));
+
+      const mc = mockClient;
+      const ddbLib = require('@aws-sdk/lib-dynamodb');
+      const rawDdbLib = require('@aws-sdk/client-dynamodb');
+      const kmsLib = require('@aws-sdk/client-kms');
+      const bedrockLib = require('@aws-sdk/client-bedrock-runtime');
+      const sqsLib = require('@aws-sdk/client-sqs');
+      const sesLib = require('@aws-sdk/client-ses');
+      const lambdaLib = require('@aws-sdk/client-lambda');
+
+      seGetCommand = ddbLib.GetCommand;
+      sePutCommand = ddbLib.PutCommand;
+      seQueryCommand = ddbLib.QueryCommand;
+      seUpdateCommand = ddbLib.UpdateCommand;
+      seDeleteCommand = ddbLib.DeleteCommand;
+      seDecryptCommand = kmsLib.DecryptCommand;
+      seInvokeCommand = lambdaLib.InvokeCommand;
+      seSendMessageCommand = sqsLib.SendMessageCommand;
+      sePutItemCommand = rawDdbLib.PutItemCommand;
+
+      seDdbMock = mc(ddbLib.DynamoDBDocumentClient);
+      seRawDdbMock = mc(rawDdbLib.DynamoDBClient); // shared/scheduling/consent.js's own client
+      seKmsMock = mc(kmsLib.KMSClient);
+      seBedrockMock = mc(bedrockLib.BedrockRuntimeClient);
+      seSqsMock = mc(sqsLib.SQSClient);
+      seSesMock = mc(sesLib.SESClient);
+      seLambdaMock = mc(lambdaLib.LambdaClient);
+
+      const bc = require('../shared/bedrock-core');
+      seLoadConfig = bc.loadConfig;
+      seRetrieveKB = bc.retrieveKB;
+
+      seHandler = require('./index').handler;
+    });
+  });
+
+  afterAll(() => {
+    delete process.env.CONVERSATION_STATE_TABLE;
+    delete process.env.BOOKING_COMMIT_FUNCTION;
+  });
+
+  const SE_APPT_TYPES_CFG_BASE = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'Helpful.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true, scheduling_enabled: true },
+    cta_definitions: {
+      book_cta: { label: 'Book an appointment', action: 'start_scheduling', type: 'scheduling_trigger', ai_available: true },
+    },
+    scheduling: {
+      appointment_types: {
+        consult: { name: 'Consult', timezone: 'America/Los_Angeles', conference_type: 'google_meet' },
+      },
+    },
+  };
+
+  function seChannelMappingItem(pageId) {
+    return {
+      Item: {
+        PK: `PAGE#${pageId}`,
+        SK: 'CHANNEL#messenger',
+        encryptedPageToken: Buffer.from('encrypted-blob').toString('base64'),
+        tenantId: 'TENANT_SCHED',
+      },
+    };
+  }
+
+  function seProposeResult(overrides = {}) {
+    return {
+      outcome: 'ok',
+      poolSize: 3,
+      slots: [
+        { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] },
+        { slotId: 'slot#2', start: '2026-08-01T18:00:00Z', end: '2026-08-01T18:30:00Z', label: 'Sat, Aug 1 · 11:00 AM', candidateResourceIds: ['r1'] },
+      ],
+      context: { duration_minutes: 30, conference_type: 'google_meet', conference_label: 'Google Meet', tz_label: 'PDT' },
+      ...overrides,
+    };
+  }
+
+  function seBufferPayload(obj) {
+    return Buffer.from(JSON.stringify(obj));
+  }
+
+  /** Wires the SAME Lambda invoke mock to answer propose vs. commit differently,
+   * based on the payload's own `action` field (mirrors the real BCH routing). */
+  function seWireInvoke({ proposeResult, commitResult }) {
+    seLambdaMock.on(seInvokeCommand).callsFake((input) => {
+      const body = JSON.parse(Buffer.from(input.Payload).toString('utf-8'));
+      if (body.action === 'scheduling_propose') {
+        return { Payload: seBufferPayload(proposeResult ?? seProposeResult()) };
+      }
+      return { Payload: seBufferPayload(commitResult ?? { status: 'BOOKED', bookingId: 'bk_default' }) };
+    });
+  }
+
+  beforeEach(() => {
+    seDdbMock.reset();
+    seRawDdbMock.reset();
+    seKmsMock.reset();
+    seBedrockMock.reset();
+    seSqsMock.reset();
+    seSesMock.reset();
+    seLambdaMock.reset();
+
+    seLoadConfig.mockResolvedValue(SE_APPT_TYPES_CFG_BASE);
+    seRetrieveKB.mockResolvedValue('KB context.');
+
+    seSqsMock.on(seSendMessageCommand).resolves({ MessageId: 'mock-sqs-id' });
+    seKmsMock.on(seDecryptCommand).resolves({ Plaintext: Buffer.from('EAABtest_page_token') });
+    seRawDdbMock.on(sePutItemCommand).resolves({}); // consent.js's conditional PutItem
+    seDdbMock.on(seQueryCommand).resolves({ Items: [] });
+    seDdbMock.on(sePutCommand).resolves({});
+    seDdbMock.on(seUpdateCommand).resolves({ Attributes: {} });
+    seDdbMock.on(seDeleteCommand).resolves({});
+    seDdbMock
+      .on(seGetCommand, { Key: { PK: 'PAGE#PAGE_SCHED', SK: 'CHANNEL#messenger' } })
+      .resolves(seChannelMappingItem('PAGE_SCHED'));
+    seDdbMock
+      .on(seGetCommand, { Key: { PK: 'PAGE#PAGE_SCHED', SK: 'CHANNEL#instagram' } })
+      .resolves(seChannelMappingItem('PAGE_SCHED'));
+    seDdbMock.on(seGetCommand, { Key: { sessionId: SE_SESSION_ID, stateType: 'pause' } }).resolves({});
+    // No active scheduling session by default — individual tests override.
+    seDdbMock.on(seGetCommand, { Key: { sessionId: SE_SESSION_ID, stateType: 'scheduling_session' } }).resolves({});
+    seDdbMock.on(seGetCommand, { Key: { sessionId: SE_SESSION_ID, stateType: 'form_session' } }).resolves({});
+
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.test' }) });
+  });
+
+  afterEach(() => {
+    delete global.fetch;
+  });
+
+  function seBuildEvent(overrides = {}) {
+    return {
+      psid: 'PSID_SCHED',
+      messageText: 'Hello',
+      pageId: 'PAGE_SCHED',
+      tenantId: 'TENANT_SCHED',
+      tenantHash: 'abc123defabc123def',
+      channelType: 'messenger',
+      messageMid: 'm_test_mid',
+      ...overrides,
+    };
+  }
+
+  function seSessionRow(overrides = {}) {
+    const now = Date.now();
+    return {
+      sessionId: SE_SESSION_ID,
+      stateType: 'scheduling_session',
+      program_id: 'consult',
+      stage: 'proposing',
+      candidate_slots: [
+        { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] },
+        { slotId: 'slot#2', start: '2026-08-01T18:00:00Z', end: '2026-08-01T18:30:00Z', label: 'Sat, Aug 1 · 11:00 AM', candidateResourceIds: ['r1'] },
+      ],
+      pool_size: 3,
+      channel: 'messenger',
+      appointment_type: { id: 'consult', name: 'Consult', timezone: 'America/Los_Angeles', conference_type: 'google_meet', cancellation_window_hours: 0 },
+      started_at: now,
+      updated_at: now,
+      schema_version: 1,
+      expires_at: Math.floor(now / 1000) + 3600,
+      ...overrides,
+    };
+  }
+
+  function seSetActiveSession(overrides = {}) {
+    seDdbMock
+      .on(seGetCommand, { Key: { sessionId: SE_SESSION_ID, stateType: 'scheduling_session' } })
+      .resolves({ Item: seSessionRow(overrides) });
+  }
+
+  function seSentTexts() {
+    return global.fetch.mock.calls
+      .map(([, opts]) => JSON.parse(opts.body)?.message)
+      .filter(Boolean);
+  }
+
+  function seLastSchedulingSessionPut() {
+    const puts = seDdbMock.commandCalls(sePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'scheduling_session');
+    return puts.length ? puts[puts.length - 1].args[0].input.Item : undefined;
+  }
+
+  function seInvokePayloads() {
+    return seLambdaMock.commandCalls(seInvokeCommand).map((c) => JSON.parse(Buffer.from(c.args[0].input.Payload).toString('utf-8')));
+  }
+
+  test('start_scheduling CTA tap begins a session — proposes, sends tz-labeled carousel + text list, no Bedrock', async () => {
+    seWireInvoke({});
+    await seHandler(seBuildEvent({ messageText: 'Book an appointment', quickReplyPayload: 'PIC1:cta:book_cta', isPostback: false }));
+
+    const saved = seLastSchedulingSessionPut();
+    expect(saved).toBeDefined();
+    expect(saved.stage).toBe('proposing');
+    expect(saved.program_id).toBe('consult');
+
+    const sent = seSentTexts();
+    const textMsg = sent.find((m) => typeof m.text === 'string' && m.text.includes('PDT'));
+    const carouselMsg = sent.find((m) => m.attachment?.payload?.template_type === 'generic');
+    expect(textMsg).toBeDefined();
+    expect(carouselMsg.attachment.payload.elements.length).toBeLessThanOrEqual(10);
+    expect(carouselMsg.attachment.payload.elements[0].buttons[0].payload).toBe('PIC1:sched:slot:slot#1');
+
+    expect(seBedrockMock.commandCalls(InvokeModelCommand)).toHaveLength(0);
+  });
+
+  test('scheduling_enabled flag OFF — CTA tap never starts scheduling, no BCH invoke, no row created', async () => {
+    seLoadConfig.mockResolvedValue({ ...SE_APPT_TYPES_CFG_BASE, feature_flags: { MESSENGER_CHANNEL: true, scheduling_enabled: false } });
+    seWireInvoke({});
+    await seHandler(seBuildEvent({ messageText: 'Book an appointment', quickReplyPayload: 'PIC1:cta:book_cta', isPostback: false }));
+
+    expect(seLambdaMock.commandCalls(seInvokeCommand)).toHaveLength(0);
+    const saved = seDdbMock.commandCalls(sePutCommand).filter((c) => c.args[0].input.Item?.stateType === 'scheduling_session');
+    expect(saved).toHaveLength(0);
+  });
+
+  test('happy path E2E (FB): slot tap -> email typed -> phone "skip" -> confirm tap -> pinned commit payload incl. attendee.email (C8), row deleted, no consent write (no phone)', async () => {
+    seWireInvoke({ commitResult: { status: 'BOOKED', bookingId: 'bk_fb_1', resourceId: 'r1' } });
+
+    // 1) tap a slot
+    seSetActiveSession({ stage: 'proposing' });
+    await seHandler(seBuildEvent({ messageText: 'Pick this time', quickReplyPayload: 'PIC1:sched:slot:slot#1' }));
+    const afterSlot = seLastSchedulingSessionPut();
+    expect(afterSlot.stage).toBe('contact_email');
+    expect(afterSlot.selected_slot.slotId).toBe('slot#1');
+
+    // 2) email (typed)
+    seSetActiveSession({ stage: 'contact_email', selected_slot: afterSlot.selected_slot });
+    await seHandler(seBuildEvent({ messageText: 'jane@example.com' }));
+    const afterEmail = seLastSchedulingSessionPut();
+    expect(afterEmail.stage).toBe('contact_phone');
+    expect(afterEmail.contact.email).toBe('jane@example.com');
+    expect(afterEmail.consent_language_shown).toBeTruthy();
+
+    // 3) phone — FB allows "skip"
+    seSetActiveSession({ stage: 'contact_phone', contact: afterEmail.contact, consent_language_shown: afterEmail.consent_language_shown, selected_slot: afterSlot.selected_slot });
+    await seHandler(seBuildEvent({ messageText: 'skip' }));
+    const afterPhone = seLastSchedulingSessionPut();
+    expect(afterPhone.stage).toBe('confirm');
+    expect(afterPhone.contact.phone).toBeUndefined();
+
+    // 4) confirm tap -> commit
+    seSetActiveSession({ stage: 'confirm', contact: afterPhone.contact, selected_slot: afterSlot.selected_slot });
+    await seHandler(seBuildEvent({ messageText: 'Confirm', quickReplyPayload: 'PIC1:sched:confirm' }));
+
+    const commitCalls = seInvokePayloads().filter((p) => p.action !== 'scheduling_propose');
+    expect(commitCalls).toHaveLength(1);
+    expect(commitCalls[0]).toMatchObject({
+      tenant_id: 'TENANT_SCHED',
+      session_id: SE_SESSION_ID,
+      attendee: { email: 'jane@example.com' },
+    });
+
+    const deletes = seDdbMock.commandCalls(seDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'scheduling_session');
+    expect(deletes).toHaveLength(1); // T2': row deleted on successful commit
+
+    expect(seRawDdbMock.commandCalls(sePutItemCommand)).toHaveLength(0); // no phone -> no consent write
+
+    const sent = seSentTexts();
+    expect(sent.some((m) => m.text === 'You\'re booked! We\'ll send a confirmation shortly.')).toBe(true);
+  });
+
+  test('IG: phone is mandatory — "skip" rejected, invalid phone re-prompts, valid phone advances + records consent (source=messenger_booking_ig) AFTER commit', async () => {
+    seWireInvoke({ commitResult: { status: 'BOOKED', bookingId: 'bk_ig_1' } });
+    const igEvent = (overrides = {}) => seBuildEvent({ channelType: 'instagram', ...overrides });
+
+    seSetActiveSession({ stage: 'contact_phone', channel: 'instagram', contact: { email: 'jane@ig.example.com' }, selected_slot: { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] } });
+    await seHandler(igEvent({ messageText: 'skip' }));
+    let saved = seLastSchedulingSessionPut();
+    // "skip" is REJECTED on IG — re-prompted, still at contact_phone, no phone recorded
+    // (T1' still refreshes the row's TTL — that's activity, not a terminal failure).
+    expect(saved.stage).toBe('contact_phone');
+    expect(saved.contact.phone).toBeUndefined();
+    let sent = seSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /required/i.test(m.text))).toBe(true);
+
+    seSetActiveSession({ stage: 'contact_phone', channel: 'instagram', contact: { email: 'jane@ig.example.com' }, selected_slot: { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] } });
+    await seHandler(igEvent({ messageText: '123' })); // invalid E.164 (C5)
+    saved = seLastSchedulingSessionPut();
+    expect(saved.stage).toBe('contact_phone');
+    expect(saved.contact.phone).toBeUndefined();
+
+    seSetActiveSession({ stage: 'contact_phone', channel: 'instagram', contact: { email: 'jane@ig.example.com' }, consent_language_shown: 'IG consent text', selected_slot: { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] } });
+    await seHandler(igEvent({ messageText: '(415) 555-0100' }));
+    const afterPhone = seLastSchedulingSessionPut();
+    expect(afterPhone.stage).toBe('confirm');
+    expect(afterPhone.contact.phone).toBe('+14155550100');
+
+    seSetActiveSession({ stage: 'confirm', channel: 'instagram', contact: afterPhone.contact, consent_language_shown: afterPhone.consent_language_shown, selected_slot: afterPhone.selected_slot });
+    await seHandler(igEvent({ messageText: 'confirm' }));
+
+    const consentPuts = seRawDdbMock.commandCalls(sePutItemCommand);
+    expect(consentPuts).toHaveLength(1);
+    const consentItem = consentPuts[0].args[0].input.Item;
+    expect(consentItem.consent_method.S).toBe('messenger_booking_ig');
+    expect(consentItem.consent_language.S).toBe(afterPhone.consent_language_shown);
+    expect(consentItem.phone_e164.S).toBe('+14155550100');
+  });
+
+  test('escalation intent mid-scheduling wins — scheduling session left intact, no commit invoked', async () => {
+    seSetActiveSession({ stage: 'confirm', contact: { email: 'jane@example.com' }, selected_slot: { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] } });
+    seLoadConfig.mockResolvedValue({ ...SE_APPT_TYPES_CFG_BASE, messenger_behavior: { escalation_email: '' } });
+    await seHandler(seBuildEvent({ messageText: 'I want to talk to a person please' }));
+
+    expect(seLambdaMock.commandCalls(seInvokeCommand)).toHaveLength(0); // no propose, no commit
+    const sent = seSentTexts();
+    expect(sent.some((m) => typeof m.text === 'string' && /connecting you with a person/i.test(m.text))).toBe(true);
+  });
+
+  test("T1' — expired scheduling_session is treated as absent; CTA tap starts a brand-new session instead", async () => {
+    seDdbMock
+      .on(seGetCommand, { Key: { sessionId: SE_SESSION_ID, stateType: 'scheduling_session' } })
+      .resolves({ Item: seSessionRow({ expires_at: Math.floor(Date.now() / 1000) - 10 }) });
+    seWireInvoke({});
+    await seHandler(seBuildEvent({ messageText: 'Book an appointment', quickReplyPayload: 'PIC1:cta:book_cta', isPostback: false }));
+
+    // Expired row deleted (best-effort) by the load path, THEN a fresh one created by the CTA entry.
+    const deletes = seDdbMock.commandCalls(seDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'scheduling_session');
+    expect(deletes.length).toBeGreaterThanOrEqual(1);
+    const saved = seLastSchedulingSessionPut();
+    expect(saved.stage).toBe('proposing');
+  });
+
+  test('conflict retry: commit returns SLOT_UNAVAILABLE -> re-propose -> fresh carousel sent, row updated (not deleted)', async () => {
+    let commitCallCount = 0;
+    seLambdaMock.on(seInvokeCommand).callsFake((input) => {
+      const body = JSON.parse(Buffer.from(input.Payload).toString('utf-8'));
+      if (body.action === 'scheduling_propose') {
+        return {
+          Payload: seBufferPayload(seProposeResult({
+            slots: [{ slotId: 'slot#9', start: '2026-08-02T17:00:00Z', end: '2026-08-02T17:30:00Z', label: 'Sun, Aug 2 · 10:00 AM', candidateResourceIds: ['r2'] }],
+          })),
+        };
+      }
+      commitCallCount++;
+      return { Payload: seBufferPayload({ status: 'SLOT_UNAVAILABLE', reason: 'recheck_busy' }) };
+    });
+
+    seSetActiveSession({ stage: 'confirm', contact: { email: 'jane@example.com' }, selected_slot: { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] } });
+    await seHandler(seBuildEvent({ messageText: 'confirm', quickReplyPayload: 'PIC1:sched:confirm' }));
+
+    expect(commitCallCount).toBe(1);
+    const deletes = seDdbMock.commandCalls(seDeleteCommand).filter((c) => c.args[0].input.Key?.stateType === 'scheduling_session');
+    expect(deletes).toHaveLength(0); // NOT deleted — re-offer, row updated instead
+    const saved = seLastSchedulingSessionPut();
+    expect(saved.stage).toBe('proposing');
+    expect(saved.candidate_slots[0].slotId).toBe('slot#9');
+  });
+
+  test('double-confirm race: two coalesced confirm taps on the SAME lock hold -> exactly ONE commit invoke', async () => {
+    seWireInvoke({ commitResult: { status: 'BOOKED', bookingId: 'bk_race' } });
+    const confirmSession = seSessionRow({
+      stage: 'confirm',
+      contact: { email: 'jane@example.com' },
+      selected_slot: { slotId: 'slot#1', start: '2026-08-01T17:00:00Z', end: '2026-08-01T17:30:00Z', label: 'Sat, Aug 1 · 10:00 AM', candidateResourceIds: ['r1'] },
+    });
+    seSetActiveSession(confirmSession);
+
+    // Simulate the C7 lock: first invocation wins and acquires it; the SECOND
+    // racing confirm coalesces onto the SAME lock's pending list (this is
+    // exactly what conversationLock.acquireOrCoalesce does for a genuinely
+    // concurrent second invocation — we drive it directly here to pin the
+    // outcome deterministically without a real race).
+    let lockPutCount = 0;
+    seDdbMock.on(sePutCommand).callsFake((input) => {
+      if (input.Item?.stateType === 'lock') {
+        lockPutCount++;
+        if (lockPutCount === 1) {
+          return { Attributes: {} }; // winner acquires cleanly
+        }
+      }
+      return {};
+    });
+    // Winner's UpdateCommand (claimPending) surfaces the SECOND confirm tap as
+    // a pending item coalesced during the winner's own processing.
+    let claimed = false;
+    seDdbMock.on(seUpdateCommand).callsFake((input) => {
+      if (!claimed && input.UpdateExpression?.includes('REMOVE pending')) {
+        claimed = true;
+        return {
+          Attributes: {
+            pending: [
+              { timestamp: Date.now(), mid: 'm_second_confirm', text: 'Confirm', quickReplyPayload: 'PIC1:sched:confirm' },
+            ],
+          },
+        };
+      }
+      return { Attributes: {} };
+    });
+
+    await seHandler(seBuildEvent({ messageText: 'Confirm', quickReplyPayload: 'PIC1:sched:confirm' }));
+
+    const commitInvokes = seInvokePayloads().filter((p) => p.action !== 'scheduling_propose');
+    expect(commitInvokes).toHaveLength(1); // exactly ONE commit — the drained duplicate fell through to RAG, not a second commit
+  });
+});
