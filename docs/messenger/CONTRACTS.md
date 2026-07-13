@@ -289,6 +289,8 @@ Attachment rule: renderings attach to the **same turn's send sequence** (no cros
 
 **Free-text-fallback principle (frozen):** every tap-driven flow MUST also accept the equivalent typed text — quick replies are skippable and vanish after the next message. A tap is an accelerator, never the only path. Every M4/M7/M8 flow ships a free-text-path test to CI.
 
+**Mixed-turn placement (v1.1, M4 implementation finding):** Meta displays quick replies only on the MOST RECENT message. When a turn renders BOTH quick replies and a button template, the split-reply rule above would strand the QRs on the second-to-last message — so quick replies attach to the turn's LAST message: the final text chunk when no buttons exist, the button template message when they do. Also clarified: `show_info` CTAs are suggestion-class (quick replies), same as `send_query` — both resolve to a free-text turn on tap (C3 `cta` route: send_query → `query`, show_info → `prompt`).
+
 ---
 
 ## Version log
@@ -297,3 +299,4 @@ Attachment rule: renderings attach to the **same turn's send sequence** (no cros
 |---|---|---|
 | 2026-07-13 | C1–C9 v1.0 frozen (M0), after tech-lead-reviewer adversarial pass — 3 blocking + 4 should-fix findings applied pre-freeze (echo `psid` inversion; C7 conditional release + drain semantics + TTL invariant; C4 pending shape carries v2 fields; metadata-only-event skip rule; `replyTo` context; C9 split-reply rule) | lambda#433 |
 | 2026-07-13 | **C1 → v1.1** (M1a implementation findings, additive clarifications): echo `messageText` always null (loop guard — legacy processor would answer our own echoed replies during the deploy gap); `timestamp` falls back to receipt time when Meta omits it; `'standby'` removed from the eventKind enum (standby-ness rides `isStandby`, matching the prose rule); NOTE for M1b: edit/delete bypass webhook dedup, so Meta redeliveries double-invoke — processor edit/delete handling MUST be idempotent | (M1a PR) |
+| 2026-07-13 | **C9 → v1.1** (M4 implementation finding): mixed-turn placement — quick replies attach to the turn's LAST message (button template when present; Meta shows QRs only on the most recent message); `show_info` classified suggestion-class alongside `send_query` | lambda M4 PR |

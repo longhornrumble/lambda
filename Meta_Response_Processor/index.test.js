@@ -1625,3 +1625,235 @@ describe('M3b — review follow-ups', () => {
     for (const t of texts) expect(t).not.toContain('<<<ACTIONS');
   });
 });
+
+// ─── M4 — CTA rendering + PIC1 payload routing (C3, C5, C9) ─────────────────
+
+describe('M4 — rendering matrix (renderMessengerActions)', () => {
+  const { renderMessengerActions, resolveCtaPayload, truncateTitle } = require('./renderMessengerActions');
+  const noopLog = () => {};
+  const CFG = {
+    cta_definitions: {
+      learn_x: { label: 'Our Programs', action: 'send_query', query: 'tell me about programs', ai_available: true },
+      info_y: { label: 'About Us', action: 'show_info', prompt: 'describe the org', ai_available: true },
+      apply_z: { label: 'Apply To Volunteer Today', action: 'external_link', url: 'https://x.org/apply', ai_available: true },
+      form_nourl: { label: 'Sign Up', action: 'start_form', formId: 'f1', ai_available: true },
+      form_url: { label: 'Sign Up Online', action: 'start_form', formId: 'f1', url: 'https://x.org/form', ai_available: true },
+    },
+  };
+
+  test('suggestion class → quick replies with PIC1 payloads; commitment class → web_url buttons', () => {
+    const r = renderMessengerActions(['learn_x', 'info_y', 'apply_z', 'form_url'], CFG, noopLog);
+    expect(r.quickReplies.map((q) => q.payload)).toEqual(['PIC1:cta:learn_x', 'PIC1:cta:info_y']);
+    expect(r.quickReplies.every((q) => q.content_type === 'text')).toBe(true);
+    expect(r.buttons.map((b) => b.url)).toEqual(['https://x.org/apply', 'https://x.org/form']);
+    expect(r.buttons.every((b) => b.type === 'web_url')).toBe(true);
+  });
+
+  test('start_form without url: skipped with a log, never silently', () => {
+    const logs = [];
+    const r = renderMessengerActions(['form_nourl'], CFG, (lvl, msg, meta) => logs.push({ lvl, msg, meta }));
+    expect(r.quickReplies).toHaveLength(0);
+    expect(r.buttons).toHaveLength(0);
+    expect(logs.some((l) => l.msg.includes('no url') && l.meta.ctaId === 'form_nourl')).toBe(true);
+  });
+
+  test('titles truncated to the C5 20-char cap', () => {
+    expect(truncateTitle('Apply To Volunteer Today').length).toBeLessThanOrEqual(20);
+    const r = renderMessengerActions(['apply_z'], CFG, noopLog);
+    expect(r.buttons[0].title.length).toBeLessThanOrEqual(20);
+  });
+
+  test('C5 caps enforced: ≤13 quick replies, ≤3 buttons, V5 order wins', () => {
+    const bigCfg = { cta_definitions: {} };
+    const qrIds = [], btnIds = [];
+    for (let i = 0; i < 15; i++) {
+      bigCfg.cta_definitions[`q${i}`] = { label: `Q${i}`, action: 'send_query', query: 'x', ai_available: true };
+      qrIds.push(`q${i}`);
+      bigCfg.cta_definitions[`b${i}`] = { label: `B${i}`, action: 'external_link', url: 'https://x.org', ai_available: true };
+      btnIds.push(`b${i}`);
+    }
+    const r = renderMessengerActions([...qrIds, ...btnIds], bigCfg, noopLog);
+    expect(r.quickReplies).toHaveLength(13);
+    expect(r.buttons).toHaveLength(3);
+    expect(r.quickReplies[0].title).toBe('Q0');
+    expect(r.buttons[0].title).toBe('B0');
+  });
+
+  test('resolveCtaPayload: send_query → query, show_info → prompt, unknown → null', () => {
+    expect(resolveCtaPayload('PIC1:cta:learn_x', CFG).turnText).toBe('tell me about programs');
+    expect(resolveCtaPayload('PIC1:cta:info_y', CFG).turnText).toBe('describe the org');
+    expect(resolveCtaPayload('PIC1:cta:nope', CFG)).toBeNull();
+    expect(resolveCtaPayload('PIC2:cta:learn_x', CFG)).toBeNull();
+    expect(resolveCtaPayload('GET_STARTED', CFG)).toBeNull();
+  });
+});
+
+describe('M4 — rendering + routing through the handler', () => {
+  const M4_CONFIG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'T.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    cta_definitions: {
+      learn_x: { label: 'Our Programs', action: 'send_query', query: 'tell me about programs', ai_available: true },
+      apply_z: { label: 'Apply Now', action: 'external_link', url: 'https://x.org/apply', ai_available: true },
+    },
+  };
+
+  function sentMessages() {
+    return fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message)
+      .map((b) => b.message);
+  }
+
+  beforeEach(() => {
+    loadConfig.mockResolvedValue(M4_CONFIG);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
+  });
+
+  test('QR-only turn: quick replies ride the final text chunk', async () => {
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Sure!\n<<<ACTIONS ["learn_x"]>>>'));
+    await handler(buildEvent());
+    const msgs = sentMessages().filter((m) => m.text || m.attachment);
+    const last = msgs[msgs.length - 1];
+    expect(last.text).toContain('Sure!');
+    expect(last.quick_replies).toHaveLength(1);
+    expect(last.quick_replies[0].payload).toBe('PIC1:cta:learn_x');
+  });
+
+  test('button turn: template sent AFTER the final text chunk (C9)', async () => {
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Ready when you are.\n<<<ACTIONS ["apply_z"]>>>'));
+    await handler(buildEvent());
+    const msgs = sentMessages().filter((m) => m.text || m.attachment);
+    const last = msgs[msgs.length - 1];
+    expect(last.attachment.payload.template_type).toBe('button');
+    expect(last.attachment.payload.buttons[0].url).toBe('https://x.org/apply');
+    expect(msgs[msgs.length - 2].text).toContain('Ready when you are.');
+  });
+
+  test('mixed turn: QRs attach to the button template — the turn\'s LAST message (C9 v1.1)', async () => {
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Both!\n<<<ACTIONS ["learn_x","apply_z"]>>>'));
+    await handler(buildEvent());
+    const msgs = sentMessages().filter((m) => m.text || m.attachment);
+    const last = msgs[msgs.length - 1];
+    expect(last.attachment.payload.template_type).toBe('button');
+    expect(last.quick_replies).toHaveLength(1);
+    const textMsgs = msgs.filter((m) => m.text);
+    expect(textMsgs.every((m) => !m.quick_replies)).toBe(true);
+  });
+
+  test('QR tap round-trip: PIC1:cta:learn_x becomes the CTA\'s query as the Bedrock user turn', async () => {
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Programs are…\n<<<ACTIONS []>>>'));
+    await handler(buildEvent({
+      eventKind: 'quick_reply',
+      messageText: 'Our Programs',
+      quickReplyPayload: 'PIC1:cta:learn_x',
+    }));
+    const body = JSON.parse(Buffer.from(bedrockMock.commandCalls(InvokeModelCommand)[0].args[0].input.body).toString());
+    const userTurn = body.messages[body.messages.length - 1].content[0].text;
+    expect(userTurn).toBe('tell me about programs');
+  });
+
+  test('unknown PIC1 payload falls through to RAG as free text (C3)', async () => {
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('I can help!\n<<<ACTIONS []>>>'));
+    await handler(buildEvent({
+      eventKind: 'quick_reply',
+      messageText: 'Old Button',
+      quickReplyPayload: 'PIC1:ffld:form1:field:value',
+    }));
+    const body = JSON.parse(Buffer.from(bedrockMock.commandCalls(InvokeModelCommand)[0].args[0].input.body).toString());
+    const userTurn = body.messages[body.messages.length - 1].content[0].text;
+    expect(userTurn).toBe('Old Button'); // message.text flows, payload untouched
+  });
+
+  test('GET_STARTED postback preserved (welcome short-circuit, no rendering)', async () => {
+    await handler(buildEvent({ eventKind: 'postback', isPostback: true, messageText: 'GET_STARTED' }));
+    expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+    const msgs = sentMessages().filter((m) => m.text);
+    expect(msgs.some((m) => m.text.includes('help'))).toBe(true);
+  });
+
+  test('flag OFF: no rendering machinery on the legacy path (no quick_replies, no templates)', async () => {
+    loadConfig.mockResolvedValue({ ...M4_CONFIG, feature_flags: {} });
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Legacy reply.'));
+    await handler(buildEvent());
+    const msgs = sentMessages();
+    expect(msgs.every((m) => !m.quick_replies && !m.attachment)).toBe(true);
+  });
+});
+
+// ─── M4 review follow-ups ────────────────────────────────────────────────────
+
+describe('M4 — review follow-ups', () => {
+  const M4_CFG = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'T.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+    cta_definitions: {
+      learn_x: { label: 'Our Programs', action: 'send_query', query: 'tell me about programs', ai_available: true },
+      apply_z: { label: 'Apply Now', action: 'external_link', url: 'https://x.org/apply', ai_available: true },
+    },
+  };
+
+  beforeEach(() => {
+    loadConfig.mockResolvedValue(M4_CFG);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
+  });
+
+  test('IG button turn: template rides the /me/messages IG path with the same body shape', async () => {
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Go!\n<<<ACTIONS ["apply_z"]>>>'));
+    await handler(buildEvent({ channelType: 'instagram' }));
+    const templateCall = fetchMock.mock.calls.find(([, opts]) => {
+      const b = opts && opts.body ? JSON.parse(opts.body) : null;
+      return b && b.message && b.message.attachment;
+    });
+    expect(templateCall).toBeDefined();
+    expect(templateCall[0]).toContain('/me/messages'); // IG send path
+    const body = JSON.parse(templateCall[1].body);
+    expect(body.message.attachment.payload.template_type).toBe('button');
+    expect(body.messaging_type).toBeUndefined(); // IG body shape (no messaging_type)
+  });
+
+  test('stale cta id (config edited after button rendered) → tapped text flows to RAG (C3)', async () => {
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Happy to help!\n<<<ACTIONS []>>>'));
+    await handler(buildEvent({
+      eventKind: 'quick_reply',
+      messageText: 'Old Removed Button',
+      quickReplyPayload: 'PIC1:cta:removed_cta_id',
+    }));
+    const body = JSON.parse(Buffer.from(bedrockMock.commandCalls(InvokeModelCommand)[0].args[0].input.body).toString());
+    expect(body.messages[body.messages.length - 1].content[0].text).toBe('Old Removed Button');
+  });
+
+  test('empty button_intro override degrades to the default, send never fails on it', async () => {
+    loadConfig.mockResolvedValue({ ...M4_CFG, messenger_behavior: { strings: { button_intro: '   ' } } });
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Go!\n<<<ACTIONS ["apply_z"]>>>'));
+    await handler(buildEvent());
+    const templateCall = fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .find((b) => b && b.message && b.message.attachment);
+    expect(templateCall.message.attachment.payload.text.trim().length).toBeGreaterThan(0);
+  });
+
+  test('coalesced PIC1 tap drains as the CTA\'s canonical query (C7 step 3)', async () => {
+    loadConfig.mockResolvedValue(M4_CFG);
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Combined answer.\n<<<ACTIONS []>>>'));
+    // This suite has no CONVERSATION_STATE_TABLE (lock disabled) — test the
+    // routing seam directly through the drain text-mapping logic instead:
+    const { resolveCtaPayload } = require('./renderMessengerActions');
+    const batch = [
+      { text: 'Our Programs', quickReplyPayload: 'PIC1:cta:learn_x', mid: 'm1', timestamp: 1 },
+      { text: 'and a typed question', mid: 'm2', timestamp: 2 },
+    ];
+    const texts = batch.map((i) => {
+      if (typeof i.quickReplyPayload === 'string' && i.quickReplyPayload.startsWith('PIC1:')) {
+        const r = resolveCtaPayload(i.quickReplyPayload, M4_CFG);
+        if (r) return r.turnText;
+      }
+      return i.text;
+    });
+    expect(texts).toEqual(['tell me about programs', 'and a typed question']);
+  });
+});

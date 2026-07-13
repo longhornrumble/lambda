@@ -48,6 +48,7 @@ const { MESSAGE_CHAR_LIMITS } = require('./capabilities');
 const conversationLock = require('./conversationLock');
 const { classifyMetaSendError } = require('./metaSendErrors');
 const { buildMessengerV5Prompt, resolveMessengerModelId } = require('./prompt_messenger');
+const { renderMessengerActions, resolveCtaPayload } = require('./renderMessengerActions');
 const { computeSessionWindow } = require('./sessionWindow');
 const { createTailParser } = require('../shared/prompt/streamTail');
 const { validateActionIds } = require('../shared/prompt/prompt_v5');
@@ -94,6 +95,9 @@ const DEFAULT_DISCLOSURE_LINE =
 
 /** Default C7 drain-cap reply (config: messenger_behavior.strings.rate_limited) */
 const DEFAULT_RATE_LIMITED = "You're sending messages faster than I can keep up — one moment please.";
+
+/** Default button-template lead-in (config: messenger_behavior.strings.button_intro) */
+const DEFAULT_BUTTON_INTRO = 'Tap below to take the next step:';
 const DEFAULT_UNSUPPORTED_INPUT_FALLBACK =
   "Sorry, I can't read that kind of message yet — could you type it instead?";
 
@@ -641,6 +645,16 @@ async function sendTypingIndicator(pageId, psid, accessToken, channelType) {
  * @returns {Promise<object>}
  */
 async function sendMessengerMessage(pageId, psid, text, accessToken, channelType) {
+  return sendStructuredMessage(pageId, psid, { text }, accessToken, channelType);
+}
+
+/**
+ * Send an arbitrary message payload (text, text+quick_replies, or an
+ * attachment/template) through the per-channel Send API plumbing (M4).
+ *
+ * @param {object} messagePayload — the `message` object for the Send API
+ */
+async function sendStructuredMessage(pageId, psid, messagePayload, accessToken, channelType) {
   let url, headers, body;
 
   if (channelType === 'instagram') {
@@ -654,7 +668,7 @@ async function sendMessengerMessage(pageId, psid, text, accessToken, channelType
     headers = { 'Content-Type': 'application/json' };
     body = JSON.stringify({
       recipient: { id: psid },
-      message: { text },
+      message: messagePayload,
       access_token: accessToken,
     });
   } else {
@@ -663,7 +677,7 @@ async function sendMessengerMessage(pageId, psid, text, accessToken, channelType
     headers = { 'Content-Type': 'application/json' };
     body = JSON.stringify({
       recipient: { id: psid },
-      message: { text },
+      message: messagePayload,
       messaging_type: 'RESPONSE',
       access_token: accessToken,
     });
@@ -745,17 +759,48 @@ function splitMessage(text, maxChars = MESSAGE_CHAR_LIMITS.messenger) {
  * @param {string} accessToken
  * @returns {Promise<void>}
  */
-async function sendResponseMessages(pageId, psid, text, accessToken, channelType) {
+async function sendResponseMessages(pageId, psid, text, accessToken, channelType, actions = null) {
   const maxChars = MESSAGE_CHAR_LIMITS[channelType] || MESSAGE_CHAR_LIMITS.messenger;
   const chunks = splitMessage(text, maxChars);
   log('INFO', 'Sending response', { pageId, psid, chunks: chunks.length, totalChars: text.length, channelType });
+
+  const quickReplies = actions?.quickReplies?.length ? actions.quickReplies : null;
+  const buttons = actions?.buttons?.length ? actions.buttons : null;
 
   for (let i = 0; i < chunks.length; i++) {
     if (i > 0) {
       await sleep(SPLIT_MESSAGE_DELAY_MS);
     }
-    await sendMessengerMessage(pageId, psid, chunks[i], accessToken, channelType);
+    const isFinalChunk = i === chunks.length - 1;
+    // C9 (v1.1 mixed-case rule): quick replies ride the LAST message of the
+    // turn — the final text chunk normally, the button template below when
+    // buttons exist (Meta only displays QRs on the most recent message).
+    const attachQrHere = isFinalChunk && quickReplies && !buttons;
+    await sendStructuredMessage(
+      pageId,
+      psid,
+      attachQrHere ? { text: chunks[i], quick_replies: quickReplies } : { text: chunks[i] },
+      accessToken,
+      channelType
+    );
     log('INFO', 'Sent message chunk', { pageId, psid, chunk: i + 1, of: chunks.length });
+  }
+
+  if (buttons) {
+    await sleep(SPLIT_MESSAGE_DELAY_MS);
+    const templateMessage = {
+      attachment: {
+        type: 'template',
+        payload: {
+          template_type: 'button',
+          text: actions.buttonIntro,
+          buttons,
+        },
+      },
+    };
+    if (quickReplies) templateMessage.quick_replies = quickReplies; // C9 v1.1: QRs on the turn's last message
+    await sendStructuredMessage(pageId, psid, templateMessage, accessToken, channelType);
+    log('INFO', 'Sent button template', { pageId, psid, buttons: buttons.length, withQuickReplies: !!quickReplies });
   }
 }
 
@@ -1155,7 +1200,7 @@ exports.handler = async function handler(event) {
   }
 
   // Sanitise user input before any processing
-  const sanitizedInput = sanitizeUserInput(messageText);
+  let sanitizedInput = sanitizeUserInput(messageText);
   if (!sanitizedInput) {
     log('WARN', 'sanitizeUserInput returned empty string — dropping message', {
       pageId,
@@ -1256,8 +1301,18 @@ exports.handler = async function handler(event) {
           if (released) return;
           continue; // new pending raced in between claim and release — drain again
         }
+        // C7 step 3: structured members (quick_reply with a PIC1 payload)
+        // route via their C3 handlers individually — the canonical CTA text
+        // joins the combined turn, not the raw tap label.
         const texts = batch
-          .map((i) => (i && typeof i.text === 'string' ? i.text : null))
+          .map((i) => {
+            if (!i) return null;
+            if (typeof i.quickReplyPayload === 'string' && i.quickReplyPayload.startsWith('PIC1:')) {
+              const resolved = resolveCtaPayload(i.quickReplyPayload, config);
+              if (resolved) return resolved.turnText;
+            }
+            return typeof i.text === 'string' ? i.text : null;
+          })
           .filter((t) => t && t.length > 0);
         const lastMid = batch.length > 0 ? batch[batch.length - 1].mid || null : null;
         batch = [];
@@ -1334,6 +1389,29 @@ exports.handler = async function handler(event) {
       error: configErr.message,
     });
     config = {};
+  }
+
+  // ── 0b2. Structured payload routing (contract C3, M4) ────────────────────
+  // A PIC1:cta quick-reply tap or postback resolves to the free text its CTA
+  // stands for (send_query -> query, show_info -> prompt). Anything that
+  // does not resolve — unknown route, unknown id, future PIC2 — falls through
+  // UNCHANGED as free text into RAG (C3's forever-rule for stale buttons).
+  const pic1Payload =
+    typeof event.quickReplyPayload === 'string' && event.quickReplyPayload.startsWith('PIC1:')
+      ? event.quickReplyPayload
+      : event.isPostback === true && typeof messageText === 'string' && messageText.startsWith('PIC1:')
+        ? messageText
+        : null;
+  if (pic1Payload) {
+    const resolved = resolveCtaPayload(pic1Payload, config);
+    if (resolved) {
+      sanitizedInput = sanitizeUserInput(resolved.turnText) || resolved.turnText;
+      log('INFO', 'PIC1 payload routed to CTA turn text', { ctaId: resolved.ctaId });
+    } else {
+      log('INFO', 'Unresolvable PIC1 payload — treating as free text (C3)', {
+        payloadPrefix: pic1Payload.slice(0, 24),
+      });
+    }
   }
 
   // ── 0c. Postback handling ────────────────────────────────────────────────
@@ -1520,8 +1598,27 @@ exports.handler = async function handler(event) {
       }
     }
 
+    // M4: render the turn's validated actions per C9 (same-turn send; QRs on
+    // the last message; button template after the final text chunk).
+    let turnActions = null;
+    if (messengerFlagOn && selectedActionIds.length > 0) {
+      const rendered = renderMessengerActions(selectedActionIds, config, log);
+      if (rendered.quickReplies.length > 0 || rendered.buttons.length > 0) {
+        // Meta requires template text non-empty and <=640 chars — a bad
+        // config override must degrade to the default, not fail the send.
+        const rawIntro = getMessengerString(config, channelType, 'button_intro', DEFAULT_BUTTON_INTRO);
+        turnActions = {
+          ...rendered,
+          buttonIntro:
+            typeof rawIntro === 'string' && rawIntro.trim().length > 0
+              ? rawIntro.trim().slice(0, 640)
+              : DEFAULT_BUTTON_INTRO,
+        };
+      }
+    }
+
     try {
-      await sendResponseMessages(pageId, psid, responseText, pageAccessToken, channelType);
+      await sendResponseMessages(pageId, psid, responseText, pageAccessToken, channelType, turnActions);
       log('INFO', 'Response delivered to Messenger', {
         pageId,
         psid,
