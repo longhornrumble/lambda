@@ -460,7 +460,17 @@ describe('POST /webhook — error resilience', () => {
     expect(lambdaMock).not.toHaveReceivedCommand(InvokeCommand);
   });
 
-  test('ignores message echo events', async () => {
+  test('forwards echo events with messageText:null and psid from recipient.id (C1)', async () => {
+    ddbMock.on(GetItemCommand).resolves({
+      Item: {
+        tenantId:   { S: TENANT_ID },
+        tenantHash: { S: TENANT_HASH },
+        enabled:    { BOOL: true },
+      },
+    });
+    ddbMock.on(PutItemCommand).resolves({});
+    lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+
     const echoBody = {
       object: 'page',
       entry: [
@@ -476,6 +486,7 @@ describe('POST /webhook — error resilience', () => {
                 mid: MESSAGE_MID,
                 text: 'Echo of our own message',
                 is_echo: true,
+                app_id: 1122334455,
               },
             },
           ],
@@ -487,7 +498,14 @@ describe('POST /webhook — error resilience', () => {
 
     const res = await handler(event);
     expect(res.statusCode).toBe(200);
-    expect(lambdaMock).not.toHaveReceivedCommand(InvokeCommand);
+    expect(lambdaMock).toHaveReceivedCommandTimes(InvokeCommand, 1);
+
+    const invokeCall = lambdaMock.commandCalls(InvokeCommand)[0];
+    const payload = JSON.parse(Buffer.from(invokeCall.args[0].input.Payload).toString('utf8'));
+    expect(payload.eventKind).toBe('echo');
+    expect(payload.psid).toBe(PSID);          // customer, NOT the page (C1 inversion rule)
+    expect(payload.messageText).toBeNull();   // never forward echo text (loop guard, C1 v1.1)
+    expect(payload.appId).toBe('1122334455');
   });
 });
 
@@ -503,5 +521,137 @@ describe('Unsupported HTTP methods', () => {
     };
     const res = await handler(event);
     expect(res.statusCode).toBe(405);
+  });
+});
+
+// ─── Tests: payload v2 (contract C1 — M1a) ───────────────────────────────────────
+
+const FIXTURES = require('./__fixtures__/messagingEvents');
+
+/** Wrap a single messaging event in a signed webhook POST. */
+function makeEventPost(messagingEvent, { objectType = 'page', standby = false } = {}) {
+  const entry = { id: PAGE_ID, time: Date.now() };
+  if (standby) entry.standby = [messagingEvent];
+  else entry.messaging = [messagingEvent];
+  const rawBody = JSON.stringify({ object: objectType, entry: [entry] });
+  return makePostEvent({ body: rawBody, signature: makeSignature(rawBody) });
+}
+
+function mockHappyPath() {
+  ddbMock.on(GetItemCommand).resolves({
+    Item: {
+      tenantId:   { S: TENANT_ID },
+      tenantHash: { S: TENANT_HASH },
+      enabled:    { BOOL: true },
+    },
+  });
+  ddbMock.on(PutItemCommand).resolves({});
+  lambdaMock.on(InvokeCommand).resolves({ StatusCode: 202 });
+}
+
+function invokedPayloads() {
+  return lambdaMock
+    .commandCalls(InvokeCommand)
+    .map((call) => JSON.parse(Buffer.from(call.args[0].input.Payload).toString('utf8')));
+}
+
+describe('POST /webhook — payload v2 (C1)', () => {
+  test('v1 fields are byte-identical for a text message (pinned contract)', async () => {
+    mockHappyPath();
+    const res = await handler(makeEventPost(FIXTURES.fbText));
+    expect(res.statusCode).toBe(200);
+
+    const [payload] = invokedPayloads();
+    // Pinned v1 subset — any change here breaks the legacy processor contract
+    const v1 = (({ psid, messageText, pageId, tenantId, tenantHash, channelType, messageMid, isPostback }) =>
+      ({ psid, messageText, pageId, tenantId, tenantHash, channelType, messageMid, isPostback }))(payload);
+    expect(v1).toEqual({
+      psid: FIXTURES.PSID,
+      messageText: 'Hello from Messenger',
+      pageId: PAGE_ID,
+      tenantId: TENANT_ID,
+      tenantHash: TENANT_HASH,
+      channelType: 'messenger',
+      messageMid: FIXTURES.MID,
+      isPostback: false,
+    });
+    // v2 additions present
+    expect(payload.v).toBe(2);
+    expect(payload.eventKind).toBe('text');
+    expect(payload.timestamp).toBe(FIXTURES.TS);
+  });
+
+  test('attachment-only message → v2 invoke with eventKind attachment, messageText null', async () => {
+    mockHappyPath();
+    await handler(makeEventPost(FIXTURES.fbAttachmentImage));
+    const [payload] = invokedPayloads();
+    expect(payload.eventKind).toBe('attachment');
+    expect(payload.messageText).toBeNull();
+    expect(payload.attachmentTypes).toEqual(['image']);
+  });
+
+  test('edit event bypasses the dedup guard (idempotent downstream)', async () => {
+    mockHappyPath();
+    await handler(makeEventPost(FIXTURES.fbEdit));
+    expect(lambdaMock).toHaveReceivedCommandTimes(InvokeCommand, 1);
+    // The only PutItem in this Lambda is the dedup write — it must NOT run for edits
+    expect(ddbMock).not.toHaveReceivedCommand(PutItemCommand);
+    const [payload] = invokedPayloads();
+    expect(payload.eventKind).toBe('edit');
+    expect(payload.targetMid).toBe(FIXTURES.MID);
+    expect(payload.editedText).toBe('edited text');
+  });
+
+  test('FB message_deletions with 2 mids → 2 delete invokes, no dedup writes', async () => {
+    mockHappyPath();
+    await handler(makeEventPost(FIXTURES.fbDeleteTwoMids));
+    const payloads = invokedPayloads();
+    expect(payloads).toHaveLength(2);
+    expect(payloads.map((p) => p.targetMid).sort()).toEqual(['m_deleted_1', 'm_deleted_2']);
+    expect(ddbMock).not.toHaveReceivedCommand(PutItemCommand);
+  });
+
+  test('standby-channel event → invoke with isStandby true', async () => {
+    mockHappyPath();
+    await handler(makeEventPost(FIXTURES.fbText, { standby: true }));
+    const [payload] = invokedPayloads();
+    expect(payload.eventKind).toBe('text');
+    expect(payload.isStandby).toBe(true);
+  });
+
+  test('metadata-only events (reaction, receipts, referral, feedback) → 200, zero invokes', async () => {
+    mockHappyPath();
+    for (const fixture of [
+      FIXTURES.fbReaction,
+      FIXTURES.fbDeliveryReceipt,
+      FIXTURES.fbReadReceipt,
+      FIXTURES.fbStandaloneReferral,
+      FIXTURES.fbResponseFeedback,
+    ]) {
+      const res = await handler(makeEventPost(fixture));
+      expect(res.statusCode).toBe(200);
+    }
+    expect(lambdaMock).not.toHaveReceivedCommand(InvokeCommand);
+  });
+
+  test('quick-reply tap → quickReplyPayload populated, messageText preserved (v1 compat)', async () => {
+    mockHappyPath();
+    await handler(makeEventPost(FIXTURES.igQuickReply, { objectType: 'instagram' }));
+    const [payload] = invokedPayloads();
+    expect(payload.eventKind).toBe('quick_reply');
+    expect(payload.quickReplyPayload).toBe('PIC1:cta:apply');
+    expect(payload.messageText).toBe('How do I apply?');
+    expect(payload.channelType).toBe('instagram');
+  });
+
+  test('event without Meta timestamp → receipt-time fallback (timestamp always present)', async () => {
+    mockHappyPath();
+    const noTs = { ...FIXTURES.fbText };
+    delete noTs.timestamp;
+    const before = Date.now();
+    await handler(makeEventPost(noTs));
+    const [payload] = invokedPayloads();
+    expect(typeof payload.timestamp).toBe('number');
+    expect(payload.timestamp).toBeGreaterThanOrEqual(before);
   });
 });

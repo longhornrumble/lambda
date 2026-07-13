@@ -37,7 +37,8 @@ The payload `Meta_Webhook_Handler` sends via async `InvokeCommand` to `Meta_Resp
 {
   v: 2,                        // payload schema version marker
   eventKind: 'text' | 'postback' | 'quick_reply' | 'attachment' | 'sticker'
-           | 'edit' | 'delete' | 'echo' | 'standby' | 'unsupported',
+           | 'edit' | 'delete' | 'echo' | 'unsupported',
+           // standby-ness is NOT an eventKind — it rides the isStandby flag (v1.1)
   timestamp: number,           // Meta messaging[].timestamp (epoch ms) — REQUIRED in every v2 payload
   quickReplyPayload: string|null,  // message.quick_reply.payload (C3 namespace); null unless eventKind='quick_reply'
   appId: string|null,          // message.app_id where Meta provides it (echoes); else null
@@ -50,6 +51,10 @@ The payload `Meta_Webhook_Handler` sends via async `InvokeCommand` to `Meta_Resp
 ```
 
 **`psid` inversion on echoes:** Meta inverts sender/recipient on echo events — the business's own account is `sender.id`, the customer is `recipient.id` (research report 04, IG echo marker). For `eventKind:'echo'` (main or standby channel), **`psid` MUST be read from `recipient.id`**, so the session key `meta:{pageId}:{psid}` stays the customer's conversation. For every other kind, `psid` = `sender.id` as today.
+
+**Echo `messageText` is ALWAYS null (v1.1, loop guard):** echoes carry `message.text` (our own bot reply), and a processor that reads it as a user turn would answer it — bot answering itself, an infinite loop. This is not hypothetical: the *legacy* processor treats any non-empty `messageText` as a user message, so forwarding echo text during the M1a→M1b deploy gap would loop live. The webhook therefore never populates `messageText` on echo payloads; M6b's pause logic needs only `psid`/`appId`/`timestamp`. (Also PII minimization — no need to re-ship reply text.)
+
+**`timestamp` fallback (v1.1):** when Meta omits `messaging[].timestamp` on an event shape, the webhook stamps receipt time (`Date.now()`), so `timestamp` is present in every v2 payload as required. Receipt time is conservative for the 24h send-window guard (never older than the true event time).
 
 ### Classification rules (webhook side, M1a)
 
@@ -290,4 +295,5 @@ Attachment rule: renderings attach to the **same turn's send sequence** (no cros
 
 | Date | Change | PR |
 |---|---|---|
-| 2026-07-13 | C1–C9 v1.0 frozen (M0), after tech-lead-reviewer adversarial pass — 3 blocking + 4 should-fix findings applied pre-freeze (echo `psid` inversion; C7 conditional release + drain semantics + TTL invariant; C4 pending shape carries v2 fields; metadata-only-event skip rule; `replyTo` context; C9 split-reply rule) | (this PR) |
+| 2026-07-13 | C1–C9 v1.0 frozen (M0), after tech-lead-reviewer adversarial pass — 3 blocking + 4 should-fix findings applied pre-freeze (echo `psid` inversion; C7 conditional release + drain semantics + TTL invariant; C4 pending shape carries v2 fields; metadata-only-event skip rule; `replyTo` context; C9 split-reply rule) | lambda#433 |
+| 2026-07-13 | **C1 → v1.1** (M1a implementation findings, additive clarifications): echo `messageText` always null (loop guard — legacy processor would answer our own echoed replies during the deploy gap); `timestamp` falls back to receipt time when Meta omits it; `'standby'` removed from the eventKind enum (standby-ness rides `isStandby`, matching the prose rule); NOTE for M1b: edit/delete bypass webhook dedup, so Meta redeliveries double-invoke — processor edit/delete handling MUST be idempotent | (M1a PR) |
