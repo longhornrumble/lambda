@@ -40,6 +40,9 @@
  *   SES_FROM_EMAIL           — M6a staff-escalation sender; '' disables the email (escalation.js)
  *   FB_INBOX_APP_ID          — M6a pass_thread_control target for Messenger (escalation.js)
  *   IG_INBOX_APP_ID          — M6a pass_thread_control target for Instagram (escalation.js)
+ *   META_APP_ID              — M6b: this Lambda's own Meta App ID, to tell our own echoed
+ *                              sends apart from a foreign (staff/other-tool) reply on the
+ *                              same thread; '' (default) disables echo-watch (matches nothing)
  */
 
 const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
@@ -89,6 +92,12 @@ const RECENT_MESSAGES_TABLE =
   process.env.RECENT_MESSAGES_TABLE || 'picasso-recent-messages';
 // C7 serialization (M1c). Empty ⇒ serialization disabled (fail-open for local/dev).
 const CONVERSATION_STATE_TABLE = process.env.CONVERSATION_STATE_TABLE || '';
+// M6b echo-watch (see file header). Read once at module load like the other
+// config constants above — '' disables the appId comparison entirely (an
+// unset value can never equal a populated appId), so no per-invocation
+// config load or DDB write can ever fire; a one-time note is logged below
+// (after `log` is defined) so a cold start makes the disabled state visible.
+const META_APP_ID = process.env.META_APP_ID || '';
 const KMS_KEY_ID = process.env.KMS_KEY_ID || 'alias/picasso-channel-tokens';
 const ANALYTICS_QUEUE_URL =
   process.env.ANALYTICS_QUEUE_URL ||
@@ -147,6 +156,12 @@ function log(level, message, meta = {}) {
   console[level === 'ERROR' ? 'error' : level === 'WARN' ? 'warn' : 'log'](
     JSON.stringify({ level, message, service: 'MetaResponseProcessor', ...meta })
   );
+}
+
+// M6b: log the echo-watch disabled state once per cold start (not once per
+// invocation — this runs at module load, alongside the constant above).
+if (!META_APP_ID) {
+  log('INFO', 'META_APP_ID not set — echo-watch pause disabled (appId comparison matches nothing)');
 }
 
 // ─── Analytics emission ───────────────────────────────────────────────────────
@@ -505,9 +520,19 @@ function getMessengerString(config, channelType, key, fallback) {
  * gate. Callers additionally gate this on the MESSENGER_CHANNEL flag so
  * flag-off tenants issue no GetItem at all (byte-identical baseline).
  *
+ * M6b: an expired row found here is opportunistically cleaned up (see
+ * `escalation.deleteExpiredPauseRow`) — the resume semantics themselves
+ * don't depend on the delete (expiry is already read-time authoritative
+ * above), this is just housekeeping.
+ *
  * @param {string} sessionId — `meta:{pageId}:{psid}`
  * @returns {Promise<boolean>}
  */
+// ACCEPTED RACE (M6b review): the pause check runs ONCE, before lock
+// acquisition. A pause row landing (staff echo) while a bot turn is already
+// in flight does NOT recall that turn's reply — the reply was owed before
+// staff took over, and recalling mid-flight sends is not possible anyway.
+// Every SUBSEQUENT inbound goes silent. Pinned by the in-flight race test.
 async function isConversationPaused(sessionId) {
   if (!CONVERSATION_STATE_TABLE) return false;
   try {
@@ -518,13 +543,113 @@ async function isConversationPaused(sessionId) {
       })
     );
     const nowSec = Math.floor(Date.now() / 1000);
-    return !!(pauseResult.Item && pauseResult.Item.expires_at > nowSec);
+    if (pauseResult.Item && pauseResult.Item.expires_at > nowSec) {
+      return true;
+    }
+    if (pauseResult.Item) {
+      // M6b: found a stale (expired) pause row — opportunistic best-effort
+      // cleanup so it doesn't linger until DynamoDB's own TTL sweep (which
+      // can lag). Conditioned inside deleteExpiredPauseRow so a pause
+      // refreshed between this read and the delete (a fresh echo-watch or
+      // escalation) is never removed. Never affects the return value below —
+      // this turn already proceeds normally either way.
+      try {
+        await escalation.deleteExpiredPauseRow({
+          client: dynamodb,
+          tableName: CONVERSATION_STATE_TABLE,
+          sessionId,
+          nowSec,
+        });
+      } catch (cleanupErr) {
+        log('WARN', 'Stale pause-row cleanup failed (non-fatal — TTL sweep will catch it)', {
+          sessionId,
+          error: cleanupErr.message,
+        });
+      }
+    }
+    return false;
   } catch (pauseErr) {
     log('WARN', 'Pause-state lookup failed — proceeding normally (fail-open)', {
       sessionId,
       error: pauseErr.message,
     });
     return false;
+  }
+}
+
+/**
+ * M6b — echo-watch pause: belt-and-suspenders coexistence that works even
+ * when a tenant hasn't configured Conversation Routing (unlike M6a's
+ * `pass_thread_control` handoff, this doesn't depend on it — it only reads
+ * the echo Meta already sends us for every reply on the thread).
+ *
+ * Every echo OUR OWN sends produce carries `appId === META_APP_ID` — the
+ * overwhelmingly common case — and must cost ZERO extra calls, so that
+ * check runs first and returns immediately (no config load, no DDB call).
+ * Only when `appId` is present, `META_APP_ID` is configured, AND they
+ * differ (a human staff reply typed in Business Suite, or another
+ * connected tool) do we load the tenant config (cached by bedrock-core) to
+ * check the MESSENGER_CHANNEL flag, then write/refresh the C4 pause row —
+ * mirroring "staff reply auto-takes control" locally. Each new foreign-app
+ * echo refreshes (overwrites) the row, extending the 24h window, matching
+ * the "staff still active" semantic (C4 `pause` row, `writePauseRow`
+ * overwrite-is-fine contract).
+ *
+ * @param {{sessionId: string, appId: string|null, tenantHash: string}} params
+ * @returns {Promise<void>}
+ */
+async function handleEchoEvent({ sessionId, appId, tenantHash }) {
+  if (!appId || !META_APP_ID || appId === META_APP_ID) {
+    log('INFO', 'Echo event — no reply, no history write', { sessionId, appId: appId || null });
+    return;
+  }
+
+  // Foreign-app echo (rare): a human or another tool replied on this thread.
+  let echoConfig = {};
+  try {
+    echoConfig = (await loadConfig(tenantHash)) || {};
+  } catch (configErr) {
+    log('WARN', 'Failed to load tenant config for echo-watch — skipping pause', {
+      sessionId,
+      appId,
+      error: configErr.message,
+    });
+    return;
+  }
+
+  if (echoConfig.feature_flags?.MESSENGER_CHANNEL !== true) {
+    log('INFO', 'Foreign-app echo observed — MESSENGER_CHANNEL off, echo-watch pause skipped', {
+      sessionId,
+      appId,
+    });
+    return;
+  }
+
+  if (!CONVERSATION_STATE_TABLE) {
+    log('INFO', 'Foreign-app echo observed — CONVERSATION_STATE_TABLE unset, echo-watch pause skipped', {
+      sessionId,
+      appId,
+    });
+    return;
+  }
+
+  try {
+    await escalation.writePauseRow({
+      client: dynamodb,
+      tableName: CONVERSATION_STATE_TABLE,
+      sessionId,
+      reason: 'echo_watch',
+    });
+    log('INFO', 'Echo-watch pause written — foreign-app reply detected, bot standing down', {
+      sessionId,
+      appId,
+    });
+  } catch (pauseErr) {
+    log('ERROR', 'Failed to write echo-watch pause row', {
+      sessionId,
+      appId,
+      error: pauseErr.message,
+    });
   }
 }
 
@@ -1254,13 +1379,26 @@ exports.handler = async function handler(event) {
     const v2ChannelType = event.channelType || 'messenger';
     const sessionId = `meta:${v2PageId}:${v2Psid}`;
 
-    // ── echo / standby: staff/self traffic — never answer, never store ────
-    if (eventKind === 'echo' || event.isStandby === true) {
-      log('INFO', 'Echo or standby event — no reply, no history write', {
-        sessionId,
-        eventKind,
-        isStandby: event.isStandby === true,
-      });
+    // ── echo: own-app sends return immediately (zero extra calls); a
+    // foreign-app echo (staff/other-tool reply) triggers M6b echo-watch pause
+    if (eventKind === 'echo') {
+      await handleEchoEvent({ sessionId, appId: event.appId ?? null, tenantHash: event.tenantHash });
+      return;
+    }
+
+    // ── standby (non-echo): staff owns the thread — never answer, never
+    // store. A standby TEXT event is a real user message (M6b: distinct log
+    // marker for soak observability — no behavior change beyond the log).
+    if (event.isStandby === true) {
+      if (eventKind === 'text') {
+        log('INFO', 'Standby user message observed (staff owns thread)', { sessionId, eventKind });
+      } else {
+        log('INFO', 'Echo or standby event — no reply, no history write', {
+          sessionId,
+          eventKind,
+          isStandby: true,
+        });
+      }
       return;
     }
 

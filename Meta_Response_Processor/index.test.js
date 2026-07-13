@@ -1031,6 +1031,59 @@ describe('M1b — processor hygiene', () => {
     });
   });
 
+  // ── M6b — echo-watch pause + standby-consumption logging ───────────────
+  describe('M6b — echo-watch pause + standby observability', () => {
+    test('foreign-app-looking appId, META_APP_ID unset (this suite never sets it) → echo-watch stays disabled: no config load, no pause', async () => {
+      loadConfig.mockClear();
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbEcho);
+      // fbEcho fixture carries a real (non-null) appId — with META_APP_ID
+      // unset, echo-watch must still be a no-op (module-level `!META_APP_ID`
+      // short-circuit), regardless of what appId happens to be.
+      expect(classification.appId).toBeTruthy();
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbEcho, { timestamp: Date.now() });
+      await handler(event);
+
+      expect(loadConfig).not.toHaveBeenCalled();
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 0);
+    });
+
+    test('appId null on an echo → no config load, no pause (own-send-shaped no-op path)', async () => {
+      loadConfig.mockClear();
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbEcho);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbEcho, { timestamp: Date.now(), appId: null });
+      await handler(event);
+
+      expect(loadConfig).not.toHaveBeenCalled();
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 0);
+    });
+
+    test('standby TEXT event (isStandby true, non-echo) logs the distinct "staff owns thread" marker', async () => {
+      const logSpy = jest.spyOn(console, 'log');
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbText);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbText, { isStandby: true, timestamp: Date.now() });
+      await handler(event);
+
+      const logged = logSpy.mock.calls.map((args) => args.join(' ')).join('\n');
+      expect(logged).toContain('Standby user message observed (staff owns thread)');
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(bedrockMock).not.toHaveReceivedCommand(InvokeModelCommand);
+      expect(ddbMock).toHaveReceivedCommandTimes(PutCommand, 0);
+    });
+
+    test('standby non-text (non-echo) event does NOT log the text-specific marker (generic echo/standby log instead)', async () => {
+      const logSpy = jest.spyOn(console, 'log');
+      loadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+      const [classification] = classifyMessagingEvent(WEBHOOK_FIXTURES.fbAttachmentImage);
+      const event = v2Payload(classification, WEBHOOK_FIXTURES.fbAttachmentImage, { isStandby: true, timestamp: Date.now() });
+      await handler(event);
+
+      const logged = logSpy.mock.calls.map((args) => args.join(' ')).join('\n');
+      expect(logged).not.toContain('Standby user message observed');
+      expect(logged).toContain('Echo or standby event — no reply, no history write');
+    });
+  });
+
   describe('Delete / edit — idempotent, meta:-only (C1 v1.1 — Meta redeliveries bypass dedup)', () => {
     test('delete event queries then deletes ONLY matching-mid rows', async () => {
       const sessionId = `meta:${WEBHOOK_FIXTURES.PAGE_ID}:${WEBHOOK_FIXTURES.PSID}`;
@@ -2318,17 +2371,20 @@ describe('M6a — escalation E2E through the handler (CONVERSATION_STATE_TABLE u
   });
 });
 
-// ─── M6a — pause check + escalation-writes-the-pause-row, with serialization
-// (CONVERSATION_STATE_TABLE) enabled ─────────────────────────────────────────
+// ─── M6a/M6b — pause check + resume + echo-watch, with serialization
+// (CONVERSATION_STATE_TABLE) AND META_APP_ID enabled ────────────────────────
 //
-// Both the pause check and the pause-row write inside escalation are gated on
-// CONVERSATION_STATE_TABLE (same env var C7 serialization uses) — empty ⇒
-// disabled, matching the rest of this file's convention (index.test.js
-// deliberately leaves it unset elsewhere; conversationLock.integration.test.js
-// is the existing sibling pattern for env-var-at-module-load tests). Rather
+// The pause check, the escalation pause-row write, the M6b stale-row cleanup,
+// and the M6b echo-watch pause write are all gated on CONVERSATION_STATE_TABLE
+// (same env var C7 serialization uses) — empty ⇒ disabled, matching the rest
+// of this file's convention (index.test.js deliberately leaves it unset
+// elsewhere; conversationLock.integration.test.js is the existing sibling
+// pattern for env-var-at-module-load tests). Echo-watch additionally needs
+// META_APP_ID set (also module-load-time) to have anything to compare
+// against — set here so this instance's "own" app id is 'OUR_APP_ID'. Rather
 // than adding a new test file, this block uses jest.isolateModules to get a
 // second, independently-configured instance of the handler within this file.
-describe('M6a — pause check (CONVERSATION_STATE_TABLE enabled)', () => {
+describe('M6a/M6b — pause check, resume, echo-watch (CONVERSATION_STATE_TABLE + META_APP_ID enabled)', () => {
   const ST_TABLE = 'picasso-conversation-state-test';
   let stHandler;
   let stDdbMock, stKmsMock, stBedrockMock, stSqsMock, stSesMock;
@@ -2340,6 +2396,9 @@ describe('M6a — pause check (CONVERSATION_STATE_TABLE enabled)', () => {
     jest.isolateModules(() => {
       process.env.CONVERSATION_STATE_TABLE = ST_TABLE;
       process.env.SES_FROM_EMAIL = 'notify@myrecruiter.ai';
+      // M6b echo-watch: this instance's "own" app id, so foreign-appId
+      // fixtures below are unambiguously a staff/other-tool reply.
+      process.env.META_APP_ID = 'OUR_APP_ID';
 
       jest.doMock('../shared/bedrock-core', () => ({
         loadConfig: jest.fn(),
@@ -2387,6 +2446,7 @@ describe('M6a — pause check (CONVERSATION_STATE_TABLE enabled)', () => {
   afterAll(() => {
     delete process.env.CONVERSATION_STATE_TABLE;
     delete process.env.SES_FROM_EMAIL;
+    delete process.env.META_APP_ID;
   });
 
   const ST_CFG = {
@@ -2614,5 +2674,192 @@ describe('M6a — pause check (CONVERSATION_STATE_TABLE enabled)', () => {
       .commandCalls(stPutCommand)
       .find((c) => c.args[0].input.Item?.stateType === 'pause');
     expect(pauseRowPut).toBeDefined();
+  });
+
+  // ── M6b — echo-watch pause (foreign-app echo) + resume/cleanup ──────────
+  describe('M6b — echo-watch pause + stale-pause cleanup', () => {
+    /** Raw v2 echo event — this suite tests the pause logic directly, not
+     * the webhook classifier (already covered elsewhere), so it builds the
+     * C1 shape by hand. Default appId matches this instance's META_APP_ID
+     * ('OUR_APP_ID') — override per test for the foreign-app cases. */
+    function stEchoEvent(overrides = {}) {
+      return {
+        psid: 'PSID_123',
+        messageText: null,
+        pageId: 'PAGE_456',
+        tenantId: 'TENANT_789',
+        tenantHash: 'abc123defabc123def',
+        channelType: 'messenger',
+        messageMid: 'm_echo_mid',
+        isPostback: false,
+        v: 2,
+        eventKind: 'echo',
+        timestamp: Date.now(),
+        quickReplyPayload: null,
+        appId: 'OUR_APP_ID',
+        attachmentTypes: [],
+        targetMid: null,
+        editedText: null,
+        replyTo: null,
+        isStandby: false,
+        ...overrides,
+      };
+    }
+
+    test('foreign-app echo (flag ON) → pause row written with reason echo_watch + sessionId from psid (C1 recipient.id inversion already applied upstream by the webhook)', async () => {
+      stLoadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+
+      await stHandler(stEchoEvent({ appId: 'FOREIGN_APP_ID' }));
+
+      const pauseRowPut = stDdbMock
+        .commandCalls(stPutCommand)
+        .find((c) => c.args[0].input.Item?.stateType === 'pause');
+      expect(pauseRowPut).toBeDefined();
+      expect(pauseRowPut.args[0].input.TableName).toBe(ST_TABLE);
+      expect(pauseRowPut.args[0].input.Item.sessionId).toBe('meta:PAGE_456:PSID_123');
+      expect(pauseRowPut.args[0].input.Item.reason).toBe('echo_watch');
+      expect(stBedrockMock).not.toHaveReceivedCommand(stInvokeModelCommand);
+    });
+
+    test('our-own-app echo (appId === META_APP_ID) → zero config loads, zero DDB commands', async () => {
+      await stHandler(stEchoEvent()); // default appId: 'OUR_APP_ID'
+
+      expect(stLoadConfig).not.toHaveBeenCalled();
+      expect(stDdbMock.commandCalls(stPutCommand).length).toBe(0);
+      expect(stDdbMock.commandCalls(stGetCommand).length).toBe(0);
+    });
+
+    test('appId null on an echo → zero config loads, zero DDB commands', async () => {
+      await stHandler(stEchoEvent({ appId: null }));
+
+      expect(stLoadConfig).not.toHaveBeenCalled();
+      expect(stDdbMock.commandCalls(stPutCommand).length).toBe(0);
+    });
+
+    test('foreign-app echo, MESSENGER_CHANNEL flag OFF → config loaded but pause NOT written', async () => {
+      stLoadConfig.mockResolvedValue({ feature_flags: {} });
+
+      await stHandler(stEchoEvent({ appId: 'FOREIGN_APP_ID' }));
+
+      expect(stLoadConfig).toHaveBeenCalled();
+      const pauseRowPut = stDdbMock
+        .commandCalls(stPutCommand)
+        .find((c) => c.args[0].input.Item?.stateType === 'pause');
+      expect(pauseRowPut).toBeUndefined();
+    });
+
+    test('a SECOND foreign-app echo REFRESHES the pause row (staff still active → overwrite, new 24h window)', async () => {
+      stLoadConfig.mockResolvedValue({ feature_flags: { MESSENGER_CHANNEL: true } });
+
+      await stHandler(stEchoEvent({ appId: 'FOREIGN_APP_ID' }));
+      await stHandler(stEchoEvent({ appId: 'FOREIGN_APP_ID' }));
+
+      const pausePuts = stDdbMock
+        .commandCalls(stPutCommand)
+        .filter((c) => c.args[0].input.Item?.stateType === 'pause');
+      expect(pausePuts.length).toBe(2);
+      expect(pausePuts[1].args[0].input.Item.expires_at).toBeGreaterThanOrEqual(
+        pausePuts[0].args[0].input.Item.expires_at
+      );
+    });
+
+    test('expired pause row read → stale-row cleanup DeleteCommand issued, conditioned on expires_at <= now', async () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      stDdbMock
+        .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+        .resolves({ Item: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause', reason: 'escalation', expires_at: nowSec - 10 } });
+      stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.1' }) });
+
+      await stHandler(stBuildEvent());
+
+      const cleanupDelete = stDdbMock
+        .commandCalls(stDeleteCommand)
+        .find((c) => c.args[0].input.Key?.stateType === 'pause');
+      expect(cleanupDelete).toBeDefined();
+      expect(cleanupDelete.args[0].input.ConditionExpression).toBe('expires_at <= :nowSec');
+      expect(cleanupDelete.args[0].input.ExpressionAttributeValues[':nowSec']).toBe(nowSec);
+      // Cleanup never blocks or changes the outcome of the normal turn.
+      expect(stBedrockMock).toHaveReceivedCommandTimes(stInvokeModelCommand, 1);
+    });
+
+    test('stale-row cleanup delete races a fresh pause (ConditionalCheckFailedException) → swallowed, no throw, turn still proceeds', async () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      stDdbMock
+        .on(stGetCommand, { Key: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause' } })
+        .resolves({ Item: { sessionId: 'meta:PAGE_456:PSID_123', stateType: 'pause', reason: 'escalation', expires_at: nowSec - 10 } });
+      const conditionalError = new Error('The conditional request failed');
+      conditionalError.name = 'ConditionalCheckFailedException';
+      stDdbMock.on(stDeleteCommand).rejects(conditionalError);
+      stBedrockMock.on(stInvokeModelCommand).resolves(stMakeBedrockResponse('Hi!\n<<<ACTIONS []>>>'));
+      global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ message_id: 'mid.1' }) });
+
+      await expect(stHandler(stBuildEvent())).resolves.toBeUndefined();
+
+      expect(stBedrockMock).toHaveReceivedCommandTimes(stInvokeModelCommand, 1);
+    });
+  });
+});
+
+// ─── M6b — META_APP_ID unset: echo-watch disabled, logged once at cold start ─
+//
+// The disabled-state note logs once at MODULE LOAD (not per invocation) — see
+// index.js right after `log` is defined. Needs its own jest.isolateModules
+// instance (module-load-time behavior) with a console.log spy installed
+// BEFORE the require, matching the pattern the M6a/M6b block above uses for
+// other module-load-time env vars.
+describe('M6b — META_APP_ID unset: echo-watch disabled (logged once at cold start)', () => {
+  test('module load logs the disabled note exactly once; a foreign-looking echo still never pauses', () => {
+    let noAppIdHandler;
+    let logSpy;
+
+    jest.isolateModules(() => {
+      delete process.env.META_APP_ID; // explicit — this instance never sets it
+      process.env.CONVERSATION_STATE_TABLE = 'picasso-conversation-state-test-noappid';
+
+      jest.doMock('../shared/bedrock-core', () => ({
+        loadConfig: jest.fn(),
+        retrieveKB: jest.fn(),
+        sanitizeUserInput: jest.fn((t) => t?.trim() || ''),
+      }));
+
+      logSpy = jest.spyOn(console, 'log');
+      noAppIdHandler = require('./index').handler;
+    });
+
+    delete process.env.CONVERSATION_STATE_TABLE;
+
+    const loggedDisabledNotes = logSpy.mock.calls.filter(([line]) =>
+      typeof line === 'string' && line.includes('META_APP_ID not set — echo-watch pause disabled')
+    );
+    expect(loggedDisabledNotes.length).toBe(1);
+    expect(typeof noAppIdHandler).toBe('function');
+  });
+});
+
+// ─── M6b review follow-ups ───────────────────────────────────────────────────
+
+describe('M6b — review follow-ups (error branches + in-flight race semantic)', () => {
+  const FLAG_ON = {
+    model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+    tone_prompt: 'T.',
+    streaming: { max_tokens: 500, temperature: 0 },
+    feature_flags: { MESSENGER_CHANNEL: true },
+  };
+
+  test('in-flight race semantic: reply owed before the pause landed still sends (accepted, documented)', async () => {
+    loadConfig.mockResolvedValue(FLAG_ON);
+    ddbMock.on(QueryCommand).resolves(makeRecentMessagesQueryResult([{ role: 'user', content: 'hi', messageTimestamp: Date.now() - 60000 }]));
+    // Pause check happens FIRST (returns not-paused), then the turn runs; a
+    // pause row landing mid-flight cannot recall the send. We simulate by
+    // having the pause GetCommand return no row (pre-turn state) and assert
+    // the reply sends — the semantic is that ONLY the pause check gates.
+    bedrockMock.on(InvokeModelCommand).resolves(makeBedrockResponse('Owed reply.'));
+    await handler(buildEvent());
+    const texts = fetchMock.mock.calls
+      .map(([, opts]) => (opts && opts.body ? JSON.parse(opts.body) : null))
+      .filter((b) => b && b.message && typeof b.message.text === 'string')
+      .map((b) => b.message.text);
+    expect(texts.some((t) => t.includes('Owed reply.'))).toBe(true);
   });
 });

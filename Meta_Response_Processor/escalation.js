@@ -1,13 +1,21 @@
 'use strict';
 
 /**
- * M6a — Escalation: transfer + notify (docs/messenger/CONTRACTS.md C2/C4).
+ * M6a/M6b — Escalation + coexistence: transfer + notify + pause-row lifecycle
+ * (docs/messenger/CONTRACTS.md C2/C4).
  *
  * "Talk to a human" intent detection + the three-step handoff:
  *   1. pass_thread_control to the tenant's inbox app (Business Suite inbox)
  *   2. a 24h pause row in the C4 conversation-state table (bot stands down)
  *   3. a best-effort SES email to staff (deep link only — no conversation
  *      content, no psid; G-P2 PII minimization)
+ *
+ * M6b extends the pause row with a second writer: `reason: 'echo_watch'`
+ * (index.js `handleEchoEvent`) pauses the bot when a foreign-app echo shows
+ * a human/other tool replying on the thread, even when the tenant hasn't
+ * configured Conversation Routing (belt-and-suspenders vs. M6a's
+ * thread-control handoff). `deleteExpiredPauseRow` is M6b's opportunistic
+ * cleanup of a row `isConversationPaused` (index.js) already found expired.
  *
  * Every function here is defensive on the escalation *side effects*
  * (thread-control handoff, email) — a tenant that hasn't configured
@@ -27,7 +35,7 @@
  */
 
 const { SendEmailCommand } = require('@aws-sdk/client-ses');
-const { PutCommand } = require('@aws-sdk/lib-dynamodb');
+const { PutCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 
 const DEFAULT_FB_INBOX_APP_ID = '263902037430900';
 const DEFAULT_IG_INBOX_APP_ID = '1217981644879628';
@@ -166,17 +174,19 @@ async function passThreadControl({ pageId, psid, channelType, accessToken, metad
 
 /**
  * Write the C4 `pause` row: bot stands down for ~24h while staff owns the
- * thread (M6b consumes this to resume). Plain PutItem — an escalation retry
- * overwriting an existing pause row is fine (idempotent).
+ * thread. Plain PutItem — overwriting an existing pause row is fine
+ * (idempotent for an escalation retry; for M6b echo-watch it's the intended
+ * "staff still active" refresh — each new foreign-app echo extends the 24h
+ * window).
  *
  * Does NOT catch errors itself — the caller decides how loud to be about a
  * failed pause write (index.js logs ERROR and continues; a missing pause row
  * just means the next inbound gets a normal turn instead of standing down).
  *
- * @param {{client: object, tableName: string, sessionId: string}} params
+ * @param {{client: object, tableName: string, sessionId: string, reason?: 'escalation'|'echo_watch'}} params
  * @returns {Promise<void>}
  */
-async function writePauseRow({ client, tableName, sessionId }) {
+async function writePauseRow({ client, tableName, sessionId, reason = 'escalation' }) {
   const nowMs = Date.now();
   await client.send(
     new PutCommand({
@@ -184,7 +194,7 @@ async function writePauseRow({ client, tableName, sessionId }) {
       Item: {
         sessionId,
         stateType: 'pause',
-        reason: 'escalation',
+        reason,
         paused_at: nowMs,
         updated_at: nowMs,
         schema_version: 1,
@@ -192,6 +202,41 @@ async function writePauseRow({ client, tableName, sessionId }) {
       },
     })
   );
+}
+
+/**
+ * M6b — opportunistic best-effort cleanup of a pause row already found
+ * expired (`expires_at <= nowSec`) by the caller's read. Not load-bearing for
+ * correctness (`isConversationPaused` already treats an expired row as
+ * "not paused" on read), just housekeeping so a stale row doesn't linger
+ * until DynamoDB's own TTL sweep (which can lag — TTL deletion is
+ * best-effort and not instantaneous).
+ *
+ * Conditioned on `expires_at <= :nowSec` so a pause refreshed BETWEEN the
+ * caller's read and this delete (e.g. another foreign-app echo just
+ * extended it) is never removed — the condition failing
+ * (ConditionalCheckFailedException) is the expected, silent outcome of that
+ * race, not an error.
+ *
+ * @param {{client: object, tableName: string, sessionId: string, nowSec: number}} params
+ * @returns {Promise<void>}
+ */
+async function deleteExpiredPauseRow({ client, tableName, sessionId, nowSec }) {
+  try {
+    await client.send(
+      new DeleteCommand({
+        TableName: tableName,
+        Key: { sessionId, stateType: 'pause' },
+        ConditionExpression: 'expires_at <= :nowSec',
+        ExpressionAttributeValues: { ':nowSec': nowSec },
+      })
+    );
+  } catch (err) {
+    if (err.name === 'ConditionalCheckFailedException') {
+      return; // a fresh pause landed in between — never delete it
+    }
+    throw err;
+  }
 }
 
 // ─── Staff email (SES) ────────────────────────────────────────────────────────
@@ -296,6 +341,7 @@ module.exports = {
   detectEscalationIntent,
   passThreadControl,
   writePauseRow,
+  deleteExpiredPauseRow,
   sendEscalationEmail,
   DEFAULT_FB_INBOX_APP_ID,
   DEFAULT_IG_INBOX_APP_ID,
