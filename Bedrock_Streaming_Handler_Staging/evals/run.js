@@ -36,13 +36,13 @@ const {
   V4_STEP2_INFERENCE_PARAMS,
   V4_CONVERSATION_PROMPT_VERSION,
   ACTION_SELECTOR_PROMPT_VERSION,
-} = require('../prompt_v4');
+} = require('../../shared/prompt/prompt_v4');
 const {
   buildV5TurnPrompt,
   V5_TURN_PROMPT_VERSION,
   V5_TURN_INFERENCE_PARAMS,
-} = require('../prompt_v5');
-const { createTailParser } = require('../streamTail');
+} = require('../../shared/prompt/prompt_v5');
+const { createTailParser } = require('../../shared/prompt/streamTail');
 const {
   GROUNDEDNESS_JUDGE_PROMPT_VERSION,
   buildGroundednessJudgePrompt,

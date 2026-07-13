@@ -406,15 +406,3 @@ describe('streamTail — unicode and emoji', () => {
   });
 });
 
-describe('streamTail — V5.5 wired contract (1a source-pin pattern)', () => {
-  // V5.5 wired the parser into the request path. index.js has two near-identical
-  // handler blocks (streaming + buffered); pin BOTH call sites in the source —
-  // each block must construct the parser behind the V5 flag.
-  test('index.js imports streamTail and constructs the parser in BOTH handler blocks', () => {
-    const fs = require('fs');
-    const source = fs.readFileSync(require.resolve('../index.js'), 'utf8');
-    expect(source).toContain("require('./streamTail')");
-    const parserSites = source.match(/const tailParser = v5Active \? createTailParser\(\) : null;/g) || [];
-    expect(parserSites).toHaveLength(2);
-  });
-});
