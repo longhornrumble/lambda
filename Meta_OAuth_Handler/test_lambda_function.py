@@ -105,6 +105,21 @@ class TestGetOAuthUrl(unittest.TestCase):
         self.assertEqual(response["statusCode"], 400)
 
     @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    def test_config_id_replaces_scope_when_env_set(self, _mock_secret):
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        with patch.object(lf, "_META_LOGIN_CONFIG_ID", "CONFIG_992"):
+            event = _make_event("GET", "/meta/oauth/url", {"tenant_id": "TENANT_123"})
+            response = lf.lambda_handler(event, _make_context())
+
+        body = json.loads(response["body"])
+        url = body["oauth_url"]
+        # FLB dialog: config_id present, scope absent (Meta: "should not be used")
+        self.assertIn("config_id=CONFIG_992", url)
+        self.assertNotIn("scope=", url)
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
     def test_state_jwt_is_signed_and_decodable(self, _mock_secret):
         import jwt
         import lambda_function as lf
@@ -180,6 +195,93 @@ class TestOAuthCallback(unittest.TestCase):
         # the mocked encrypted value (not the raw plaintext page token)
         self.assertIn("encryptedPageToken", item)
         self.assertEqual(item["encryptedPageToken"], "ENCRYPTED_TOKEN_BASE64")
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    @patch("lambda_function._graph_post")
+    @patch("lambda_function._encrypt_token", return_value="ENCRYPTED_TOKEN_BASE64")
+    @patch("lambda_function._channel_table")
+    def test_granular_scope_fallback_when_me_accounts_empty(
+        self, mock_table, mock_encrypt, mock_post, mock_get, _mock_secret
+    ):
+        """FLB grant on a portfolio-owned Page: /me/accounts is empty but
+        debug_token granular scopes carry the Page ID → direct fetch succeeds."""
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},  # token exchange
+            {"data": []},  # /me/accounts — empty (the FLB symptom)
+            {  # /debug_token
+                "data": {
+                    "granular_scopes": [
+                        {"scope": "pages_show_list", "target_ids": ["PAGE_777"]},
+                        {"scope": "pages_messaging", "target_ids": ["PAGE_777"]},
+                    ]
+                }
+            },
+            {"id": "PAGE_777", "name": "Portfolio Page", "access_token": "PAGE_TOKEN_777"},  # direct fetch
+        ]
+        mock_post.return_value = {"success": True}
+        mock_table.return_value.put_item = MagicMock()
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        response = lf.lambda_handler(event, _make_context())
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertIn("META_OAUTH_SUCCESS", response["body"])
+        self.assertIn("PAGE_777", response["body"])
+
+        # debug_token must be called with the app token (app_id|app_secret)
+        debug_call = mock_get.call_args_list[2]
+        self.assertEqual(debug_call[0][0], "/debug_token")
+        self.assertEqual(debug_call[0][1]["access_token"], f"TEST_APP_ID|{_FAKE_APP_SECRET}")
+
+        item = mock_table.return_value.put_item.call_args[1]["Item"]
+        self.assertEqual(item["PK"], "PAGE#PAGE_777")
+        self.assertEqual(item["encryptedPageToken"], "ENCRYPTED_TOKEN_BASE64")
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    def test_no_pages_even_after_granular_fallback(self, mock_get, _mock_secret):
+        """Empty /me/accounts AND no pages_show_list targets → clean error popup."""
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},  # token exchange
+            {"data": []},  # /me/accounts — empty
+            {"data": {"granular_scopes": []}},  # /debug_token — nothing granted
+        ]
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        response = lf.lambda_handler(event, _make_context())
+
+        self.assertIn("META_OAUTH_ERROR", response["body"])
+        self.assertIn("No Facebook Pages found", response["body"])
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    def test_granular_fallback_page_fetch_failure_yields_error(self, mock_get, _mock_secret):
+        """Granted Page whose direct fetch throws is skipped; none left → error popup."""
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},  # token exchange
+            {"data": []},  # /me/accounts — empty
+            {"data": {"granular_scopes": [{"scope": "pages_show_list", "target_ids": ["PAGE_888"]}]}},
+            Exception("Graph 500 on page fetch"),  # direct fetch fails
+        ]
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        response = lf.lambda_handler(event, _make_context())
+
+        self.assertIn("META_OAUTH_ERROR", response["body"])
+        self.assertIn("No Facebook Pages found", response["body"])
 
     @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
     def test_expired_state_jwt(self, _mock_secret):
