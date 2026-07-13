@@ -248,6 +248,68 @@ describe('keyword detection (C9 free-text fallback)', () => {
     expect(formEngine.isConfirmKeyword('Yes')).toBe(true);
     expect(formEngine.isConfirmKeyword('yes please')).toBe(false);
   });
+
+  test('M7b: isCancelKeyword extends to exit/quit/stop/"never mind"/"nevermind", whole-message only', () => {
+    for (const word of ['exit', 'quit', 'stop', 'never mind', 'nevermind', 'NEVERMIND', 'Stop']) {
+      expect(formEngine.isCancelKeyword(word)).toBe(true);
+    }
+    // "stop" only cancels as the ENTIRE trimmed message — a substring never trips it.
+    expect(formEngine.isCancelKeyword('please stop by our office')).toBe(false);
+    expect(formEngine.isCancelKeyword('quitting my job')).toBe(false);
+  });
+
+  test('M7b: isQuestionLike matches a trailing "?" or a leading interrogative/aux word, word-boundary + case-insensitive', () => {
+    expect(formEngine.isQuestionLike('What are your hours?')).toBe(true);
+    expect(formEngine.isQuestionLike('is this open on weekends')).toBe(true);
+    expect(formEngine.isQuestionLike('CAN you help me')).toBe(true);
+    expect(formEngine.isQuestionLike('jane@example.com')).toBe(false);
+    expect(formEngine.isQuestionLike('cancel')).toBe(false);
+    expect(formEngine.isQuestionLike('')).toBe(false);
+    expect(formEngine.isQuestionLike(null)).toBe(false);
+    // word-boundary: "iso-something" must not match a leading "is" prefix.
+    expect(formEngine.isQuestionLike('isochrone map please')).toBe(false);
+  });
+});
+
+describe('M7b: findStep', () => {
+  test('resolves the flattened step for a given current_field, including a composite dotted key', () => {
+    const step = formEngine.findStep(SAMPLE_FORM, 'full_name.first');
+    expect(step).toMatchObject({ key: 'full_name.first', parentId: 'full_name', subId: 'first' });
+  });
+
+  test('returns null for an unresolvable field key', () => {
+    expect(formEngine.findStep(SAMPLE_FORM, 'nonexistent')).toBeNull();
+  });
+});
+
+describe('M7b: checkEligibility (ports Picasso/src/context/FormModeContext.jsx:219-320 — MFS has no server-side eligibility logic)', () => {
+  test('select field: an option value of exactly "no" is ineligible', () => {
+    const step = { type: 'select', options: [{ value: 'yes', label: 'Yes' }, { value: 'no', label: 'No' }] };
+    expect(formEngine.checkEligibility(step, 'no')).toMatchObject({ ineligible: true });
+    expect(formEngine.checkEligibility(step, 'yes')).toEqual({ ineligible: false });
+  });
+
+  test('select field: failure_message on the step wins over the default', () => {
+    const step = { type: 'select', options: [{ value: 'no', label: 'No' }], failure_message: 'Custom decline.' };
+    const result = formEngine.checkEligibility(step, 'no');
+    expect(result.failureMessage).toBe('Custom decline.');
+  });
+
+  test('date field: age below minimum_age is ineligible; at/above is eligible', () => {
+    const step = { type: 'date', minimum_age: 18 };
+    const tooYoung = new Date();
+    tooYoung.setFullYear(tooYoung.getFullYear() - 10);
+    expect(formEngine.checkEligibility(step, tooYoung.toISOString().slice(0, 10)).ineligible).toBe(true);
+
+    const oldEnough = new Date();
+    oldEnough.setFullYear(oldEnough.getFullYear() - 25);
+    expect(formEngine.checkEligibility(step, oldEnough.toISOString().slice(0, 10))).toEqual({ ineligible: false });
+  });
+
+  test('a field with eligibility_gate but neither options nor date+minimum_age has no effect', () => {
+    const step = { type: 'text' };
+    expect(formEngine.checkEligibility(step, 'anything')).toEqual({ ineligible: false });
+  });
 });
 
 describe('C3 payload parsing', () => {

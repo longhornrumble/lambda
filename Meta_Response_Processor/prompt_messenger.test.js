@@ -88,6 +88,19 @@ describe('buildMessengerV5Prompt — composition', () => {
     expect(twoQuestions.systemContent).toContain('asked this user 2 questions');
   });
 
+  test('M7b: suppressActions:true forces v5Active=false and omits the catalog/tail even with ai_available CTAs present', () => {
+    const { systemContent, v5Active } = buildMessengerV5Prompt('hi', 'KB TEXT', CTA_CONFIG, [], 'messenger', {
+      suppressActions: true,
+    });
+    expect(v5Active).toBe(false);
+    expect(systemContent).not.toContain('AVAILABLE ACTIONS');
+    expect(systemContent).not.toContain('ACTION TAIL');
+    expect(systemContent).not.toContain('volunteer_form');
+    // Everything else (tone, base rules, KB context) is unaffected.
+    expect(systemContent).toContain(MESSENGER_BASE_RULES);
+    expect(systemContent).toContain('Relevant information from the knowledge base:\nKB TEXT');
+  });
+
   test('history window honors messenger_behavior.max_history_turns', () => {
     const history = Array.from({ length: 20 }, (_, i) => row(i % 2 ? 'assistant' : 'user', `m${i}`, i));
     const cfg = { ...CTA_CONFIG, messenger_behavior: { max_history_turns: 2 } };

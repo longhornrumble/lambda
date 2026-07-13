@@ -69,6 +69,9 @@ const DEFAULT_FORM_SUBMISSION_ERROR =
 const DEFAULT_FORM_CANCELLED =
   "No problem — I've cancelled that. Let me know if you'd like to start again.";
 const DEFAULT_FIELD_REQUIRED = 'This field is required. Could you provide a value?';
+/** Generic fallback when an eligibility gate fails and neither the field's own
+ * `failure_message` nor `messenger_behavior.strings.form_ineligible` is set. */
+const DEFAULT_FORM_INELIGIBLE = "Unfortunately, you don't meet the requirements for this program.";
 
 // ─── C2 string precedence (small local copy — avoids a circular require with
 // index.js, which also defines this; keep in sync if C2 precedence changes) ──
@@ -193,10 +196,28 @@ function flattenSteps(form) {
         required: field.required !== false,
         options: field.options,
         validation: field.validation,
+        // M7b eligibility_gate (CB config.ts FormField; composite subfields
+        // never carry these — no gate on a name/address subfield).
+        eligibility_gate: field.eligibility_gate === true,
+        failure_message: field.failure_message,
+        minimum_age: field.minimum_age,
       });
     }
   }
   return steps;
+}
+
+/**
+ * M7b: resolve the flattened step for a session's current_field. Small,
+ * separately-exported helper so index.js can pre-check a step (digression
+ * detection) without duplicating flattenSteps' traversal.
+ *
+ * @param {object} form
+ * @param {string} fieldKey — session.current_field
+ * @returns {object|null}
+ */
+function findStep(form, fieldKey) {
+  return flattenSteps(form).find((s) => s.key === fieldKey) || null;
 }
 
 function findOptionMatch(options, trimmedLower) {
@@ -288,6 +309,60 @@ function validateAnswer(step, rawText) {
   }
 }
 
+// ─── Eligibility gate (M7b) ───────────────────────────────────────────────────
+// Ports the WIDGET's client-side eligibility check (the only real spec — MFS's
+// form_handler.py implements NO eligibility logic at all; the gate is purely a
+// pre-submission decision point today) so Messenger and the widget agree.
+// Reference: Picasso/src/context/FormModeContext.jsx:219-320 — `eligibility_gate`
+// on a FormField (never a composite subfield — CB config.ts has no such field
+// on FormSubField), evaluated one of two ways depending on field shape:
+//   - type 'date' + `minimum_age` set: age (computed from the answered date,
+//     same year/month/day adjustment as the widget) below minimum_age fails.
+//   - `options` set (a `select` field): the answer resolves to an option whose
+//     `value` is the literal string 'no' (exact match, same as the widget).
+// Anything else with `eligibility_gate: true` but neither shape has no effect
+// (matches the widget's if/else-if — never both checks on one field).
+
+/**
+ * @param {object} step — a flattened step (see flattenSteps); only fields with
+ *   `eligibility_gate: true` are checked (callers gate on that already)
+ * @param {string} value — the already-validated answer (validateAnswer's
+ *   resolved `value`, e.g. an option's own `value` string for `select`)
+ * @returns {{ineligible: boolean, failureMessage?: string, defaultMessage?: string}}
+ */
+function checkEligibility(step, value) {
+  if (step.type === 'date' && step.minimum_age) {
+    const birthDate = new Date(value);
+    const today = new Date();
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const monthDiff = today.getMonth() - birthDate.getMonth();
+    const dayDiff = today.getDate() - birthDate.getDate();
+    if (monthDiff < 0 || (monthDiff === 0 && dayDiff < 0)) age--;
+
+    if (age < step.minimum_age) {
+      return {
+        ineligible: true,
+        failureMessage: step.failure_message || null,
+        defaultMessage: `You must be at least ${step.minimum_age} years old to qualify for this program.`,
+      };
+    }
+    return { ineligible: false };
+  }
+
+  if (step.options) {
+    if (String(value) === 'no') {
+      return {
+        ineligible: true,
+        failureMessage: step.failure_message || null,
+        defaultMessage: DEFAULT_FORM_INELIGIBLE,
+      };
+    }
+    return { ineligible: false };
+  }
+
+  return { ineligible: false };
+}
+
 // ─── Message building (prompts, summary) ─────────────────────────────────────
 
 /**
@@ -366,14 +441,36 @@ function buildSummary(session, form, config, channelType) {
 
 // ─── Keyword detection (C9 free-text fallback — every tap has a typed equivalent) ──
 
-/** Exact word, case-insensitive — never a substring match (an option value of
- * "cancellation" or similar must not trip this). */
+/** Exact word/phrase, case-insensitive, matched against the ENTIRE trimmed
+ * message — never a substring match (an option value of "cancellation" or
+ * similar must not trip this). M7b extends the vocabulary to exit/quit/stop/
+ * "never mind"/"nevermind" (same anytime-cancel semantics, same cleanup).
+ * "stop" is deliberately whole-message-only: a form answer of "stop" alone is
+ * ambiguous (could be a literal field value) but cancel wins the ambiguity —
+ * a bare "stop" mid-form always cancels, never gets recorded as an answer. */
 function isCancelKeyword(text) {
-  return typeof text === 'string' && /^cancel$/i.test(text.trim());
+  return typeof text === 'string' && /^(cancel|exit|quit|stop|never ?mind)$/i.test(text.trim());
 }
 
 function isConfirmKeyword(text) {
   return typeof text === 'string' && /^(confirm|yes)$/i.test(text.trim());
+}
+
+/**
+ * M7b digression detection (plan §6 M7b, decision 1): free-typed text is
+ * "question-like" when it ends with '?' OR opens with a common interrogative/
+ * auxiliary word (word-boundary, case-insensitive). Used ONLY against an
+ * invalid answer to decide digression-vs-normal-reprompt — never against a
+ * resolved `ffld` tap value (a tap is never a digression by construction).
+ */
+const QUESTION_START_REGEX = /^(who|what|when|where|why|how|can|could|do|does|is|are|will|should)\b/i;
+
+function isQuestionLike(text) {
+  if (typeof text !== 'string') return false;
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.endsWith('?')) return true;
+  return QUESTION_START_REGEX.test(trimmed);
 }
 
 // ─── Payload parsing (C3 ffld/fctl routes) ────────────────────────────────────
@@ -451,7 +548,9 @@ function beginForm({ sessionId, formId, form, config, channelType }) {
  * function — this function itself does not log at all (pure).
  *
  * @param {{session: object, form: object, config: object, channelType: string, rawText: string}} params
- * @returns {{session: object, message: {text: string, quickReplies: Array<object>}, status: 'invalid'|'next_field'|'summary'}}
+ * @returns {{session: object|null, message: {text: string, quickReplies: Array<object>}, status: 'invalid'|'next_field'|'summary'|'ineligible'}}
+ *   `status: 'ineligible'` returns `session: null` (M7b — the form ends via
+ *   an eligibility-gate decline; the caller deletes the row, never submits).
  */
 function handleAnswer({ session, form, config, channelType, rawText }) {
   const steps = flattenSteps(form);
@@ -484,6 +583,24 @@ function handleAnswer({ session, form, config, channelType, rawText }) {
       message: fieldPromptMessage(step, form.form_id || session.form_id, config, channelType, error),
       status: 'invalid',
     };
+  }
+
+  // M7b eligibility gate: checked on a VALID answer, before it is recorded.
+  // Ineligible ⇒ the form ends here (session: null signals "nothing to
+  // persist" — the caller deletes the row per the state-escape rule, same as
+  // cancel) and the completed answers so far are never submitted.
+  if (step.eligibility_gate) {
+    const elig = checkEligibility(step, value);
+    if (elig.ineligible) {
+      const text =
+        elig.failureMessage ||
+        getMessengerString(config, channelType, 'form_ineligible', elig.defaultMessage || DEFAULT_FORM_INELIGIBLE);
+      return {
+        session: null,
+        message: { text, quickReplies: [] },
+        status: 'ineligible',
+      };
+    }
   }
 
   const answers = { ...session.answers };
@@ -784,9 +901,12 @@ module.exports = {
   parseFctlPayload,
   isCancelKeyword,
   isConfirmKeyword,
+  isQuestionLike,
   // internals exposed for unit tests
   flattenSteps,
+  findStep,
   validateAnswer,
+  checkEligibility,
   fieldPromptMessage,
   confirmCancelQuickReplies,
   // constants
@@ -798,5 +918,6 @@ module.exports = {
   DEFAULT_FORM_SUBMITTED,
   DEFAULT_FORM_SUBMISSION_ERROR,
   DEFAULT_FORM_CANCELLED,
+  DEFAULT_FORM_INELIGIBLE,
   CF_ORIGIN_HEADER_NAME,
 };
