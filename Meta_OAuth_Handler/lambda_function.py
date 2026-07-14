@@ -11,6 +11,7 @@ Routes:
     GET  /meta/oauth/callback?code=X&state=Y    — Handle OAuth callback
     POST /meta/channels/{tenant_id}/disconnect  — Disconnect a Page
     POST /meta/channels/{tenant_id}/toggle      — Enable / disable a Page
+    POST /meta/channels/{tenant_id}/repush-welcome — Re-push welcome surfaces to Meta
     GET  /meta/channels/{tenant_id}             — List connected channels
 
 Dependencies (must be present in the deployment package or a Lambda Layer):
@@ -942,6 +943,50 @@ def _handle_list_channels(tenant_id: str) -> dict:
     return _json_response(200, {"channels": safe_channels})
 
 
+def _handle_repush_welcome(tenant_id: str, channel: str = "messenger") -> dict:
+    """
+    POST /meta/channels/{tenant_id}/repush-welcome
+
+    Re-push the tenant's `messenger_behavior.welcome` surfaces (ice breakers +
+    persistent menu) to the Messenger Profile API using the stored Page token —
+    the exact code path the OAuth callback and `scripts/repush_welcome_surfaces.py`
+    use. The Config Builder calls this after a deploy so welcome-surface edits
+    reach the live profile without a manual script run.
+
+    Best-effort by design: `push_welcome_surfaces()` never raises and returns a
+    summary (`{"pushed": …}` / `{"skipped": …}` / `{"error": …}`), so the caller
+    can treat a non-2xx as "not connected / no token" and a 200 body's `result`
+    as the push outcome.
+    """
+    if not tenant_id:
+        return _error_response(400, "tenant_id path parameter is required")
+
+    print(f"[INFO] Re-pushing welcome surfaces for tenant_id={tenant_id} channel={channel}")
+
+    try:
+        channels = _query_channels_by_tenant(tenant_id)
+    except Exception as exc:
+        print(f"[ERROR] DynamoDB query failed for tenant_id={tenant_id}: {exc}")
+        return _error_response(500, "Failed to resolve channel mapping")
+
+    matches = [c for c in channels if c.get("channelType") == channel]
+    if not matches:
+        return _error_response(404, f"No {channel} channel connected for this tenant")
+
+    encrypted_token = matches[0].get("encryptedPageToken", "")
+    if not encrypted_token:
+        return _error_response(400, "Connected channel has no stored Page token")
+
+    try:
+        page_token = _decrypt_token(encrypted_token)
+    except Exception as exc:
+        print(f"[ERROR] Token decrypt failed for tenant_id={tenant_id}: {exc}")
+        return _error_response(500, "Failed to decrypt Page token")
+
+    summary = push_welcome_surfaces(page_token, tenant_id)
+    return _json_response(200, {"tenant_id": tenant_id, "channel": channel, "result": summary})
+
+
 # ---------------------------------------------------------------------------
 # HTML popup helpers
 # ---------------------------------------------------------------------------
@@ -1065,6 +1110,9 @@ def _route(event: dict) -> dict:
             except json.JSONDecodeError:
                 return _error_response(400, "Request body is not valid JSON")
             return _handle_toggle_channel(tenant_id, body)
+
+        if http_method == "POST" and action == "repush-welcome":
+            return _handle_repush_welcome(tenant_id)
 
         if http_method == "GET" and action is None:
             return _handle_list_channels(tenant_id)
