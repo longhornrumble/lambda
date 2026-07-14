@@ -880,5 +880,164 @@ class TestRepushWelcome(unittest.TestCase):
         mock_push.assert_not_called()
 
 
+class TestChannelAuthorization(unittest.TestCase):
+    """Caller authz on /meta/channels/{tenant_id}/* management routes."""
+
+    _SECRET = "test-signing-secret"
+
+    def _internal_jwt(self, tenant_id, exp=None):
+        import base64 as _b64
+        import hashlib as _hashlib
+        import hmac as _hmac
+
+        header = _b64.urlsafe_b64encode(
+            json.dumps({"alg": "HS256", "typ": "JWT"}).encode()
+        ).rstrip(b"=").decode()
+        claims = {"tenant_id": tenant_id}
+        if exp is not None:
+            claims["exp"] = exp
+        payload = _b64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
+        msg = f"{header}.{payload}".encode()
+        sig = _b64.urlsafe_b64encode(
+            _hmac.new(self._SECRET.encode(), msg, _hashlib.sha256).digest()
+        ).rstrip(b"=").decode()
+        return f"{header}.{payload}.{sig}"
+
+    def _url_event(self, method, path, token=None):
+        """A Function-URL-shaped event (has requestContext → auth-gated)."""
+        headers = {}
+        if token is not None:
+            headers["authorization"] = f"Bearer {token}"
+        return {
+            "httpMethod": method,
+            "path": path,
+            "headers": headers,
+            "requestContext": {"http": {"method": method}},
+            "queryStringParameters": {},
+            "body": None,
+        }
+
+    # --- unit tests on _authorize_channel_request ---
+
+    def test_internal_invoke_no_requestcontext_is_allowed(self):
+        import lambda_function as lf
+
+        # The welcome-repush backstop shape: no requestContext (IAM-authed invoke).
+        event = {"httpMethod": "POST", "path": "/meta/channels/T1/repush-welcome"}
+        self.assertIsNone(lf._authorize_channel_request(event, "T1"))
+
+    def test_missing_token_returns_401(self):
+        import lambda_function as lf
+
+        event = self._url_event("POST", "/meta/channels/T1/disconnect")
+        resp = lf._authorize_channel_request(event, "T1")
+        self.assertEqual(resp["statusCode"], 401)
+
+    @patch("lambda_function._get_jwt_signing_secret")
+    def test_internal_jwt_matching_tenant_allowed(self, mock_secret):
+        import lambda_function as lf
+
+        mock_secret.return_value = self._SECRET
+        event = self._url_event("GET", "/meta/channels/T1", token=self._internal_jwt("T1"))
+        self.assertIsNone(lf._authorize_channel_request(event, "T1"))
+
+    @patch("lambda_function._get_jwt_signing_secret")
+    def test_internal_jwt_wrong_tenant_returns_403(self, mock_secret):
+        import lambda_function as lf
+
+        mock_secret.return_value = self._SECRET
+        # Token minted for T2, but the path is T1 → IDOR block.
+        event = self._url_event("POST", "/meta/channels/T1/disconnect", token=self._internal_jwt("T2"))
+        resp = lf._authorize_channel_request(event, "T1")
+        self.assertEqual(resp["statusCode"], 403)
+
+    @patch("lambda_function._get_jwt_signing_secret")
+    def test_expired_internal_jwt_not_accepted(self, mock_secret):
+        import lambda_function as lf
+
+        mock_secret.return_value = self._SECRET
+        event = self._url_event(
+            "POST", "/meta/channels/T1/disconnect", token=self._internal_jwt("T1", exp=1)
+        )
+        # Expired → not a valid internal JWT; operator check fails on a non-Clerk
+        # token → 401 (not silently allowed).
+        with patch("lambda_function._verify_operator_clerk_jwt", return_value=False):
+            resp = lf._authorize_channel_request(event, "T1")
+        self.assertEqual(resp["statusCode"], 401)
+
+    @patch("lambda_function._verify_operator_clerk_jwt", return_value=True)
+    @patch("lambda_function._get_jwt_signing_secret", return_value=_SECRET)
+    def test_operator_clerk_jwt_allows_any_tenant(self, _mock_secret, _mock_op):
+        import lambda_function as lf
+
+        # Not a valid internal JWT (wrong secret / opaque) but a valid operator
+        # Clerk token → allowed for any tenant.
+        event = self._url_event("POST", "/meta/channels/ANY/toggle", token="clerk.rs256.token")
+        self.assertIsNone(lf._authorize_channel_request(event, "ANY"))
+
+    def test_operator_clerk_jwt_real_rs256_roundtrip(self):
+        """Exercise the actual RS256/JWKS path (not mocked) end to end."""
+        import jwt as pyjwt
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from jwt.algorithms import RSAAlgorithm
+
+        import lambda_function as lf
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pub_jwk = json.loads(RSAAlgorithm.to_jwk(key.public_key()))
+        pub_jwk["kid"] = "test-kid"
+        token = pyjwt.encode(
+            {"exp": int(time.time()) + 3600, "sub": "user_operator"},
+            key,
+            algorithm="RS256",
+            headers={"kid": "test-kid"},
+        )
+
+        with patch("lambda_function._fetch_config_clerk_jwks", return_value={"keys": [pub_jwk]}):
+            self.assertTrue(lf._verify_operator_clerk_jwt(token))
+
+        # Unknown kid (key rotated / different instance) → rejected.
+        with patch("lambda_function._fetch_config_clerk_jwks", return_value={"keys": []}):
+            self.assertFalse(lf._verify_operator_clerk_jwt(token))
+
+        # Expired operator token → rejected.
+        expired = pyjwt.encode(
+            {"exp": int(time.time()) - 10, "sub": "user_operator"},
+            key,
+            algorithm="RS256",
+            headers={"kid": "test-kid"},
+        )
+        with patch("lambda_function._fetch_config_clerk_jwks", return_value={"keys": [pub_jwk]}):
+            self.assertFalse(lf._verify_operator_clerk_jwt(expired))
+
+    # --- integration through lambda_handler (the wired gate) ---
+
+    def test_unauthenticated_disconnect_via_url_returns_401(self):
+        import lambda_function as lf
+
+        event = self._url_event("POST", "/meta/channels/VICTIM/disconnect")
+        resp = lf.lambda_handler(event, _make_context())
+        self.assertEqual(resp["statusCode"], 401)
+
+    @patch("lambda_function._get_jwt_signing_secret")
+    def test_wrong_tenant_list_via_url_returns_403(self, mock_secret):
+        import lambda_function as lf
+
+        mock_secret.return_value = self._SECRET
+        event = self._url_event("GET", "/meta/channels/VICTIM", token=self._internal_jwt("ATTACKER"))
+        resp = lf.lambda_handler(event, _make_context())
+        self.assertEqual(resp["statusCode"], 403)
+
+    @patch("lambda_function._query_channels_by_tenant", return_value=[])
+    @patch("lambda_function._get_jwt_signing_secret")
+    def test_authorized_list_via_url_dispatches(self, mock_secret, _mock_query):
+        import lambda_function as lf
+
+        mock_secret.return_value = self._SECRET
+        event = self._url_event("GET", "/meta/channels/T1", token=self._internal_jwt("T1"))
+        resp = lf.lambda_handler(event, _make_context())
+        self.assertEqual(resp["statusCode"], 200)
+
+
 if __name__ == "__main__":
     unittest.main()
