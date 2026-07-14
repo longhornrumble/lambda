@@ -41,6 +41,7 @@ Environment variables:
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -87,6 +88,30 @@ _TENANT_REGISTRY_TABLE = os.environ.get("TENANT_REGISTRY_TABLE", "")
 # entirely (no S3 read attempted), a safe no-op for envs that haven't wired
 # the env var / IAM grant yet.
 _CONFIG_BUCKET = os.environ.get("CONFIG_BUCKET", "")
+
+# --- Caller authorization for the /meta/channels/* management routes ---
+# The Function URL is AuthType NONE (the OAuth callback must be publicly
+# reachable for Meta's redirect), so the management routes authorize the CALLER
+# in-handler. Two accepted identities:
+#   1. Tenant self-service — the dashboard/portal's internal Picasso JWT
+#      (HS256, same secret Analytics_Dashboard_API signs). Authorized only for
+#      its OWN tenant (token tenant_id must equal the path tenant_id).
+#   2. Operator (super-admin) — the Config Builder's Clerk 'picasso-config' JWT
+#      (RS256, verified against the config Clerk JWKS). Authorized for any
+#      tenant, mirroring Picasso_Config_Manager's trust model.
+# Direct server-to-server invokes (no Function URL requestContext, e.g. Config
+# Manager's welcome-repush backstop) are already IAM-authenticated and exempt.
+_JWT_SECRET_KEY_NAME = os.environ.get(
+    "JWT_SECRET_KEY_NAME", "picasso/staging/jwt/signing-key"
+)
+_CLERK_CONFIG_JWKS_URL = os.environ.get(
+    "CLERK_CONFIG_JWKS_URL",
+    "https://clerk.config.myrecruiter.ai/.well-known/jwks.json",
+)
+_jwt_signing_secret: Optional[str] = None      # cached HS256 secret
+_clerk_jwks_cache: Optional[dict] = None        # cached config Clerk JWKS
+_clerk_jwks_cache_time: float = 0
+_CLERK_JWKS_CACHE_TTL = 3600  # seconds
 
 # C5: ice breakers cap at 4 (both channels); persistent_menu title cap
 # mirrors the C5 quick-reply title cap (20 chars).
@@ -1061,6 +1086,154 @@ def _html_error_popup(error_message: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Caller authorization (management routes)
+# ---------------------------------------------------------------------------
+
+
+def _bearer_token(event: dict) -> Optional[str]:
+    """Extract the bearer token from the Authorization header (case-insensitive)."""
+    headers = event.get("headers") or {}
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
+    if auth[:7].lower() == "bearer ":
+        auth = auth[7:]
+    return auth.strip() or None
+
+
+def _get_jwt_signing_secret() -> str:
+    """Fetch + cache the HS256 signing secret for the internal Picasso JWT."""
+    global _jwt_signing_secret
+    if _jwt_signing_secret:
+        return _jwt_signing_secret
+    response = _secrets_client.get_secret_value(SecretId=_JWT_SECRET_KEY_NAME)
+    secret = response.get("SecretString", "")
+    # Support JSON-wrapped secrets (mirror Analytics_Dashboard_API).
+    try:
+        data = json.loads(secret)
+        secret = data.get("signingKey") or data.get("key") or data.get("secret") or secret
+    except (json.JSONDecodeError, TypeError):
+        pass
+    _jwt_signing_secret = secret
+    return secret
+
+
+def _verify_internal_jwt(token: str) -> Optional[dict]:
+    """
+    Verify an internal Picasso JWT (HS256) and return its claims, or None.
+
+    Port of Analytics_Dashboard_API.validate_jwt — hand-rolled HMAC-SHA256, no
+    third-party dependency. Never raises: any malformed/failed token → None.
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        header_b64, payload_b64, signature_b64 = parts
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "=="))
+        exp = payload.get("exp")
+        if exp and time.time() > exp:
+            return None
+        secret = _get_jwt_signing_secret()
+        message = f"{header_b64}.{payload_b64}".encode("utf-8")
+        expected = (
+            base64.urlsafe_b64encode(
+                hmac.new(secret.encode("utf-8"), message, hashlib.sha256).digest()
+            )
+            .rstrip(b"=")
+            .decode("utf-8")
+        )
+        if not hmac.compare_digest(signature_b64.rstrip("="), expected):
+            return None
+        return payload
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[WARN] internal JWT verification error: {exc}")
+        return None
+
+
+def _fetch_config_clerk_jwks() -> dict:
+    """Fetch + cache the Config Builder Clerk JWKS."""
+    global _clerk_jwks_cache, _clerk_jwks_cache_time
+    now = time.time()
+    if _clerk_jwks_cache and (now - _clerk_jwks_cache_time) < _CLERK_JWKS_CACHE_TTL:
+        return _clerk_jwks_cache
+    req = urllib.request.Request(
+        _CLERK_CONFIG_JWKS_URL, headers={"Accept": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310 (https literal)
+        data = json.loads(resp.read().decode("utf-8"))
+    _clerk_jwks_cache = data
+    _clerk_jwks_cache_time = now
+    return data
+
+
+def _verify_operator_clerk_jwt(token: str) -> bool:
+    """
+    Verify a Config Builder Clerk 'picasso-config' JWT (RS256) via JWKS.
+
+    Mirrors Analytics_Dashboard_API._decode_clerk_jwt_claims (PyJWT + the
+    cryptography layer). Returns True on a valid, unexpired operator token.
+    Never raises.
+    """
+    try:
+        kid = jwt.get_unverified_header(token).get("kid")
+        if not kid:
+            return False
+        signing_key = None
+        for key_data in _fetch_config_clerk_jwks().get("keys", []):
+            if key_data.get("kid") == kid:
+                from jwt.algorithms import RSAAlgorithm
+
+                signing_key = RSAAlgorithm.from_jwk(key_data)
+                break
+        if signing_key is None:
+            return False
+        jwt.decode(
+            token,
+            signing_key,
+            algorithms=["RS256"],
+            options={"require": ["exp"], "verify_exp": True, "verify_aud": False},
+        )
+        return True
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[WARN] operator Clerk JWT verification failed: {exc}")
+        return False
+
+
+def _authorize_channel_request(event: dict, tenant_id: str) -> Optional[dict]:
+    """
+    Authorize a caller for a /meta/channels/{tenant_id}/* management route.
+
+    Returns None when authorized, or an `_error_response(...)` to return verbatim.
+
+    Order:
+      * Direct server-to-server invoke (no Function URL requestContext) → allow
+        (already IAM-authenticated; e.g. the welcome-repush backstop).
+      * Internal Picasso JWT whose tenant_id == path tenant_id → allow (tenant).
+      * Internal Picasso JWT with a DIFFERENT tenant → 403 (IDOR block).
+      * Valid operator Clerk JWT → allow (super-admin, any tenant).
+      * Otherwise → 401.
+    """
+    if not event.get("requestContext"):
+        return None  # internal server-to-server invoke (IAM-authenticated)
+
+    token = _bearer_token(event)
+    if not token:
+        return _error_response(401, "Missing or invalid Authorization header")
+
+    claims = _verify_internal_jwt(token)
+    if claims is not None:
+        token_tenant = claims.get("tenant_id") or claims.get("sub")
+        if token_tenant == tenant_id:
+            return None
+        print(f"[WARN] tenant mismatch: token tenant != path tenant ({tenant_id})")
+        return _error_response(403, "Not authorized for this tenant")
+
+    if _verify_operator_clerk_jwt(token):
+        return None
+
+    return _error_response(401, "Unauthorized")
+
+
+# ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
 
@@ -1114,6 +1287,12 @@ def _route(event: dict) -> dict:
     if channels_index is not None and len(path_parts) > channels_index + 1:
         tenant_id = path_parts[channels_index + 1]
         action = path_parts[channels_index + 2] if len(path_parts) > channels_index + 2 else None
+
+        # Every /meta/channels/{tenant_id}/* route reads or mutates a tenant's
+        # channel state — gate the caller before dispatching.
+        denied = _authorize_channel_request(event, tenant_id)
+        if denied is not None:
+            return denied
 
         if http_method == "POST" and action == "disconnect":
             return _handle_disconnect_channel(tenant_id)

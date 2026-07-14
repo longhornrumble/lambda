@@ -4,3 +4,7 @@
 # lambda_function.py and MUST ship or the handler ImportErrors at cold start.
 # Pin style mirrors Analytics_Dashboard_API/requirements-layer.txt.
 PyJWT>=2.8.0,<3.0.0
+# cryptography backs PyJWT's RS256 verification of the Config Builder Clerk
+# operator JWT on the /meta/channels/* management routes (mirrors
+# Analytics_Dashboard_API's Clerk-JWT layer). Without it PyJWT raises on RS256.
+cryptography>=3.4.0
