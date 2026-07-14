@@ -782,5 +782,78 @@ class TestCorsAndRouting(unittest.TestCase):
         self.assertIn("Access-Control-Allow-Origin", response["headers"])
 
 
+class TestRepushWelcome(unittest.TestCase):
+    """POST /meta/channels/{tenant_id}/repush-welcome — re-push welcome surfaces."""
+
+    _PATH = "/meta/channels/TENANT_123/repush-welcome"
+
+    @patch("lambda_function.push_welcome_surfaces")
+    @patch("lambda_function._decrypt_token")
+    @patch("lambda_function._query_channels_by_tenant")
+    def test_success_pushes_and_returns_result(self, mock_query, mock_decrypt, mock_push):
+        import lambda_function as lf
+
+        mock_query.return_value = [
+            {"channelType": "messenger", "pageId": "PAGE_1", "encryptedPageToken": "ENC"}
+        ]
+        mock_decrypt.return_value = "PLAINTEXT_PAGE_TOKEN"
+        mock_push.return_value = {"pushed": {"ice_breakers": 3, "persistent_menu": 2, "get_started": True}}
+
+        event = _make_event("POST", self._PATH)
+        response = lf.lambda_handler(event, _make_context())
+
+        self.assertEqual(response["statusCode"], 200)
+        body = json.loads(response["body"])
+        self.assertEqual(body["tenant_id"], "TENANT_123")
+        self.assertEqual(body["result"], {"pushed": {"ice_breakers": 3, "persistent_menu": 2, "get_started": True}})
+        # The stored token was decrypted and handed to the push (never the ciphertext).
+        mock_decrypt.assert_called_once_with("ENC")
+        mock_push.assert_called_once_with("PLAINTEXT_PAGE_TOKEN", "TENANT_123")
+
+    @patch("lambda_function.push_welcome_surfaces")
+    @patch("lambda_function._decrypt_token")
+    @patch("lambda_function._query_channels_by_tenant")
+    def test_passes_through_best_effort_skip(self, mock_query, mock_decrypt, mock_push):
+        import lambda_function as lf
+
+        mock_query.return_value = [{"channelType": "messenger", "encryptedPageToken": "ENC"}]
+        mock_decrypt.return_value = "TOKEN"
+        # push_welcome_surfaces is best-effort — a flag-off tenant returns a skip summary.
+        mock_push.return_value = {"skipped": "MESSENGER_CHANNEL flag not enabled"}
+
+        response = lf.lambda_handler(_make_event("POST", self._PATH), _make_context())
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(json.loads(response["body"])["result"], {"skipped": "MESSENGER_CHANNEL flag not enabled"})
+
+    @patch("lambda_function._query_channels_by_tenant")
+    def test_no_connected_channel_returns_404(self, mock_query):
+        import lambda_function as lf
+
+        mock_query.return_value = []  # nothing connected
+        response = lf.lambda_handler(_make_event("POST", self._PATH), _make_context())
+        self.assertEqual(response["statusCode"], 404)
+
+    @patch("lambda_function._query_channels_by_tenant")
+    def test_channel_without_token_returns_400(self, mock_query):
+        import lambda_function as lf
+
+        mock_query.return_value = [{"channelType": "messenger"}]  # connected but no stored token
+        response = lf.lambda_handler(_make_event("POST", self._PATH), _make_context())
+        self.assertEqual(response["statusCode"], 400)
+
+    @patch("lambda_function.push_welcome_surfaces")
+    @patch("lambda_function._decrypt_token")
+    @patch("lambda_function._query_channels_by_tenant")
+    def test_does_not_push_before_resolving_a_channel(self, mock_query, mock_decrypt, mock_push):
+        import lambda_function as lf
+
+        mock_query.return_value = [{"channelType": "instagram", "encryptedPageToken": "ENC"}]  # only IG, no messenger
+        lf.lambda_handler(_make_event("POST", self._PATH), _make_context())
+        # Default channel is messenger; an IG-only tenant yields 404 and never decrypts or pushes.
+        mock_decrypt.assert_not_called()
+        mock_push.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
