@@ -524,6 +524,31 @@ class TestListChannels(unittest.TestCase):
         body = json.loads(response["body"])
         self.assertEqual(body["channels"], [])
 
+    @patch("lambda_function._query_channels_by_tenant")
+    def test_decimal_ttl_serializes_without_500(self, mock_query):
+        """DynamoDB returns numbers as Decimal; the response must not 500."""
+        from decimal import Decimal
+
+        import lambda_function as lf
+
+        mock_query.return_value = [
+            {
+                "PK": "PAGE#PAGE_001",
+                "SK": "CHANNEL#messenger",
+                "tenantId": "TENANT_XYZ",
+                "pageId": "PAGE_001",
+                "enabled": True,
+                "ttl": Decimal("1752537600"),  # epoch, as DynamoDB returns it
+            }
+        ]
+
+        event = _make_event("GET", "/meta/channels/TENANT_XYZ")
+        response = lf.lambda_handler(event, _make_context())
+
+        self.assertEqual(response["statusCode"], 200)
+        body = json.loads(response["body"])
+        self.assertEqual(body["channels"][0]["ttl"], 1752537600)
+
 
 class TestPushWelcomeSurfaces(unittest.TestCase):
     """M5: push_welcome_surfaces() — Messenger Profile API push on connect."""

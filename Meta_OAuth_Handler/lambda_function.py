@@ -49,6 +49,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 import boto3
@@ -168,6 +169,20 @@ def _get_meta_app_secret() -> str:
 # ---------------------------------------------------------------------------
 
 
+def _json_default(obj: Any) -> Any:
+    """
+    json.dumps fallback for types the stdlib encoder can't handle.
+
+    DynamoDB's resource API returns every number as decimal.Decimal, so any
+    route that echoes a stored item (e.g. GET /meta/channels/{id} returning
+    the `ttl` epoch) would otherwise raise "Object of type Decimal is not JSON
+    serializable" and 500. Whole values → int (ttl, counts); fractional → float.
+    """
+    if isinstance(obj, Decimal):
+        return int(obj) if obj == obj.to_integral_value() else float(obj)
+    raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+
 def _json_response(status_code: int, body: Any, extra_headers: Optional[dict] = None) -> dict:
     """Build a Lambda proxy integration response with CORS headers."""
     headers = dict(_CORS_HEADERS)
@@ -176,7 +191,7 @@ def _json_response(status_code: int, body: Any, extra_headers: Optional[dict] = 
     return {
         "statusCode": status_code,
         "headers": headers,
-        "body": json.dumps(body),
+        "body": json.dumps(body, default=_json_default),
     }
 
 
