@@ -30,6 +30,7 @@ import {
 
 import { authenticateRequest } from './auth.mjs';
 import { dispatchPromoteWorkflow, getPromoteStatus } from './promoteDispatch.mjs';
+import { maybeRepushWelcomeSurfaces } from './welcomeRepush.mjs';
 
 /**
  * Authentication enforcement flag
@@ -601,6 +602,12 @@ export const handler = async (event) => {
         }
         throw error;
       }
+
+      // Server-side backstop: if this config carries Messenger welcome surfaces,
+      // fire-and-forget re-push them to the live FB/IG profile (browser-independent
+      // complement to the Config Builder's own post-deploy call). Best-effort —
+      // never blocks or fails the write response.
+      await maybeRepushWelcomeSurfaces(tenantId, finalConfig);
 
       return {
         statusCode: 200,
