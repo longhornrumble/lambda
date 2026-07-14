@@ -677,6 +677,11 @@ def lambda_handler(event, context):
         elif path.endswith('/settings/scheduling/activation') and method == 'PATCH':
             body = json.loads(event.get('body', '{}') or '{}')
             return handle_scheduling_activation_patch(auth_result, tenant_id, body)
+        elif path.endswith('/settings/messenger') and method == 'GET':
+            return handle_settings_messenger_get(tenant_id)
+        elif path.endswith('/settings/messenger') and method == 'PATCH':
+            body = json.loads(event.get('body', '{}') or '{}')
+            return handle_settings_messenger_patch(auth_result, tenant_id, body)
 
         # =================================================================
         # Team Management endpoints (Phase 3)
@@ -8171,6 +8176,176 @@ def handle_settings_notifications_patch(
         'form_id': form_id,
         'notifications': updated,
     })
+
+
+# ---------------------------------------------------------------------------
+# GET/PATCH /settings/messenger  (Messenger Product Surface T3c)
+#
+# Portal write path for `messenger_behavior` — a top-level tenant-config
+# section otherwise owned by the Config Builder / Picasso_Config_Manager
+# (which wholesale-replaces the section). This endpoint mirrors
+# update_tenant_notifications / update_tenant_scheduling_activation: S3
+# ETag/If-Match read-modify-write with a targeted deep-merge, so a portal
+# admin editing just the escalation recipient never wipes sibling keys
+# (tone_override, welcome, strings, etc.) written by the Config Builder.
+#
+# Scope is intentionally narrow (C2 contract, escalation_email + the
+# escalation_confirmation string) — not a general messenger_behavior editor.
+# ---------------------------------------------------------------------------
+
+# Basic RFC-5322-ish check — good enough to catch typos, not exhaustive.
+_EMAIL_PATTERN = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+_EMAIL_MAX_LEN = 254  # RFC 5321 §4.5.3.1.3 mailbox length ceiling
+
+# escalation_confirmation is shown VERBATIM to the Messenger end user (consumer-
+# facing, unlike escalation_email) — cap length so an admin can't paste an
+# oversized blob (or, per PII advisory, a copy-pasted third party's PII) into
+# a field with no other size guard.
+_MESSENGER_STRING_MAX_LEN = 500
+
+# The only `strings` sub-keys this endpoint accepts — mirrors the shape
+# Meta_Response_Processor/index.js already reads from config (C2 contract).
+# Kept tight on purpose: do not add keys here without a contract update.
+_MESSENGER_STRING_KEYS = {'escalation_confirmation'}
+
+
+def update_tenant_messenger_behavior(tenant_id: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Targeted deep-merge of `messenger_behavior` sub-fields in S3.
+
+    Uses S3 ETag optimistic locking (mirrors update_tenant_notifications /
+    update_tenant_scheduling_activation). Creates the `messenger_behavior`
+    section if it doesn't exist yet (forward-compatible: older tenant
+    configs predate this section). Only the keys present in `updates` are
+    touched — siblings (tone_override, welcome, channel_overrides, ...)
+    survive untouched.
+
+    Returns the updated `messenger_behavior` section.
+
+    Raises:
+        ConcurrentModificationError: ETag mismatch — concurrent writer.
+        ClientError: Unexpected S3 error.
+    """
+    bucket = S3_CONFIG_BUCKET
+    key = f"tenants/{tenant_id}/{tenant_id}-config.json"
+
+    response = s3.get_object(Bucket=bucket, Key=key)
+    etag = response['ETag']
+    config = json.loads(response['Body'].read().decode('utf-8'))
+
+    messenger_behavior = config.get('messenger_behavior')
+    if not isinstance(messenger_behavior, dict):
+        messenger_behavior = {}
+    _deep_merge(messenger_behavior, updates)
+    config['messenger_behavior'] = messenger_behavior
+
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(config, indent=2),
+            ContentType='application/json',
+            IfMatch=etag,
+        )
+    except ClientError as e:
+        if e.response['Error']['Code'] in ('PreconditionFailed', '412'):
+            raise ConcurrentModificationError(
+                "Config was modified by another user. Please refresh."
+            )
+        raise
+
+    _tenant_config_cache.pop(tenant_id, None)
+    _tenant_config_cache_time.pop(tenant_id, None)
+
+    # Never log the email value itself (business-contact PII per the pii-data-
+    # lifecycle-advisor review) — only that a write happened.
+    logger.info(
+        f"[settings/messenger] config updated tenant={redact_tenant_id(tenant_id)}"
+    )
+    return messenger_behavior
+
+
+def handle_settings_messenger_get(tenant_id: str) -> Dict[str, Any]:
+    """
+    GET /settings/messenger
+
+    Returns the tenant's messenger_behavior section (or {} if absent —
+    forward-compatible for tenants that predate this feature).
+    """
+    config = get_tenant_config(tenant_id)
+    if not config:
+        return cors_response(404, {'error': 'Tenant configuration not found'})
+
+    messenger_behavior = config.get('messenger_behavior')
+    if not isinstance(messenger_behavior, dict):
+        messenger_behavior = {}
+
+    return cors_response(200, {'messenger_behavior': messenger_behavior})
+
+
+def handle_settings_messenger_patch(
+    auth_result: Dict[str, Any],
+    tenant_id: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    PATCH /settings/messenger
+
+    Deep-merges the supplied messenger_behavior sub-fields.
+    Body: { "escalation_email": str, "strings": { "escalation_confirmation": str } }
+    Both keys are optional; at least one must be present. escalation_email
+    may be an empty string to clear the recipient (falls back to the
+    ESCALATION_EMAIL env default in Meta_Response_Processor).
+    """
+    user_role = auth_result.get('role')
+    role_error = _require_write_role(user_role)
+    if role_error:
+        return role_error
+
+    updates: Dict[str, Any] = {}
+
+    has_email = 'escalation_email' in body
+    if has_email:
+        escalation_email = body.get('escalation_email')
+        if not isinstance(escalation_email, str):
+            return cors_response(400, {'error': 'escalation_email must be a string'})
+        escalation_email = escalation_email.strip()
+        if len(escalation_email) > _EMAIL_MAX_LEN:
+            return cors_response(400, {'error': f'escalation_email exceeds {_EMAIL_MAX_LEN} characters'})
+        if escalation_email and not _EMAIL_PATTERN.match(escalation_email):
+            return cors_response(400, {'error': 'escalation_email is not a valid email address'})
+        updates['escalation_email'] = escalation_email
+
+    strings = body.get('strings')
+    if strings is not None:
+        if not isinstance(strings, dict) or not strings:
+            return cors_response(400, {'error': 'strings must be a non-empty object'})
+        unknown = set(strings.keys()) - _MESSENGER_STRING_KEYS
+        if unknown:
+            return cors_response(400, {'error': f'Unsupported strings key(s): {sorted(unknown)}'})
+        for k, v in strings.items():
+            if not isinstance(v, str):
+                return cors_response(400, {'error': f'strings.{k} must be a string'})
+            if len(v) > _MESSENGER_STRING_MAX_LEN:
+                return cors_response(400, {'error': f'strings.{k} exceeds {_MESSENGER_STRING_MAX_LEN} characters'})
+        updates['strings'] = strings
+
+    if not updates:
+        return cors_response(400, {'error': 'At least one of escalation_email, strings is required'})
+
+    logger.info(
+        f"[settings/messenger] PATCH tenant={redact_tenant_id(tenant_id)} fields={sorted(updates.keys())}"
+    )
+
+    try:
+        updated = update_tenant_messenger_behavior(tenant_id, updates)
+    except ConcurrentModificationError as e:
+        return cors_response(409, {'error': str(e)})
+    except ClientError as e:
+        logger.error(f"[settings/messenger] S3 error: {e}")
+        return cors_response(500, {'error': 'Failed to update messenger settings'})
+
+    return cors_response(200, {'messenger_behavior': updated})
 
 
 # ---------------------------------------------------------------------------
