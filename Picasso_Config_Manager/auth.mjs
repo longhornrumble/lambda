@@ -11,6 +11,22 @@
 import crypto from 'crypto';
 import https from 'https';
 
+// ─── Machine (M2M) service callers ──────────────────────────────────────────
+// Clerk M2M tokens are instance-signed JWTs whose subject is a machine id
+// (`mch_...`) and which carry NO user role claim. We grant super_admin ONLY to
+// an explicitly allowlisted automation machine: the *verified machine identity*
+// is the authorization. We deliberately never read a `role` claim off these
+// tokens — an M2M token's claims are set by whoever mints it, so trusting a
+// self-asserted role would let any machine-secret holder claim super_admin.
+//
+// The machine id is NOT a secret (the machine SECRET, held only by the token
+// minter, is). It is hardcoded rather than an env var because Config Manager's
+// Lambda env is Terraform-managed (one writer per resource) — hardcoding a
+// non-secret id keeps this a single code change with no infra drift.
+const CONFIG_AUTOMATION_MACHINE_IDS = [
+  'mch_3GeaXVgEBzXRJwT52bIfi9pESy0', // picasso-config-automation (clerk.config.myrecruiter.ai)
+];
+
 // ─── JWKS cache ─────────────────────────────────────────────────────────────
 const CLERK_JWKS_URL = process.env.CLERK_JWKS_URL ||
   'https://present-skunk-55.clerk.accounts.dev/.well-known/jwks.json';
@@ -115,33 +131,69 @@ export async function authenticateRequest(event) {
 
     const token = match[1];
     const payload = await verifyClerkJwt(token);
-
-    // Claims come directly from the picasso-config JWT template
-    const email = payload.email || '';
-    const name = payload.name || '';
-    const role = payload.role || 'member';
-    const tenantId = payload.tenant_id || null;
-    const tenantHash = payload.tenant_hash || null;
-    const company = payload.company || '';
-
-    // Build tenants array — for super_admin all tenants are accessible,
-    // for regular users just their org's tenant
-    const tenants = tenantId ? [tenantId] : [];
-
-    console.log(`[clerk-auth] Authenticated: ${email} role=${role} tenant=${tenantId}`);
-
-    return {
-      success: true,
-      email,
-      name: name || undefined,
-      role,
-      tenant_id: tenantId,
-      tenant_hash: tenantHash,
-      company,
-      tenants,
-    };
+    return authorizeVerifiedPayload(payload);
   } catch (error) {
     console.error('[clerk-auth] Authentication failed:', error.message);
     return { success: false, error: error.message };
   }
+}
+
+/**
+ * Map an already-signature-verified JWT payload to an auth result.
+ * Pure (no I/O) so it is unit-testable without JWKS/crypto.
+ *
+ * Two callers:
+ *  - Machine (M2M) tokens: subject `mch_...`, authorized ONLY if the machine id
+ *    is allowlisted (see CONFIG_AUTOMATION_MACHINE_IDS). Role claims on these
+ *    tokens are ignored by design.
+ *  - Human users: claims come from the 'picasso-config' JWT template.
+ *
+ * @param {Object} payload - verified JWT payload
+ * @returns {Object} auth result
+ */
+export function authorizeVerifiedPayload(payload) {
+  const sub = payload.sub || '';
+
+  // Machine-to-machine service caller
+  if (sub.startsWith('mch_')) {
+    if (CONFIG_AUTOMATION_MACHINE_IDS.includes(sub)) {
+      console.log(`[clerk-auth] Authenticated M2M service machine ${sub}`);
+      return {
+        success: true,
+        email: `m2m:${sub}`,
+        role: 'super_admin',
+        tenant_id: null,
+        tenant_hash: null,
+        company: '',
+        tenants: [],
+        service: true,
+      };
+    }
+    return { success: false, error: `Unrecognized machine subject: ${sub}` };
+  }
+
+  // Human user — claims come directly from the picasso-config JWT template
+  const email = payload.email || '';
+  const name = payload.name || '';
+  const role = payload.role || 'member';
+  const tenantId = payload.tenant_id || null;
+  const tenantHash = payload.tenant_hash || null;
+  const company = payload.company || '';
+
+  // Build tenants array — for super_admin all tenants are accessible,
+  // for regular users just their org's tenant
+  const tenants = tenantId ? [tenantId] : [];
+
+  console.log(`[clerk-auth] Authenticated: ${email} role=${role} tenant=${tenantId}`);
+
+  return {
+    success: true,
+    email,
+    name: name || undefined,
+    role,
+    tenant_id: tenantId,
+    tenant_hash: tenantHash,
+    company,
+    tenants,
+  };
 }
