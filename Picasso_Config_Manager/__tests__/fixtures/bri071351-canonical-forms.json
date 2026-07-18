@@ -1,0 +1,642 @@
+{
+  "conversational_forms": {
+    "volunteer_application": {
+      "form_id": "volunteer_application",
+      "title": "Volunteer Application",
+      "description": "General volunteer interest for Bright Futures and event support.",
+      "program": "bright_futures",
+      "enabled": true,
+      "trigger_phrases": [
+        "I want to volunteer",
+        "How do I sign up to volunteer",
+        "Volunteer application"
+      ],
+      "introduction": "Wonderful \u2014 takes a few minutes, and Dana follows up personally within a day or two.",
+      "fields": [
+        {
+          "id": "field_1763001000010",
+          "type": "select",
+          "label": "How did you hear about us",
+          "prompt": "First \u2014 how did you hear about BrightPath?",
+          "required": true,
+          "options": [
+            {
+              "value": "friend",
+              "label": "Friend or word of mouth"
+            },
+            {
+              "value": "social",
+              "label": "Social media"
+            },
+            {
+              "value": "google",
+              "label": "Google search"
+            },
+            {
+              "value": "volunteer_platform",
+              "label": "Volunteer recruitment platform"
+            },
+            {
+              "value": "employer",
+              "label": "Employer"
+            },
+            {
+              "value": "other",
+              "label": "Other"
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000001",
+          "type": "name",
+          "label": "Full name",
+          "prompt": "What's your full name?",
+          "required": true,
+          "subfields": [
+            {
+              "id": "field_1763001000001.first_name",
+              "label": "First Name",
+              "placeholder": "e.g., John",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763001000001.middle_name",
+              "label": "Middle Name",
+              "placeholder": "Optional",
+              "required": false,
+              "type": "text"
+            },
+            {
+              "id": "field_1763001000001.last_name",
+              "label": "Last Name",
+              "placeholder": "e.g., Smith",
+              "required": true,
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000011",
+          "type": "date",
+          "label": "Date of birth",
+          "prompt": "What's your date of birth?",
+          "required": true
+        },
+        {
+          "id": "field_1763001000002",
+          "type": "email",
+          "label": "Email address",
+          "prompt": "What's the best email to reach you at?",
+          "required": true
+        },
+        {
+          "id": "field_1763001000003",
+          "type": "phone",
+          "label": "Primary phone",
+          "prompt": "And a phone number, in case email gets buried?",
+          "required": true
+        },
+        {
+          "id": "field_1763001000012",
+          "type": "select",
+          "label": "Text message consent",
+          "prompt": "Is it okay if we text you about next steps?",
+          "required": true,
+          "options": [
+            {
+              "value": "yes",
+              "label": "Yes"
+            },
+            {
+              "value": "no",
+              "label": "No"
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000007",
+          "type": "address",
+          "label": "Home address",
+          "prompt": "What's your home address? (helps us match you to a nearby family)",
+          "required": true,
+          "subfields": [
+            {
+              "id": "field_1763001000007.street",
+              "label": "Street Address",
+              "placeholder": "e.g., 123 Main Street",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763001000007.apt_unit",
+              "label": "Apt/Suite/Unit",
+              "placeholder": "Optional",
+              "required": false,
+              "type": "text"
+            },
+            {
+              "id": "field_1763001000007.city",
+              "label": "City",
+              "placeholder": "e.g., Portland",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763001000007.state",
+              "label": "State",
+              "placeholder": "e.g., OR",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763001000007.zip_code",
+              "label": "ZIP Code",
+              "placeholder": "e.g., 97201",
+              "required": true,
+              "type": "text",
+              "validation": {
+                "pattern": "^\\d{5}(-\\d{4})?$",
+                "message": "Please enter a valid ZIP code (e.g., 12345 or 12345-6789)"
+              }
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000013",
+          "type": "select",
+          "label": "Reliable transportation",
+          "prompt": "Do you have reliable transportation?",
+          "required": true,
+          "options": [
+            {
+              "value": "yes",
+              "label": "Yes"
+            },
+            {
+              "value": "no",
+              "label": "No"
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000014",
+          "type": "select",
+          "label": "Preferred language",
+          "prompt": "What language are you most comfortable in?",
+          "required": true,
+          "options": [
+            {
+              "value": "english",
+              "label": "English"
+            },
+            {
+              "value": "spanish",
+              "label": "Spanish"
+            },
+            {
+              "value": "other",
+              "label": "Other"
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000004",
+          "type": "select",
+          "label": "Ways you'd like to serve",
+          "prompt": "Which way would you feel most comfortable serving a family?",
+          "required": true,
+          "options": [
+            {
+              "value": "mentorship",
+              "label": "Mentorship"
+            },
+            {
+              "value": "meals",
+              "label": "Meals and grocery deliveries"
+            },
+            {
+              "value": "transportation",
+              "label": "Transportation and pickups"
+            },
+            {
+              "value": "tutoring",
+              "label": "Tutoring and educational support"
+            },
+            {
+              "value": "care_packages",
+              "label": "Care packages and essentials"
+            },
+            {
+              "value": "babysitting",
+              "label": "Babysitting and date-night support"
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000016",
+          "type": "textarea",
+          "label": "What motivates you to volunteer",
+          "prompt": "What's drawing you to support a family in foster care?",
+          "required": true
+        },
+        {
+          "id": "field_1763001000008",
+          "type": "textarea",
+          "label": "References",
+          "prompt": "Please share two references (name and how we can reach them).",
+          "required": true
+        },
+        {
+          "id": "field_1763001000009",
+          "type": "select",
+          "label": "Background check consent",
+          "prompt": "Everyone who works with youth completes a background check and fingerprinting. Are you comfortable with that?",
+          "required": true,
+          "options": [
+            {
+              "value": "yes",
+              "label": "Yes"
+            },
+            {
+              "value": "no",
+              "label": "No"
+            }
+          ]
+        },
+        {
+          "id": "field_1763001000006",
+          "type": "textarea",
+          "label": "Anything else we should know",
+          "prompt": "Anything you'd like the team to know before they reach out?",
+          "required": false
+        }
+      ]
+    },
+    "mentor_application": {
+      "form_id": "mentor_application",
+      "title": "Mentor Application",
+      "description": "Application for the Mentorship Matches program \u2014 a twelve-month commitment.",
+      "program": "mentorship_matches",
+      "enabled": true,
+      "trigger_phrases": [
+        "I want to be a mentor",
+        "How do I become a mentor",
+        "Mentor application"
+      ],
+      "introduction": "Mentoring is a year-long commitment, so this one asks a bit more. Marcus reviews every application himself.",
+      "fields": [
+        {
+          "id": "field_1763002000001",
+          "type": "name",
+          "label": "Applicant name",
+          "prompt": "What's your full name?",
+          "required": true,
+          "subfields": [
+            {
+              "id": "field_1763002000001.first_name",
+              "label": "First Name",
+              "placeholder": "e.g., John",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763002000001.middle_name",
+              "label": "Middle Name",
+              "placeholder": "Optional",
+              "required": false,
+              "type": "text"
+            },
+            {
+              "id": "field_1763002000001.last_name",
+              "label": "Last Name",
+              "placeholder": "e.g., Smith",
+              "required": true,
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "id": "field_1763002000002",
+          "type": "email",
+          "label": "Email",
+          "prompt": "Best email for you?",
+          "required": true
+        },
+        {
+          "id": "field_1763002000003",
+          "type": "phone",
+          "label": "Phone",
+          "prompt": "And a phone number?",
+          "required": true
+        },
+        {
+          "id": "field_1763002000008",
+          "type": "address",
+          "label": "Home address",
+          "prompt": "What's your home address? (helps us match you nearby)",
+          "required": true,
+          "subfields": [
+            {
+              "id": "field_1763002000008.street",
+              "label": "Street Address",
+              "placeholder": "e.g., 123 Main Street",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763002000008.apt_unit",
+              "label": "Apt/Suite/Unit",
+              "placeholder": "Optional",
+              "required": false,
+              "type": "text"
+            },
+            {
+              "id": "field_1763002000008.city",
+              "label": "City",
+              "placeholder": "e.g., Portland",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763002000008.state",
+              "label": "State",
+              "placeholder": "e.g., OR",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763002000008.zip_code",
+              "label": "ZIP Code",
+              "placeholder": "e.g., 97201",
+              "required": true,
+              "type": "text",
+              "validation": {
+                "pattern": "^\\d{5}(-\\d{4})?$",
+                "message": "Please enter a valid ZIP code (e.g., 12345 or 12345-6789)"
+              }
+            }
+          ]
+        },
+        {
+          "id": "field_1763002000004",
+          "type": "select",
+          "label": "Twelve-month commitment",
+          "prompt": "Mentorship Matches asks for a minimum of twelve months. Can you commit to that?",
+          "required": true,
+          "options": [
+            {
+              "value": "yes",
+              "label": "Yes"
+            },
+            {
+              "value": "no",
+              "label": "No"
+            }
+          ]
+        },
+        {
+          "id": "field_1763002000005",
+          "type": "select",
+          "label": "Age group preference",
+          "prompt": "Any age group you'd feel most at home with?",
+          "required": false,
+          "options": [
+            {
+              "value": "9_12",
+              "label": "9-12"
+            },
+            {
+              "value": "13_15",
+              "label": "13-15"
+            },
+            {
+              "value": "16_17",
+              "label": "16-17"
+            },
+            {
+              "value": "no_preference",
+              "label": "No preference"
+            }
+          ]
+        },
+        {
+          "id": "field_1763002000006",
+          "type": "textarea",
+          "label": "Why mentoring",
+          "prompt": "What's drawing you to mentoring right now?",
+          "required": true
+        },
+        {
+          "id": "field_1763002000009",
+          "type": "textarea",
+          "label": "References",
+          "prompt": "Please share two references (name and how we can reach them).",
+          "required": true
+        },
+        {
+          "id": "field_1763002000007",
+          "type": "select",
+          "label": "Background check consent",
+          "prompt": "Every mentor completes a background check before being matched. Are you comfortable with that?",
+          "required": true,
+          "options": [
+            {
+              "value": "yes",
+              "label": "Yes"
+            },
+            {
+              "value": "no",
+              "label": "No"
+            }
+          ]
+        }
+      ]
+    },
+    "donation_inquiry": {
+      "form_id": "donation_inquiry",
+      "title": "Donation Inquiry",
+      "description": "For givers with a question \u2014 recurring gifts, employer matching, designating a program.",
+      "program": "general_support",
+      "enabled": true,
+      "trigger_phrases": [
+        "I have a question about donating",
+        "Employer matching",
+        "Can I designate my gift"
+      ],
+      "introduction": "Happy to help \u2014 Priya handles giving questions and is quick to reply.",
+      "fields": [
+        {
+          "id": "field_1763003000001",
+          "type": "name",
+          "label": "Contact name",
+          "prompt": "What's your name?",
+          "required": true,
+          "subfields": [
+            {
+              "id": "field_1763003000001.first_name",
+              "label": "First Name",
+              "placeholder": "e.g., John",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763003000001.middle_name",
+              "label": "Middle Name",
+              "placeholder": "Optional",
+              "required": false,
+              "type": "text"
+            },
+            {
+              "id": "field_1763003000001.last_name",
+              "label": "Last Name",
+              "placeholder": "e.g., Smith",
+              "required": true,
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "id": "field_1763003000002",
+          "type": "email",
+          "label": "Email",
+          "prompt": "Where should Priya reply?",
+          "required": true
+        },
+        {
+          "id": "field_1763003000003",
+          "type": "select",
+          "label": "What it's about",
+          "prompt": "What's your question about?",
+          "required": true,
+          "options": [
+            {
+              "value": "recurring",
+              "label": "Setting up a recurring gift"
+            },
+            {
+              "value": "matching",
+              "label": "Employer matching"
+            },
+            {
+              "value": "designate",
+              "label": "Designating a gift to a program"
+            },
+            {
+              "value": "stock_or_daf",
+              "label": "Stock or donor-advised fund"
+            },
+            {
+              "value": "other",
+              "label": "Something else"
+            }
+          ]
+        },
+        {
+          "id": "field_1763003000004",
+          "type": "textarea",
+          "label": "Your question",
+          "prompt": "What would you like to know?",
+          "required": true
+        }
+      ]
+    },
+    "event_registration": {
+      "form_id": "event_registration",
+      "title": "Gala Registration",
+      "description": "Registration for the annual Rivermont gala.",
+      "program": "general_support",
+      "enabled": true,
+      "trigger_phrases": [
+        "Register for the gala",
+        "I want to attend the event",
+        "Gala tickets"
+      ],
+      "introduction": "The gala is BrightPath's one big night a year. Let's get you on the list.",
+      "fields": [
+        {
+          "id": "field_1763004000001",
+          "type": "name",
+          "label": "Guest name",
+          "prompt": "What name should be on the list?",
+          "required": true,
+          "subfields": [
+            {
+              "id": "field_1763004000001.first_name",
+              "label": "First Name",
+              "placeholder": "e.g., John",
+              "required": true,
+              "type": "text"
+            },
+            {
+              "id": "field_1763004000001.middle_name",
+              "label": "Middle Name",
+              "placeholder": "Optional",
+              "required": false,
+              "type": "text"
+            },
+            {
+              "id": "field_1763004000001.last_name",
+              "label": "Last Name",
+              "placeholder": "e.g., Smith",
+              "required": true,
+              "type": "text"
+            }
+          ]
+        },
+        {
+          "id": "field_1763004000002",
+          "type": "email",
+          "label": "Email",
+          "prompt": "Where should we send your confirmation?",
+          "required": true
+        },
+        {
+          "id": "field_1763004000003",
+          "type": "select",
+          "label": "Number attending",
+          "prompt": "How many seats do you need?",
+          "required": true,
+          "options": [
+            {
+              "value": "1",
+              "label": "Just me"
+            },
+            {
+              "value": "2",
+              "label": "Two"
+            },
+            {
+              "value": "table",
+              "label": "A full table (8)"
+            }
+          ]
+        },
+        {
+          "id": "field_1763004000004",
+          "type": "text",
+          "label": "Dietary needs",
+          "prompt": "Any dietary needs we should pass to the caterer?",
+          "required": false
+        },
+        {
+          "id": "field_1763004000005",
+          "type": "select",
+          "label": "Sponsorship interest",
+          "prompt": "Would you like Priya to send the sponsorship options?",
+          "required": false,
+          "options": [
+            {
+              "value": "yes",
+              "label": "Yes"
+            },
+            {
+              "value": "no",
+              "label": "No"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

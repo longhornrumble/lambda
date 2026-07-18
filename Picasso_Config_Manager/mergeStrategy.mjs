@@ -123,6 +123,53 @@ export function extractEditableSections(fullConfig) {
 }
 
 /**
+ * Form field types the Picasso widget can render (FormFieldPrompt.jsx).
+ * The Config Builder authors a subset of these (it does not offer
+ * phone_with_consent), so builder-authored configs always pass. Anything
+ * outside this set reaches the widget as a prompt with NO input control —
+ * a dead-end form (the BRI071351 'boolean' incident, 2026-07-18). This
+ * Lambda is the only write path to the config bucket, so this is the last
+ * gate before a bad shape can reach live forms.
+ */
+const WIDGET_FIELD_TYPES = [
+  'text', 'email', 'phone', 'select', 'textarea', 'number', 'date',
+  'name', 'address', 'phone_with_consent',
+];
+
+// Composite types render via CompositeFieldGroup, which requires subfields.
+const COMPOSITE_FIELD_TYPES = ['name', 'address', 'phone_with_consent'];
+
+/**
+ * Validate that every form field is a shape the widget can render.
+ * Appends human-readable messages to `errors`. Tolerates missing/odd
+ * structure (forward-compatible reads) — only flags fields that would
+ * concretely break rendering.
+ */
+function validateFormShapes(forms, errors) {
+  for (const [formId, form] of Object.entries(forms || {})) {
+    for (const field of (form && form.fields) || []) {
+      const t = field?.type;
+      const id = field?.id ?? '(no id)';
+      if (!WIDGET_FIELD_TYPES.includes(t)) {
+        errors.push(
+          `Form "${formId}" field "${id}": unsupported type "${t}" — the widget cannot render it. Supported: ${WIDGET_FIELD_TYPES.join(', ')}`
+        );
+      }
+      if (COMPOSITE_FIELD_TYPES.includes(t) && !(Array.isArray(field.subfields) && field.subfields.length > 0)) {
+        errors.push(
+          `Form "${formId}" field "${id}": composite type "${t}" requires a non-empty subfields array`
+        );
+      }
+      if (t === 'select' && !(Array.isArray(field.options) && field.options.length > 0)) {
+        errors.push(
+          `Form "${formId}" field "${id}": select requires a non-empty options array`
+        );
+      }
+    }
+  }
+}
+
+/**
  * Validate that edited sections only contain allowed sections
  *
  * @param {Object} editedSections - Object containing edited sections
@@ -146,6 +193,12 @@ export function validateEditedSections(editedSections) {
   const readOnlyAttempts = editedKeys.filter(key => READ_ONLY_SECTIONS.includes(key));
   if (readOnlyAttempts.length > 0) {
     errors.push(`Cannot edit read-only sections: ${readOnlyAttempts.join(', ')}`);
+  }
+
+  // Block form field shapes the widget cannot render (only when the write
+  // touches conversational_forms — untouched sections are never re-validated).
+  if (editedSections.conversational_forms) {
+    validateFormShapes(editedSections.conversational_forms, errors);
   }
 
   return {

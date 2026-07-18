@@ -6,7 +6,7 @@
   "main": "index.mjs",
   "scripts": {
     "test": "node --test *.test.mjs",
-    "package": "npm ci --omit=dev && zip -r deployment.zip . -x '*.zip' -x '*.test.mjs' -x 'node_modules/.cache/*' -x 'README.md'",
+    "package": "npm ci --omit=dev && zip -r deployment.zip . -x '*.zip' -x '*.test.mjs' -x '__tests__/*' -x 'node_modules/.cache/*' -x 'README.md'",
     "deploy": "aws lambda update-function-code --function-name Picasso_Config_Manager --zip-file fileb://deployment.zip --profile ai-developer"
   },
   "engines": {
