@@ -1229,3 +1229,21 @@ class TestActiveSecondsFromInteractionStream:
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
+
+
+# --- 2026-07-18: channel name must be in the row; frozen tenants skip recompute ---
+
+def test_attribution_frozen_flag():
+    assert agg._attribution_frozen({'attribution_frozen': True}) is True
+    assert agg._attribution_frozen({'feature_flags': {'attribution_frozen': True}}) is True
+    assert agg._attribution_frozen({'feature_flags': {}}) is False
+    assert agg._attribution_frozen({}) is False
+
+
+def test_build_channel_includes_channel_name():
+    sm = {'s1': {'has_lead': True, 'is_engaged': True, 'has_application': False,
+                 'is_after_hours': False, 'active_seconds': 60,
+                 'topic_counts': {'Volunteer': 1}, 'resource_clicks': {}, 'entry_point_id': None}}
+    row = agg._build_channel('website', ['s1'], sm, {})
+    assert row['channel'] == 'website'
+    assert row['conversations'] == 1
