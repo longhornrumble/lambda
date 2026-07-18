@@ -187,9 +187,21 @@ def lambda_handler(event: Dict, context: Any) -> Dict:
 # ---------------------------------------------------------------------------
 # Core: aggregate one tenant for the current (and optionally prior) month
 # ---------------------------------------------------------------------------
+def _attribution_frozen(config: Dict) -> bool:
+    """A tenant can freeze its attribution so a fully-reconciled, directly-seeded
+    set of aggregate rows is never overwritten by the live recompute. Used by
+    demo tenants; schema-tolerant (flag may live top-level or under feature_flags).
+    """
+    ff = config.get('feature_flags') or {}
+    return bool(config.get('attribution_frozen') or ff.get('attribution_frozen'))
+
+
 def _aggregate_attribution(tenant_hash: str, tenant_id: str) -> int:
     """Return count of aggregate rows written."""
     config = _get_tenant_config(tenant_id)
+    if _attribution_frozen(config):
+        logger.info('Attribution frozen for tenant %s; skipping recompute', tenant_id[:8])
+        return 0
     tz_name = config.get('timezone', DEFAULT_TZ)  # C7 schema-tolerant
     try:
         tz = ZoneInfo(tz_name)
@@ -577,6 +589,7 @@ def _build_channel(
         reach = {'scans': scans, 'clicks': clicks}
 
     row = {
+        'channel': channel,   # the channel name must live in the row, not only in the sk
         'conversations': conversations,
         'engaged': engaged,
         'applications': applications,
