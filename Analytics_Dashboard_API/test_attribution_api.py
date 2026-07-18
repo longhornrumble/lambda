@@ -972,3 +972,40 @@ class TestPriorMonth:
 
     def test_january_wraps_to_december(self):
         assert attribution_api._prior_month("2026-01") == "2025-12"
+
+
+# --- Regression: aggregator writes metrics under a `data` Map; the reader must
+# hoist them to top level or the dashboard shows the empty state (2026-07-18). ---
+
+def test_hoist_data_lifts_nested_metrics_to_top_level():
+    raw = {
+        "pk": {"S": "TENANT#T1"},
+        "sk": {"S": "METRIC#attribution_summary#2026-07"},
+        "updated_at": {"S": "2026-07-18T00:00:00Z"},
+        "ttl": {"N": "123"},
+        "data": {"M": {
+            "conversations": {"N": "42"},
+            "leads": {"N": "7"},
+            "self_booked_pct": {"NULL": True},
+            "topic_counts": {"M": {"Volunteer": {"N": "10"}, "Donation": {"N": "5"}}},
+            "reach": {"M": {"scans": {"N": "3"}, "clicks": {"N": "0"}}},
+        }},
+    }
+    item = attribution_api._deserialize_item(attribution_api._hoist_data(raw))
+    assert int(item.get("conversations", 0)) == 42          # top-level readable
+    assert int(item.get("leads", 0)) == 7
+    assert item.get("self_booked_pct") is None
+    assert item.get("topic_counts") == {"Volunteer": 10, "Donation": 5}  # nested Map intact
+    assert item.get("reach") == {"scans": 3, "clicks": 0}
+
+
+def test_hoist_data_noop_on_top_level_rows():
+    raw = {"pk": {"S": "TENANT#T1"}, "sk": {"S": "x"}, "conversations": {"N": "9"}}
+    item = attribution_api._deserialize_item(attribution_api._hoist_data(raw))
+    assert int(item.get("conversations", 0)) == 9
+
+
+def test_hoist_data_prefers_data_on_conflict():
+    raw = {"conversations": {"N": "1"}, "data": {"M": {"conversations": {"N": "99"}}}}
+    item = attribution_api._deserialize_item(attribution_api._hoist_data(raw))
+    assert int(item.get("conversations", 0)) == 99

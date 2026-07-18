@@ -144,6 +144,23 @@ def _deserialize_item(raw: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _hoist_data(raw: dict[str, Any]) -> dict[str, Any]:
+    """The Attribution_Aggregator writes the C5 metrics nested under a `data`
+    Map; older/seeded rows also carry them at the top level. Merge the `data`
+    members up to the top level (raw AttributeValue level, so nested Maps like
+    topic_counts/reach deserialize correctly) so the reader is tolerant of both
+    shapes. `data` members win on conflict — the aggregator is authoritative.
+    Without this, aggregator-written rows read as all-zeros (the reader accesses
+    metrics top-level) and the dashboard shows the empty state.
+    """
+    data = raw.get("data")
+    if isinstance(data, dict) and isinstance(data.get("M"), dict):
+        merged = {k: v for k, v in raw.items() if k != "data"}
+        merged.update(data["M"])
+        return merged
+    return raw
+
+
 def _get_agg_item(tenant_id: str, sk: str) -> Optional[dict[str, Any]]:
     """
     Fetch a single C5 aggregate row by pk=TENANT#{tenant_id} sk=METRIC#{sk}.
@@ -165,7 +182,7 @@ def _get_agg_item(tenant_id: str, sk: str) -> Optional[dict[str, Any]]:
     raw = resp.get("Item")
     if not raw:
         return None
-    return _deserialize_item(raw)
+    return _deserialize_item(_hoist_data(raw))
 
 
 def _query_agg_prefix(tenant_id: str, sk_prefix: str) -> list[dict[str, Any]]:
@@ -191,7 +208,7 @@ def _query_agg_prefix(tenant_id: str, sk_prefix: str) -> list[dict[str, Any]]:
                          e.response["Error"]["Code"])
             raise
         for raw in resp.get("Items", []):
-            results.append(_deserialize_item(raw))
+            results.append(_deserialize_item(_hoist_data(raw)))
         last = resp.get("LastEvaluatedKey")
         if not last:
             break
