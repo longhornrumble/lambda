@@ -6729,7 +6729,7 @@ def handle_lead_detail(tenant_id: str, submission_id: str) -> Dict[str, Any]:
         # Direct GetItem by primary key
         response = dynamodb.get_item(
             TableName=FORM_SUBMISSIONS_TABLE,
-            Key={'submission_id': {'S': submission_id}}
+            Key={'tenant_id': {'S': tenant_id}, 'submission_id': {'S': submission_id}}
         )
 
         item = response.get('Item')
@@ -6890,7 +6890,7 @@ def handle_lead_status_update(
         # First, verify the lead exists and belongs to tenant
         response = dynamodb.get_item(
             TableName=FORM_SUBMISSIONS_TABLE,
-            Key={'submission_id': {'S': submission_id}},
+            Key={'tenant_id': {'S': tenant_id}, 'submission_id': {'S': submission_id}},
             ProjectionExpression='tenant_id, pipeline_status'
         )
 
@@ -6929,7 +6929,7 @@ def handle_lead_status_update(
         # Perform update
         update_params = {
             'TableName': FORM_SUBMISSIONS_TABLE,
-            'Key': {'submission_id': {'S': submission_id}},
+            'Key': {'tenant_id': {'S': tenant_id}, 'submission_id': {'S': submission_id}},
             'UpdateExpression': update_expr,
             'ExpressionAttributeValues': expr_values
         }
@@ -6985,7 +6985,7 @@ def handle_lead_notes_update(
         # Verify lead exists and belongs to tenant
         response = dynamodb.get_item(
             TableName=FORM_SUBMISSIONS_TABLE,
-            Key={'submission_id': {'S': submission_id}},
+            Key={'tenant_id': {'S': tenant_id}, 'submission_id': {'S': submission_id}},
             ProjectionExpression='tenant_id'
         )
 
@@ -7001,7 +7001,7 @@ def handle_lead_notes_update(
         # Update notes
         dynamodb.update_item(
             TableName=FORM_SUBMISSIONS_TABLE,
-            Key={'submission_id': {'S': submission_id}},
+            Key={'tenant_id': {'S': tenant_id}, 'submission_id': {'S': submission_id}},
             UpdateExpression='SET internal_notes = :notes, updated_at = :now, processed_by = :user',
             ExpressionAttributeValues={
                 ':notes': {'S': notes},
@@ -7052,7 +7052,7 @@ def handle_lead_reactivate(
         # Fetch current lead state
         response = dynamodb.get_item(
             TableName=FORM_SUBMISSIONS_TABLE,
-            Key={'submission_id': {'S': submission_id}},
+            Key={'tenant_id': {'S': tenant_id}, 'submission_id': {'S': submission_id}},
             ProjectionExpression='tenant_id, pipeline_status, internal_notes'
         )
 
@@ -7113,7 +7113,7 @@ def handle_lead_reactivate(
 
         dynamodb.update_item(
             TableName=FORM_SUBMISSIONS_TABLE,
-            Key={'submission_id': {'S': submission_id}},
+            Key={'tenant_id': {'S': tenant_id}, 'submission_id': {'S': submission_id}},
             UpdateExpression=update_expr,
             ExpressionAttributeValues=expr_values,
             ExpressionAttributeNames=expr_names
