@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from typing import Dict, Any, Optional
@@ -1792,6 +1793,46 @@ def handle_cache_warming(event: Dict[str, Any], tenant_hash: str) -> Dict[str, A
     
     return add_cors_headers(response, event)
 
+def handle_log_error(event: Dict[str, Any], tenant_hash: str) -> Dict[str, Any]:
+    """
+    Log-only diagnostic reports from the widget host script (currently the
+    mis-embed detection: the snippet running inside a sandboxed builder iframe,
+    e.g. a Wix "Embed HTML" element, where position:fixed can't reach the real
+    viewport). Emits one structured CloudWatch line; stores nothing.
+
+    PII discipline (pii-data-lifecycle-advisor review 2026-07-18): this path
+    must NEVER log the raw event or requestContext (sourceIp / user-agent live
+    there) and never echoes input back. Only the allowlisted, shape-validated
+    fields below are emitted.
+    """
+    try:
+        body = json.loads(event.get('body', '{}')) if event.get('body') else {}
+    except (ValueError, TypeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    def _hostname(value: Any) -> str:
+        s = str(value or '').lower()
+        return s if re.fullmatch(r'[a-z0-9.-]{1,253}', s) else ''
+
+    event_type = str(body.get('type') or '')
+    frame_host = _hostname(body.get('frame_host'))
+    page_host = _hostname(body.get('page_host'))
+    tenant = tenant_hash if re.fullmatch(r'[a-z0-9]{8,32}', tenant_hash or '') else ''
+
+    if event_type == 'embed_sandboxed_frame' and tenant:
+        logger.warning(
+            f"WIDGET_EMBED_MISCONFIG tenant={tenant} frame_host={frame_host} page_host={page_host}"
+        )
+    else:
+        # Unknown type or invalid tenant: drop silently (open endpoint —
+        # don't give probers a log-injection or enumeration surface).
+        logger.info("WIDGET_CLIENT_LOG dropped invalid report")
+
+    response = {'statusCode': 200, 'body': json.dumps({'ok': True})}
+    return add_cors_headers(response, event)
+
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
     Main Lambda handler with centralized routing and CORS
@@ -1859,6 +1900,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             return clear_cache(tenant_hash, event)
         elif action == 'warm_cache':
             return handle_cache_warming(event, tenant_hash)
+        elif action == 'log_error':
+            return handle_log_error(event, tenant_hash)
         elif not action:
             # No action specified, default to health check
             return health_check(event)
@@ -1870,7 +1913,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'body': json.dumps({
                     'error': 'Not Found',
                     'message': f'Action {action} not found',
-                    'available_actions': ['health_check', 'get_config', 'chat', 'conversation', 'init_session', 'cache_status', 'clear_cache', 'warm_cache']
+                    'available_actions': ['health_check', 'get_config', 'chat', 'conversation', 'init_session', 'cache_status', 'clear_cache', 'warm_cache', 'log_error']
                 })
             }
             return add_cors_headers(response, event)
