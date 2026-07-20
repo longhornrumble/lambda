@@ -295,9 +295,10 @@ export const handler = async (event) => {
         cta_definitions: {},
         conversation_branches: {},
         content_showcase: [],
-        // New tenants start on the V4.0 Action Selector (the preferred CTA
-        // pipeline for new clients; legacy rungs exist only for stored data).
-        feature_flags: { V4_ACTION_SELECTOR: true },
+        // New tenants start on the V5 single-pass turn (the default pipeline
+        // per Chris 2026-07-19); V4 Action Selector stays on as the explicit
+        // fallback rung if V5 is ever disabled for a tenant.
+        feature_flags: { V5_SINGLE_PASS: true, V4_ACTION_SELECTOR: true },
         cta_settings: { fallback_tags: [] },
       };
 
