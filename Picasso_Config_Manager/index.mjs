@@ -14,7 +14,6 @@ import {
   saveConfig,
   deleteConfig,
   listBackups,
-  listProposals,
   storeTenantMapping,
   ConfigETagMismatchError,
 } from './s3Operations.mjs';
@@ -249,76 +248,57 @@ export const handler = async (event) => {
 
       const tenantHash = generateTenantHash(tenant_id);
 
-      // Build skeleton config
+      // Build skeleton config — Hairline shape, mirroring what the current
+      // Config Builder emits (2026-07 dead-field cleanup, cb#102–#111).
+      // Branding is the single-input Hairline contract (primary_color drives
+      // the tenantTheme() ramp; font_family is the self-hosted enum;
+      // chat_position is honored by the widget host). Optional sections
+      // (quick_help, action_chips, bedrock_instructions) are OMITTED — all
+      // readers are sparse-tolerant and the builder seeds them on first edit.
+      // conversational_forms / cta_definitions / conversation_branches are
+      // dicts keyed by id, not arrays (canonical widget-renderable shape).
       const config = {
         tenant_id: tenant_id,
         tenant_hash: tenantHash,
         version: 1,
         generated_at: Date.now(),
         chat_title: chat_title || tenant_id,
-        chat_subtitle: '',
         welcome_message: welcome_message || 'Hello! How can I help you today?',
         subscription_tier: subscription_tier || 'Free',
         tone_prompt: '',
         branding: {
-          primary_color: primary_color || '#10B981',
-          secondary_color: '#059669',
-          accent_color: '#34D399',
-          background_color: '#FFFFFF',
-          text_color: '#1F2937',
-          font_family: 'Inter, system-ui, sans-serif',
+          primary_color: primary_color || '#a08a4a',
+          font_family: 'plus-jakarta-sans',
+          chat_position: 'bottom-right',
         },
         features: {
           uploads: false,
           photo_uploads: false,
           voice_input: false,
-          streaming: true,
-          conversational_forms: false,
-          smart_cards: false,
           sms: false,
-          webchat: true,
-          qr: false,
-          bedrock_kb: false,
-          ats: false,
-          interview_scheduling: false,
           dashboard_conversations: false,
           dashboard_forms: false,
           dashboard_attribution: false,
+          dashboard_notifications: false,
+          callout: { enabled: false, auto_dismiss: true },
         },
         widget_behavior: {
           start_open: false,
           remember_state: true,
           auto_open_delay: 0,
         },
-        quick_help: {
-          enabled: false,
-          title: 'Quick Help',
-          toggle_text: 'Need help?',
-          close_after_selection: true,
-          prompts: [],
-        },
         aws: {
           knowledge_base_id: knowledge_base_id || '',
-          aws_region: 'us-east-1',
         },
         programs: [],
-        conversational_forms: [],
-        cta_definitions: [],
-        conversation_branches: [],
+        conversational_forms: {},
+        cta_definitions: {},
+        conversation_branches: {},
         content_showcase: [],
-        topic_definitions: [],
-        feature_flags: {},
+        // New tenants start on the V4.0 Action Selector (the preferred CTA
+        // pipeline for new clients; legacy rungs exist only for stored data).
+        feature_flags: { V4_ACTION_SELECTOR: true },
         cta_settings: { fallback_tags: [] },
-        action_chips: [],
-        bedrock_instructions: '',
-        card_inventory: [],
-        monitor: {
-          enabled: true,
-          siteUrl: '',
-          keyPages: ['/'],
-          dubTag: '',
-          webhookUrl: 'https://integrate.myrecruiter.ai/webhook/kb-monitor',
-        },
       };
 
       // Save config
@@ -658,40 +638,6 @@ export const handler = async (event) => {
           success: true,
           ...result,
         }),
-      };
-    }
-
-    // GET /proposals?tenantId=... - List pending KB-freshness proposals for a tenant.
-    // Read-only endpoint consumed by the Pending Changes review UI.
-    if (httpMethod === 'GET' && path === '/proposals') {
-      const tenantId = queryStringParameters?.tenantId;
-      const idError = validateTenantId(tenantId, headers);
-      if (idError) return idError;
-
-      if (auth.success && auth.role !== 'super_admin') {
-        const userTenants = auth.tenants || [];
-        if (!userTenants.includes(tenantId)) {
-          console.warn(`User ${auth.email} attempted to list proposals for tenant ${tenantId} without permission`);
-          if (ENFORCE_AUTH) {
-            return {
-              statusCode: 403,
-              headers,
-              body: JSON.stringify({
-                error: 'Forbidden',
-                message: 'You do not have access to this tenant',
-              }),
-            };
-          } else {
-            console.warn('PERMISSIVE MODE: Allowing unauthorized proposal listing');
-          }
-        }
-      }
-
-      const proposals = await listProposals(tenantId);
-      return {
-        statusCode: 200,
-        headers,
-        body: JSON.stringify({ proposals }),
       };
     }
 
