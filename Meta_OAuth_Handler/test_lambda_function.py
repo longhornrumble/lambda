@@ -1039,5 +1039,192 @@ class TestChannelAuthorization(unittest.TestCase):
         self.assertEqual(resp["statusCode"], 200)
 
 
+class TestMultiPageSelection(unittest.TestCase):
+    """Multi-Page grant → in-popup picker → POST /meta/oauth/select-page."""
+
+    def _valid_state(self, tenant_id="TENANT_XYZ"):
+        import jwt
+        payload = {
+            "tenant_id": tenant_id,
+            "nonce": "abc123",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 600,
+        }
+        return jwt.encode(payload, _FAKE_APP_SECRET, algorithm="HS256")
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    @patch("lambda_function._encrypt_token", return_value="ENC")
+    @patch("lambda_function._channel_table")
+    def test_multiple_pages_renders_picker_and_stores_nonce(
+        self, mock_table, mock_encrypt, mock_get, _mock_secret
+    ):
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},  # token exchange
+            {"data": [  # /me/accounts — TWO Pages granted
+                {"id": "PAGE_001", "name": "Austin Angels", "access_token": "TOK_1"},
+                {"id": "PAGE_002", "name": "Foster Village", "access_token": "TOK_2"},
+            ]},
+        ]
+        mock_table.return_value.put_item = MagicMock()
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        response = lf.lambda_handler(event, _make_context())
+
+        # Picker HTML, not a channel connection
+        self.assertEqual(response["statusCode"], 200)
+        self.assertIn("text/html", response["headers"]["Content-Type"])
+        self.assertIn("Choose the Page to connect", response["body"])
+        self.assertIn("Austin Angels", response["body"])
+        self.assertIn("Foster Village", response["body"])
+        self.assertIn("/meta/oauth/select-page", response["body"])
+        # No success/channel yet
+        self.assertNotIn("META_OAUTH_SUCCESS", response["body"])
+
+        # A single-use selection record was stored — NOT a live channel row.
+        mock_table.return_value.put_item.assert_called_once()
+        item = mock_table.return_value.put_item.call_args[1]["Item"]
+        self.assertTrue(item["PK"].startswith("SELECT#"))
+        self.assertEqual(item["SK"], "OAUTH_SELECTION")
+        self.assertEqual(item["pendingTenantId"], "TENANT_XYZ")
+        # Must NOT carry the TenantIndex GSI key, or it would surface as a channel.
+        self.assertNotIn("tenantId", item)
+        self.assertEqual(len(item["pages"]), 2)
+        self.assertEqual({p["id"] for p in item["pages"]}, {"PAGE_001", "PAGE_002"})
+        # Page tokens are encrypted at rest, never plaintext.
+        self.assertTrue(all(p["encToken"] == "ENC" for p in item["pages"]))
+        self.assertNotIn("TOK_1", response["body"])
+        self.assertNotIn("TOK_2", response["body"])
+
+    @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
+    @patch("lambda_function._graph_get")
+    @patch("lambda_function._encrypt_token", return_value="ENC")
+    @patch("lambda_function._channel_table")
+    def test_only_one_usable_token_connects_directly(
+        self, mock_table, mock_encrypt, mock_get, _mock_secret
+    ):
+        """Several Pages returned but only one carries a token → connect it, no picker."""
+        import lambda_function as lf
+        lf._meta_app_secret = None
+
+        mock_get.side_effect = [
+            {"access_token": "USER_TOKEN_XYZ"},  # token exchange
+            {"data": [
+                {"id": "PAGE_001", "name": "No Token Page", "access_token": ""},
+                {"id": "PAGE_002", "name": "Real Page", "access_token": "TOK_2"},
+            ]},
+            {},  # instagram_business_account lookup — none linked
+        ]
+        mock_table.return_value.put_item = MagicMock()
+
+        state = self._valid_state()
+        event = _make_event("GET", "/meta/oauth/callback", {"code": "AUTH_CODE", "state": state})
+        response = lf.lambda_handler(event, _make_context())
+
+        self.assertIn("META_OAUTH_SUCCESS", response["body"])
+        self.assertIn("Real Page", response["body"])
+        item = mock_table.return_value.put_item.call_args[1]["Item"]
+        self.assertEqual(item["PK"], "PAGE#PAGE_002")
+        self.assertEqual(item["SK"], "CHANNEL#messenger")
+
+    def _select_event(self, nonce="NONCE123", page_id="PAGE_002"):
+        return {
+            "httpMethod": "POST",
+            "path": "/meta/oauth/select-page",
+            "queryStringParameters": {},
+            "body": f"nonce={nonce}&page_id={page_id}",
+        }
+
+    def _stored_record(self, ttl_offset=600):
+        return {
+            "PK": "SELECT#NONCE123",
+            "SK": "OAUTH_SELECTION",
+            "pendingTenantId": "TENANT_XYZ",
+            "pages": [
+                {"id": "PAGE_001", "name": "Austin Angels", "encToken": "E1"},
+                {"id": "PAGE_002", "name": "Foster Village", "encToken": "E2"},
+            ],
+            "ttl": int(time.time()) + ttl_offset,
+        }
+
+    @patch("lambda_function._graph_post", return_value={"success": True})
+    @patch("lambda_function._graph_get", return_value={})
+    @patch("lambda_function._decrypt_token", return_value="PAGE_TOKEN_2")
+    @patch("lambda_function._encrypt_token", return_value="ENCRYPTED_TOKEN_BASE64")
+    @patch("lambda_function._channel_table")
+    def test_select_page_connects_chosen_page_and_consumes_nonce(
+        self, mock_table, mock_encrypt, mock_decrypt, mock_get, mock_post
+    ):
+        import lambda_function as lf
+
+        mock_table.return_value.get_item.return_value = {"Item": self._stored_record()}
+        mock_table.return_value.put_item = MagicMock()
+        mock_table.return_value.delete_item = MagicMock()
+
+        response = lf.lambda_handler(self._select_event(page_id="PAGE_002"), _make_context())
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertIn("META_OAUTH_SUCCESS", response["body"])
+        self.assertIn("Foster Village", response["body"])
+        # Chosen Page's token was decrypted, then the channel written for it.
+        mock_decrypt.assert_called_once_with("E2")
+        item = mock_table.return_value.put_item.call_args[1]["Item"]
+        self.assertEqual(item["PK"], "PAGE#PAGE_002")
+        self.assertEqual(item["tenantId"], "TENANT_XYZ")
+        # Single-use: the nonce record is deleted.
+        mock_table.return_value.delete_item.assert_called_once_with(
+            Key={"PK": "SELECT#NONCE123", "SK": "OAUTH_SELECTION"}
+        )
+
+    @patch("lambda_function._channel_table")
+    def test_select_page_expired_nonce_errors(self, mock_table):
+        import lambda_function as lf
+        mock_table.return_value.get_item.return_value = {"Item": self._stored_record(ttl_offset=-10)}
+        mock_table.return_value.delete_item = MagicMock()
+
+        response = lf.lambda_handler(self._select_event(), _make_context())
+        self.assertIn("META_OAUTH_ERROR", response["body"])
+        self.assertIn("expired", response["body"])
+
+    @patch("lambda_function._channel_table")
+    def test_select_page_unknown_nonce_errors(self, mock_table):
+        import lambda_function as lf
+        mock_table.return_value.get_item.return_value = {}  # no Item
+
+        response = lf.lambda_handler(self._select_event(), _make_context())
+        self.assertIn("META_OAUTH_ERROR", response["body"])
+
+    @patch("lambda_function._channel_table")
+    def test_select_page_unknown_page_id_errors(self, mock_table):
+        import lambda_function as lf
+        mock_table.return_value.get_item.return_value = {"Item": self._stored_record()}
+        mock_table.return_value.delete_item = MagicMock()
+
+        response = lf.lambda_handler(self._select_event(page_id="PAGE_999"), _make_context())
+        self.assertIn("META_OAUTH_ERROR", response["body"])
+
+    def test_select_page_missing_fields_errors(self):
+        import lambda_function as lf
+        event = {"httpMethod": "POST", "path": "/meta/oauth/select-page", "body": "nonce=X"}
+        response = lf.lambda_handler(event, _make_context())
+        self.assertIn("META_OAUTH_ERROR", response["body"])
+        self.assertIn("Missing Page selection", response["body"])
+
+
+class TestSuccessPopupPayloadShape(unittest.TestCase):
+    """The dashboard reads event.data.payload.pageId — the popup must wrap it."""
+
+    def test_success_popup_wraps_payload(self):
+        import lambda_function as lf
+        resp = lf._html_success_popup("PAGE_042", "Test Page")
+        self.assertIn("payload:", resp["body"])
+        self.assertIn("pageId: 'PAGE_042'", resp["body"])
+        self.assertIn("pageName: 'Test Page'", resp["body"])
+
+
 if __name__ == "__main__":
     unittest.main()

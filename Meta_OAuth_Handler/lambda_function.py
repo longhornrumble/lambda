@@ -42,6 +42,7 @@ Environment variables:
 import base64
 import hashlib
 import hmac
+import html
 import json
 import os
 import secrets
@@ -135,6 +136,10 @@ _META_LOGIN_CONFIG_ID = os.environ.get("META_LOGIN_CONFIG_ID", "")
 
 # State JWT lifetime in seconds (10 minutes)
 _STATE_JWT_TTL = 600
+
+# Multi-Page selection nonce lifetime — how long the in-popup Page picker stays
+# valid before the admin must reconnect (10 minutes, matches the state JWT).
+_SELECTION_TTL_SECONDS = 600
 
 # Page token TTL in DynamoDB — 10 years expressed as seconds
 _TOKEN_TTL_SECONDS = 10 * 365 * 24 * 3600
@@ -654,19 +659,15 @@ def _handle_oauth_callback(event: dict) -> dict:
       1. Validates the state JWT to recover tenant_id
       2. Exchanges the auth code for a User Access Token
       3. Lists the user's Pages
-      4. Selects the target Page (first, or matching page_id param)
-      5. Encrypts the Page Access Token with KMS
-      6. Writes the channel mapping to DynamoDB
-      7. Subscribes the Page to the webhook
-      8. Configures the Get Started button
-      9. Returns an HTML popup that posts a message to the opener and closes
+      4. One Page granted -> connects it via _connect_page. Several granted ->
+         hands off to _begin_page_selection (in-popup picker), since Picasso
+         connects one Page per tenant.
 
     SECURITY: No tokens are logged at any point.
     """
     params = event.get("queryStringParameters") or {}
     code = params.get("code", "").strip()
     state_token = params.get("state", "").strip()
-    preferred_page_id = params.get("page_id", "").strip()
 
     # --- Validate state JWT ---
     if not state_token:
@@ -728,17 +729,28 @@ def _handle_oauth_callback(event: dict) -> dict:
         return _html_error_popup("Failed to retrieve your Facebook Pages")
 
     # --- Select target Page ---
-    if preferred_page_id:
-        matched = [p for p in pages if p.get("id") == preferred_page_id]
-        page = matched[0] if matched else pages[0]
-        if not matched:
-            print(
-                f"[WARN] Requested page_id={preferred_page_id} not found; "
-                f"using first available Page for tenant_id={tenant_id}"
-            )
-    else:
-        page = pages[0]
+    # One granted Page → connect it directly. Several granted Pages → Picasso
+    # connects one Page per tenant, so let the admin choose which via an
+    # in-popup picker (POST /meta/oauth/select-page). Facebook's own asset
+    # picker already covers the common single-Page grant.
+    if len(pages) == 1:
+        return _connect_page(tenant_id, pages[0])
+    return _begin_page_selection(tenant_id, pages)
 
+
+def _connect_page(tenant_id: str, page: dict) -> dict:
+    """
+    Finish connecting a single chosen Page: encrypt its access token, write the
+    Messenger (and any linked Instagram) channel mapping, push welcome surfaces,
+    subscribe the webhook, configure the Get Started button, and return the
+    success popup.
+
+    Shared by the single-Page callback path and the multi-Page selection path
+    (POST /meta/oauth/select-page). `page` is a dict with id / name /
+    access_token, exactly as returned by /me/accounts or the granular fetch.
+
+    SECURITY: No tokens are logged at any point.
+    """
     page_id: str = page["id"]
     page_name: str = page.get("name", page_id)
     page_access_token: str = page.get("access_token", "")
@@ -851,6 +863,133 @@ def _handle_oauth_callback(event: dict) -> dict:
 
     # --- Return popup HTML ---
     return _html_success_popup(page_id, page_name)
+
+
+def _begin_page_selection(tenant_id: str, pages: list) -> dict:
+    """
+    The account granted more than one Page. Persist each granted Page's access
+    token (KMS-encrypted) under a single-use, short-TTL selection nonce and
+    render an in-popup picker; the admin's choice completes via
+    POST /meta/oauth/select-page.
+
+    The transient record deliberately stores the tenant under `pendingTenantId`
+    (NOT `tenantId`) so it stays out of the TenantIndex GSI and never surfaces
+    as a live channel to list/disconnect/toggle.
+
+    SECURITY: Page tokens live only KMS-encrypted at rest; only Page ids/names
+    (non-secret) are ever sent to the browser.
+    """
+    usable = [p for p in pages if p.get("id") and p.get("access_token")]
+    if not usable:
+        return _html_error_popup(
+            "No connectable Pages were returned — please re-authorise"
+        )
+    # Only one Page actually carried a usable token → nothing to choose.
+    if len(usable) == 1:
+        return _connect_page(tenant_id, usable[0])
+
+    stored_pages = []
+    for p in usable:
+        try:
+            enc = _encrypt_token(p["access_token"])
+        except Exception as exc:
+            print(f"[ERROR] KMS encryption failed during page selection for tenant_id={tenant_id}: {exc}")
+            return _html_error_popup("Failed to secure the Page access tokens")
+        stored_pages.append({"id": p["id"], "name": p.get("name", p["id"]), "encToken": enc})
+
+    nonce = secrets.token_urlsafe(24)
+    item = {
+        "PK": f"SELECT#{nonce}",
+        "SK": "OAUTH_SELECTION",
+        "pendingTenantId": tenant_id,
+        "pages": stored_pages,
+        "ttl": int(time.time()) + _SELECTION_TTL_SECONDS,
+    }
+    try:
+        _channel_table().put_item(Item=item)
+    except Exception as exc:
+        print(f"[ERROR] Failed to persist page selection for tenant_id={tenant_id}: {exc}")
+        return _html_error_popup("Failed to start Page selection — please try again")
+
+    print(
+        f"[INFO] Multiple Pages granted for tenant_id={tenant_id}; "
+        f"rendering picker ({len(stored_pages)} pages)"
+    )
+    return _html_page_picker(
+        nonce, [{"id": p["id"], "name": p["name"]} for p in stored_pages]
+    )
+
+
+def _parse_form_body(event: dict) -> dict:
+    """Parse a urlencoded (or JSON) POST body into a flat {key: str} dict."""
+    raw = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        try:
+            raw = base64.b64decode(raw).decode()
+        except Exception:
+            raw = ""
+    raw = raw.strip()
+    if not raw:
+        return {}
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            return {k: str(v) for k, v in data.items()}
+        except json.JSONDecodeError:
+            return {}
+    parsed = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    return {k: v[0] for k, v in parsed.items()}
+
+
+def _handle_select_page(event: dict) -> dict:
+    """
+    POST /meta/oauth/select-page   (form body: nonce, page_id)
+
+    Completes a multi-Page connection: looks up the single-use selection nonce,
+    connects the chosen Page, and deletes the transient record. Public at the
+    URL layer like the OAuth callback — protected instead by the unguessable,
+    single-use, short-TTL nonce (never a Clerk/internal JWT, which the popup
+    form submit does not carry).
+    """
+    form = _parse_form_body(event)
+    nonce = (form.get("nonce") or "").strip()
+    page_id = (form.get("page_id") or "").strip()
+    if not nonce or not page_id:
+        return _html_error_popup("Missing Page selection — please try connecting again")
+
+    key = {"PK": f"SELECT#{nonce}", "SK": "OAUTH_SELECTION"}
+    try:
+        record = _channel_table().get_item(Key=key).get("Item")
+    except Exception as exc:
+        print(f"[ERROR] Failed to read page-selection nonce: {exc}")
+        return _html_error_popup("Could not complete Page selection — please try again")
+
+    # Single-use: delete immediately so the nonce cannot be replayed.
+    if record:
+        try:
+            _channel_table().delete_item(Key=key)
+        except Exception as exc:
+            print(f"[WARN] Failed to delete used page-selection nonce: {exc}")
+
+    # DynamoDB TTL deletion lags, so enforce expiry in code too.
+    if not record or int(record.get("ttl", 0)) < int(time.time()):
+        return _html_error_popup("Your Page selection expired — please connect again")
+
+    tenant_id = record.get("pendingTenantId", "")
+    chosen = next((p for p in record.get("pages", []) if p.get("id") == page_id), None)
+    if not tenant_id or not chosen:
+        return _html_error_popup("That Page is no longer available — please connect again")
+
+    try:
+        page_access_token = _decrypt_token(chosen["encToken"])
+    except Exception as exc:
+        print(f"[ERROR] KMS decryption failed during page selection for tenant_id={tenant_id}: {exc}")
+        return _html_error_popup("Failed to read the Page access token — please re-authorise")
+
+    return _connect_page(
+        tenant_id,
+        {"id": chosen["id"], "name": chosen.get("name", chosen["id"]), "access_token": page_access_token},
+    )
 
 
 def _handle_disconnect_channel(tenant_id: str) -> dict:
@@ -1045,7 +1184,7 @@ def _html_success_popup(page_id: str, page_name: str) -> dict:
 <script>
   try {{
     window.opener.postMessage(
-      {{ type: 'META_OAUTH_SUCCESS', pageId: '{safe_page_id}', pageName: '{safe_page_name}' }},
+      {{ type: 'META_OAUTH_SUCCESS', payload: {{ pageId: '{safe_page_id}', pageName: '{safe_page_name}' }} }},
       '*'
     );
   }} catch (e) {{
@@ -1083,6 +1222,63 @@ def _html_error_popup(error_message: str) -> dict:
 </body>
 </html>"""
     return _html_response(400, html)
+
+
+def _select_page_action_url() -> str:
+    """Derive the select-page POST URL from the configured callback URL."""
+    suffix = "/meta/oauth/callback"
+    if _OAUTH_CALLBACK_URL.endswith(suffix):
+        return _OAUTH_CALLBACK_URL[: -len(suffix)] + "/meta/oauth/select-page"
+    # Fallback: relative path — resolves to the same origin as the popup.
+    return "/meta/oauth/select-page"
+
+
+def _html_page_picker(nonce: str, pages: list) -> dict:
+    """
+    Render the multi-Page chooser shown when an account granted more than one
+    Page. Submitting posts { nonce, page_id } to POST /meta/oauth/select-page,
+    which completes the connection and returns the success popup.
+    """
+    action = html.escape(_select_page_action_url(), quote=True)
+    safe_nonce = html.escape(nonce, quote=True)
+    rows = []
+    for i, p in enumerate(pages):
+        pid = html.escape(str(p.get("id", "")), quote=True)
+        pname = html.escape(str(p.get("name", p.get("id", ""))))
+        checked = " checked" if i == 0 else ""
+        rows.append(
+            f'  <label class="row"><input type="radio" name="page_id" value="{pid}"{checked}>'
+            f'<span class="name">{pname}</span></label>'
+        )
+    rows_html = "\n".join(rows)
+    body = f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Choose a Page</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: #1e293b; margin: 0; padding: 24px; }}
+  h1 {{ font-size: 18px; margin: 0 0 6px; }}
+  p.sub {{ font-size: 13px; color: #64748b; margin: 0 0 18px; line-height: 1.4; }}
+  .row {{ display: flex; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid #e2e8f0; border-radius: 10px; margin-bottom: 8px; cursor: pointer; }}
+  .row:hover {{ border-color: #50C878; }}
+  .name {{ font-size: 14px; font-weight: 600; }}
+  button {{ margin-top: 12px; width: 100%; font-size: 14px; font-weight: 600; color: #fff; background: #50C878; border: none; border-radius: 999px; padding: 12px; cursor: pointer; }}
+  button:hover {{ background: #059669; }}
+</style>
+</head>
+<body>
+<h1>Choose the Page to connect</h1>
+<p class="sub">Your Facebook account manages more than one Page. Picasso connects one Page &mdash; pick the Page whose Messenger and Instagram messages should route here.</p>
+<form method="POST" action="{action}">
+  <input type="hidden" name="nonce" value="{safe_nonce}">
+{rows_html}
+  <button type="submit">Connect this Page</button>
+</form>
+</body>
+</html>"""
+    return _html_response(200, body)
 
 
 # ---------------------------------------------------------------------------
@@ -1270,6 +1466,10 @@ def _route(event: dict) -> dict:
     # --- GET /meta/oauth/callback ---
     if http_method == "GET" and path.endswith("/meta/oauth/callback"):
         return _handle_oauth_callback(event)
+
+    # --- POST /meta/oauth/select-page (nonce-gated, like the callback) ---
+    if http_method == "POST" and path.endswith("/meta/oauth/select-page"):
+        return _handle_select_page(event)
 
     # --- Routes with {tenant_id} path parameter ---
     # /meta/channels/{tenant_id}/disconnect
