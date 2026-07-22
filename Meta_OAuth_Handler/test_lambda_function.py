@@ -1098,6 +1098,10 @@ class TestMultiPageSelection(unittest.TestCase):
         # Page tokens are encrypted at rest, never plaintext.
         self.assertTrue(all(p["encToken"] == "ENC" for p in item["pages"]))
         self.assertNotIn("TOK_1", response["body"])
+        # Each token encrypted under its page-bound KMS context (SR #4).
+        mock_encrypt.assert_any_call(
+            "TOK_1", {"purpose": "meta-page-selection", "pageId": "PAGE_001"}
+        )
         self.assertNotIn("TOK_2", response["body"])
 
     @patch("lambda_function._get_meta_app_secret", return_value=_FAKE_APP_SECRET)
@@ -1170,8 +1174,11 @@ class TestMultiPageSelection(unittest.TestCase):
         self.assertEqual(response["statusCode"], 200)
         self.assertIn("META_OAUTH_SUCCESS", response["body"])
         self.assertIn("Foster Village", response["body"])
-        # Chosen Page's token was decrypted, then the channel written for it.
-        mock_decrypt.assert_called_once_with("E2")
+        # Chosen Page's token was decrypted with its page-bound KMS context,
+        # then the channel written for it.
+        mock_decrypt.assert_called_once_with(
+            "E2", {"purpose": "meta-page-selection", "pageId": "PAGE_002"}
+        )
         item = mock_table.return_value.put_item.call_args[1]["Item"]
         self.assertEqual(item["PK"], "PAGE#PAGE_002")
         self.assertEqual(item["tenantId"], "TENANT_XYZ")
@@ -1303,6 +1310,53 @@ class TestPopupXssEscaping(unittest.TestCase):
         out = lf._js_string("a</script>b")
         self.assertTrue(out.startswith('"') and out.endswith('"'))
         self.assertNotIn("</script>", out)
+
+
+class TestSelectionKmsContextAndCsp(unittest.TestCase):
+    """SR #4 (KMS EncryptionContext on ephemeral selection tokens) + SR #5 (CSP)."""
+
+    def test_popups_set_locked_down_csp(self):
+        import lambda_function as lf
+        responses = [
+            lf._html_success_popup("P", "N"),
+            lf._html_error_popup("boom"),
+            lf._html_page_picker("n", [{"id": "1", "name": "A"}, {"id": "2", "name": "B"}]),
+        ]
+        for resp in responses:
+            csp = resp["headers"].get("Content-Security-Policy", "")
+            self.assertIn("default-src 'none'", csp)
+            self.assertIn("form-action 'self'", csp)  # picker's POST must survive
+
+    @patch("lambda_function._kms_client")
+    def test_encrypt_passes_context_when_given(self, mock_kms):
+        import lambda_function as lf
+        mock_kms.encrypt.return_value = {"CiphertextBlob": b"xx"}
+        lf._encrypt_token("tok", lf._selection_enc_context("P1"))
+        self.assertEqual(
+            mock_kms.encrypt.call_args[1].get("EncryptionContext"),
+            {"purpose": "meta-page-selection", "pageId": "P1"},
+        )
+
+    @patch("lambda_function._kms_client")
+    def test_encrypt_omits_context_for_longterm_tokens(self, mock_kms):
+        """Long-term channel tokens must stay context-free — existing at-rest
+        ciphertext was written without one; adding it would break decrypt."""
+        import lambda_function as lf
+        mock_kms.encrypt.return_value = {"CiphertextBlob": b"xx"}
+        lf._encrypt_token("tok")
+        self.assertNotIn("EncryptionContext", mock_kms.encrypt.call_args[1])
+
+    @patch("lambda_function._kms_client")
+    def test_decrypt_passes_context_when_given(self, mock_kms):
+        import lambda_function as lf
+        mock_kms.decrypt.return_value = {"Plaintext": b"tok"}
+        lf._decrypt_token(
+            base64.b64encode(b"xx").decode(), lf._selection_enc_context("P1")
+        )
+        self.assertEqual(
+            mock_kms.decrypt.call_args[1].get("EncryptionContext"),
+            {"purpose": "meta-page-selection", "pageId": "P1"},
+        )
 
 
 if __name__ == "__main__":
