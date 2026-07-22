@@ -1174,11 +1174,28 @@ def _handle_repush_welcome(tenant_id: str, channel: str = "messenger") -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _js_string(value: str) -> str:
+    """
+    Return a safe, fully-quoted JS string literal for embedding inside an inline
+    <script>. json.dumps handles quotes/backslashes/control chars; the extra
+    escapes stop a `</script>` (or `<!--`) in the value from breaking out of the
+    script element — the HTML tokenizer scans for those byte sequences regardless
+    of JS-string quoting. Page names / error text are attacker-controllable
+    (a Facebook Page's display name), so this is load-bearing, not cosmetic.
+    """
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
 def _html_success_popup(page_id: str, page_name: str) -> dict:
     """Return an HTML response that posts META_OAUTH_SUCCESS to the opener popup."""
-    # Escape values for safe embedding in a JS string literal
-    safe_page_id = page_id.replace("'", "\\'").replace('"', '\\"')
-    safe_page_name = page_name.replace("'", "\\'").replace('"', '\\"')
+    # _js_string returns the quoted literal — no surrounding quotes in the f-string.
+    js_page_id = _js_string(page_id)
+    js_page_name = _js_string(page_name)
     html = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Connecting...</title></head>
@@ -1187,7 +1204,7 @@ def _html_success_popup(page_id: str, page_name: str) -> dict:
 <script>
   try {{
     window.opener.postMessage(
-      {{ type: 'META_OAUTH_SUCCESS', payload: {{ pageId: '{safe_page_id}', pageName: '{safe_page_name}' }} }},
+      {{ type: 'META_OAUTH_SUCCESS', payload: {{ pageId: {js_page_id}, pageName: {js_page_name} }} }},
       '*'
     );
   }} catch (e) {{
@@ -1203,18 +1220,20 @@ def _html_success_popup(page_id: str, page_name: str) -> dict:
 def _html_error_popup(error_message: str) -> dict:
     """Return an HTML response that posts META_OAUTH_ERROR to the opener popup."""
     print(f"[ERROR] OAuth popup error: {error_message}")
-    # Escape for safe embedding
-    safe_message = error_message.replace("'", "\\'").replace('"', '\\"')
-    html = f"""<!DOCTYPE html>
+    # HTML context for the visible line; JS-string context for the postMessage.
+    # error_message can embed an attacker-controlled Page name — escape both.
+    safe_message_html = html.escape(error_message)
+    js_message = _js_string(error_message)
+    body = f"""<!DOCTYPE html>
 <html>
 <head><meta charset="utf-8"><title>Connection Error</title></head>
 <body>
 <p>An error occurred while connecting your Facebook Page.</p>
-<p><strong>{error_message}</strong></p>
+<p><strong>{safe_message_html}</strong></p>
 <script>
   try {{
     window.opener.postMessage(
-      {{ type: 'META_OAUTH_ERROR', error: '{safe_message}' }},
+      {{ type: 'META_OAUTH_ERROR', error: {js_message} }},
       '*'
     );
   }} catch (e) {{
@@ -1224,7 +1243,7 @@ def _html_error_popup(error_message: str) -> dict:
 </script>
 </body>
 </html>"""
-    return _html_response(400, html)
+    return _html_response(400, body)
 
 
 def _select_page_action_url() -> str:

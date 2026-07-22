@@ -1259,8 +1259,50 @@ class TestSuccessPopupPayloadShape(unittest.TestCase):
         import lambda_function as lf
         resp = lf._html_success_popup("PAGE_042", "Test Page")
         self.assertIn("payload:", resp["body"])
-        self.assertIn("pageId: 'PAGE_042'", resp["body"])
-        self.assertIn("pageName: 'Test Page'", resp["body"])
+        # JS literals are now emitted as JSON (double-quoted) by _js_string.
+        self.assertIn('pageId: "PAGE_042"', resp["body"])
+        self.assertIn('pageName: "Test Page"', resp["body"])
+
+
+class TestPopupXssEscaping(unittest.TestCase):
+    """Page names / error text are attacker-controllable (a Facebook Page's
+    display name) and land in inline <script> and HTML contexts. Guard against
+    </script> breakout and raw HTML injection in both popups."""
+
+    SCRIPT_BREAKOUT = "</script><script>alert(document.domain)</script>"
+    IMG_ONERROR = '"><img src=x onerror=alert(1)>'
+
+    def test_success_popup_blocks_script_breakout_in_page_name(self):
+        import lambda_function as lf
+        body = lf._html_success_popup("PAGE_1", self.SCRIPT_BREAKOUT)["body"]
+        # The literal </script> must not appear to close our inline script early.
+        self.assertNotIn("</script><script>alert", body)
+        self.assertIn("\\u003c/script", body)  # neutralized form
+
+    def test_success_popup_still_carries_clean_page_data(self):
+        import lambda_function as lf
+        body = lf._html_success_popup("PAGE_42", "Austin Angels")["body"]
+        self.assertIn("META_OAUTH_SUCCESS", body)
+        self.assertIn("PAGE_42", body)
+        self.assertIn("Austin Angels", body)
+
+    def test_error_popup_escapes_script_breakout(self):
+        import lambda_function as lf
+        body = lf._html_error_popup(f"No token for Page '{self.SCRIPT_BREAKOUT}'")["body"]
+        self.assertNotIn("<script>alert(document.domain)</script>", body)
+        self.assertIn("&lt;script&gt;", body)  # visible line HTML-escaped
+
+    def test_error_popup_escapes_img_onerror(self):
+        import lambda_function as lf
+        body = lf._html_error_popup(f"Page '{self.IMG_ONERROR}'")["body"]
+        self.assertNotIn("<img src=x", body)
+        self.assertIn("&lt;img", body)
+
+    def test_js_string_returns_quoted_neutralized_literal(self):
+        import lambda_function as lf
+        out = lf._js_string("a</script>b")
+        self.assertTrue(out.startswith('"') and out.endswith('"'))
+        self.assertNotIn("</script>", out)
 
 
 if __name__ == "__main__":
