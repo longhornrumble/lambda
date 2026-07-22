@@ -957,19 +957,22 @@ def _handle_select_page(event: dict) -> dict:
     if not nonce or not page_id:
         return _html_error_popup("Missing Page selection — please try connecting again")
 
+    # Atomically CLAIM the nonce: conditional delete returns the record only to
+    # the single caller that wins, so a double-submit can't connect twice. The
+    # delete IS the claim (no separate get) — no replay window.
     key = {"PK": f"SELECT#{nonce}", "SK": "OAUTH_SELECTION"}
     try:
-        record = _channel_table().get_item(Key=key).get("Item")
-    except Exception as exc:
-        print(f"[ERROR] Failed to read page-selection nonce: {exc}")
+        record = _channel_table().delete_item(
+            Key=key,
+            ConditionExpression="attribute_exists(PK)",
+            ReturnValues="ALL_OLD",
+        ).get("Attributes")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            # Already claimed by a concurrent submit, or never existed.
+            return _html_error_popup("Your Page selection expired — please connect again")
+        print(f"[ERROR] Failed to claim page-selection nonce: {exc}")
         return _html_error_popup("Could not complete Page selection — please try again")
-
-    # Single-use: delete immediately so the nonce cannot be replayed.
-    if record:
-        try:
-            _channel_table().delete_item(Key=key)
-        except Exception as exc:
-            print(f"[WARN] Failed to delete used page-selection nonce: {exc}")
 
     # DynamoDB TTL deletion lags, so enforce expiry in code too.
     if not record or int(record.get("ttl", 0)) < int(time.time()):
