@@ -1161,9 +1161,9 @@ class TestMultiPageSelection(unittest.TestCase):
     ):
         import lambda_function as lf
 
-        mock_table.return_value.get_item.return_value = {"Item": self._stored_record()}
+        # Atomic claim: conditional delete returns the record in ALL_OLD.
+        mock_table.return_value.delete_item.return_value = {"Attributes": self._stored_record()}
         mock_table.return_value.put_item = MagicMock()
-        mock_table.return_value.delete_item = MagicMock()
 
         response = lf.lambda_handler(self._select_event(page_id="PAGE_002"), _make_context())
 
@@ -1175,16 +1175,18 @@ class TestMultiPageSelection(unittest.TestCase):
         item = mock_table.return_value.put_item.call_args[1]["Item"]
         self.assertEqual(item["PK"], "PAGE#PAGE_002")
         self.assertEqual(item["tenantId"], "TENANT_XYZ")
-        # Single-use: the nonce record is deleted.
-        mock_table.return_value.delete_item.assert_called_once_with(
-            Key={"PK": "SELECT#NONCE123", "SK": "OAUTH_SELECTION"}
-        )
+        # The nonce is claimed via a conditional delete (single-use, atomic).
+        delete_kwargs = mock_table.return_value.delete_item.call_args[1]
+        self.assertEqual(delete_kwargs["Key"], {"PK": "SELECT#NONCE123", "SK": "OAUTH_SELECTION"})
+        self.assertEqual(delete_kwargs["ConditionExpression"], "attribute_exists(PK)")
+        self.assertEqual(delete_kwargs["ReturnValues"], "ALL_OLD")
 
     @patch("lambda_function._channel_table")
     def test_select_page_expired_nonce_errors(self, mock_table):
         import lambda_function as lf
-        mock_table.return_value.get_item.return_value = {"Item": self._stored_record(ttl_offset=-10)}
-        mock_table.return_value.delete_item = MagicMock()
+        mock_table.return_value.delete_item.return_value = {
+            "Attributes": self._stored_record(ttl_offset=-10)
+        }
 
         response = lf.lambda_handler(self._select_event(), _make_context())
         self.assertIn("META_OAUTH_ERROR", response["body"])
@@ -1192,20 +1194,55 @@ class TestMultiPageSelection(unittest.TestCase):
 
     @patch("lambda_function._channel_table")
     def test_select_page_unknown_nonce_errors(self, mock_table):
+        """No such nonce (or already claimed) -> conditional delete fails -> error."""
         import lambda_function as lf
-        mock_table.return_value.get_item.return_value = {}  # no Item
+        mock_table.return_value.delete_item.side_effect = ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "not found"}},
+            "DeleteItem",
+        )
 
         response = lf.lambda_handler(self._select_event(), _make_context())
         self.assertIn("META_OAUTH_ERROR", response["body"])
+        self.assertIn("expired", response["body"])
 
     @patch("lambda_function._channel_table")
     def test_select_page_unknown_page_id_errors(self, mock_table):
         import lambda_function as lf
-        mock_table.return_value.get_item.return_value = {"Item": self._stored_record()}
-        mock_table.return_value.delete_item = MagicMock()
+        mock_table.return_value.delete_item.return_value = {"Attributes": self._stored_record()}
 
         response = lf.lambda_handler(self._select_event(page_id="PAGE_999"), _make_context())
         self.assertIn("META_OAUTH_ERROR", response["body"])
+
+    @patch("lambda_function._graph_post", return_value={"success": True})
+    @patch("lambda_function._graph_get", return_value={})
+    @patch("lambda_function._decrypt_token", return_value="PAGE_TOKEN_2")
+    @patch("lambda_function._encrypt_token", return_value="ENCRYPTED_TOKEN_BASE64")
+    @patch("lambda_function._channel_table")
+    def test_select_page_double_submit_only_one_connects(
+        self, mock_table, mock_encrypt, mock_decrypt, mock_get, mock_post
+    ):
+        """Two racing submits of the same nonce: the atomic claim lets exactly
+        one win (connect); the loser's conditional delete fails -> clean error,
+        no second connection."""
+        import lambda_function as lf
+
+        mock_table.return_value.put_item = MagicMock()
+        # First claim wins (ALL_OLD returns the record); second is already gone.
+        mock_table.return_value.delete_item.side_effect = [
+            {"Attributes": self._stored_record()},
+            ClientError(
+                {"Error": {"Code": "ConditionalCheckFailedException", "Message": "gone"}},
+                "DeleteItem",
+            ),
+        ]
+
+        first = lf.lambda_handler(self._select_event(page_id="PAGE_002"), _make_context())
+        second = lf.lambda_handler(self._select_event(page_id="PAGE_002"), _make_context())
+
+        self.assertIn("META_OAUTH_SUCCESS", first["body"])
+        self.assertIn("META_OAUTH_ERROR", second["body"])
+        # Only the winner wrote a channel row.
+        mock_table.return_value.put_item.assert_called_once()
 
     def test_select_page_missing_fields_errors(self):
         import lambda_function as lf
