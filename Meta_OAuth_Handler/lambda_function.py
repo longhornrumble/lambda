@@ -230,6 +230,15 @@ def _html_response(status_code: int, html: str) -> dict:
     headers = {
         "Content-Type": "text/html; charset=utf-8",
         "Access-Control-Allow-Origin": "*",
+        # Defense-in-depth (SR #5): the popups load NO external resources — only
+        # inline <script>/<style> and a same-origin form post. Lock everything
+        # else off so a regressed escape can't exfil via img/connect/frame.
+        # (Does not stop inline-script XSS on its own — the escaping in
+        # _js_string/_html_error_popup is the primary control.)
+        "Content-Security-Policy": (
+            "default-src 'none'; script-src 'unsafe-inline'; "
+            "style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'"
+        ),
     }
     return {
         "statusCode": status_code,
@@ -345,20 +354,37 @@ def _graph_delete(path: str, params: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _encrypt_token(plaintext: str) -> str:
-    """Encrypt a token string with KMS and return a base64-encoded ciphertext."""
-    response = _kms_client.encrypt(
-        KeyId=_KMS_KEY_ID,
-        Plaintext=plaintext.encode(),
-    )
+def _selection_enc_context(page_id: str) -> dict:
+    """KMS EncryptionContext binding an ephemeral page-selection token to its
+    Page (SR #4). Identical string is required at encrypt + decrypt time."""
+    return {"purpose": "meta-page-selection", "pageId": page_id}
+
+
+def _encrypt_token(plaintext: str, encryption_context: Optional[dict] = None) -> str:
+    """Encrypt a token string with KMS and return a base64-encoded ciphertext.
+
+    encryption_context (optional) binds the ciphertext to a purpose/pageId so it
+    can only be decrypted with the SAME context — used for the ephemeral
+    page-selection tokens. Long-term channel tokens omit it (backward compat:
+    existing at-rest ciphertext was written without a context)."""
+    kwargs = {"KeyId": _KMS_KEY_ID, "Plaintext": plaintext.encode()}
+    if encryption_context:
+        kwargs["EncryptionContext"] = encryption_context
+    response = _kms_client.encrypt(**kwargs)
     ciphertext_blob = response["CiphertextBlob"]
     return base64.b64encode(ciphertext_blob).decode()
 
 
-def _decrypt_token(encoded_ciphertext: str) -> str:
-    """Decrypt a base64-encoded KMS ciphertext and return the plaintext token."""
+def _decrypt_token(encoded_ciphertext: str, encryption_context: Optional[dict] = None) -> str:
+    """Decrypt a base64-encoded KMS ciphertext and return the plaintext token.
+
+    Pass the same encryption_context used at encrypt time (page-selection
+    tokens); omit for legacy/long-term tokens encrypted without a context."""
     ciphertext_blob = base64.b64decode(encoded_ciphertext)
-    response = _kms_client.decrypt(CiphertextBlob=ciphertext_blob)
+    kwargs = {"CiphertextBlob": ciphertext_blob}
+    if encryption_context:
+        kwargs["EncryptionContext"] = encryption_context
+    response = _kms_client.decrypt(**kwargs)
     return response["Plaintext"].decode()
 
 
@@ -891,7 +917,7 @@ def _begin_page_selection(tenant_id: str, pages: list) -> dict:
     stored_pages = []
     for p in usable:
         try:
-            enc = _encrypt_token(p["access_token"])
+            enc = _encrypt_token(p["access_token"], _selection_enc_context(p["id"]))
         except Exception as exc:
             print(f"[ERROR] KMS encryption failed during page selection for tenant_id={tenant_id}: {exc}")
             return _html_error_popup("Failed to secure the Page access tokens")
@@ -984,7 +1010,9 @@ def _handle_select_page(event: dict) -> dict:
         return _html_error_popup("That Page is no longer available — please connect again")
 
     try:
-        page_access_token = _decrypt_token(chosen["encToken"])
+        page_access_token = _decrypt_token(
+            chosen["encToken"], _selection_enc_context(chosen["id"])
+        )
     except Exception as exc:
         print(f"[ERROR] KMS decryption failed during page selection for tenant_id={tenant_id}: {exc}")
         return _html_error_popup("Failed to read the Page access token — please re-authorise")
