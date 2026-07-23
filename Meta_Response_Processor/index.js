@@ -2918,6 +2918,33 @@ exports.handler = async function handler(event) {
     // Send typing indicator (best-effort) then welcome message
     await sendTypingIndicator(pageId, psid, pageAccessToken, channelType);
 
+    // Disclosure on entry: GET_STARTED is the FORCED first interaction on
+    // Messenger (a fresh conversation shows only the Get Started button, no
+    // input box), and the welcome we're about to store makes the next turn's
+    // history non-empty — so the RAG-turn disclosure (gated on empty history)
+    // is never reachable in the normal flow. Send it here so every user is told
+    // it's an automated assistant on first contact. Flag-gated (off ⇒
+    // byte-identical baseline), config-driven (same disclosure_line string),
+    // best-effort (never blocks the welcome). No double-fire: after this the
+    // RAG-turn disclosure stays suppressed (history non-empty); an Instagram
+    // user who types first (no GET_STARTED) is still covered by that path.
+    if (messengerFlagOn) {
+      const disclosureText = getMessengerString(
+        config,
+        channelType,
+        'disclosure_line',
+        DEFAULT_DISCLOSURE_LINE
+      );
+      try {
+        await sendResponseMessages(pageId, psid, disclosureText, pageAccessToken, channelType);
+        log('INFO', 'Sent disclosure line (GET_STARTED entry)', { pageId, psid });
+      } catch (discErr) {
+        log('WARN', 'Failed to send disclosure line on GET_STARTED — continuing with welcome', {
+          pageId, psid, error: discErr.message,
+        });
+      }
+    }
+
     try {
       await sendResponseMessages(pageId, psid, welcomeMessage, pageAccessToken, channelType);
     } catch (sendErr) {
