@@ -548,6 +548,69 @@ describe('Meta_Response_Processor handler', () => {
       expect(ddbMock).toHaveReceivedCommandTimes(UpdateCommand, 1);
     });
 
+    test('GET_STARTED sends the disclosure BEFORE the welcome when MESSENGER_CHANNEL is on', async () => {
+      loadConfig.mockResolvedValueOnce({
+        welcome_message: 'Welcome to our service! How can I help you?',
+        tone_prompt: 'Helpful.',
+        feature_flags: { MESSENGER_CHANNEL: true },
+      });
+
+      // typing + disclosure + welcome
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing_on
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.disclosure' } },
+        { ok: true, body: { recipient_id: 'PSID_123', message_id: 'mid.welcome' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      // Still no RAG
+      expect(bedrockMock).toHaveReceivedCommandTimes(InvokeModelCommand, 0);
+
+      // Three sends: typing, disclosure, welcome (disclosure BEFORE welcome)
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body).message.text).toMatch(/automated assistant/i);
+      expect(JSON.parse(fetchMock.mock.calls[2][1].body).message.text).toBe(
+        'Welcome to our service! How can I help you?'
+      );
+    });
+
+    test('GET_STARTED disclosure honors the messenger_behavior.strings.disclosure_line override', async () => {
+      loadConfig.mockResolvedValueOnce({
+        welcome_message: 'Hi!',
+        feature_flags: { MESSENGER_CHANNEL: true },
+        messenger_behavior: { strings: { disclosure_line: 'Custom: this is a bot.' } },
+      });
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} },
+        { ok: true, body: { message_id: 'mid.disc' } },
+        { ok: true, body: { message_id: 'mid.welcome' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body).message.text).toBe('Custom: this is a bot.');
+    });
+
+    test('GET_STARTED does NOT send a disclosure when MESSENGER_CHANNEL is off (byte-identical baseline)', async () => {
+      loadConfig.mockResolvedValueOnce({
+        welcome_message: 'Welcome!',
+        feature_flags: { MESSENGER_CHANNEL: false },
+      });
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing
+        { ok: true, body: { message_id: 'mid.welcome' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      // Only typing + welcome (no disclosure)
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body).message.text).toBe('Welcome!');
+    });
+
     test('GET_STARTED uses default welcome when config has no welcome_message', async () => {
       loadConfig.mockResolvedValueOnce({ tone_prompt: 'Helpful.' }); // no welcome_message
 
