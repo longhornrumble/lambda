@@ -38,6 +38,54 @@ function truncateTitle(label) {
 }
 
 /**
+ * Build welcome quick replies from the tenant's `action_chips.default_chips`
+ * (the widget-format welcome chips). Reused on the Messenger GET_STARTED
+ * welcome so the greeting carries the same starter chips the widget shows.
+ * The caller gates on MESSENGER_CHANNEL; here we only honour the config's own
+ * `enabled` + `show_on_welcome` switches. Titles are truncated to the C5 QR
+ * cap; the count is capped at `max_display` (default QUICK_REPLY_MAX) and hard
+ * capped at QUICK_REPLY_MAX.
+ *
+ * Payload is `PIC1:chip:{key}` — `resolveChipPayload` turns a tap back into the
+ * chip's `value` (a raw QR tap only carries the ≤20-char truncated title).
+ *
+ * @param {object} config — tenant config (action_chips)
+ * @returns {Array<{content_type:'text', title:string, payload:string}>}
+ */
+function buildWelcomeChips(config) {
+  const ac = config?.action_chips;
+  if (!ac || ac.enabled !== true || ac.show_on_welcome !== true) return [];
+  const cap = Math.min(
+    typeof ac.max_display === 'number' && ac.max_display > 0 ? ac.max_display : QUICK_REPLY_MAX,
+    QUICK_REPLY_MAX
+  );
+  const chips = [];
+  for (const [key, chip] of Object.entries(ac.default_chips || {})) {
+    const label = chip?.label;
+    if (typeof label !== 'string' || !label.trim()) continue; // skip unlabeled
+    chips.push({ content_type: 'text', title: truncateTitle(label), payload: `PIC1:chip:${key}` });
+    if (chips.length >= cap) break;
+  }
+  return chips;
+}
+
+/**
+ * Resolve a `PIC1:chip:{key}` welcome-chip payload to the turn text it stands
+ * for — the chip's `value` (the query/info text the widget would send),
+ * falling back to its label. Returns null when the payload is not a chip route
+ * or the key is unknown (caller then treats it as free text, C3).
+ *
+ * @returns {{ key:string, turnText:string } | null}
+ */
+function resolveChipPayload(payload, config) {
+  if (typeof payload !== 'string' || !payload.startsWith('PIC1:chip:')) return null;
+  const key = payload.slice('PIC1:chip:'.length);
+  const chip = config?.action_chips?.default_chips?.[key];
+  if (!chip) return null;
+  return { key, turnText: chip.value || chip.label || key };
+}
+
+/**
  * @param {string[]} actionIds — validated ids (validateActionIds output)
  * @param {object} config — tenant config (cta_definitions)
  * @param {(level: string, msg: string, meta?: object) => void} log
@@ -204,4 +252,4 @@ function resolveCtaPayload(payload, config) {
   }
 }
 
-module.exports = { renderMessengerActions, resolveCtaPayload, truncateTitle };
+module.exports = { renderMessengerActions, resolveCtaPayload, truncateTitle, buildWelcomeChips, resolveChipPayload };
