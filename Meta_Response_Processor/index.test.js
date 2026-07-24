@@ -653,6 +653,110 @@ describe('Meta_Response_Processor handler', () => {
     });
   });
 
+  // ── Welcome chips (action_chips.default_chips on the GET_STARTED greeting) ──
+
+  describe('Welcome chips', () => {
+    const withChips = (extra = {}) => ({
+      welcome_message: 'Hi there!',
+      feature_flags: { MESSENGER_CHANNEL: true },
+      action_chips: {
+        enabled: true,
+        show_on_welcome: true,
+        max_display: 6,
+        default_chips: {
+          how_can_i_volunteer: { label: '📖 Learn about Mentoring', action: 'send_query', value: 'Tell me about your mentoring program.' },
+          donate: { label: '💸 Make a Donation', action: 'send_query', value: 'How can I donate?' },
+        },
+      },
+      ...extra,
+    });
+
+    test('GET_STARTED attaches welcome chips to the greeting when MESSENGER_CHANNEL is on', async () => {
+      loadConfig.mockResolvedValueOnce(withChips());
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing
+        { ok: true, body: { message_id: 'mid.disc' } }, // disclosure
+        { ok: true, body: { message_id: 'mid.welcome' } }, // welcome
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      // welcome is the 3rd send (typing, disclosure, welcome)
+      const welcomeBody = JSON.parse(fetchMock.mock.calls[2][1].body);
+      expect(welcomeBody.message.text).toBe('Hi there!');
+      expect(welcomeBody.message.quick_replies).toHaveLength(2);
+      expect(welcomeBody.message.quick_replies.map((q) => q.payload)).toEqual([
+        'PIC1:chip:how_can_i_volunteer',
+        'PIC1:chip:donate',
+      ]);
+    });
+
+    test('GET_STARTED attaches NO chips when MESSENGER_CHANNEL is off (baseline)', async () => {
+      loadConfig.mockResolvedValueOnce(withChips({ feature_flags: { MESSENGER_CHANNEL: false } }));
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} }, // typing
+        { ok: true, body: { message_id: 'mid.welcome' } }, // welcome (no disclosure — flag off)
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      const welcomeBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(welcomeBody.message.text).toBe('Hi there!');
+      expect(welcomeBody.message.quick_replies).toBeUndefined();
+    });
+
+    test('GET_STARTED attaches NO chips when show_on_welcome is off', async () => {
+      loadConfig.mockResolvedValueOnce(
+        withChips({
+          action_chips: {
+            enabled: true,
+            show_on_welcome: false,
+            default_chips: { a: { label: 'A', action: 'send_query', value: 'a' } },
+          },
+        })
+      );
+      fetchMock = makeFetchMock([
+        { ok: true, body: {} },
+        { ok: true, body: { message_id: 'mid.disc' } },
+        { ok: true, body: { message_id: 'mid.welcome' } },
+      ]);
+      global.fetch = fetchMock;
+
+      await handler(buildEvent({ isPostback: true, messageText: 'GET_STARTED' }));
+
+      const welcomeBody = JSON.parse(fetchMock.mock.calls[2][1].body);
+      expect(welcomeBody.message.quick_replies).toBeUndefined();
+    });
+
+    test('a welcome-chip tap (PIC1:chip) runs the chip VALUE through RAG, not the truncated title', async () => {
+      loadConfig.mockResolvedValueOnce({
+        model_id: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+        tone_prompt: 'Helpful.',
+        streaming: { max_tokens: 500, temperature: 0 },
+        feature_flags: { MESSENGER_CHANNEL: true },
+        action_chips: {
+          enabled: true,
+          show_on_welcome: true,
+          default_chips: {
+            how_can_i_volunteer: { label: '📖 Learn about Mentoring', action: 'send_query', value: 'Tell me about your mentoring program.' },
+          },
+        },
+      });
+
+      await handler(
+        buildEvent({
+          messageText: '📖 Learn about Ment…', // Meta echoes the ≤20-char QR title
+          quickReplyPayload: 'PIC1:chip:how_can_i_volunteer',
+        })
+      );
+
+      // RAG queried the chip's precise value, not the truncated echoed title
+      expect(retrieveKB).toHaveBeenCalledWith('Tell me about your mentoring program.', expect.anything());
+    });
+  });
+
   // ── Enhancement 2: 24-hour messaging-window enforcement ───────────────────
 
   describe('24-hour messaging window', () => {

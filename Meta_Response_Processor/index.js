@@ -64,7 +64,7 @@ const formEngine = require('./formEngine');
 const schedulingDriver = require('./schedulingDriver');
 const { classifyMetaSendError } = require('./metaSendErrors');
 const { buildMessengerV5Prompt, resolveMessengerModelId } = require('./prompt_messenger');
-const { renderMessengerActions, resolveCtaPayload } = require('./renderMessengerActions');
+const { renderMessengerActions, resolveCtaPayload, buildWelcomeChips, resolveChipPayload } = require('./renderMessengerActions');
 const { computeSessionWindow } = require('./sessionWindow');
 const { createTailParser } = require('../shared/prompt/streamTail');
 const { validateActionIds } = require('../shared/prompt/prompt_v5');
@@ -2677,8 +2677,18 @@ exports.handler = async function handler(event) {
   // code would already have returned).
   let startSchedulingApptTypeId = null;
   if (pic1Payload) {
-    const schedStart = schedulingEnabled ? schedulingDriver.parseSchedPayload(pic1Payload) : null;
-    if (schedStart && schedStart.op === 'start' && schedStart.arg) {
+    const chipRoute = resolveChipPayload(pic1Payload, config);
+    const schedStart = !chipRoute && schedulingEnabled ? schedulingDriver.parseSchedPayload(pic1Payload) : null;
+    if (chipRoute) {
+      // Welcome chip (action_chips.default_chips): route the tap to the chip's
+      // configured `value` — a raw QR tap only carries the ≤20-char truncated
+      // title — then let the normal RAG turn (below) answer it. show_info chips
+      // likewise run their value through RAG (a widget target_branch has no
+      // Messenger peer; the schedule chip therefore answers ABOUT scheduling
+      // rather than opening the picker — that's the schedule_intro_call CTA).
+      sanitizedInput = sanitizeUserInput(chipRoute.turnText) || chipRoute.turnText;
+      log('INFO', 'PIC1 welcome-chip payload routed to chip value', { chipKey: chipRoute.key });
+    } else if (schedStart && schedStart.op === 'start' && schedStart.arg) {
       startSchedulingApptTypeId = schedStart.arg;
     } else {
       const resolved = resolveCtaPayload(pic1Payload, config);
@@ -2945,8 +2955,17 @@ exports.handler = async function handler(event) {
       }
     }
 
+    // Welcome starter chips: attach the tenant's action_chips.default_chips as
+    // quick replies on the greeting (widget parity — the widget shows these on
+    // its welcome via show_on_welcome). Flag-gated (off ⇒ byte-identical
+    // baseline). Taps route via PIC1:chip:{key} → the chip's value (below).
+    const welcomeChips = messengerFlagOn ? buildWelcomeChips(config) : [];
+    const welcomeActions = welcomeChips.length ? { quickReplies: welcomeChips } : null;
     try {
-      await sendResponseMessages(pageId, psid, welcomeMessage, pageAccessToken, channelType);
+      await sendResponseMessages(pageId, psid, welcomeMessage, pageAccessToken, channelType, welcomeActions);
+      if (welcomeActions) {
+        log('INFO', 'Welcome chips attached to greeting', { pageId, psid, chips: welcomeChips.length });
+      }
     } catch (sendErr) {
       log('ERROR', 'Failed to send welcome message — will retry', {
         pageId, psid, error: sendErr.message,
